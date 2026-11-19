@@ -1,0 +1,6 @@
+{
+  "extends": "@fixlevelup/tooling/tsconfig/node",
+  "compilerOptions": { "jsx": "react-jsx" },
+  "include": ["vite.config.ts", "tests/**/*.ts", "tests/**/*.tsx"],
+  "exclude": ["node_modules", "dist"]
+}

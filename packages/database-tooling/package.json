@@ -1,0 +1,22 @@
+{
+  "name": "@fixlevelup/database-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "check:connection": "node scripts/check-connection.mjs",
+    "check:runtime": "node scripts/audit-runtime.mjs",
+    "typecheck": "tsc --noEmit",
+    "roles": "node scripts/roles.mjs",
+    "deploy": "node scripts/deploy.mjs",
+    "test:migrations": "node scripts/test-migrations.mjs",
+    "test:constraints": "node scripts/test-constraints.mjs"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "prisma": "7.10.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  }
+}

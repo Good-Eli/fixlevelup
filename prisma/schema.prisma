@@ -1,0 +1,38 @@
+generator client {
+  provider               = "prisma-client"
+  output                 = "../apps/api/src/generated/prisma"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+  schemas  = ["foundation"]
+}
+
+// Technical infrastructure only. No customers, requests or geography models.
+model AuditLog {
+  id            String   @id @db.Uuid
+  operation     String   @db.VarChar(64)
+  correlationId String   @map("correlation_id") @db.Uuid
+  occurredAt    DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
+  details       Json     @default("{}") @db.JsonB
+
+  @@map("audit_logs")
+  @@schema("foundation")
+}
+
+model OutboxEvent {
+  id           String   @id @db.Uuid
+  eventId      String   @unique(map: "outbox_events_event_id_key") @map("event_id") @db.Uuid
+  eventType    String   @map("event_type") @db.VarChar(64)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  status       String   @default("PENDING") @db.VarChar(16)
+  payload      Json     @default("{}") @db.JsonB
+  attemptCount Int      @default(0) @map("attempt_count")
+
+  @@index([status, createdAt], map: "outbox_events_queue_idx")
+  @@map("outbox_events")
+  @@schema("foundation")
+}

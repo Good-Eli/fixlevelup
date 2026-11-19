@@ -1,0 +1,414 @@
+# Дорожная карта реализации и критерии приёмки
+
+**Ревизия R3.2, 19.11.2026. Документация/Preflight: утверждённое будущее нескольких городов одной компании и пересмотр stable стека, не разрешение на реализацию.** Повторный полный аудит не требуется; входные условия P01 — отдельный [Preflight P01](PREFLIGHT_P01.md). Текущие подтверждённые решения владельца/AS-MAX-01 — [DECISIONS §20](DECISIONS.md#20-решения-владельца-r32); историческая фиксация §18 сохранена. Источники: [ТЗ](../ТЗ.md), расширение владельца Telegram/VK/MAX, аудит Claude; см. [архитектуру](ARCHITECTURE.md), [модель БД](DATABASE.md), [API](API.md), [решения и platform evidence](DECISIONS.md).
+
+## 1. Состояние, границы и Definition of Done
+
+Актуализируются шесть документов (пять основных+Preflight), приложение/зависимости/миграции отсутствуют. Исходные четыре материала неизменны. Подтверждены: самозанятость/резидентство РФ,3 равноправных канала и управление ими через admin, defer всех MAX registration/verification/moderation/token, AS-MAX-01 для project+development **без повторного договорного исследования/вопросов**. Новое направление — будущие несколько городов одной компании, v1 active1 без ручного selector, no tenants. WF-R2 и точные DB/API/права остаются предложениями; эти решения не разрешают код. Сначала явное разрешение пользователя на scope; вопрос, относящийся только к MAX или Pricing, не блокирует отдельно разрешённый CI/Auth на синтетических данных. Полный выпуск всех трёх клиентских каналов без их live acceptance невозможен, partial pilot только по отдельному Q23.
+
+Общий DoD любого подэтапа после разрешения: reviewed diff + Git commit с согласованным author, нет секретов/реальных ПД; schema changes только миграции с fresh/upgrade/drift tests; lint/typecheck/unit/integration/build/contract проверки фактически выполнены; read-only либо write поведение через реальный backend/БД (не mock в production); права/ownership/version/idempotency/PII redaction негативно проверены; event+audit+outbox транзакционны; API client/OpenAPI/README/CHANGELOG обновлены; evidence тестов/ограничений и ручной приёмки предъявлены. Синтетические fixtures и fakes разрешены в tests; доступ к реальным платформам никогда не имитируется отчётом «готово».
+
+Глобальный gate только owner approval scope/стек/ответственность; модульные Q перечислены ниже; production — legal/platform/retention/операционные gates. Сроки и бюджет не придумываются, platform moderation/contract ожидание учитывается отдельно от engineering critical path.
+
+## 2. Исправленные зависимости
+
+```mermaid
+flowchart LR
+  P00[Архитектура и решения] --> P01[Foundation и CI]
+  P00 --> UX[P00-UX Макеты и протоколы]
+  P00 --> ACC[P00-ACCESS Документы и допущения: без регистрации]
+  P01 --> P02[Auth и capabilities]
+  P02 --> P03[Settings Legal Files]
+  P03 --> P04[Catalog Pricing core]
+  P04 --> P05[Requests Intake]
+  P05 --> P06[CRM]
+  P05 --> P07[Channels core]
+  P07 --> TG[P07-TG]
+  P07 --> VK[P07-VK]
+  P07 --> MAX[P07-MAX Isolated adapter]
+  P03 --> ADM[P07-ADM Настройки A–E]
+  P07 --> ADM
+  ACC --> TG
+  ACC --> VK
+  ACC --> MAX
+  MAX --> MLIVE[P07-MAX-LIVE Позднее подключение и live acceptance]
+  ADM --> MLIVE
+  P04 --> A[P09A Availability]
+  P05 --> A
+  P06 --> B[P09B Dispatch]
+  A --> B
+  P05 --> P08A[P08A Сайт и формы: engineering]
+  A --> P08A
+  UX --> P08A
+  P08A --> P08B[P08B Live и release приёмка сайта]
+  RG{Release gate: >=1 опубликованный готовый messenger} --> P08B
+  ADM -. готовность каталога требуется при release .-> RG
+  TG -. если TG публикуется .-> P08B
+  VK -. если VK публикуется .-> P08B
+  MAX -. если MAX публикуется .-> P08B
+  MLIVE -. actual readiness только при публикации MAX .-> P08B
+  TG --> P10[Telegram Mini App]
+  B --> P10
+  UX --> P10
+  P04 --> QA[P11A Quote API и CRM]
+  P05 --> QA
+  P07 --> QA
+  QA --> QB[P11B Три канала сметы и Mini App UI]
+  P10 --> QB
+  VK --> QB
+  MAX -. если MAX включён в live scope смет .-> QB
+  MLIVE -. actual MAX live acceptance только для MAX scope .-> QB
+  QB --> P12[Reports Payments]
+  P12 --> P13[Close Revisit Analytics]
+  P03 --> PRIV[P13P Retention и Privacy jobs]
+  P13 --> P14[Security Load Restore]
+  MLIVE -->|только полная live приёмка3 каналов| P14
+  PRIV --> P14
+  P08A --> P14
+  P08B -. полный live release gate .-> P14
+  P14 --> P15[Production и передача]
+```
+
+Edges отражают engineering dependencies; MLIVE→P14 относится **только к полной live приёмке всех3**, не к началу P14 offline/security checks. P07-MAX-LIVE не зависимость core/TG/VK/MAX isolated/P08A UI/P11B offline или P12/P13: их можно разработать и проверить изолированно после отдельного разрешения, не выдавая это за live MAX. P08A — engineering, P08B — отдельная live/release приёмка; QB(P11B) также различает engineering и опубликованный provider scope. Пунктир MAX→P08B/QB означает условную зависимость **лишь если MAX публикуется**, не блокировку сайта/TG/VK. `P07-ADM` не engineering prerequisite P08A: во время интеграции контракт каталога тестируется синтетическими fixtures, но в production только реальный core (no mocks). Для P08B no-call release требуется каталог и хотя бы один A-enabled∧B∧C-tech∧C-live∧D messenger; если нет ни одного — только честное unavailable поведение, не приёмка no-call. Q24 отдельно регулирует намеренный callback-only release. Регистрация/moderation/token MAX в P00 не требуется и сейчас явно отложена. P11A не ждёт Mini App; его UI интегрируется P11B. P09A выделен **в этап1** целиком (выдача честных окон до живого сайта), P09B — этап2/ранний согласованный подэтап. R1 смешение P08/P09 устранено. Audit/outbox/backup строятся с foundations, этап4 их проверяет, не добавляет впервые.
+
+| Этап ТЗ | R3.2: ориентировочная группировка, учёт/приёмка по P-элементам |
+|---|---|
+| 0 | P00/UX/ACCESS: документы, решения/прототипы/evidence; **без миграций**, как прямо ограничил пользователь |
+| 1 | P01–P08A/B, P07-ADM/P09A: engineering3 каналов и admin selector без обязательного MAX token. Public/new intake только A-enabled∧actual B–D; полная live приёмкаMAX переносится в P07-MAX-LIVE, отдельно согласованный partial pilot не удаляет MAX из scope |
+| 2 | P09B/P10: реальное назначение/жизненный цикл и staff Telegram Mini App, не VK/MAX приложение мастера |
+| 3 | P11A/B/P12/P13: смета→согласие→отчёт→отметки оплаты→закрытие/повторы. P11A может начаться раньше параллельно |
+| 4 | P13P/P14/P15: privacy исполнение, нагрузка/security/restore, platform live acceptance, production handover |
+
+Ничего из ТЗ не вырезано. Этапы0–4 — только ориентировочная группировка; учёт/приёмка по конкретным P-элементам, у каждого engineering/live/release outcome отдельно (m12), не один гигантский gate «этап1». Перенос по зависимостям и новые каналы явно требуют согласования. ВыборMAX недоступен в публичной форме до access gate, но это **не** завершение трёхканального требования.
+
+## 3. Малые подэтапы с приёмкой
+
+### P00 — утвердить архитектурный вариант
+
+- **Результат/модули:** ADR13–19 и WF-R2, canonical ER/API, audit disposition46 строк, перечень открытых Q; только docs.
+- **Зависимости:** Q01/Q04/Q05/Q17/Q19/Q23 в части базового scope; юридический ответственный Q13. Business prices не требуются для isolated CI approval.
+- **Проверки:** walkthrough обычного/callback/no-call/двухстороннего bind, future cancel/late STOP, wait-parts return/PAUSED, decline/expire quote, closing debt/revisit; все transitions имеют actor/target/side effects.
+- **Критерий:** owner принял/изменил каждый блокирующий вариант и явно разрешил конкретный следующий P; нет default price/contact/status, «обратно в работу» не остаётся кодом.
+- **Риски:** принять подробную таблицу за утверждение; partial approval не означает release всех модулей.
+
+### P00-UX — согласовать ключевые интерфейсы (до соответствующего UI)
+
+- **Результат/модули:** прототипы7-step формы/раннего consent, 3 channel pairing+recovery/fallback, предложения окна/подтверждение/отмена/pending STOP, CRM dashboard/card/calendar, staff today/quote/report/availability.
+- **Зависимости:** P00, реальный визуальный просмотр исходного референса доступным инструментом; не выдавать наличие изображений за UX-анализ.
+- **Тесты:** mobile/keyboard/error walkthrough, разделение booking vs request cancellation, «не подтверждено» vs «запрос принят».
+- **Критерий:** сохранён согласованный артефакт+дата/owner decision, UI не требует выдуманной информации/неизвестного SLA; P08A/P10 UI не стартуют без него; foundation P01 не требует макетов.
+- **Риски:** pairing теряет браузер на переходе в мессенджер, клиент принимает чужой candidate, отмена непонятного scope.
+
+### P00-ACCESS — технические контракты и принятое MAX допущение, без регистрации
+
+- **Результат/модули:** технические API/ports, принятое AS-MAX-01, подтверждённые owner facts и отдельная поздняя connection checklist. Повторное исследование/запросы правовых разрешений MAX не выполняются и не ставятся prerequisite; только docs, не live connection.
+- **Зависимости:** доступные официальные тексты/owner decisions. **Не требует** MAX profile/token/moderation/договора; все эти действия отложены на P07-MAX-LIVE. TG/VK live gates относятся к своим подключениям, не готовности общего ядра.
+- **Проверки:** fact/assumption/external condition раздельно; requirements по binding/цели не обходятся форматом payload; current docs recheck до adapter contract implementation.
+- **Критерий:** документированы constraints и deferred gates, isolated core/MAX adapter не ждут token; MAX real/send/public запрещены до actual conditions. Не называть допущение разрешением платформы.
+- **Риски:** AS-MAX-01 не подтвердится или protocol изменится: изменить adapter/ADR, не снижать security/не обходить MAX.
+
+### P01 — foundation, Git, CI, proof ограничений
+
+- **Результат/модули:** monorepo/pnpm12 workspace/TS6+ESLint10 candidates, API+worker entrypoints/health, devPG18.7+Garage2.5.0S3 candidates, migration/audit/outbox/CI/synthetic backup-restore/run instructions. Единственный основной runnerVitest5+Supertest, browserE2EPlaywright отдельно; exact inventory [PreflightB](PREFLIGHT_P01.md#b-стек-и-версии--полный-exact-baseline-r32). Geo contract учтён documentary/synthetic FK proof **до domain migrations**, но city CRM/settings/prices/реальные заявки не реализуются.
+- **Зависимости:** owner P00 scope, Git author/committer privacy и remote/CI policy (**local identity существует, публичный email не разрешён**), доступ разрешённого Engine/CI runner (успешный prior Engine check записан, readiness до запуска перепроверить), supported package/hosting compatibility (Node24/PG18 proposal не новые defaults).
+- **Тесты:** clean install/frozen lock/build, real PG fresh/upgrade; доказать concrete FK joins/line owner constraints и SQL migration drift handling Prisma, tx rollback+outbox, runtime-role audit no UPDATE/DELETE, backup restore synthetic data.
+- **Критерий:** воспроизводимый стенд и actual CI evidence, stage0 snapshot коммитится **только после отдельного разрешения на commit** с утверждёнными неперсональными/no-reply author и committer; локально заданная личная почта не approval. До approval фиксируется BLOCKED Git gate, а не создаётся commit. Общая текущая просьба commit запрещает; B-04 proof выполнен до соответствующих доменных миграций. Никакой production db push.
+- **Риски:** Engine недоступен в конкретной среде запуска (в confined-режиме DSH блокируются только именованные каналы, сам Engine проверен 19.11.2026), расширения недоступны, Prisma/raw SQL introspection drift. При неуспехе альтернативный ORM обсуждается ADR, не меняется молча.
+
+### P02 — сотрудники, Auth и capabilities
+
+- **Результат/модули:** bootstrapA без default password, login/logout/renew/password/revoke, staff activation/leave/fired, capabilities DEC§13, staff invitation proof; Auth/Staff/Audit/CRM auth.
+- **Зависимости:** P01, Q12 boundaries/session policies, Q03 dual identity rules.
+- **Тесты:** role×capability×scope×state, 401/403/404/no IDOR, CSRF/cookies, brute force, deny role escalation/self permissions, current auth_version every request, disabled user live sessions.
+- **Критерий:** каждая unauthorized операция отвергнута backend, включая «спрятанную» кнопку; audit.self только actor filter/redacted, employee history не удаляется.
+- **Риски:** shared staff/customer identity, token-only invitation, blocked employee stale session.
+
+### P03 — settings/legal/files и типизированные справочники
+
+- **Результат/модули:** Settings/Geography: service_cities/versions, existing service_areas+versions с city FK, optional administrative_districts+M:N FULL/PARTIAL coverage, technician city/zone membership структуры; одна реальная ACTIVE/primary city конфигурация v1. City local timezone/contacts/hours/content отделены от company legal/security. Также consent/ref entries/files/privacy как ранее. Без публичного city selector/мультигородской CRM.
+- **Зависимости:** P02, Q02/Q12/Q13/Q16; stage synthetic only до legal gate.
+- **Тесты:** consent version stale/purpose separate, unknown config blocks publish, wrong reference type, archived reference historical snapshot intact, MIME spoof/size/count/EXIF/scan timeout/unowned file, no public bucket, signed URL expiry/stream revoke.
+- **Критерий:** отсутствие scanner ответа не делает READY; загрузка ПД только после consent/основания; DB+object backup documented; field-level encryption/blind index risk decision принят до P05.
+- **Риски:** data в signed URL/log/EXIF, manual SQL settings, lost consent anchor до submit, retention key management.
+
+### P04 — catalog, pricing core, CRM completeness
+
+- **Результат/модули:** shared catalog kinds+**city_id NOT NULL** в price/rule versions/public estimates, exclusion(city,item/rule,period), без неявного global fallback; money trace/header breakdown/rounding policy; Catalog/Pricing/Settings/CRM справочники.
+- **Зависимости:** P03, Q06/Q09/Q10, реальный прайс нормализован владельцем (дубликат/диапазоны не автоматический fixed каталог).
+- **Тесты:** integer property tests, percent bases/stack/night vs evening/express/min-max, unknown price≠zero, total/component/line consistency, effective period overlap, invalid kind fields/PART duration, archived prices/history.
+- **Критерий:** все14 групп §9.6 (техника, симптомы, бренды, работы/цены, детали/цены, duration, ranges, travel/diagnostics, вечер/ночь, express, discounts/limits, зоны, FAQ/контакты, Avito) имеют конкретного CRM-владельца и edit/archive/publish contract; итог неотрицателен, rounding воспроизводим. Ни цены мастера, ни SQL-only управление.
+- **Риски:** считать ranges exact, неверный тарифный момент/налоги, uniform item lifecycle. Неизвестные business values пустые, не demo defaults.
+
+### P05 — Requests/Customers/Intake и утверждённый workflow
+
+- **Результат/модули:** callback/full submit с обязательным city_id из trusted F/staff intake context (даже callback без адреса), city lifetime stable; historical city/zone/address/timezone snapshots+same-city current FKs, request_faults single source, idempotency receipts, F sessions per form, no-call3 provider waiting states, manual entry/coverage/policy; Requests/Customers/Legal/Files.
+- **Зависимости:** P02–P04, approved WF-R2/Q02/Q03/Q04/Q16/Q17/Q19. Scheduling effects can be contract-tested before adapter.
+- **Тесты:** callback без адреса/техники, ручной PHONE→NEW и messenger→waiting, repeat create after lost response, чужой form/file/snapshot denied, no merge по phone, consent ранний адрес/финальный submit, out-of-zone honest/manual.
+- **Критерий:** свой TG waiting exact WAITING_TELEGRAM_LINK (test3), VK/MAX WAITING_CHANNEL_LINK, no dispatch без proof. m4: единственная read-only DB view/generated expression is_waiting_link объединяет оба кода; тесты очередей/filters/reminder/cleanup показывают одинаковую обработку, нет mutable boolean и отдельных TG-only predicates. Полная command×status matrix allow/deny; process states не зависят от delivery error.
+- **Риски:** вечные customers от abandoned submit, source enum mismatch, raw PII в URL/search, неразрешённые status changes.
+
+### P06 — CRM реестр, карточка и dashboard
+
+- **Результат/модули:** protected registry/card/history/internal/staff comments/customer conversation, dashboard server DTO/asOf/definitionsVersion/filter links, search POST PII-safe; Web CRM/Requests/Analytics queries.
+- **Зависимости:** P05, UX; scheduling-derived live availability до P09A возвращает честное unknown/not_ready, не нулевую выдуманную свободу; полная dashboard приёмка после P09A.
+- **Тесты:** каждый счётчик dashboard равен соответствующему фильтру registry на одном snapshot, нормальный/empty/large synthetic dataset, cursor stability, internal comment isolation, pii capability redaction, no-call call task denied.
+- **Критерий:** ТЗ§9.1 все server-derived groups, «свободен» имеет explicit asOf/service context из Scheduling, не client counts; все действия проходят backend rights.
+- **Риски:** Next SSR cache между пользователями, N+1 counts, inconsistent snapshots.
+
+### P07 — Channels core, templates, inbox/outbox и routing
+
+- **Результат/модули:** accounts/endpoints/links/grants/preferences/permission epochs/challenges/action tokens, shared commands, inbox/fanout/deliveries/attempts/fenced jobs, versioned template allowlists DEC§16, routing/manager alerts; CustomerMessaging/Notifications/Legal.
+- **Зависимости:** P05/P02/P03, Q17/Q18/Q20, platform-independent domain contracts; реальные providers подключаются отдельно ниже. TG/VK/MAX/регистрации не blocker foundationP01, не dependencies technical build proof.
+- **Тесты:** dual proof/no forwarded-link auth, no duplicate account/endpoint grant, cross-channel competing actions one domain result, revoke vs pending send, re-route generation, wrong role/internal message, arbitrary payload denied; crash after external accepted before SENT допускает message duplicate но не booking/payment duplicate; stale worker lease fencing.
+- **Критерий:** каждый §11 event→approved template/audience/allowlist, unknown variable rejected; manager routing works с2 recipients и без duty assignee (CRM queue), cleanup raw inbox retains dedupe/domain IDs, fallback только explicit scoped grant, PHONE не включается от failure.
+- **Риски:** technical allow ошибочно равен consent, max best-effort dedupe объявлен exact, message accepted выдан за customer CONFIRM. No real functionality ready до adapter tests.
+
+### P07-TG — клиентский Telegram и staff transport
+
+- **Результат/модули:** BotFather config+verified webhook/start/help/callback renderer/permission updates, staff TG invitations separate; Telegram adapter вызывает те же application commands.
+- **Зависимости:** P07/P00-ACCESS-TG, raw official docs initData/Bot API доступны до реализации, approved bot account/token secrets/HTTPS.
+- **Тесты:** wrong/missing secret, update_id duplicate/reorder, token reissue/expiry, start required, callback query answer vs domain outcome, rate limits/403/429/timeouts, MiniApp rights отдельно P10.
+- **Критерий:** live staging customer bind/confirm/reschedule/cancel/notifications+quote sample проходят без PII в deep links/payload, исходные Telegram tests2/3/21 сохранены; secret rotation после cutoff rejects old.
+- **Риски:** индекс docs не security specification, stolen initData, stop не замечен, wrong bot namespace.
+
+### P07-VK — сообщество VK
+
+- **Результат/модули:** community token rights/events, Callback confirmation+secret/group/version, message_new/event/allow/deny normalization, keyboard/render/send/eventAnswer, stable random_id retry; только VK adapter.
+- **Зависимости:** P07/P00-ACCESS-VK/Q22, реальный admin доступ/разрешения, current quotas/rules, client_info support.
+- **Тесты:** confirmation response не ordinary ok, wrong group/secret/schema, top-level event_id duplicates, object.event_id timely answer, ref не permission, allow/deny reorder fail-closed, send denied/privacy/rate limits/random_id same retry, no community join prerequisite.
+- **Критерий:** live staging dual binding+4 новых client actions/updates через common commands; без отдельных VK pricing/state rules; access/applicability evidence stored без secrets.
+- **Риски:** monthly limits/token model неопределённы, ref limit не найден, callback version меняется, bot policy блокирует канал.
+
+### P07-MAX — изолированный MAX adapter по официальному API
+
+- **Результат/модули:** schema/render/normalize/auth-header validation/permission/stop adapters к общим ports и contract tests. Работа по **AS-MAX-01**, без real connections/регистрации/токенов; не отдельная business logic.
+- **Зависимости:** P07/P00-ACCESS documentary API contract, отдельное разрешение владельца начать код в будущем. **Нет зависимости от реального token, профиля/verification/moderation/договора MAX.** Это не разрешение разработки сейчас.
+- **Тесты:** isolated synthetic fixtures/stub transport с запретом network egress: HTTPS/TLS config validation, secret missing/wrong, durable inbox/30s protocol design, retry/unsubscribe/error200 parse, mid/callback/fingerprint strength, stopped events, peer rate-limit behavior. Fake только в tests, не в production adapter ветке.
+- **Критерий:** common commands/expected errors идентичны TG/VK, offline tests воспроизводимы; AS-MAX-01 не записан VERIFIED и MAX не опубликован/не отправляет. Report «adapter isolated-ready», не «MAX live-ready».
+- **Риски:** фактическая technical/API/config compatibility при позднем подключении может отличаться от fixtures; подмена test-ready real-ready недопустима. Это не повод заранее блокировать core/MAX adapter или повторять договорное исследование.
+
+### P07-ADM — CRM управление клиентскими способами A–E
+
+- **Результат/модули:** «Настройки → Клиентские каналы и способы подтверждения»,3 равноправных option cards, draft/publish catalog/history/audit, future config без connection, computed readiness/blockers, public filtered list+single intake snapshot; Settings/Channels/Requests/CRM.
+- **Зависимости:** P03/P05/P07 + UX admin. Моделирование/isolated UI tests не требуют реальных токенов; public publication требует actual B–D/live per option.
+- **Тесты:** N01–N12, permissions/manage vs publish vs connections, concurrent publications/ETag, disabled/no credentials/expired readiness отсутствуют public; A-off сохраняет старые requests/consents, real suspend отдельно.
+- **Критерий:** enabled draft будущего MAX сохраняется без registration, publish enabled fail-closed; public только A∧B∧C∧D, а actual bind/send требует E. Intake принимает один channelSelection и snapshot versions; ни toggle, ни direct API не делает ready/verified/consent override.
+- **Точные требования S1 (не реализация сейчас):** создать scheduled CONFIG/CREDENTIAL/WEBHOOK/TLS/ADAPTER check runs; `RecordChannelReadinessCheck` принимает run/evidence только trusted checker (`channels.readiness.record`), запуск — `channels.readiness.run`; `RecordLiveAcceptance` принимает actual authorized run/report только trusted recorder (`channels.live.acceptance.record`), запуск — `.run`; D вручную аттестует reviewer (`channels.evidence.attest`) с mandatory evidence_ref/purpose/protocol/validity. Для TG/VK reviewed terms+конкретный use case, не выдуманная platform справка; MAX purpose/binding в архитектуре и разработке принят AS-MAX-01 без повторного договорного inquiry; позднее actual connection/method/protocol compatibility+live proof не подменяются этим допущением. Согласовать интервалы/TTL/evidence owner, SSRF/egress guards и invalidation при version change. P01 это не реализует.
+- **Приёмка S1/m1–m3/m5/m6/m10–m11:** N03/N08/N11/N12 расширены assertions без новых IDs: no evidence→publish409; replay/stale config results не создают current PASS; options.publish не даёт run/record/attest; FK(catalog,option_version) rejects чужой entry; C-tech отдельно от C-live; validation POST read+CSRF/idempotent/no side effects; DTO только public supportedActions; Q24 утверждён до намеренного zero-channel live release, outage все равно fail-closed. Все69 сценариев остаются в общем evidence.
+- **Риски:** слияние A со suspend, требование E у anonymous visitor, stale GET→submit, скрытое включение телефона/массовое переписывание старых prefs, ручные ready flags без доказательства.
+
+### P07-MAX-LIVE — отложенные регистрация, подключение и live acceptance
+
+- **Результат/модули:** фактические MAX профиль/verification owner, бот/moderation, действующие secret refs, actual purpose/protocol permission evidence, connection config/checks+live test. **Сейчас не выполняется.**
+- **Зависимости:** отдельное позднее разрешение на реальные connection операции; P07-MAX и deferred operational checklist Q21 (не новый MAX business/legal approval вопрос). Owner self-employed/RF residency уже факт, не open business status. P07-ADM publication может выполняться после readiness, не dependency permission получения.
+- **Проверки:** реальный HTTPS443/trusted chain/Authorization/current official host, hooks/secrets/retry, зарегистрированные цели SERVICE+needed actions/binding и lawful customer opt-in, permitted staging E2E confirm/reschedule/cancel/notifications. Фактическая среда/credential version отражены в acceptance evidence.
+- **Критерий:** все реальные prerequisites выполнены до live sends; успешный live staging test перед public offer/production. После него admin вправе publish A-enabled option, но не обязан. Принять AS-MAX-01 за evidence/перескочить блокирующее условие нельзя.
+- **Риски:** отказ/задержка/лимит bot квоты, изменение terms/допустимого protocol, поэтому MAX остаётся unavailable для реальных отправок; core/TG/VK/isolated adapter при этом не блокируются.
+
+### P09A — окна, смены и доступность (этап1)
+
+- **Результат/модули:** city schedules+membership scopes и timezone snapshot **города визита**, глобальный technician lock/UTC capacity across cities, scheduling policies (duration/grid/buffers/timezone/DST/capacity), shifts/exceptions/presence, possible slots/express/no-candidate reasons, calendar read projections; Scheduling/API/CRM/public.
+- **Зависимости:** P04/P05, Q05/Q10/Q12, реальные policy inputs утверждены, ни геокодер ни GPS не добавляются без решения.
+- **Тесты:** overnight/DST/edge buffers/[), capacity sweep baseline/end-before-start, absence vs holiday, no windows→manual preference, no capacity guarantee; типовые filters/map zone.
+- **Критерий:** public availability учитывает все8 факторов §7.2, не возвращает PII/roster/гарантию; duration может быть category estimate только configured. P08A availability gate в этой же ориентировочной группе этап1.
+- **Риски:** смешать arrival window с временем занятости, count overlaps, universal EXCLUDE ломает capacity>1.
+
+### P09B — назначения, версии визитов и customer confirmation
+
+- **Результат/модули:** city-scoped stable visits/immutable plans с city/area/address versions+visit timezone, current city+zone eligibility техников, reservations/history, manager candidates/manual assign/reschedule/reassign, customer confirm/change/cancel/STOP pending, tech acknowledgement, CRM calendar drag-drop/technician summary/workload.
+- **Зависимости:** P09A/P06/P07+адаптеры для live all-channel acceptance, Q04/Q05/Q12/Q19. Изолированный DB/API можно раньше отдельным scope.
+- **Тесты:**2 managers race, shift/absence/deactivate vs assign, failed reschedule old remains, same UUID/new version/old ack invalid, after departure immutable actuals/new linked visit, changing address new rechecked plan, cancellation guard по lifecycle включая PAUSED/WAITING_PARTS returns, confirmation vs cancel cross-channels.
+- **Критерий:** максимум разрешённой capacity, no autoassign, один current visit per request по принятому Q05; confirmed/tech ACK обе текущие до depart; future cancel releases booking не теряя order, поздний STOP не заявляется выполненным до outcome. Technician summary совпадает с calendar/query definitions.
+- **Риски:** versioned actions без epoch, клиентская отмена обходит safe-stop, passive indefinite reservation.
+
+### P08A — сайт и формы: инженерная готовность
+
+- **Результат/модули:**10 блоков §4.2/mobile-first/7-step form, callback/detailed no-call, dynamic public channel catalog client и receipt/binding UI, coverage/slots, SEO из published content; никаких provider-specific бизнес-правил.
+- **Зависимости:** P03/P05/P09A/UX+стабильный catalog/binding API contract. Ни MAX adapter/token/live, ни P07-ADM как live stage не блокируют UI/изолированные integration tests. Test fixtures только в тестах; production использует реальный endpoint/core и текущую A–E политику.
+- **Тесты:**mobile/accessibility/валидация/сохранение шагов/network retry/no false success; все1/2/3/0 доступных способов каталога, ровно один выбор, whitelist public supportedActions, отсутствие ready/secret fields; callback только после самостоятельного выбора и phone allow; items:[] честно блокирует messenger submit без silent fallback.
+- **Критерий:** сборка+компонентные/контрактные tests пройдены, динамический каталог работает без жёсткой зависимости от существования MAX; это **не** live acceptance no-call и не публикация клиентам. Счётчик без legal основания отсутствует.
+- **Риски:** fake transport попал в production, design пустого списка ошибочно выдан за выполненный no-call requirement, hardcoded TG default.
+
+### P08B — live и release-приёмка клиентских путей
+
+- **Результат/модули:** реальный callback→CRM и detailed no-call→verified request grant→queue для каждого публикуемого provider; published catalog/admin controls, real content/legal/consents/Avito/контакты.
+- **Зависимости:** P08A/P07 core и release-gate **не менее одного опубликованного готового messenger** (A∧B∧C-tech∧C-live∧D), фактические channel adapters и E. TG/VK/MAX requirements только для включённых способов, MAX→P08B **условно**, если он публикуется; all3 scope ready нельзя заявить без P07-MAX-LIVE. Частичный пилот/Q24 callback-only — отдельное явное business/release approval.
+- **Тесты:** original25/M/X/N применимые к сайту; live linking/confirm/notification, old snapshot after admin-off, screenshot+manual UX approval; нет индексации staging/CRM и ПД в аналитике.
+- **Критерий:** каждый предлагаемый клиенту путь фактически работает, не3 фиктивные кнопки; если approved no-call release нет готового канала — gate не пройден. Общая матрица всех69 остаётся полной, непройденный MAX marked deferred/blocked, не PASS/удалённый scope.
+- **Риски:** admin toggle принимается за live permission; релиз с формально готовой UI, но ни одним usable каналом; ошибочная публикация незавершённого MAX.
+
+### P10 — Telegram Mini App мастера
+
+- **Результат/модули:** verified initData exchange, Сегодня/Заказы/Расписание/Доступность/История/Профиль, ack/decline/depart/arrive/diagnostics/parts pause, private files; staff Telegram только.
+- **Зависимости:** P02/P03/P07-TG/P09B/UX/Q12/официальный алгоритм validation; этот интерфейс не зависит от VK/MAX Mini Apps.
+- **Тесты:**forged/expired/future/replayed initData/session limit/revoke, unauthorized user не auto-register, чужие/current old assignments, PII temporal redaction, offline/loading/empty/retry, explicit customer confirm guard.
+- **Критерий:** активный назначенный мастер работает с реальным backend, не видит чужое/исторический полный адрес, не создаёт смену вне утверждения; expiry/exchange retries не создают бесконечные sessions.
+- **Риски:** initDataUnsafe, cookie/bearer cross-surface confusion, staff invitation только по украденному link, UI обещает ещё не готовую смету.
+
+### P11A — API/CRM смет (параллельно P10)
+
+- **Результат/модули:** cumulative quote revisions/lineage, header money breakdown+rounding trace, manager review/admin overlimit decisions, nonstandard work/parts, send/approve/decline/question/expire/new-version; Pricing/WorkOrders/CRM/common Channel command contracts.
+- **Зависимости:** P04/P05/P07/P09B contract, Q04/Q06–Q11; **не** весь Mini App.
+- **Тесты:** master price spoof, обязательные строки, overlimit/request decisions/current policy at send, old amount snapshot, expiry vs approval (deadline проверяется в command не job timing), accepted survives deadline, stale quote/cross-channel buttons, new revision pauses new work without erasing old debt.
+- **Критерий:** current approved quote и offered quote различаются явно, declined/question не repair/cancel автоматически; report work lineage даёт одну согласованную cumulative quantity across revisions; все monetary components воспроизводимы.
+- **Риски:** складывать totals ревизий, перенос approval на изменённую цену, silent diagnostics fee, stale deadline.
+
+### P11B — сметы в трёх каналах и Mini App
+
+- **Результат/модули:** mobile quote UI+manager review, одинаковая детализация/action semantics TG/VK/MAX с versioned rendering и permission-aware delivery.
+- **Зависимости:** P11A/P10/3 isolated adapter contracts/P07-ADM/UX для engineering; actual adapter access нужен только live приёмке каждого provider, MAX в P07-MAX-LIVE позднее.
+- **Тесты:** engineering: isolated одинаковая детализация/actions3 providers, quote chunking/version/question/duplicates/allowlist. Live acceptance каждого provider — реальные permitted staging sends/decisions после actual prerequisites, отдельно от offline pass.
+- **Критерий:** одна application-команда/результат независимо от provider, callback UX pending не выдаётся за business completion; неполученный MAX доступ не заменяется fake.
+- **Риски:** разные суммы/состояния ботов, rate limits кнопок, template version drift.
+
+### P12 — фактические отчёты и платёжные отметки
+
+- **Результат/модули:** immutable report revisions/one quote per revision/work lineage, no-repair outcomes, manager review/correction; ledger receipts/reversal/refund allocations/balance; WorkOrders/Payments/CRM/Mini App.
+- **Зависимости:** P11A/B engineering acceptance, Q07/Q08/Q09, approved payment methods. Deferred MAX live acceptance не блокирует разработку/изолированную проверку Reports/Payments; полный channel release gate остаётся P14/P15.
+- **Тесты:** mixed-request/quote lines DB rejection, cumulative qty across revisions/visits, finish visit releases reservation, document-only correction vs физическая доработка, receipt повтор/overpay/multiple payment/refund duplicate/cross account/net constraints, no due override.
+- **Критерий:** submit→TECHNICIAN_COMPLETED+visit FINISH+release+outbox атомарно; исправление не стирает accepted revision; payment записывает фактическую сумму не меняя quote; manager visible discrepancy.
+- **Риски:** report reopens finished visit, смешать версии cumulative works, ошибочный отрицательный баланс, выдавать mark за банковское подтверждение.
+
+### P13 — закрытие, revisits, аналитика
+
+- **Результат/модули:** unique closure+amendments/as_of balance, REVISIT_REQUIRED parent/child workflow/guarantee policy, no master reopen, все KPI§9.7/definitions/cohorts/technician attribution/sources; Requests/WorkOrders/Payments/Analytics/CRM.
+- **Зависимости:** P09B–P12,Q05/Q07–Q09/Q14/Q15/Q19.
+- **Тесты:**concurrent close one record, unpaid closed debt retained, zero/no-charge evidence, linked revisit не наследует finance/grants автоматически/не двойной count, cancellation reasons, counts/average/cohorts/timezone/refund corrections, no divide zero.
+- **Критерий:** full order cycle работает; «сумма оплат, отмеченных в системе» не «банковская выручка»; warranty text/стоимость только approved; source/criteria consistent with dashboard.
+- **Риски:** дважды считать visits/order/money, бесплатность гарантий без решения, parent завис навечно.
+
+### P13P — исполнение retention/обезличивания и восстановление ПД
+
+- **Результат/модули:**privacy jobs+assignee/approval/hold/checkpoint, field/file deletion matrix, abandoned submits/session/orphan cleanup, encrypted inbox/messages/payload TTL+tombstones, backup deletion ledger/reapply after restore; Legal/Files/Notifications/Operations.
+- **Зависимости:** P03/P05/P07 schema, Q13/Q20 concrete retention/incident owner, before real-data production.
+- **Тесты:**held record not erased, unheld scopes anonymized across snapshots/comments/files/queue, financial references remain, same-phone other customer safe, retry job idempotent, restored backup rescrub before opening service.
+- **Критерий:** ни ручного SQL как единственного удаления, ни «RESTRICT значит хранить вечно»; отчёт доказательств без ПД, секреты/keys/backup доступы отделены.
+- **Риски:** revocation mistaken erasure everything, восстановление воскресило PД, DSAR requester не verified.
+
+### P14 — сквозная приёмка/security/load/restore
+
+- **Результат/модули:**evidence по всем69 сценариям (25 исходных+20 M+12 X+12 N), threat review/remediation, нагрузочный/UX/a11y отчёт, BД+objects restore/off-host backup/alerts/outbox outage exercises; tests/all apps/infra.
+- **Зависимости:** P08A/P13/P13P engineering acceptance и agreed data/device/network/concurrency/observability/RPO/RTO для independent checks. Все actual platform gates/P07-MAX-LIVE — только prerequisite полной live части25/M и final production acceptance, не начало isolated security/load tests.
+- **Тесты:**таблицы ниже, api p95≤500мс без внешних/тяжёлых uploads, LCP≤2.5с при согласованном профиле; no PII telemetry, secret/dependency/license scans, stale callback/lease,3 provider outages/rate limits/uncertainty.
+- **Критерий:** actual reproducible evidence, нет critical/high security defect, restore БД+file versions+deleted-data ledger проверен, residual risks accepted владельцем; поддержка/MAX approval не маскируются passing unit tests.
+- **Риски:** SQLite, фальшивая нагрузка, внешний provider SLA не наш p95, backup без объектов.
+
+### P15 — production и передача
+
+- **Результат/модули:**РФ host/DB/S3/backups, TLS/domain/реальные bots/communities/secrets, migration release/rollback compatible app, readiness/pilot/handover.
+- **Зависимости:** P14,Q13/Q15/Q18/Q20–Q23, legal/fiscal decisions, assigned ops/privacy owner, bot contracts/access, полноценный scope все3 либо отдельный explicit partial release.
+- **Тесты:**safe smoke без персональных fixtures в Git, hook/key rotation cutoff, employee revoke, backup/ingress unsubscribe/independent alert, rollback supported schemas, incident drill.
+- **Критерий:**переданы исходники/Git/lock/миграции, OpenAPI, local/deploy/users/bots3+MiniApp/backup-restore/privacy/incident instructions, env.example без secrets, tests evidence/known limitations/license inventory; secrets отдельным protected каналом.
+- **Риски:** production с неуказанным оператором/городом/ценой/terms, реальные ПД в staging, отказ платформы после запуска, отсутствие поддержки.
+
+### GEO-R3.2 — порядок географии без расширения P01 в бизнес
+
+| Когда | Что обязательно закладывается / результат | Проверяемое завершение |
+|---|---|---|
+| Этап0/P01 до первых domain migrations | Canonical city/zone/district/version модель DB§3.8 и city-aware application ports. P01 только documentary review+synthetic FK/timezone/price-scope proof в изолированном test schema | Не создана public city CRM/доменные geography tables на foundation; proof показывает cross-city references rejected, same-tech lock глобальный, поле city не зашито global constant |
+| P03 | Cities+immutable settings versions; existing service_areas gains city+coverage versions; optional administrative districts/M:N FULL/PARTIAL; membership структуры, one active city server-context, company/local settings split | Не менее2 synthetic cities можно вне production fixtures связать существующими fields без ALTER; district≠service area; PARTIAL/FULL не доказательство конкретного адреса; реальные данные только владельца |
+| P04 | City price/rule versions/public estimates с первой migration; common catalog и pricing engine, нет global fallback | Один item имеет разные concurrent periods/amounts в2 synthetic cities без overlap false-positive; чужой city source denied, accepted snapshot не меняется |
+| P05 | Request/F city non-null даже callback, address snapshots city/area/district/version, lifetime request city | V1 клиент не выбирает город; raw forged city rejected; настройки поменялись→committed snapshot/replay неизменны |
+| P09A/B | City shifts/timezone snapshots+valid tech city/zone permissions; visit city same request; UTC capacity всех cities | G01–G07 assertions +X02/X05/X06/X08 пройдены, same tech не назначен одновременно в разных городах |
+| Перед launch2 | Actual city settings/зоны/прайс/memberships/контакты и readiness, public route/selector UX, CRM filters/scopes/report periods, межгородские manual travel blocks | Новый city активируется данными/настройками/экранами поверх тех же FK, а не переделкой request/appointment/price keys. Нет tenants/GIS/route optimizer |
+
+**G01–G07 — вложенные geography assertions**, подробно DB§3.8; верхняя матрица69 IDs/46 audit rows не меняется. География city-aware заранее согласуется до business migrations, но факт будущих городов одной компании **уже утверждён**, не новый вопрос владельцу. Остаются только реальные названия/контакты/часовые пояса/правила покрытия/прайс и UX второго запуска.
+
+## 4. Исходные 25 сценариев ТЗ (номера сохранены)
+
+| № ТЗ | Сценарий / обязательный результат | Подэтапы / evidence |
+|---:|---|---|
+| 1 | Callback → CALLBACK_REQUIRED, менеджер notified | P05/P06/P07; API/tx/outbox E2E |
+| 2 | Подробная заявка + **Telegram** → привязана, manager queue | P05/P07-TG/P08A/P08B; real TG E2E, multi-channel extension не заменяет этот сценарий |
+| 3 | Без Start → **WAITING_TELEGRAM_LINK**, нет unsolicited TG | P05/P07-TG/P08A/P08B; exact legacy code; VK/MAX аналоги M02 |
+| 4 | Фото checked/private/authorized | P03/P08A/P08B/P10; MIME/quota/IDOR |
+| 5 | Вне зоны → честный warning/manual review | P05/P08A/P08B/P09A; ранний consent либо explicit manual district policy |
+| 6 | Занятое окно не подтверждается | P09A/B/P08A/P08B; availability/assignment race |
+| 7 | Manager assign проверяет skills/shift/overlap | P09B; PostgreSQL integration |
+| 8 | Два менеджера на одно время → только допустимая операция | P09B; concurrent tx, capacity1 test |
+| 9 | Mini App validates initData/rights | P10; official vectors+real TG |
+| 10 | Unknown Telegram user denied | P02/P10; negative auth |
+| 11 | Work price из каталога, T не меняет | P04/P11/P12; mass assignment reject |
+| 12 | Arbitrary work не в total, approval request | P11A/B; DTO+policy |
+| 13 | Allowed discount detail+audit | P04/P11; authority/snapshot tests |
+| 14 | Overlimit → A approval or rejection | P02/P11A; separate decision evidence |
+| 15 | Quote decline не IN_PROGRESS, decision retained | P11A/B; TG + M provider matrix |
+| 16 | Changed quote → new revision+reapproval | P11A/P12; stale callbacks/current approval |
+| 17 | Report→TECHNICIAN_COMPLETED+manager event | P12; visit finish/release+tx |
+| 18 | Payment amount/method/status, price unchanged | P12; immutable ledger |
+| 19 | Amount discrepancy visible | P12/P13; under/overpay retained |
+| 20 | Manager CLOSED, history/money preserved | P13; unique closure/as_of/permissions |
+| 21 | **Telegram outage** не теряет request, notification retry | P07-TG/P14; original TG scenario сохранён, других providers M14 |
+| 22 | Price change не меняет closed sum | P04/P11–P13; snapshot regression |
+| 23 | Manager reschedule rechecks/history/notifies both | P09B/P10; current plan version+both recipients |
+| 24 | Deactivated employee blocked/history stays | P02/P10/P13; revoke race |
+| 25 | Чужой request denied, no disclosure | Все protected APIs, endpoints/actions/files/quotes IDOR |
+
+## 5. Дополнительные сценарии трёх клиентских каналов
+
+**Не заменяют и не перенумеровывают §4.** M01–M20 выполняются как общие тесты и provider matrix TG/VK/MAX, если применимо; недоступный законно MAX означает blocked live acceptance, не passed.
+
+| ID | Сценарий / точный ожидаемый результат | Подэтап |
+|---|---|---|
+| M01 | Один клиент связывает3 аккаунта с одной заявкой; каждый dual proof, никакого all-customer access | P07/adapters |
+| M02 | VK не allow / MAX не start / TG не Start → нет message/dispatch, current provider waiting state, honest recovery | P05/P07/P08A/P08B |
+| M03 | Пересланный deep link в чужом аккаунте без исходной F-сессии → только CLAIM, нет request PII/grant | P07 |
+| M04 | Challenge expired/reissued/used, чужая connection/provider/F → reject, повтор не открывает новое право | P07 |
+| M05 | Confirm предложенного окна current version через каждый messenger → один confirmation, не цена/не autoassign | P09B |
+| M06 | Reschedule request → PENDING change request, прежнее время не меняется до manager transaction | P09B |
+| M07 | Manager меняет план → new immutable version, старые CONFIRM/ACK/buttons недействительны, повторное уведомление | P09B |
+| M08 | Client future booking cancel → release только visit, request WAITING_ASSIGNMENT либо прежняя return stage; scope показан | P09B |
+| M09 | Cancel когда мастер en-route/return PAUSED/WAITING_PARTS → STOP_PENDING, safe ack/reconcile до terminal | P09B/P12 |
+| M10 | Cross-channel confirm/cancel/quote decisions concurrently → один последовательный domain outcome, stale ответ объяснён | P07/P09/P11 |
+| M11 | Отзыв service opt-in/платформенный deny/stop → queued sends invalidated, нет автоматического re-opt-in от старого event | P07/adapters |
+| M12 | Primary недоступен + explicit fallback разрешён → только scoped verified endpoint/purpose, актуальная version, history сохранена | P07 |
+| M13 | Fallback не разрешён/все каналы blocked → CRM alert, **нет звонка**; явный PHONE allow открывает только соответствующий task | P07/P06 |
+| M14 | TG/VK/MAX timeout/429/5xx/200error/uncertain send → backoff/lease/attempt log, no business rollback/duplicate effect | P07/P14 |
+| M15 | Wrong webhook secret/connection/group/schema/replayed event → reject/dedupe; provider ACK только после durable receipt | Adapters |
+| M16 | MAX no global update_id: message/callback/lifecycle type keys+strength; duplicate не повторяет action, no false monetary command from fingerprint | P07-MAX |
+| M17 | Template v1 отправлен, v2 опубликован: history content/allowlist version воспроизводимы, forbidden phone/address variable rejected | P07 |
+| M18 | Смена primary preference при pending send → same intent/new route generation, old pending invalidated; SENT history неизменна | P07 |
+| M19 | Пользователь3 каналов не получает staff Mini App права через customer grant; staff unknown denied | P02/P10 |
+| M20 | MAX owner premise AS-MAX-01 принята, но actual connection/technical readiness/live acceptance ещё нет → public/send не ready; отсутствующие B/C не подменяются assumption/token одним полем. **R3.2 уточняет старый contract-gate test**: повторного договорного запроса нет, core/adapter продолжают разработку | P07-MAX isolated negative test / P07-MAX-LIVE / P15 |
+
+## 6. Дополнительные технические сценарии аудита
+
+| ID | Expected invariant | Подэтап |
+|---|---|---|
+| X01 | Full command×WF states allow/deny, включая return visit logistics и PAUSED | P05/P09/P11 |
+| X02 | Appointment reschedule same stable ID/new version, rollback old booking, address snapshot recheck | P09B |
+| X03 | Quote expiry job delayed: deadline всё равно blocks APPROVE; accepted agreement не истекает | P11A |
+| X04 | Cumulative work lineage across quote/report revisions: old performed qty не считается дважды | P11A/P12 |
+| X05 | Money breakdown/rounding/version/zero price invariants, negative/mixed component rejected | P04/P11 |
+| X06 | Concrete/composite FK: orphan/wrong request/quote/report/file owner insertion denied DB | P01/P05/P12 |
+| X07 | Receipt retry/double reverse/refund over source/cross account rejected; overpaid facts preserved | P12 |
+| X08 | Dashboard snapshot equals filtered registry, technician summary equals calendar/definitions | P06/P09/P13 |
+| X09 | Privacy hold+erase+orphan cleanup+backup rescrub, audit/money references remain | P13P/P14 |
+| X10 | Missing/old rotated secret/session/role permissions reject; audit UPDATE/DELETE denied runtime role | P02/P07/P10 |
+| X11 | Crash after provider accepted before SENT, lease generation stale writer, outbox fanout replay, no duplicate domain effect | P07/P14 |
+| X12 | Idempotency cache cleanup retains domain tombstone, contract backward compatibility/cached Mini App upgrade safety | P01/P07/P10 |
+
+## 7. Сценарии административного управления N01–N12
+
+Новые проверки **дополняют**, не меняют IDs/содержание original25, M01–M20, X01–X12. Синтетические B–E fixtures проверяют ядро/adapter изолированно, но не создают actual live evidence.
+
+| ID | Сценарий / критерий | Подэтап |
+|---|---|---|
+| N01 | CRM показывает все3 равноправных providers и отдельные A/B/C/D/E context; future MAX без connection доступен для draft, не для публичного выбора | P07-ADM |
+| N02 | Enabled draft без credentials сохраняется как намерение, public list неизменен; никаких вызовов регистрации/send | P07-ADM |
+| N03 | Publish enabled при B missing/C failed/D pending/no live acceptance →409 blockers, прежний catalog неизменен; readiness=true/verified=true из PATCH rejected | P07-ADM |
+| N04 | Public purpose REQUEST_CONFIRMATION возвращает только A-enabled∧B∧C∧D, без disabled/unready/unavailable rows/причин/secret IDs; unsupported purpose не ослабляет guards | P07-ADM/P08A/P08B |
+| N05 | A-off при healthy connection убирает способ для новых заявок, не меняет snapshot/primary/grants/consents старой; существующий waiting bind продолжим при B–D/E | P05/P07-ADM |
+| N06 | Клиент submit выбирает ровно один provider/optionVersion/catalogVersion; неизвестная/чужая/двойная selection отклонена, принятый выбор неизменяемо сохранён до binding | P05/P08A/P08B |
+| N07 | Catalog changed/off или readiness expired между GET и submit →409, обновить список без silent switch/лишней заявки; idempotent replay committed submit возвращает прежний результат | P05/P07-ADM |
+| N08 | M/T без capabilities не меняют A/publish; два A concurrent publish дают один current catalog и audited conflict, история old/new/reason/scope без secrets | P02/P07-ADM |
+| N09 | После публикации connection revoke/suspend/D denial исключает новые offers и blocks old real sends с alerts, но старые consent/preference snapshots не переписаны, phone не включён | P07/P07-ADM |
+| N10 | A/B/C/D ready ещё не E: до customer proof/opt-in/platform allow нет unsolicited message/request grant; admin toggle не создаёт consent за клиента | P07/P07-ADM |
+| N11 | MAX AS-MAX-01/owner RF self-employed/offline tests → не VERIFIED/live_ready; isolated adapter работает без token в tests, public MAX отсутствует до actual prerequisites/live PASS | P07-MAX/P07-ADM |
+| N12 | Меняется connection reference/provider catalog revision: старый request endpoint не подменяется; только explicit existing-request change создаёт новую preference/evidence. Credential/protocol relevant version change инвалидирует соответствующий acceptance и fail-closed offer | P07/P07-ADM/P07-MAX-LIVE |
+
+## 8. Launch checklist и остановка
+
+Реальные город/название/контакты/IANA zone/office+staff hours/зоны/прайс+детали/diagnostics/travel/надбавки/лимиты/express/warranty/Avito и legal документы заполнены владельцем; не hardcoded fake values. Platform evidence current, staging/prod separate, TLS/secrets outside Git, service/auth permissions и message opt-in каждой площадки подтверждены. Полная приёмка всех3 либо explicit partial pilot decision Q23. Все **69 сценариев:25 исходных+20 M+12 X+12 N** и вложенные G01–G07 географии учтены в release evidence (PASS либо явный применимый BLOCKED/отдельно принятый partial-scope outcome; BLOCKED не означает PASS), RPO/RTO и нагрузочный профиль приняты. Назначены ops/privacy/incident owners, independent alerts, DB+objects backup/restore/deletion ledger tested. Applicable legal/fiscal/incident notification duties подтвердил юрист, no overclaimed legal audit.
+
+**После представления обновлённого Этапа0 остановиться.** Следующая работа — только после явного разрешения владельца и решения gates выбранного P. Никакие документы R2 не разрешают автоматически регистрировать bots/сообщества, создавать SQL/код/контейнеры, устанавливать зависимости или менять исходные материалы.

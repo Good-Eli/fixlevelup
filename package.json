@@ -1,0 +1,37 @@
+{
+  "name": "fixlevelup",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": "24.22.3",
+    "pnpm": "12.21.0"
+  },
+  "scripts": {
+    "db:generate": "corepack pnpm --filter @fixlevelup/database-tooling run generate",
+    "db:check": "corepack pnpm --filter @fixlevelup/database-tooling run check:connection",
+    "db:roles": "corepack pnpm --filter @fixlevelup/database-tooling run roles",
+    "db:deploy": "corepack pnpm --filter @fixlevelup/database-tooling run deploy",
+    "db:test-constraints": "corepack pnpm --filter @fixlevelup/database-tooling run test:constraints",
+    "db:test-migrations": "corepack pnpm --filter @fixlevelup/database-tooling run test:migrations",
+    "db:runtime-check": "corepack pnpm --filter @fixlevelup/database-tooling run check:runtime",
+    "lint": "corepack pnpm run db:generate && eslint . --max-warnings 0",
+    "typecheck": "corepack pnpm run db:generate && corepack pnpm --filter @fixlevelup/database-tooling run typecheck && tsc --noEmit && corepack pnpm --filter @fixlevelup/api run typecheck && corepack pnpm --filter @fixlevelup/web run typecheck && corepack pnpm --filter @fixlevelup/miniapp run typecheck",
+    "build": "corepack pnpm run db:generate && corepack pnpm --filter @fixlevelup/api run build && corepack pnpm --filter @fixlevelup/web run build && corepack pnpm --filter @fixlevelup/miniapp run build",
+    "test": "corepack pnpm run build && vitest run",
+    "check": "corepack pnpm run lint && corepack pnpm run typecheck && corepack pnpm run test"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@fixlevelup/tooling": "workspace:*",
+    "@next/eslint-plugin-next": "16.4.6",
+    "@types/node": "24.19.2",
+    "eslint": "10.15.0",
+    "globals": "17.14.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.73.0",
+    "vite": "8.3.8",
+    "vitest": "5.1.1"
+  }
+}

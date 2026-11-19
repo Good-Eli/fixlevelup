@@ -1,0 +1,49 @@
+packages:
+  - apps/*
+  - packages/*
+
+registry: https://registry.npmjs.org/
+strictSsl: true
+storeDir: node_modules/.cache/pnpm-store
+
+# Native Windows/Linux bindings remain enabled. The unused WASI fallback
+# pulls @emnapi 2 beta packages and is outside the approved platform baseline.
+overrides:
+  '@rolldown/binding-wasm32-wasi:optional': '-'
+
+# No dependency lifecycle scripts are approved in P01-01.1.
+ignoreScripts: true
+allowBuilds: {}
+strictDepBuilds: true
+dangerouslyAllowAllBuilds: false
+sideEffectsCache: false
+ignorePnpmfile: true
+
+strictPeerDependencies: true
+autoInstallPeers: false
+autoInstallPeersFromHighestMatch: false
+dedupePeerDependents: false
+# Preserve existing framework type resolution but never hoist dev-only
+# Prisma tooling or its React/Visx providers into API package reachability.
+hoistPattern:
+  - '*'
+  - '!prisma'
+  - '!@prisma/*'
+  - '!@visx/*'
+  - '!react'
+  - '!react-dom'
+projectScopedOptionalPeers: true
+resolvePeersFromWorkspaceRoot: true
+
+verifyDepsBeforeRun: error
+enablePrePostScripts: false
+updateNotifier: false
+engineStrict: true
+saveExact: true
+pmOnFail: error
+runtime: false
+runtimeOnFail: error
+
+# Dependencies must not install agent instructions or skills.
+skills:
+  dirs: []

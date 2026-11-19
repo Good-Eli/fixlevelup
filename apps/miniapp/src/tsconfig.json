@@ -1,0 +1,7 @@
+{
+  "extends": "@fixlevelup/tooling/tsconfig/bundler",
+  "compilerOptions": {
+    "types": ["vite/client", "react", "react-dom"]
+  },
+  "include": ["./**/*.ts", "./**/*.tsx"]
+}

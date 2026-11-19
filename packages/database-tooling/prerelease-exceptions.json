@@ -1,0 +1,15 @@
+{
+  "reason": "Owner-approved exact upstream exceptions for Prisma 7.10.1 Foundation; Studio must not run or enter API runtime.",
+  "packages": {
+    "@visx/curve": "4.0.1-alpha.0",
+    "@visx/event": "4.0.1-alpha.0",
+    "@visx/grid": "4.0.1-alpha.0",
+    "@visx/group": "4.0.1-alpha.0",
+    "@visx/point": "4.0.1-alpha.0",
+    "@visx/responsive": "4.0.1-alpha.0",
+    "@visx/scale": "4.0.1-alpha.0",
+    "@visx/shape": "4.0.1-alpha.0",
+    "@visx/vendor": "4.0.0-alpha.0",
+    "@prisma/engines-version": "8.1.0-1.d1b3f377ca835d73fd50954a5e22128b9ebdd6b8"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "extends": "@fixlevelup/tooling/tsconfig/node",
+  "include": ["packages/tooling/tests/**/*.ts", "vitest.config.mts"],
+  "exclude": ["node_modules", "coverage", "dist"]
+}
