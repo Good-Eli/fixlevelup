@@ -8,6 +8,8 @@ const moduleUrl = (path: string): string => pathToFileURL(resolve(root, 'apps/ap
 const env = {
   ...process.env,
   NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0', SHUTDOWN_TIMEOUT_MS: '5000',
+  DB_HOST: '127.0.0.1', DB_PORT: '55432', DB_NAME: 'fixlevelup_dev', DB_USER: 'fixlevelup_runtime',
+  DB_PASSWORD: 'synthetic-runtime-password-placeholder',
   NEST_LOG_LEVEL: 'synthetic-secret-canary', BOT_TOKEN: 'synthetic-secret-canary',
 };
 

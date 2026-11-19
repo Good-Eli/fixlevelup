@@ -1,15 +1,16 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module.js';
+import type { DatabaseConfig } from '../infrastructure/database/runtime-database.js';
 import { WorkerModule } from '../worker.module.js';
 import type { RuntimeConfig } from '../runtime/config.js';
 import { SafeLogger } from '../runtime/safe-logger.js';
 import { ProblemFilter } from '../runtime/problem.filter.js';
 
-export async function createApi(config: RuntimeConfig, logger: SafeLogger) {
+export async function createApi(config: RuntimeConfig, logger: SafeLogger, database?: DatabaseConfig) {
   // Nest's public options contract uses a structural class with no methods.
   // eslint-disable-next-line @typescript-eslint/no-unsafe-class-instance-assignment
-  const app = await NestFactory.create(AppModule, {
+  const app = await NestFactory.create(AppModule.register(database), {
     logger,
     abortOnError: false,
     bodyParser: false,
