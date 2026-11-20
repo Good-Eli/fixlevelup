@@ -1,0 +1,14 @@
+{
+  "name": "@fixlevelup/browser-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "playwright test --config playwright.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@fixlevelup/tooling": "workspace:*",
+    "@playwright/test": "1.65.1"
+  }
+}
