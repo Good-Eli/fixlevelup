@@ -1,0 +1,339 @@
+name: P01 technical CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p01-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: '1'
+  COREPACK_ENABLE_AUTO_PIN: '0'
+  COREPACK_DEFAULT_TO_LATEST: '0'
+  NEXT_TELEMETRY_DISABLED: '1'
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+jobs:
+  linux-proof:
+    name: Linux proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout without credential persistence
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node 24.22.3
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.3
+          check-latest: false
+          package-manager-cache: false
+      - name: Pin pnpm and verify toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm_version="$(corepack pnpm --version)"
+          test "$pnpm_version" = "12.21.0"
+          test "$(node --version)" = "v24.22.3"
+          echo "CI_PNPM_VERSION=$pnpm_version" >> "$GITHUB_ENV"
+      - name: Build pinned Linux proof image
+        id: build
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/linux-proof
+          node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/linux-proof/context.json
+          node infra/ci/docker.mjs build --builder default --file infra/linux-proof/Dockerfile --tag fixlevelup-linux-proof:ci-${GITHUB_RUN_ID} .
+      - name: Run Linux proof with network and resource isolation
+        id: linux-run
+        run: |
+          set -euo pipefail
+          node infra/ci/docker.mjs run --name fixlevelup-linux-proof-ci-${GITHUB_RUN_ID} --network none --cpus 2 --memory 4g fixlevelup-linux-proof:ci-${GITHUB_RUN_ID}
+      - name: Copy redacted Linux proof evidence
+        id: evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/linux-proof-raw"
+          node infra/ci/docker.mjs cp fixlevelup-linux-proof-ci-${GITHUB_RUN_ID}:/workspace/node_modules/.cache/linux-proof "$RUNNER_TEMP/linux-proof-raw"
+          node infra/ci/evidence.mjs collect "$RUNNER_TEMP/linux-proof-raw" node_modules/.cache/ci-artifacts/linux-proof/evidence
+      - name: Summarize Linux proof
+        if: always()
+        env:
+          CI_STEPS: ${{ toJSON(steps) }}
+          CI_JOB_STATUS: ${{ job.status }}
+        run: node infra/ci/evidence.mjs summary "Linux proof" node_modules/.cache/ci-artifacts/linux-proof
+      - name: Publish Linux proof evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p01-linux-proof-${{ github.run_id }}
+          path: |
+            node_modules/.cache/ci-artifacts/linux-proof/context.json
+            node_modules/.cache/ci-artifacts/linux-proof/execution.json
+            node_modules/.cache/ci-artifacts/linux-proof/evidence/
+          if-no-files-found: warn
+          include-hidden-files: true # Only the dedicated redacted artifact directory.
+          retention-days: 14
+      - name: Fail if Linux proof failed
+        if: always()
+        run: test "${{ steps.linux-run.outcome }}" = success
+
+  linux-integration:
+    name: Linux PostgreSQL and Garage integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout without credential persistence
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node 24.22.3
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.3
+          check-latest: false
+          package-manager-cache: false
+      - name: Pin pnpm and verify toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm_version="$(corepack pnpm --version)"
+          test "$pnpm_version" = "12.21.0"
+          test "$(node --version)" = "v24.22.3"
+          echo "CI_PNPM_VERSION=$pnpm_version" >> "$GITHUB_ENV"
+      - name: Generate fresh synthetic integration credentials
+        id: credentials
+        run: node infra/linux-integration/init.mjs
+      - name: Validate and build isolated Compose project
+        id: compose-build
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/linux-integration
+          node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/linux-integration/context.json
+          node infra/linux-integration/compose.mjs validate
+          node infra/linux-integration/compose.mjs build
+      - name: Start isolated PostgreSQL and Garage
+        id: services
+        run: |
+          set -euo pipefail
+          node infra/linux-integration/compose.mjs services
+          node infra/linux-integration/bootstrap-s3.mjs
+      - name: Run complete PostgreSQL and S3 integration proof
+        id: integration-run
+        run: node infra/linux-integration/compose.mjs run
+      - name: Run Garage restart and persistence proof
+        id: persistence-run
+        if: ${{ !cancelled() && steps.integration-run.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          node infra/linux-integration/persistence.mjs write
+          node infra/linux-integration/compose.mjs restart-garage
+          node infra/linux-integration/compose.mjs services
+          node infra/linux-integration/persistence.mjs verify
+      - name: Copy redacted integration evidence
+        id: evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/linux-integration-raw"
+          node infra/ci/docker.mjs cp fixlevelup-linux-integration-runner:/workspace/node_modules/.cache/linux-integration "$RUNNER_TEMP/linux-integration-raw"
+          node infra/ci/evidence.mjs collect "$RUNNER_TEMP/linux-integration-raw" node_modules/.cache/ci-artifacts/linux-integration/evidence
+      - name: Summarize Linux integration
+        if: always()
+        env:
+          CI_STEPS: ${{ toJSON(steps) }}
+          CI_JOB_STATUS: ${{ job.status }}
+        run: node infra/ci/evidence.mjs summary "Linux PostgreSQL and Garage integration" node_modules/.cache/ci-artifacts/linux-integration
+      - name: Publish Linux integration evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p01-linux-integration-${{ github.run_id }}
+          path: |
+            node_modules/.cache/ci-artifacts/linux-integration/context.json
+            node_modules/.cache/ci-artifacts/linux-integration/execution.json
+            node_modules/.cache/ci-artifacts/linux-integration/evidence/
+          if-no-files-found: warn
+          include-hidden-files: true # Only the dedicated redacted artifact directory.
+          retention-days: 14
+      - name: Fail if Linux integration proofs failed
+        if: always()
+        run: test "${{ steps.integration-run.outcome }}" = success && test "${{ steps.persistence-run.outcome }}" = success
+
+  browser-proof:
+    name: Browser proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout without credential persistence
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node 24.22.3
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.3
+          check-latest: false
+          package-manager-cache: false
+      - name: Pin pnpm and verify toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm_version="$(corepack pnpm --version)"
+          test "$pnpm_version" = "12.21.0"
+          test "$(node --version)" = "v24.22.3"
+          echo "CI_PNPM_VERSION=$pnpm_version" >> "$GITHUB_ENV"
+      - name: Build pinned browser proof image
+        id: build
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/browser-proof
+          node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/browser-proof/context.json
+          node infra/ci/docker.mjs build --builder default --file infra/browser-proof/Dockerfile --tag fixlevelup-browser-proof:ci-${GITHUB_RUN_ID} .
+      - name: Run real Chromium Firefox and WebKit smoke
+        id: browser-run
+        run: node infra/ci/docker.mjs run --name fixlevelup-browser-proof-ci-${GITHUB_RUN_ID} --network none --cpus 2 --memory 4g --shm-size 1g fixlevelup-browser-proof:ci-${GITHUB_RUN_ID}
+      - name: Copy redacted browser JSON and screenshots
+        id: evidence
+        if: always()
+        env:
+          CI_INCLUDE_SCREENSHOTS: '1'
+          BROWSER_OUTCOME: ${{ steps.browser-run.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/browser-proof-raw"
+          # The successful runner result may not exist on failure. Copy the
+          # real Playwright report/screenshots first, independently of it.
+          node infra/ci/docker.mjs cp fixlevelup-browser-proof-ci-${GITHUB_RUN_ID}:/workspace/test-results "$RUNNER_TEMP/browser-proof-raw/test-results"
+          if [ "$BROWSER_OUTCOME" = success ]; then
+            node infra/ci/docker.mjs cp fixlevelup-browser-proof-ci-${GITHUB_RUN_ID}:/workspace/node_modules/.cache/browser-proof "$RUNNER_TEMP/browser-proof-raw"
+          fi
+          node infra/ci/evidence.mjs collect "$RUNNER_TEMP/browser-proof-raw" node_modules/.cache/ci-artifacts/browser-proof/evidence
+      - name: Summarize browser proof
+        if: always()
+        env:
+          CI_STEPS: ${{ toJSON(steps) }}
+          CI_JOB_STATUS: ${{ job.status }}
+        run: node infra/ci/evidence.mjs summary "Browser proof" node_modules/.cache/ci-artifacts/browser-proof
+      - name: Publish browser proof evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p01-browser-proof-${{ github.run_id }}
+          path: |
+            node_modules/.cache/ci-artifacts/browser-proof/context.json
+            node_modules/.cache/ci-artifacts/browser-proof/execution.json
+            node_modules/.cache/ci-artifacts/browser-proof/evidence/
+          if-no-files-found: warn
+          include-hidden-files: true # Only the dedicated redacted artifact directory.
+          retention-days: 14
+      - name: Fail if browser proof failed
+        if: always()
+        run: test "${{ steps.browser-run.outcome }}" = success
+
+  security:
+    name: Dependency, license, lockfile and secret gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout full history without credential persistence
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node 24.22.3
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.3
+          check-latest: false
+          package-manager-cache: false
+      - name: Pin pnpm and install frozen lockfile
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm_version="$(corepack pnpm --version)"
+          test "$pnpm_version" = "12.21.0"
+          test "$(node --version)" = "v24.22.3"
+          echo "CI_PNPM_VERSION=$pnpm_version" >> "$GITHUB_ENV"
+          before="$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)"
+          corepack pnpm install --frozen-lockfile --ignore-scripts --strict-peer-dependencies
+          test "$before" = "$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)"
+          git diff --exit-code -- pnpm-lock.yaml
+      - name: Run CI tooling and Docker platform unit tests
+        id: unit-tests
+        run: |
+          node --test infra/ci/*.test.mjs infra/linux-integration/*.test.mjs
+          corepack pnpm exec eslint infra/ci infra/linux-integration --max-warnings 0
+      - name: Run dependency audit and complete technical license inventory
+        id: dependencies
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/security
+          node infra/ci/dependencies.mjs --check --output node_modules/.cache/ci-artifacts/security/dependencies.json
+      - name: Download and verify pinned Gitleaks binary
+        id: scanner-setup
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz'
+          expected='551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$url" --output "$RUNNER_TEMP/gitleaks.tar.gz"
+          echo "$expected  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/gitleaks" version)" = '8.30.1'
+      - name: Scan repository and all available Git history for secrets
+        id: secret-scan
+        if: ${{ !cancelled() && steps.scanner-setup.outcome == 'success' }}
+        run: node infra/ci/secrets.mjs "$RUNNER_TEMP/gitleaks" node_modules/.cache/ci-artifacts/security/secrets.json
+      - name: Check final lockfile invariant
+        id: lockfile
+        if: always()
+        run: git diff --exit-code -- pnpm-lock.yaml
+      - name: Write security context
+        if: always()
+        run: node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/security/context.json
+      - name: Summarize security gates
+        if: always()
+        env:
+          CI_STEPS: ${{ toJSON(steps) }}
+          CI_JOB_STATUS: ${{ job.status }}
+        run: node infra/ci/evidence.mjs summary "Dependency, license and secret gates" node_modules/.cache/ci-artifacts/security
+      - name: Publish security evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p01-security-${{ github.run_id }}
+          path: |
+            node_modules/.cache/ci-artifacts/security/context.json
+            node_modules/.cache/ci-artifacts/security/execution.json
+            node_modules/.cache/ci-artifacts/security/dependencies.json
+            node_modules/.cache/ci-artifacts/security/secrets.json
+          if-no-files-found: warn
+          include-hidden-files: true # Only the dedicated redacted artifact directory.
+          retention-days: 14

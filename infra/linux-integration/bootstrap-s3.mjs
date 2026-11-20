@@ -1,10 +1,9 @@
-import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-const container='fixlevelup-linux-integration-garage';
-function command(args){const r=spawnSync('docker',['--host','npipe:////./pipe/dockerDesktopLinuxEngine',...args],{encoding:'utf8',timeout:20000});if(r.error||r.status!==0){throw new Error('Isolated Garage bootstrap command failed');}return r.stdout;}
+import { createLocalDocker } from './docker.mjs';
 try{
-  const project=command(['inspect','--format','{{index .Config.Labels "com.docker.compose.project"}}',container]).trim();
-  if(project!=='fixlevelup-linux-integration'){throw new Error('Unexpected integration container identity');}
+  const docker=createLocalDocker();
+  const container=docker.assertContainer('garage');
+  const command=(args)=>docker.run(args).stdout;
   const text=readFileSync(new URL('.env',import.meta.url),'utf8');
   const get=(name,pattern)=>{const v=new RegExp(`^${name}=([^\\r\\n]+)$`,'m').exec(text)?.[1];if(!v||!pattern.test(v)){throw new Error('Invalid isolated credential');}return v;};
   const garage=(args)=>command(['exec',container,'/garage',...args]);

@@ -1,9 +1,9 @@
-import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { createLocalDocker, integrationImage } from './docker.mjs';
 const mode=process.argv[2];
 if(!['write','verify'].includes(mode)){throw new Error('Expected write or verify');}
 const text=readFileSync(new URL('.env',import.meta.url),'utf8');
-const env={...process.env};
+const env={};
 for(const name of ['S3_ACCESS_KEY_ID','S3_SECRET_ACCESS_KEY']){
   const value=new RegExp(`^${name}=([^\\r\\n]+)$`,'m').exec(text)?.[1];
   if(!value||!(name==='S3_ACCESS_KEY_ID'?/^GK[a-f0-9]{24}$/:/^[a-f0-9]{64}$/).test(value)){throw new Error('Invalid isolated credential');}
@@ -19,7 +19,11 @@ try{
  const r=await c.send(new GetObjectCommand({Bucket:bucket,Key:key})),actual=await r.Body.transformToByteArray();if(!Buffer.from(actual).equals(bytes)||createHash('sha256').update(actual).digest('hex')!==hash||r.Metadata?.sha256!==hash)throw new Error('Mismatch');console.log('Isolated Linux S3 persistence ${mode}: PASS');
 }catch{console.error('Isolated S3 persistence proof failed safely');process.exitCode=1;}finally{c.destroy();}
 `;
-const result=spawnSync('docker',['--host','npipe:////./pipe/dockerDesktopLinuxEngine','run','--rm','--network','container:fixlevelup-linux-integration-postgres',
-  '-e','S3_ACCESS_KEY_ID','-e','S3_SECRET_ACCESS_KEY','--entrypoint','node','fixlevelup-linux-integration:p0111b','--input-type=module','--eval',source],
-  {env,stdio:'inherit',timeout:30000});
-if(result.error){console.error('Isolated persistence container failed safely');process.exitCode=1;}else{process.exitCode=result.status??1;}
+try{
+  const docker=createLocalDocker();
+  const postgres=docker.assertContainer('postgres');
+  docker.assertContainer('garage');
+  docker.run(['run','--rm','--network',`container:${postgres}`,
+    '-e','S3_ACCESS_KEY_ID','-e','S3_SECRET_ACCESS_KEY','--entrypoint','node',integrationImage,'--input-type=module','--eval',source],
+    {env,stdio:'inherit',timeout:30000});
+}catch{console.error('Isolated persistence container failed safely');process.exitCode=1;}
