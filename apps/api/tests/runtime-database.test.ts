@@ -101,7 +101,7 @@ describe('API runtime database readiness', () => {
     const app = await createApi(config, new SafeLogger('api'), { ...database, database: name });
     const server = app.getHttpServer() as Server;
     try {
-      for (const migration of ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts']) {
+      for (const migration of ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases']) {
         await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
       }
       await fixture.query('CREATE TABLE foundation._prisma_migrations(id text PRIMARY KEY)');
@@ -114,6 +114,48 @@ describe('API runtime database readiness', () => {
       await request(server).get('/health/ready').expect(503);
       await fixture.query('GRANT INSERT ON foundation.audit_logs TO fixlevelup_runtime');
       await request(server).get('/health/ready').expect(200);
+      // Each mutation must independently make the complete three-migration schema unready.
+      for (const [breakSchema, restoreSchema] of [
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN lease_owner SET NOT NULL', 'ALTER TABLE foundation.outbox_events ALTER COLUMN lease_owner DROP NOT NULL'],
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN lease_expires_at SET NOT NULL', 'ALTER TABLE foundation.outbox_events ALTER COLUMN lease_expires_at DROP NOT NULL'],
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN last_error_code SET NOT NULL', 'ALTER TABLE foundation.outbox_events ALTER COLUMN last_error_code DROP NOT NULL'],
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN lease_generation DROP NOT NULL', 'ALTER TABLE foundation.outbox_events ALTER COLUMN lease_generation SET NOT NULL'],
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN next_attempt_at DROP NOT NULL', 'ALTER TABLE foundation.outbox_events ALTER COLUMN next_attempt_at SET NOT NULL'],
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN lease_generation TYPE integer', 'ALTER TABLE foundation.outbox_events ALTER COLUMN lease_generation TYPE bigint'],
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN lease_expires_at TYPE timestamptz(3)', 'ALTER TABLE foundation.outbox_events ALTER COLUMN lease_expires_at TYPE timestamptz(6)'],
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN next_attempt_at TYPE timestamptz(3)', 'ALTER TABLE foundation.outbox_events ALTER COLUMN next_attempt_at TYPE timestamptz(6)'],
+        ['ALTER TABLE foundation.outbox_events ALTER COLUMN last_error_code TYPE varchar(64)',
+          "ALTER TABLE foundation.outbox_events ALTER COLUMN last_error_code TYPE varchar(32); ALTER TABLE foundation.outbox_events DROP CONSTRAINT outbox_events_last_error_code_check; ALTER TABLE foundation.outbox_events ADD CONSTRAINT outbox_events_last_error_code_check CHECK (last_error_code IN ('HANDLER_FAILED', 'ATTEMPTS_EXHAUSTED'))"],
+        ['GRANT UPDATE ON foundation.outbox_events TO fixlevelup_runtime',
+          'REVOKE UPDATE ON foundation.outbox_events FROM fixlevelup_runtime; GRANT UPDATE(status,attempt_count,lease_owner,lease_generation,lease_expires_at,next_attempt_at,last_error_code) ON foundation.outbox_events TO fixlevelup_runtime'],
+        ['GRANT UPDATE(payload) ON foundation.outbox_events TO fixlevelup_runtime', 'REVOKE UPDATE(payload) ON foundation.outbox_events FROM fixlevelup_runtime'],
+        ['GRANT UPDATE(details) ON foundation.audit_logs TO fixlevelup_runtime', 'REVOKE UPDATE(details) ON foundation.audit_logs FROM fixlevelup_runtime'],
+        ['DROP INDEX foundation.outbox_events_due_idx; CREATE INDEX outbox_events_due_idx ON foundation.outbox_events(status,created_at,next_attempt_at,id)',
+          'DROP INDEX foundation.outbox_events_due_idx; CREATE INDEX outbox_events_due_idx ON foundation.outbox_events(status,next_attempt_at,created_at,id)'],
+      ] as const) {
+        await fixture.query(breakSchema);
+        await request(server).get('/health/ready').expect(503);
+        await fixture.query(restoreSchema);
+        const restored = await request(server).get('/health/ready');
+        expect(restored.status, restoreSchema).toBe(200);
+      }
+      for (const column of ['status', 'attempt_count', 'lease_owner', 'lease_generation', 'lease_expires_at', 'next_attempt_at', 'last_error_code']) {
+        await fixture.query(`REVOKE UPDATE(${column}) ON foundation.outbox_events FROM fixlevelup_runtime`);
+        await request(server).get('/health/ready').expect(503);
+        await fixture.query(`GRANT UPDATE(${column}) ON foundation.outbox_events TO fixlevelup_runtime`);
+        await request(server).get('/health/ready').expect(200);
+      }
+      for (const [name, definition] of [
+        ['outbox_events_lease_generation_check', 'lease_generation >= 0'],
+        ['outbox_events_lease_pair_check', '(lease_owner IS NULL) = (lease_expires_at IS NULL)'],
+        ['outbox_events_lease_pending_check', "lease_owner IS NULL OR status = 'PENDING'"],
+        ['outbox_events_last_error_code_check', "last_error_code IN ('HANDLER_FAILED', 'ATTEMPTS_EXHAUSTED')"],
+      ] as const) {
+        await fixture.query(`ALTER TABLE foundation.outbox_events DROP CONSTRAINT ${name}; ALTER TABLE foundation.outbox_events ADD CONSTRAINT ${name} CHECK (true)`);
+        await request(server).get('/health/ready').expect(503);
+        await fixture.query(`ALTER TABLE foundation.outbox_events DROP CONSTRAINT ${name}; ALTER TABLE foundation.outbox_events ADD CONSTRAINT ${name} CHECK (${definition})`);
+        await request(server).get('/health/ready').expect(200);
+      }
       await fixture.query('DROP INDEX foundation.outbox_events_queue_idx; CREATE INDEX outbox_events_queue_idx ON foundation.outbox_events(created_at,status)');
       await request(server).get('/health/ready').expect(503);
       await request(server).get('/health/live').expect(200);

@@ -26,7 +26,8 @@ export function credentials(create = false) {
 
 export function validateDatabase(database) {
   if (database !== 'fixlevelup_dev' && !/^fixlevelup_p017a_(?:fresh|upgrade|shadow)_[a-f0-9]{12}$/.test(database)
-    && !/^fixlevelup_p017b_proof_[a-f0-9]{12}$/.test(database)) {
+    && !/^fixlevelup_p017b_proof_[a-f0-9]{12}$/.test(database)
+    && !/^fixlevelup_p019a_worker_[a-f0-9]{12}$/.test(database)) {
     throw new Error('Database target outside P01-01.7A allowlist');
   }
 }

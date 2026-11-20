@@ -30,15 +30,20 @@ export interface ReadinessRow {
   role: string;
   safe_role: boolean;
   safe_schema: boolean;
-  columns: { table: string; column: string; type: string; not_null: boolean }[];
+  columns: { table: string; column: string; type: string; not_null: boolean; type_modifier: number }[];
   constraints: { table: string; name: string; kind: string; validated: boolean; definition: string }[];
   indexes: { table: string; name: string; valid: boolean; unique: boolean; definition: string }[];
 }
 
 const expectedColumns = {
   audit_logs: { id: 'uuid', operation: 'varchar', correlation_id: 'uuid', occurred_at: 'timestamptz', details: 'jsonb' },
-  outbox_events: { id: 'uuid', event_id: 'uuid', event_type: 'varchar', created_at: 'timestamptz', status: 'varchar', payload: 'jsonb', attempt_count: 'int4' },
+  outbox_events: {
+    id: 'uuid', event_id: 'uuid', event_type: 'varchar', created_at: 'timestamptz', status: 'varchar', payload: 'jsonb', attempt_count: 'int4',
+    lease_owner: 'uuid', lease_generation: 'int8', lease_expires_at: 'timestamptz', next_attempt_at: 'timestamptz', last_error_code: 'varchar',
+  },
 };
+const nullableOutboxColumns = new Set(['lease_owner', 'lease_expires_at', 'last_error_code']);
+const expectedOutboxTypeModifiers: Readonly<Record<string, number>> = { lease_expires_at: 6, next_attempt_at: 6, last_error_code: 36 };
 const expectedConstraints = [
   ['audit_logs', 'audit_logs_pkey', 'p', 'PRIMARY KEY (id)'],
   ['audit_logs', 'audit_logs_operation_check', 'c', 'CHECK ((length((operation)::text) > 0))'],
@@ -46,6 +51,10 @@ const expectedConstraints = [
   ['outbox_events', 'outbox_events_status_check', 'c', "CHECK (((status)::text = ANY ((ARRAY['PENDING'::character varying, 'EXPANDED'::character varying, 'FAILED'::character varying])::text[])))"],
   ['outbox_events', 'outbox_events_type_check', 'c', 'CHECK ((length((event_type)::text) > 0))'],
   ['outbox_events', 'outbox_events_attempt_count_check', 'c', 'CHECK ((attempt_count >= 0))'],
+  ['outbox_events', 'outbox_events_lease_generation_check', 'c', 'CHECK ((lease_generation >= 0))'],
+  ['outbox_events', 'outbox_events_lease_pair_check', 'c', 'CHECK (((lease_owner IS NULL) = (lease_expires_at IS NULL)))'],
+  ['outbox_events', 'outbox_events_lease_pending_check', 'c', "CHECK (((lease_owner IS NULL) OR ((status)::text = 'PENDING'::text)))"],
+  ['outbox_events', 'outbox_events_last_error_code_check', 'c', "CHECK (((last_error_code)::text = ANY ((ARRAY['HANDLER_FAILED'::character varying, 'ATTEMPTS_EXHAUSTED'::character varying])::text[])))"],
 ];
 
 @Injectable()
@@ -93,11 +102,17 @@ export class RuntimeDatabase implements OnModuleDestroy {
           AND NOT has_any_column_privilege(current_user,'foundation.audit_logs','UPDATE')
           AND has_table_privilege(current_user,'foundation.outbox_events','SELECT')
           AND has_table_privilege(current_user,'foundation.outbox_events','INSERT')
-          AND NOT has_table_privilege(current_user,'foundation.outbox_events','DELETE,TRUNCATE')
+          AND NOT has_table_privilege(current_user,'foundation.outbox_events','UPDATE,DELETE,TRUNCATE')
+          AND NOT EXISTS(SELECT 1 FROM unnest(ARRAY['status','attempt_count','lease_owner','lease_generation','lease_expires_at','next_attempt_at','last_error_code']) AS worker(column_name)
+            WHERE NOT has_column_privilege(current_user,'foundation.outbox_events',worker.column_name,'UPDATE'))
+          AND NOT EXISTS(SELECT 1 FROM pg_attribute a WHERE a.attrelid='foundation.outbox_events'::regclass
+            AND a.attnum>0 AND NOT a.attisdropped
+            AND a.attname NOT IN ('status','attempt_count','lease_owner','lease_generation','lease_expires_at','next_attempt_at','last_error_code')
+            AND has_column_privilege(current_user,'foundation.outbox_events',a.attname,'UPDATE'))
           AND NOT has_table_privilege(current_user,'foundation._prisma_migrations','SELECT')
           AND NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
              WHERE n.nspname='foundation' AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user))) AS safe_schema,
-        COALESCE((SELECT json_agg(json_build_object('table',c.relname,'column',a.attname,'type',t.typname,'not_null',a.attnotnull))
+        COALESCE((SELECT json_agg(json_build_object('table',c.relname,'column',a.attname,'type',t.typname,'not_null',a.attnotnull,'type_modifier',a.atttypmod))
           FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
           JOIN pg_type t ON t.oid=a.atttypid WHERE n.nspname='foundation' AND c.relname IN ('audit_logs','outbox_events')
           AND a.attnum>0 AND NOT a.attisdropped),'[]'::json) AS columns,
@@ -113,7 +128,10 @@ export class RuntimeDatabase implements OnModuleDestroy {
         || !row.safe_role || !row.safe_schema) { return false; }
       for (const [table, columns] of Object.entries(expectedColumns)) {
         for (const [column, type] of Object.entries(columns)) {
-          if (!row.columns.some((entry) => entry.table === table && entry.column === column && entry.type === type && entry.not_null)) { return false; }
+          const notNull = table !== 'outbox_events' || !nullableOutboxColumns.has(column);
+          const typeModifier = table === 'outbox_events' ? expectedOutboxTypeModifiers[column] : undefined;
+          if (!row.columns.some((entry) => entry.table === table && entry.column === column && entry.type === type
+            && entry.not_null === notNull && (typeModifier === undefined || entry.type_modifier === typeModifier))) { return false; }
         }
       }
       if (!expectedConstraints.every(([table, name, kind, definition]) => row.constraints.some((entry) =>
@@ -121,7 +139,9 @@ export class RuntimeDatabase implements OnModuleDestroy {
       return row.indexes.some((entry) => entry.table === 'outbox_events' && entry.name === 'outbox_events_event_id_key' && entry.valid && entry.unique
         && entry.definition === 'CREATE UNIQUE INDEX outbox_events_event_id_key ON foundation.outbox_events USING btree (event_id)')
         && row.indexes.some((entry) => entry.table === 'outbox_events' && entry.name === 'outbox_events_queue_idx' && entry.valid && !entry.unique
-          && entry.definition === 'CREATE INDEX outbox_events_queue_idx ON foundation.outbox_events USING btree (status, created_at)');
+          && entry.definition === 'CREATE INDEX outbox_events_queue_idx ON foundation.outbox_events USING btree (status, created_at)')
+        && row.indexes.some((entry) => entry.table === 'outbox_events' && entry.name === 'outbox_events_due_idx' && entry.valid && !entry.unique
+          && entry.definition === 'CREATE INDEX outbox_events_due_idx ON foundation.outbox_events USING btree (status, next_attempt_at, created_at, id)');
   }
 
   async onModuleDestroy(): Promise<void> {

@@ -1,8 +1,10 @@
-# Technical API/worker и P01-01.8B DB readiness
+# Technical API/worker, DB readiness и P01-01.9A Outbox
 
-Технические процессы одного backend-пакета. Бизнес-модули, провайдеры,
-обработка jobs/outbox ещё не реализованы. API использует Prisma/adapter-pg
-для read-only readiness под отдельной runtime-role; worker пока без DB wiring.
+Технические процессы одного backend-пакета. API использует Prisma/adapter-pg
+для read-only readiness под отдельной runtime-role. Worker подключён к БД;
+claim/lease/fencing реализованы для технического outbox. Production handlers
+пока отсутствуют, поэтому события не забираются и не помечаются обработанными.
+Бизнес-модули, провайдеры и реальные отправки не реализованы.
 
 ## Запуск из корня репозитория (PowerShell)
 
@@ -28,7 +30,7 @@ corepack pnpm --filter @fixlevelup/api start:worker
 ```
 
 Entrypoints не загружают .env автоматически. .env.example — перечень
-технических переменных без secrets. API требует DB_PASSWORD runtime-role;
+технических переменных без secrets. API и worker требуют DB_PASSWORD runtime-role;
 локальные credentials уже существуют в ignored database-tooling/.env.
 Entrypoint не читает этот файл автоматически и не использует migrator/admin.
 Оба entrypoint валидируют общий technical config. Worker не слушает порт,
@@ -52,8 +54,23 @@ Entrypoint не читает этот файл автоматически и н�
 - SafeLogger через Nest ConsoleLogger пишет только fixed event+role, без raw
   exception, stack, env, request path/body/headers и provider IDs. Неструктурированные
   framework messages подавляются; NEST_LOG_LEVEL намеренно не используется.
-- Worker создаёт настоящий Nest application context и heartbeat раз в минуту.
-  Это поддержание процесса, а не имитация выполненных jobs/notifications.
+- Worker создаёт Nest application context и heartbeat раз в минуту. Раз в секунду
+  проверяет readiness; только зарегистрированные handler event types допускаются
+  к claim. Пустой production registry оставляет все события нетронутыми.
+- OutboxStore использует отдельный pool max2 под runtime-role. Один SQL claim:
+  FOR UPDATE SKIP LOCKED, due/expiry по clock_timestamp PostgreSQL, UUID owner,
+  bigint generation и attempt_count увеличиваются при выдаче lease.
+- Lease по умолчанию30s, без продления. Complete/retry требуют id+owner+generation
+  и ещё не истёкшую lease; status остаётся PENDING до EXPANDED/FAILED. EXPANDED
+  означает успешный technical handler, а не доставку внешнего сообщения.
+- Максимум3 попытки, retry через1s/2s (общая задержка capped30s). Error code только
+  HANDLER_FAILED/ATTEMPTS_EXHAUSTED, без exception text/payload. Истёкшая последняя
+  попытка переводится в FAILED при следующем claim этого поддерживаемого типа.
+- Shutdown останавливает polling/claims, abort signal передаётся текущему handler,
+  ожидается текущая работа и закрываются оба DB pools. При остановке lease не
+  завершается: истечение позволяет recovery. Общий deadline lifecycle ограничивает
+  handler, игнорирующий отмену. Fencing защищает queue state; будущий handler обязан
+  сам обеспечивать идемпотентность своего эффекта. Exactly-once send не обещается.
 - SIGINT/SIGTERM вызывают app.close, очищают worker timer; повторный сигнал не
   начинает второй shutdown. Deadline ограничивает зависшее/отклонённое закрытие.
 

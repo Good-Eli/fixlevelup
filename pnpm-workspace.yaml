@@ -10,6 +10,8 @@ storeDir: node_modules/.cache/pnpm-store
 # pulls @emnapi 2 beta packages and is outside the approved platform baseline.
 overrides:
   '@rolldown/binding-wasm32-wasi:optional': '-'
+  # Owner-approved fix for GHSA-7589-6fvf-x4pw, Prisma CLI dev graph only.
+  '@prisma/config@7.10.1>effect': '3.22.1'
 
 # No dependency lifecycle scripts are approved in P01-01.1.
 ignoreScripts: true

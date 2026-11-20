@@ -24,15 +24,21 @@ model AuditLog {
 }
 
 model OutboxEvent {
-  id           String   @id @db.Uuid
-  eventId      String   @unique(map: "outbox_events_event_id_key") @map("event_id") @db.Uuid
-  eventType    String   @map("event_type") @db.VarChar(64)
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  status       String   @default("PENDING") @db.VarChar(16)
-  payload      Json     @default("{}") @db.JsonB
-  attemptCount Int      @default(0) @map("attempt_count")
+  id              String    @id @db.Uuid
+  eventId         String    @unique(map: "outbox_events_event_id_key") @map("event_id") @db.Uuid
+  eventType       String    @map("event_type") @db.VarChar(64)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  status          String    @default("PENDING") @db.VarChar(16)
+  payload         Json      @default("{}") @db.JsonB
+  attemptCount    Int       @default(0) @map("attempt_count")
+  leaseOwner      String?   @map("lease_owner") @db.Uuid
+  leaseGeneration BigInt    @default(0) @map("lease_generation")
+  leaseExpiresAt  DateTime? @map("lease_expires_at") @db.Timestamptz(6)
+  nextAttemptAt   DateTime  @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  lastErrorCode   String?   @map("last_error_code") @db.VarChar(32)
 
   @@index([status, createdAt], map: "outbox_events_queue_idx")
+  @@index([status, nextAttemptAt, createdAt, id], map: "outbox_events_due_idx")
   @@map("outbox_events")
   @@schema("foundation")
 }

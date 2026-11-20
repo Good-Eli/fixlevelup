@@ -1,4 +1,4 @@
-# Prisma Foundation и P01-01.7A Technical Migrations
+# Prisma Foundation и технические миграции audit/outbox
 
 Private dev-only tooling. Prisma CLI 7.10.1 находится здесь, не в root/API
 runtime. React/React DOM 19.3.1 и @types/react19.3.0 — исключительно peer
@@ -65,7 +65,7 @@ check-connection читает только локальный игнорируе
 identity/version и прежней p01_technical.persistence_probe. Ошибки фиксированные,
 без URL/password/provider payload. Client отключается в finally.
 Bootstrap dev superuser используется только в read-only proof и явном role/test
-bootstrap. API/worker ещё не используют runtime credentials; DB readiness позже.
+bootstrap. API и worker используют только fixlevelup_runtime credentials.
 
 ## P01-01.7A — Roles и технические миграции
 
@@ -77,7 +77,8 @@ bootstrap. API/worker ещё не используют runtime credentials; DB r
   на FixLevelUp dev DB для schema DDL. Runtime не owner и не получает DB CREATE/TEMP.
 - db:deploy: Prisma migrate deploy только к127.0.0.1:55432/fixlevelup_dev.
   Schema foundation; audit SELECT/INSERT, outbox SELECT/INSERT и column-limited
-  UPDATE status/attempt_count. DELETE/TRUNCATE/DDL/migration history runtime запрещены.
+  UPDATE status/attempt_count и lease_owner/lease_generation/lease_expires_at/
+  next_attempt_at/last_error_code. DELETE/TRUNCATE/DDL/migration history runtime запрещены.
 - db:test-migrations: создаёт fresh/upgrade/shadow DB с уникальным p017a suffix.
   Fresh deploy, upgrade1→2 с данными, replay, history/schema diff, явный test-only
   ALTER drift+восстановление, catalog/CHECK/commit/rollback/privilege assertions.
@@ -100,6 +101,29 @@ IF NOT EXISTS. Транзакция откатила DDL; после узког�
 неуспешная попытка отмечена migrate resolve --rolled-back, затем обе миграции
 успешны. История попытки сохранена, reset/перезапись migration SQL не выполнялись.
 
-db push/reset/studio не вызываются. Бизнес-таблиц, географии и worker обработки
-outbox нет. Existing persistence data, чужие Docker resources и Git index/config
-сохраняются. Реальный runtime-role API wiring и DB readiness — отдельный шаг.
+db push/reset/studio не вызываются. Бизнес-таблиц и географии нет. Existing
+persistence data, чужие Docker resources и Git index/config сохраняются.
+
+## P01-01.9A — Claim, lease и fencing
+
+Третья reviewed migration добавляет lease owner(UUID)/generation(bigint)/expiry,
+next_attempt_at, safe error code, CHECK инварианты и due index. Прежние migration
+SQL не меняются. Upgrade proofs проверяют пути1→latest и2→3 с сохранением данных,
+повторный deploy и drift. Runtime grants по-прежнему column-level.
+
+Outbox integration tests в API создают отдельную fixlevelup_p019a_worker_<suffix>
+БД в том же FixLevelUp container, оставляют её для evidence и закрывают clients.
+Синтетические handlers/command effects существуют только в tests. Production
+registry пуст: claim unsupported событий и фиктивный EXPANDED запрещены.
+После изменения схемы выполните db:deploy перед запуском API/worker; старый
+readiness contract намеренно несовместим с новой структурой до обновления кода.
+
+Audit 20.11.2026 выявил HIGH GHSA-7589-6fvf-x4pw в прежнем effect3.20.0
+цепочки prisma7.10.1 → @prisma/config7.10.1. Владелец отдельно согласовал
+адресный override @prisma/config@7.10.1>effect:3.22.1. Prisma CLI/client/adapter
+остаются7.10.1; остальные package versions/права/scripts policy сохранены.
+Это dev-only CLI graph; API runtime isolation audit не включает эту ветку.
+У effect3.22.1 MIT, нет install hooks, registry tarball SHA512 совпадает с lock.
+После замены обязательны frozen/offline install, полный audit, generation,
+migration proofs, quality gate и runtime isolation.
+Источник: https://github.com/advisories/GHSA-7589-6fvf-x4pw

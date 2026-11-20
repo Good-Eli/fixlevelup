@@ -27,8 +27,8 @@ export async function createApi(config: RuntimeConfig, logger: SafeLogger, datab
   }
 }
 
-export async function createWorker(logger: SafeLogger) {
+export async function createWorker(logger: SafeLogger, database?: DatabaseConfig) {
   // Same structural Nest options contract as create() above.
   // eslint-disable-next-line @typescript-eslint/no-unsafe-class-instance-assignment
-  return NestFactory.createApplicationContext(WorkerModule, { logger, abortOnError: false });
+  return NestFactory.createApplicationContext(WorkerModule.register(database), { logger, abortOnError: false });
 }
