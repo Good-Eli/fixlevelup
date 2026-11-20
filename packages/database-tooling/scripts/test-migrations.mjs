@@ -20,10 +20,12 @@ async function checkViolation(client, sql, values = []) {
   catch (error) { assert(error.code === '23514', `Expected custom CHECK violation, got ${error.code}`); checkDenials += 1; return; }
   throw new Error('Invalid CHECK input accepted');
 }
-const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases'];
+const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity'];
 const expectedChecks = [
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
+  'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check',
+  'staff_web_credentials_login_check', 'staff_web_credentials_password_hash_check', 'staff_bootstrap_marker_singleton_check',
 ];
 const client = await admin();
 const passwords = credentials();
@@ -31,14 +33,16 @@ const suffix = randomBytes(6).toString('hex');
 const fresh = `fixlevelup_p017a_fresh_${suffix}`;
 const upgrade = `fixlevelup_p017a_upgrade_${suffix}`;
 const upgradeSecond = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+const upgradeThird = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const shadow = `fixlevelup_p017a_shadow_${suffix}`;
 const historyRoot = resolve(root, `node_modules/.cache/p017a-${suffix}`);
 const firstHistory = resolve(historyRoot, 'first/migrations');
 const secondHistory = resolve(historyRoot, 'second/migrations');
+const thirdHistory = resolve(historyRoot, 'third/migrations');
 try {
-  for (const database of [fresh, upgrade, upgradeSecond, shadow]) { await prepareDatabase(client, database, true); }
-  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${shadow}`);
-  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)]]) {
+  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, shadow]) { await prepareDatabase(client, database, true); }
+  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${shadow}`);
+  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -64,10 +68,10 @@ try {
     command(['migrate', 'deploy'], upgrade);
     const after = await reader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
     assert(JSON.stringify(before.rows) === JSON.stringify(after.rows) && after.rowCount === migrations.length
-      && JSON.stringify(after.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations), 'Replay changed three-migration history');
+      && JSON.stringify(after.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations), 'Replay changed migration history');
   } finally { await reader.end(); }
 
-  // Explicit second-to-third upgrade preserves existing statuses, attempts and payloads.
+  // Explicit second-to-latest upgrade preserves existing statuses, attempts and payloads.
   command(['migrate', 'deploy'], upgradeSecond, 0, undefined, secondHistory);
   const secondWriter = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, upgradeSecond);
   await secondWriter.connect();
@@ -87,19 +91,54 @@ try {
   await secondReader.connect();
   try {
     const preserved = await secondReader.query('SELECT id,event_id,event_type,created_at,status,attempt_count,payload FROM foundation.outbox_events ORDER BY id');
-    assert(JSON.stringify(preserved.rows) === JSON.stringify(beforeRows), 'Second-to-third upgrade changed existing data');
+    assert(JSON.stringify(preserved.rows) === JSON.stringify(beforeRows), 'Second-to-latest upgrade changed existing data');
     const defaults = await secondReader.query('SELECT lease_owner,lease_generation,lease_expires_at,next_attempt_at,last_error_code FROM foundation.outbox_events');
     assert(defaults.rowCount === priorEvents.length && defaults.rows.every((event) => event.lease_owner === null && event.lease_generation === '0'
-      && event.lease_expires_at === null && event.next_attempt_at instanceof Date && event.last_error_code === null), 'Second-to-third lease defaults missing');
+      && event.lease_expires_at === null && event.next_attempt_at instanceof Date && event.last_error_code === null), 'Second-to-latest lease defaults missing');
     const applied = await secondReader.query('SELECT migration_name FROM foundation._prisma_migrations WHERE finished_at IS NOT NULL ORDER BY migration_name');
-    assert(applied.rowCount === migrations.length && JSON.stringify(applied.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations), 'Second-to-third history mismatch');
+    assert(applied.rowCount === migrations.length && JSON.stringify(applied.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations), 'Second-to-latest history mismatch');
   } finally { await secondReader.end(); }
-  console.log(`Fresh/first-to-latest/second-to-third/data preservation/replay (${migrations.length} migrations): PASS`);
+  // Upgrade the immediately preceding history with populated audit and leased outbox data.
+  command(['migrate', 'deploy'], upgradeThird, 0, undefined, thirdHistory);
+  const thirdWriter = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, upgradeThird);
+  await thirdWriter.connect();
+  const thirdId = randomUUID(), thirdEventId = randomUUID(), thirdOwner = randomUUID();
+  let thirdAuditBefore, thirdOutboxBefore;
+  try {
+    await thirdWriter.query('INSERT INTO foundation.audit_logs(id,operation,correlation_id) VALUES($1,$2,$3)', [thirdId, 'TECHNICAL_THIRD_UPGRADE', randomUUID()]);
+    await thirdWriter.query("INSERT INTO foundation.outbox_events(id,event_id,event_type,status,attempt_count,payload,lease_owner,lease_generation,lease_expires_at,next_attempt_at,last_error_code) VALUES($1,$2,$3,'PENDING',4,$4,$5,2147483648,CURRENT_TIMESTAMP+INTERVAL '1 hour',CURRENT_TIMESTAMP+INTERVAL '30 minutes','HANDLER_FAILED')",
+      [thirdId, thirdEventId, 'TECHNICAL_THIRD_UPGRADE', { technical: true }, thirdOwner]);
+    thirdAuditBefore = (await thirdWriter.query('SELECT * FROM foundation.audit_logs ORDER BY id')).rows;
+    thirdOutboxBefore = (await thirdWriter.query('SELECT * FROM foundation.outbox_events ORDER BY id')).rows;
+  } finally { await thirdWriter.end(); }
+  command(['migrate', 'deploy'], upgradeThird);
+  const thirdReader = connection('fixlevelup_migrator', passwords.fixlevelup_migrator, upgradeThird);
+  await thirdReader.connect();
+  try {
+    const auditAfter = (await thirdReader.query('SELECT * FROM foundation.audit_logs ORDER BY id')).rows;
+    const outboxAfter = (await thirdReader.query('SELECT * FROM foundation.outbox_events ORDER BY id')).rows;
+    assert(JSON.stringify(auditAfter) === JSON.stringify(thirdAuditBefore) && JSON.stringify(outboxAfter) === JSON.stringify(thirdOutboxBefore), 'Third-to-latest upgrade changed existing synthetic data');
+    const beforeReplay = await thirdReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(beforeReplay.rowCount === migrations.length && JSON.stringify(beforeReplay.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
+      && beforeReplay.rows.every((entry) => entry.finished_at !== null), 'Third-to-latest history mismatch');
+    command(['migrate', 'deploy'], upgradeThird);
+    const afterReplay = await thirdReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(JSON.stringify(afterReplay.rows) === JSON.stringify(beforeReplay.rows), 'Third-to-latest replay changed history');
+    command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeThird, 0, shadow);
+    command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeThird);
+  } finally { await thirdReader.end(); }
+  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
   command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], fresh, 0, shadow);
   command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
   const migration = connection('fixlevelup_migrator', passwords.fixlevelup_migrator, fresh);
   await migration.connect();
   try {
+    const freshBefore = await migration.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(freshBefore.rowCount === migrations.length && JSON.stringify(freshBefore.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
+      && freshBefore.rows.every((entry) => entry.finished_at !== null), 'Fresh migration history mismatch');
+    command(['migrate', 'deploy'], fresh);
+    const freshAfter = await migration.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(JSON.stringify(freshAfter.rows) === JSON.stringify(freshBefore.rows), 'Fresh replay changed migration history');
     const owner = await migration.query("SELECT pg_get_userbyid(nspowner) AS owner FROM pg_namespace WHERE nspname='foundation'");
     assert(owner.rows[0]?.owner === 'fixlevelup_migrator', 'Schema owner mismatch');
     const checks = await migration.query("SELECT conname,convalidated FROM pg_constraint WHERE connamespace='foundation'::regnamespace AND contype='c' ORDER BY conname");
@@ -185,6 +224,11 @@ try {
       'CREATE TABLE foundation.forbidden(id integer)', 'CREATE SCHEMA forbidden', 'CREATE TEMP TABLE forbidden(id integer)',
       'SET ROLE fixlevelup_migrator', "UPDATE foundation.outbox_events SET payload='{}'", 'DELETE FROM foundation.outbox_events',
       "UPDATE foundation.outbox_events SET event_id='00000000-0000-0000-0000-000000000000'", 'CREATE TABLE public.forbidden(id integer)',
+      ...['staff', 'staff_web_credentials', 'staff_bootstrap_marker'].flatMap((table) => [
+        `SELECT * FROM foundation.${table}`, `INSERT INTO foundation.${table} DEFAULT VALUES`,
+        `UPDATE foundation.${table} SET ${table === 'staff_web_credentials' ? 'staff_id=staff_id' : 'id=id'}`,
+        `DELETE FROM foundation.${table}`,
+      ]),
     ];
     for (const sql of privilegeDenials) { await denied(runtime, sql); }
     console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials and ${privilegeDenials.length} privilege denials: PASS`);

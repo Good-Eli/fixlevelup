@@ -7,7 +7,9 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/bootstrap/api.js",
-    "start:worker": "node dist/bootstrap/worker.js"
+    "start:worker": "node dist/bootstrap/worker.js",
+    "staff:bootstrap": "node dist/bootstrap/staff-bootstrap.js",
+    "staff:recover": "node dist/bootstrap/staff-recover.js"
   },
   "dependencies": {
     "@nestjs/common": "12.5.1",

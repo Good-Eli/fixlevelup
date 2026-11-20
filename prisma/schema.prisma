@@ -11,7 +11,7 @@ datasource db {
   schemas  = ["foundation"]
 }
 
-// Technical infrastructure only. No customers, requests or geography models.
+// Technical infrastructure and minimal staff identity. No customers, requests or geography models.
 model AuditLog {
   id            String   @id @db.Uuid
   operation     String   @db.VarChar(64)
@@ -20,6 +20,37 @@ model AuditLog {
   details       Json     @default("{}") @db.JsonB
 
   @@map("audit_logs")
+  @@schema("foundation")
+}
+
+model Staff {
+  id              String              @id @db.Uuid
+  role            String              @db.VarChar(16)
+  employmentState String              @map("employment_state") @db.VarChar(16)
+  authVersion     Int                 @default(0) @map("auth_version")
+  webCredential   StaffWebCredential?
+  bootstrapMarker StaffBootstrapMarker?
+
+  @@map("staff")
+  @@schema("foundation")
+}
+
+model StaffBootstrapMarker {
+  id      Int    @id @db.SmallInt
+  staffId String @unique(map: "staff_bootstrap_marker_staff_id_key") @map("staff_id") @db.Uuid
+  staff   Staff  @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@map("staff_bootstrap_marker")
+  @@schema("foundation")
+}
+
+model StaffWebCredential {
+  staffId      String @id @map("staff_id") @db.Uuid
+  login        String @unique(map: "staff_web_credentials_login_key") @db.VarChar(255)
+  passwordHash String @map("password_hash") @db.VarChar(255)
+  staff        Staff  @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@map("staff_web_credentials")
   @@schema("foundation")
 }
 
