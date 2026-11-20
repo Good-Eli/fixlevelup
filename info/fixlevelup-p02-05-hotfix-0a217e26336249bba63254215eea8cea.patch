@@ -1,326 +1,37 @@
-diff --git a/apps/api/.env.example b/apps/api/.env.example
-index 616de31..b98c04f 100644
---- a/apps/api/.env.example
-+++ b/apps/api/.env.example
-@@ -16,3 +16,7 @@ WEB_AUTH_ENABLED=0
- # WEB_AUTH_ORIGIN=
- # WEB_AUTH_CSRF_SECRET=
- # WEB_AUTH_THROTTLE_SECRET=
-+# Telegram Mini App staff authentication is disabled unless explicitly enabled.
-+# Requires WEB_AUTH_ENABLED=1; the bot token comes only from the environment.
-+# TELEGRAM_AUTH_ENABLED=0
-+# TELEGRAM_BOT_TOKEN=
-diff --git a/apps/api/src/app.module.ts b/apps/api/src/app.module.ts
-index 162e803..00ee2d9 100644
---- a/apps/api/src/app.module.ts
-+++ b/apps/api/src/app.module.ts
-@@ -8,13 +8,20 @@ import { WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE, WebAuthController } from './aut
- import { WebAuthResources } from './auth/web-auth.resources.js';
- import { AUTHORIZATION_SERVICE, AuthorizationResources } from './authz/authorization.resources.js';
- import { StaffWebAuthGuard } from './authz/authorization.guard.js';
-+import { StaffTelegramAuthGuard } from './authz/telegram-auth.guard.js';
-+import { TELEGRAM_AUTH_SERVICE, TelegramAuthController } from './auth/telegram-auth.controller.js';
-+import { TelegramAuthResources } from './auth/telegram-auth.resources.js';
-+import type { TelegramAuthConfig } from './auth/telegram-auth.config.js';
- import { StaffController, StaffService } from './staff/staff.controller.js';
- 
- @Module({})
- export class AppModule {
--  static register(database?: DatabaseConfig, webAuth?: WebAuthConfig): DynamicModule {
--    if (webAuth && !database) { throw new Error('Web authentication requires a database'); }
--    const controllers = webAuth ? [HealthController, WebAuthController, StaffController] : [HealthController];
-+  static register(database?: DatabaseConfig, webAuth?: WebAuthConfig, telegramAuth?: TelegramAuthConfig): DynamicModule {
-+    if ((webAuth || telegramAuth) && !database) { throw new Error('Web authentication requires a database'); }
-+    if (telegramAuth && !webAuth) { throw new Error('Telegram authentication requires web authentication configuration'); }
-+    const controllers = webAuth
-+      ? [HealthController, WebAuthController, StaffController, ...(telegramAuth ? [TelegramAuthController] : [])]
-+      : [HealthController];
-     const providers = [
-       HealthService, { provide: RuntimeDatabase, useFactory: () => new RuntimeDatabase(database, Boolean(webAuth)) },
-       ...(webAuth && database ? [
-@@ -28,6 +35,13 @@ export class AppModule {
-         { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin: webAuth.origin, csrfSecret: webAuth.csrfSecret } },
-         { provide: AuthorizationResources, useFactory: () => new AuthorizationResources(database) },
-         { provide: AUTHORIZATION_SERVICE, useFactory: (resources: AuthorizationResources) => resources.service, inject: [AuthorizationResources] },
-+        ...(telegramAuth ? [
-+          // Same fail-fast provider registration as StaffWebAuthGuard: no master
-+          // routes are mounted yet, but the guard's wiring is verified at startup.
-+          StaffTelegramAuthGuard,
-+          { provide: TelegramAuthResources, useFactory: () => new TelegramAuthResources(database, telegramAuth, webAuth.throttleSecret) },
-+          { provide: TELEGRAM_AUTH_SERVICE, useFactory: (resources: TelegramAuthResources) => resources.service, inject: [TelegramAuthResources] },
-+        ] : []),
-       ] : []),
-     ];
-     return { module: AppModule, controllers, providers };
-diff --git a/apps/api/src/authz/authorization.service.ts b/apps/api/src/authz/authorization.service.ts
-index 6f37ccf..f0a3d2a 100644
---- a/apps/api/src/authz/authorization.service.ts
-+++ b/apps/api/src/authz/authorization.service.ts
-@@ -1,6 +1,7 @@
- import { createHash } from 'node:crypto';
- import type { Pool, PoolClient } from 'pg';
- import { HttpException, InternalServerErrorException } from '@nestjs/common';
-+import type { Principal } from './principal.js';
- import type { StaffWebPrincipal } from './principal.js';
- import type { Capability, Scope } from './capability.js';
- import { isCapability } from './capability.js';
-@@ -17,7 +18,7 @@ export interface StaffWriteContext {
- 
- /** DI-facing API of AuthorizationService, mirroring the WebAuthServiceApi pattern. */
- export interface AuthorizationServiceApi {
--  authorize(principal: StaffWebPrincipal, capability: Capability, scope: Scope): Promise<void>;
-+  authorize(principal: Principal, capability: Capability, scope: Scope): Promise<void>;
-   read<T>(fn: (client: PoolClient) => Promise<T>): Promise<T>;
-   authorizeForWrite<T>(token: string, capability: Capability, scope: Scope, write: (context: StaffWriteContext) => Promise<T>): Promise<T>;
- }
-@@ -72,7 +73,7 @@ export class AuthorizationService implements AuthorizationServiceApi {
-   /** Throws FORBIDDEN when the principal lacks the capability in scope. Default deny.
-    * Read path: no locks, plain READ COMMITTED; the guard has just re-verified the session.
-    */
--  async authorize(principal: StaffWebPrincipal, capability: Capability, scope: Scope): Promise<void> {
-+  async authorize(principal: Principal, capability: Capability, scope: Scope): Promise<void> {
-     await this.transaction(async (client) => {
-       if (!await this.permitted(client, principal.staffId, capability, scope)) { throw new AuthorizationError('FORBIDDEN'); }
-     });
-diff --git a/apps/api/src/authz/principal.ts b/apps/api/src/authz/principal.ts
-index 64f87f4..9b08fab 100644
---- a/apps/api/src/authz/principal.ts
-+++ b/apps/api/src/authz/principal.ts
-@@ -12,4 +12,17 @@ export interface StaffWebPrincipal {
-   readonly authVersion: number;
- }
- 
--export type Principal = StaffWebPrincipal;
-+/** P02-05 principal from a verified STAFF_TELEGRAM web_sessions row (Mini App bearer
-+ * token in memory). telegramUserId is the decimal string of the BIGINT Telegram id,
-+ * never a JavaScript number. role is metadata only; rights come from capability
-+ * grants, never from the login channel.
-+ */
-+export interface StaffTelegramPrincipal {
-+  readonly kind: 'staff-telegram';
-+  readonly staffId: string;
-+  readonly role: 'TECHNICIAN';
-+  readonly authVersion: number;
-+  readonly telegramUserId: string;
-+}
-+
-+export type Principal = StaffWebPrincipal | StaffTelegramPrincipal;
-diff --git a/apps/api/src/bootstrap/api.ts b/apps/api/src/bootstrap/api.ts
-index 6ebb3f4..443b9bb 100644
---- a/apps/api/src/bootstrap/api.ts
-+++ b/apps/api/src/bootstrap/api.ts
-@@ -5,13 +5,15 @@ import { SafeLogger } from '../runtime/safe-logger.js';
- import { registerShutdown } from '../runtime/lifecycle.js';
- import { loadDatabaseConfig } from '../infrastructure/database/runtime-database.js';
- import { loadWebAuthConfig } from '../auth/web-auth.config.js';
-+import { loadTelegramAuthConfig } from '../auth/telegram-auth.config.js';
- 
- const logger = new SafeLogger('api');
- try {
-   const config = loadConfig(process.env);
-   const database = loadDatabaseConfig(process.env);
-   const webAuth = loadWebAuthConfig(process.env);
--  const app = await createApi(config, logger, database, webAuth);
-+  const telegramAuth = loadTelegramAuthConfig(process.env);
-+  const app = await createApi(config, logger, database, webAuth, telegramAuth);
-   registerShutdown(app, config, logger);
-   logger.event('started');
- } catch {
-diff --git a/apps/api/src/bootstrap/factories.ts b/apps/api/src/bootstrap/factories.ts
-index 5aea2cf..a3fb4b3 100644
---- a/apps/api/src/bootstrap/factories.ts
-+++ b/apps/api/src/bootstrap/factories.ts
-@@ -1,6 +1,7 @@
- import 'reflect-metadata';
- import { NestFactory } from '@nestjs/core';
- import type { WebAuthConfig } from '../auth/web-auth.config.js';
-+import type { TelegramAuthConfig } from '../auth/telegram-auth.config.js';
- import { AppModule } from '../app.module.js';
- import type { DatabaseConfig } from '../infrastructure/database/runtime-database.js';
- import { WorkerModule } from '../worker.module.js';
-@@ -8,15 +9,15 @@ import type { RuntimeConfig } from '../runtime/config.js';
- import { SafeLogger } from '../runtime/safe-logger.js';
- import { ProblemFilter } from '../runtime/problem.filter.js';
- 
--export async function createApi(config: RuntimeConfig, logger: SafeLogger, database?: DatabaseConfig, webAuth?: WebAuthConfig) {
-+export async function createApi(config: RuntimeConfig, logger: SafeLogger, database?: DatabaseConfig, webAuth?: WebAuthConfig, telegramAuth?: TelegramAuthConfig) {
-   // Nest's public options contract uses a structural class with no methods.
-   // eslint-disable-next-line @typescript-eslint/no-unsafe-class-instance-assignment
--  const app = await NestFactory.create(AppModule.register(database, webAuth), {
-+  const app = await NestFactory.create(AppModule.register(database, webAuth, telegramAuth), {
-     logger,
-     abortOnError: false,
-     bodyParser: false,
-   });
--  if (webAuth) {
-+  if (webAuth || telegramAuth) {
-     const expressApp = app as unknown as { useBodyParser: (kind: 'json', options: { limit: string; strict: boolean }) => void };
-     expressApp.useBodyParser('json', { limit: '4kb', strict: true });
-   }
 diff --git a/packages/database-tooling/scripts/test-migrations.mjs b/packages/database-tooling/scripts/test-migrations.mjs
-index cadb4d2..fbe81f3 100644
+index fbe81f3..2fdd36b 100644
 --- a/packages/database-tooling/scripts/test-migrations.mjs
 +++ b/packages/database-tooling/scripts/test-migrations.mjs
-@@ -26,14 +26,16 @@ async function uniqueViolation(client, sql, values = []) {
-   catch (error) { assert(error.code === '23505', `Expected unique_violation, got ${error.code}`); uniqueViolations += 1; return; }
-   throw new Error('Duplicate row accepted');
- }
--const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth', '20261120000600_authorization'];
-+const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth', '20261120000600_authorization', '20261120000700_staff_telegram_auth'];
- const expectedChecks = [
-   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
-   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
-   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check',
-   'staff_web_credentials_login_check', 'staff_web_credentials_password_hash_check', 'staff_bootstrap_marker_singleton_check',
-   'user_permissions_capability_check', 'user_permissions_scope_check', 'user_permissions_validity_check', 'user_permissions_revoked_at_check',
-+  'staff_telegram_links_telegram_user_id_check', 'staff_telegram_links_username_check', 'staff_telegram_links_revoked_at_check',
-   'web_sessions_token_hash_check', 'web_sessions_auth_version_check', 'web_sessions_expiry_check', 'web_sessions_revoked_at_check',
-+  'web_sessions_channel_check', 'web_sessions_initdata_digest_check', 'web_sessions_channel_pair_check', 'web_sessions_initdata_exchanged_at_check',
-   'web_auth_throttles_key_hash_check', 'web_auth_attempts_expiry_check', 'web_auth_attempts_completion_check',
- ];
- const client = await admin();
-@@ -177,24 +179,44 @@ try {
-     await fifthReader.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES($1,'TECHNICIAN','ACTIVE',2)", [fifthStaffId]);
-     await fifthReader.query("INSERT INTO foundation.staff_web_credentials(staff_id,login,password_hash) VALUES($1,'fifth-synthetic-login','fifth-synthetic-hash')", [fifthStaffId]);
-     await fifthReader.query("INSERT INTO foundation.web_sessions(id,staff_id,token_hash,auth_version,idle_expires_at,absolute_expires_at) VALUES($1,$2,$3,2,CURRENT_TIMESTAMP+INTERVAL '1 hour',CURRENT_TIMESTAMP+INTERVAL '30 days')", [randomUUID(), fifthStaffId, '1'.repeat(64)]);
--    const existingTables = ['staff', 'staff_web_credentials', 'web_sessions'];
--    const existingBefore = [];
--    for (const table of existingTables) { existingBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
-+    // The fifth-to-latest upgrade now applies migrations 006 and 007 together; both add
-+    // columns to web_sessions, so compare a stable projection instead of SELECT *.
-+    const existingTablesStableEarly = ['staff', 'staff_web_credentials'];
-+    const earlyWebSession = await fifthReader.query('SELECT id, staff_id, token_hash, auth_version, idle_expires_at, absolute_expires_at, revoked_at FROM foundation.web_sessions ORDER BY 1');
-+    const earlyBefore = [];
-+    for (const table of existingTablesStableEarly) { earlyBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
-     command(['migrate', 'deploy'], upgradeFifth);
--    for (const [index, table] of existingTables.entries()) {
-+    const earlyWebSessionAfter = await fifthReader.query('SELECT id, staff_id, token_hash, auth_version, idle_expires_at, absolute_expires_at, revoked_at FROM foundation.web_sessions ORDER BY 1');
-+    assert(JSON.stringify(earlyWebSessionAfter.rows) === JSON.stringify(earlyWebSession.rows), 'Fifth-to-latest upgrade changed web_sessions data');
-+    for (const [index, table] of existingTablesStableEarly.entries()) {
-       const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
--      assert(JSON.stringify(after) === JSON.stringify(existingBefore[index]), `Fifth-to-latest upgrade changed ${table} data`);
-+      assert(JSON.stringify(after) === JSON.stringify(earlyBefore[index]), `Fifth-to-latest upgrade changed ${table} data`);
-     }
-     await fifthReader.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,valid_until,granted_by) VALUES($1,$2,'FIFTH_SYNTHETIC','GLOBAL',CURRENT_TIMESTAMP+INTERVAL '7 days',$2)", [randomUUID(), fifthStaffId]);
--    const fifthTables = [...existingTables, 'user_permissions'];
-+    // After the first deploy the database is at migration 007 (fifthHistory contained
-+    // only migrations 001-005, so the single deploy above already applied 006+007).
-+    // Replay and drift checks run against the full history; no further data mutations here.
-+    const fullHistoryRows = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
-+    assert(fullHistoryRows.rowCount === migrations.length
-+      && JSON.stringify(fullHistoryRows.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
-+      && fullHistoryRows.rows.every((entry) => entry.finished_at !== null), 'Sixth history mismatch');
-+    command(['migrate', 'deploy'], upgradeFifth);
-+    const fullHistoryReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
-+    assert(JSON.stringify(fullHistoryReplay.rows) === JSON.stringify(fullHistoryRows.rows), 'Sixth-to-latest replay changed history');
-+    const replayWebSession = await fifthReader.query('SELECT id, staff_id, token_hash, auth_version, idle_expires_at, absolute_expires_at, revoked_at FROM foundation.web_sessions ORDER BY 1');
-+    assert(JSON.stringify(replayWebSession.rows) === JSON.stringify(earlyWebSessionAfter.rows), 'Sixth-to-latest replay changed web_sessions data');
-+    const fifthTables = ['staff', 'staff_web_credentials', 'user_permissions'];
-     const fifthBefore = [];
-     for (const table of fifthTables) { fifthBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
--    const fifthHistoryRows = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
--    assert(fifthHistoryRows.rowCount === migrations.length && JSON.stringify(fifthHistoryRows.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
--      && fifthHistoryRows.rows.every((entry) => entry.finished_at !== null), 'Fifth-to-latest history mismatch');
-     command(['migrate', 'deploy'], upgradeFifth);
--    const fifthReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
--    assert(JSON.stringify(fifthReplay.rows) === JSON.stringify(fifthHistoryRows.rows), 'Fifth-to-latest replay changed history');
-+    const eighthReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
-+    assert(JSON.stringify(eighthReplay.rows) === JSON.stringify(fullHistoryRows.rows), 'Fifth-to-latest replay changed history');
-+    const fifthWebSessionAfterReplay = await fifthReader.query('SELECT id, staff_id, token_hash, auth_version, idle_expires_at, absolute_expires_at, revoked_at FROM foundation.web_sessions ORDER BY 1');
-+    assert(JSON.stringify(fifthWebSessionAfterReplay.rows) === JSON.stringify(replayWebSession.rows), 'Fifth-to-latest replay changed web_sessions data');
-+    for (const [index, table] of fifthTables.entries()) {
-+      const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
-+      assert(JSON.stringify(after) === JSON.stringify(fifthBefore[index]), `Fifth-to-latest replay changed ${table} data`);
-+    }
-     for (const [index, table] of fifthTables.entries()) {
-       const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
-       assert(JSON.stringify(after) === JSON.stringify(fifthBefore[index]), `Fifth-to-latest replay changed ${table} data`);
-@@ -202,7 +224,7 @@ try {
-     command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeFifth, 0, shadow);
-     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeFifth);
-   } finally { await fifthReader.end(); }
--  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/fifth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
-+  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/fifth-to-latest/sixth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
-   command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], fresh, 0, shadow);
-   command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
-   const runtimeStaffId = randomUUID();
-@@ -282,7 +304,7 @@ try {
+@@ -304,7 +304,7 @@ try {
      assert(permissions.rowCount === 2 && permissions.rows[0].id === regrantedId && permissions.rows[0].revoked_at === null
        && permissions.rows[1].id === permissionId && permissions.rows[1].revoked_at !== null, 'Re-grant via revoke plus insert failed');
      const webGrants = [
--      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
-+      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'channel', 'initdata_digest', 'initdata_exchanged_at', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'channel', 'initdata_digest', 'initdata_exchanged_at', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
+-      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'channel', 'initdata_digest', 'initdata_exchanged_at', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'channel', 'initdata_digest', 'initdata_exchanged_at', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
++      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'channel', 'initdata_digest', 'initdata_exchanged_at', 'telegram_link_id', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'channel', 'initdata_digest', 'initdata_exchanged_at', 'telegram_link_id', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
        ['web_auth_throttles', ['key_hash'], ['key_hash'], ['key_hash']],
        ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
        ['user_permissions', ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'revoked_at', 'granted_by', 'created_at'], ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'granted_by', 'created_at'], ['valid_until', 'revoked_at']],
 diff --git a/prisma/schema.prisma b/prisma/schema.prisma
-index c5b0594..e501c64 100644
+index e501c64..0913db1 100644
 --- a/prisma/schema.prisma
 +++ b/prisma/schema.prisma
-@@ -30,9 +30,11 @@ model Staff {
-   authVersion        Int                   @default(0) @map("auth_version")
-   webCredential      StaffWebCredential?
-   bootstrapMarker    StaffBootstrapMarker?
--  webSessions        WebSession[]
--  permissions        UserPermission[]
--  grantedPermissions UserPermission[]      @relation("UserPermissionGrantedBy")
-+  webSessions          WebSession[]
-+  permissions          UserPermission[]
-+  grantedPermissions   UserPermission[]        @relation("UserPermissionGrantedBy")
-+  staffTelegramLinks   StaffTelegramLink[]
-+  linkedTelegramLinks  StaffTelegramLink[]     @relation("StaffTelegramLinkLinkedBy")
+@@ -93,6 +93,7 @@ model StaffTelegramLink {
+   revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
+   staff          Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+   linkedByStaff  Staff?    @relation("StaffTelegramLinkLinkedBy", fields: [linkedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
++  sessions       WebSession[]
  
-   @@map("staff")
-   @@schema("foundation")
-@@ -77,16 +79,39 @@ model UserPermission {
-   @@schema("foundation")
- }
- 
-+// Staff ↔ Telegram identity link; the verified binding flow lives outside P02-05
-+// (INSERT is not granted to the runtime role). Like user_permissions, the partial
-+// unique indexes (one active link per telegram subject and per staff member,
-+// WHERE revoked_at IS NULL) and the CHECK constraints exist only in migration SQL.
-+model StaffTelegramLink {
-+  id             String    @id @db.Uuid
-+  staffId        String    @map("staff_id") @db.Uuid
-+  telegramUserId BigInt    @map("telegram_user_id")
-+  username       String?   @db.VarChar(64)
-+  linkedBy       String?   @map("linked_by") @db.Uuid
-+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-+  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
-+  staff          Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
-+  linkedByStaff  Staff?    @relation("StaffTelegramLinkLinkedBy", fields: [linkedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
-+
-+  @@index([staffId], map: "staff_telegram_links_staff_id_idx")
-+  @@map("staff_telegram_links")
-+  @@schema("foundation")
-+}
-+
- model WebSession {
--  id                String    @id @db.Uuid
--  staffId           String    @map("staff_id") @db.Uuid
--  tokenHash         String    @unique(map: "web_sessions_token_hash_key") @map("token_hash") @db.VarChar(64)
--  authVersion       Int       @map("auth_version")
--  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
--  idleExpiresAt     DateTime  @map("idle_expires_at") @db.Timestamptz(6)
--  absoluteExpiresAt DateTime  @map("absolute_expires_at") @db.Timestamptz(6)
--  revokedAt         DateTime? @map("revoked_at") @db.Timestamptz(6)
--  staff             Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
-+  id                  String    @id @db.Uuid
-+  staffId             String    @map("staff_id") @db.Uuid
-+  tokenHash           String    @unique(map: "web_sessions_token_hash_key") @map("token_hash") @db.VarChar(64)
-+  authVersion         Int       @map("auth_version")
-+  channel             String    @default("CRM") @db.VarChar(16)
-+  initdataDigest      String?   @map("initdata_digest") @db.VarChar(64)
-+  initdataExchangedAt DateTime? @map("initdata_exchanged_at") @db.Timestamptz(6)
-+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-+  idleExpiresAt       DateTime  @map("idle_expires_at") @db.Timestamptz(6)
-+  absoluteExpiresAt   DateTime  @map("absolute_expires_at") @db.Timestamptz(6)
-+  revokedAt           DateTime? @map("revoked_at") @db.Timestamptz(6)
-+  staff               Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
- 
-   @@index([staffId], map: "web_sessions_staff_id_idx")
-   @@index([absoluteExpiresAt], map: "web_sessions_absolute_expiry_idx")
+   @@index([staffId], map: "staff_telegram_links_staff_id_idx")
+   @@map("staff_telegram_links")
+@@ -107,6 +108,8 @@ model WebSession {
+   channel             String    @default("CRM") @db.VarChar(16)
+   initdataDigest      String?   @map("initdata_digest") @db.VarChar(64)
+   initdataExchangedAt DateTime? @map("initdata_exchanged_at") @db.Timestamptz(6)
++  telegramLink        StaffTelegramLink? @relation(fields: [telegramLinkId], references: [id], onDelete: Restrict, onUpdate: Restrict)
++  telegramLinkId      String?   @map("telegram_link_id") @db.Uuid
+   createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+   idleExpiresAt       DateTime  @map("idle_expires_at") @db.Timestamptz(6)
+   absoluteExpiresAt   DateTime  @map("absolute_expires_at") @db.Timestamptz(6)
 diff --git a/apps/api/src/auth/telegram-initdata.ts b/apps/api/src/auth/telegram-initdata.ts
 new file mode 100644
 index 0000000..9c97bd8
@@ -492,10 +203,10 @@ index 0000000..c067157
 +}
 diff --git a/apps/api/src/auth/telegram-auth.service.ts b/apps/api/src/auth/telegram-auth.service.ts
 new file mode 100644
-index 0000000..668792e
+index 0000000..96f7e13
 --- /dev/null
 +++ b/apps/api/src/auth/telegram-auth.service.ts
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,281 @@
 +import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 +import type { Pool, PoolClient } from 'pg';
 +import { MAX_INIT_DATA_CHARS, verifyInitData } from './telegram-initdata.js';
@@ -544,7 +255,8 @@ index 0000000..668792e
 +
 +interface StaffRow { id: string; role: 'TECHNICIAN'; auth_version: number }
 +interface SessionRow { id: string; staff_id: string; auth_version: number; idle_expires_at: Date; absolute_expires_at: Date }
-+interface PriorRow { id: string; staff_id: string; revoked_at: Date | null }
++interface PriorRow { id: string; staff_id: string; telegram_link_id: string; revoked_at: Date | null }
++interface LinkRow { id: string; staff_id: string; telegram_user_id: string }
 +
 +const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 +const BOT_TOKEN = /^[0-9]+:[A-Za-z0-9_-]{30,}$/;
@@ -659,7 +371,7 @@ index 0000000..668792e
 +      // Serialize simultaneous exchanges of the same initData across all instances.
 +      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [verified.digest]);
 +      const prior = await client.query<PriorRow>(
-+        `SELECT ws.id, ws.staff_id, ws.revoked_at FROM foundation.web_sessions ws
++        `SELECT ws.id, ws.staff_id, ws.telegram_link_id, ws.revoked_at FROM foundation.web_sessions ws
 +         WHERE ws.initdata_digest = $1 AND ws.channel = 'STAFF_TELEGRAM'
 +         ORDER BY ws.created_at DESC LIMIT 1`, [verified.digest]);
 +      const priorRow = prior.rows[0];
@@ -667,6 +379,14 @@ index 0000000..668792e
 +        if (priorRow.revoked_at !== null) { await this.finish(client, reservations, true); return { ok: false, code: 'REPLAY' }; }
 +        const staff = await this.lockedStaff(client, priorRow.staff_id);
 +        if (!staff) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
++        // The exact link used at the original exchange must still be active and bound to
++        // the same Telegram identity: a re-bind (revoke A + link B) must not resurrect
++        // an old session through the grace window.
++        const priorLink = await client.query(
++          `SELECT 1 FROM foundation.staff_telegram_links l
++           WHERE l.id = $1 AND l.staff_id = $2 AND l.telegram_user_id = $3::bigint AND l.revoked_at IS NULL
++           FOR UPDATE OF l`, [priorRow.telegram_link_id, priorRow.staff_id, verified.telegramUserId]);
++        if (priorLink.rowCount !== 1) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
 +        // Grace window: same session, rotated token, idle refreshed, absolute TTL unchanged.
 +        const rotated = await client.query<SessionRow>(
 +          `UPDATE foundation.web_sessions SET token_hash = $1,
@@ -688,21 +408,26 @@ index 0000000..668792e
 +        };
 +      }
 +      // New exchange: only a pre-existing active staff Telegram link authorizes a session;
-+      // unknown Telegram users are never registered automatically.
-+      const link = await client.query<{ staff_id: string }>(
-+        'SELECT staff_id FROM foundation.staff_telegram_links WHERE telegram_user_id = $1::bigint AND revoked_at IS NULL',
++      // unknown Telegram users are never registered automatically. The link row is
++      // locked (after staff) so a concurrent revoke of this exact link serializes
++      // against the exchange; the link id is pinned immutably into the session.
++      const link = await client.query<LinkRow>(
++        `SELECT l.id, l.staff_id, l.telegram_user_id::text AS telegram_user_id
++         FROM foundation.staff_telegram_links l
++         WHERE l.telegram_user_id = $1::bigint AND l.revoked_at IS NULL`,
 +        [verified.telegramUserId]);
-+      const linkedStaffId = link.rows[0]?.staff_id;
-+      if (!linkedStaffId) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
-+      const staff = await this.lockedStaff(client, linkedStaffId);
++      const linked = link.rows[0];
++      if (!linked) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
++      const staff = await this.lockedStaff(client, linked.staff_id);
 +      if (!staff) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
++      await client.query('SELECT 1 FROM foundation.staff_telegram_links WHERE id = $1 FOR UPDATE', [linked.id]);
 +      const inserted = await client.query<SessionRow>(
 +        `INSERT INTO foundation.web_sessions (id, staff_id, token_hash, auth_version, created_at,
-+           idle_expires_at, absolute_expires_at, channel, initdata_digest, initdata_exchanged_at)
++           idle_expires_at, absolute_expires_at, channel, initdata_digest, initdata_exchanged_at, telegram_link_id)
 +         VALUES ($1, $2, $3, $4, clock_timestamp(), clock_timestamp() + interval '2 hours',
-+           clock_timestamp() + interval '24 hours', 'STAFF_TELEGRAM', $5, clock_timestamp())
++           clock_timestamp() + interval '24 hours', 'STAFF_TELEGRAM', $5, clock_timestamp(), $6)
 +         RETURNING id, staff_id, auth_version, idle_expires_at, absolute_expires_at`,
-+        [randomUUID(), staff.id, hashToken(token), staff.auth_version, verified.digest]);
++        [randomUUID(), staff.id, hashToken(token), staff.auth_version, verified.digest, linked.id]);
 +      const row = inserted.rows[0];
 +      if (!row) { throw new TelegramAuthError('FAILED'); }
 +      await this.finish(client, reservations, false);
@@ -719,8 +444,9 @@ index 0000000..668792e
 +    return outcome.credential;
 +  }
 +
-+  /** Bearer-style token check: staff state and link are re-verified on every use,
-+   * idle TTL slides within the unchanged absolute TTL, revoked sessions fail.
++  /** Bearer-style token check: the session's pinned link (same id, same staff, same
++   * Telegram identity, still active), staff state and auth_version are re-verified on
++   * every use; idle TTL slides within the unchanged absolute TTL; revoked sessions fail.
 +   */
 +  async authenticate(token: string): Promise<TelegramSessionIdentity> {
 +    if (typeof token !== 'string' || !TOKEN.test(token)) { throw new TelegramAuthError('UNAUTHORIZED'); }
@@ -737,7 +463,10 @@ index 0000000..668792e
 +        `SELECT ws.id, ws.staff_id, ws.auth_version, ws.idle_expires_at, ws.absolute_expires_at, l.telegram_user_id
 +         FROM foundation.web_sessions ws
 +         JOIN foundation.staff s ON s.id = ws.staff_id
-+         JOIN foundation.staff_telegram_links l ON l.staff_id = ws.staff_id AND l.revoked_at IS NULL
++         JOIN foundation.staff_telegram_links l ON l.id = ws.telegram_link_id AND l.staff_id = ws.staff_id
++           AND l.telegram_user_id::text = (
++             SELECT l2.telegram_user_id::text FROM foundation.staff_telegram_links l2
++             WHERE l2.id = ws.telegram_link_id AND l2.staff_id = ws.staff_id AND l2.revoked_at IS NULL)
 +         WHERE ws.token_hash = $1 AND ws.staff_id = $2 AND ws.channel = 'STAFF_TELEGRAM' AND ws.revoked_at IS NULL
 +           AND ws.idle_expires_at > clock_timestamp() AND ws.absolute_expires_at > clock_timestamp()
 +           AND ws.auth_version = s.auth_version AND s.employment_state = 'ACTIVE' AND s.role = 'TECHNICIAN'
@@ -866,107 +595,6 @@ index 0000000..a30ee37
 +
 +  async onModuleDestroy(): Promise<void> {
 +    await this.pool.end();
-+  }
-+}
-diff --git a/apps/api/src/authz/telegram-auth.guard.ts b/apps/api/src/authz/telegram-auth.guard.ts
-new file mode 100644
-index 0000000..02bb996
---- /dev/null
-+++ b/apps/api/src/authz/telegram-auth.guard.ts
-@@ -0,0 +1,95 @@
-+import {
-+  BadRequestException, ForbiddenException, HttpException, Inject, Injectable,
-+  InternalServerErrorException, UnauthorizedException,
-+} from '@nestjs/common';
-+import type { CanActivate, ExecutionContext } from '@nestjs/common';
-+import type { IncomingMessage } from 'node:http';
-+import { Reflector } from '@nestjs/core';
-+import { TELEGRAM_AUTH_SERVICE } from '../auth/telegram-auth.controller.js';
-+import type { TelegramAuthServiceApi } from '../auth/telegram-auth.controller.js';
-+import { TelegramAuthError } from '../auth/telegram-auth.service.js';
-+import { AUTHORIZATION_SERVICE } from './authorization.resources.js';
-+import { AuthorizationError } from './authorization.service.js';
-+import type { AuthorizationServiceApi } from './authorization.service.js';
-+import { CAPABILITY_METADATA, GLOBAL_SCOPE } from './capability.js';
-+import type { Capability } from './capability.js';
-+import type { StaffTelegramPrincipal } from './principal.js';
-+
-+/** The Principal union in principal.ts covers both staff channels; the authorization
-+ * service accepts it unchanged, so the guard needs only the narrow principal type.
-+ */
-+
-+/** Bearer-style session extraction for staff Telegram routes: the Mini App keeps the
-+ * opaque token in memory and sends exactly one Authorization: Bearer header.
-+ * Duplicate or malformed Authorization headers fail with 400/401 before any DB access.
-+ */
-+export function bearerToken(req: IncomingMessage & { rawHeaders: string[] }): string {
-+  let value: string | undefined;
-+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
-+    if (req.rawHeaders[i]?.toLowerCase() === 'authorization') {
-+      if (value !== undefined) { throw new BadRequestException(); }
-+      value = req.rawHeaders[i + 1];
-+    }
-+  }
-+  const token = value?.startsWith('Bearer ') ? value.slice('Bearer '.length) : undefined;
-+  if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) { throw new UnauthorizedException(); }
-+  return token;
-+}
-+
-+/** Request shape the guard fills in; future staff-telegram routes read the principal here. */
-+export type TelegramAuthorizedRequest = IncomingMessage & {
-+  principal?: StaffTelegramPrincipal;
-+  sessionToken?: string;
-+};
-+
-+/** Same safe mapping as the other auth boundaries: no raw service errors in logs. */
-+function mapAuthError(error: unknown): never {
-+  if (error instanceof TelegramAuthError) {
-+    switch (error.code) {
-+      case 'UNAUTHORIZED': case 'REPLAY': throw new UnauthorizedException();
-+      case 'RATE_LIMITED': throw new HttpException('Too Many Requests', 429);
-+      case 'INVALID_INPUT': throw new BadRequestException();
-+      default: throw new InternalServerErrorException();
-+    }
-+  }
-+  if (error instanceof AuthorizationError) {
-+    switch (error.code) {
-+      case 'UNAUTHORIZED': throw new UnauthorizedException();
-+      case 'FORBIDDEN': throw new ForbiddenException();
-+      default: throw new InternalServerErrorException();
-+    }
-+  }
-+  throw error;
-+}
-+
-+/** Session recheck + default-deny capability gate for future staff Telegram (Mini App)
-+ * routes. P02-05 registers the guard as a provider to prove its wiring, but mounts no
-+ * route: master routes arrive in later phases. The channel of login adds no rights;
-+ * authorization is the same capability check as staff-web (DECISIONS §21).
-+ */
-+@Injectable()
-+export class StaffTelegramAuthGuard implements CanActivate {
-+  constructor(
-+    private readonly reflector: Reflector,
-+    @Inject(TELEGRAM_AUTH_SERVICE) private readonly auth: TelegramAuthServiceApi,
-+    @Inject(AUTHORIZATION_SERVICE) private readonly authorization: AuthorizationServiceApi,
-+  ) {}
-+
-+  async canActivate(context: ExecutionContext): Promise<boolean> {
-+    const capability = this.reflector.getAllAndOverride<Capability | undefined>(CAPABILITY_METADATA, [context.getHandler(), context.getClass()]);
-+    if (!capability) { throw new InternalServerErrorException(); }
-+    const request = context.switchToHttp().getRequest<TelegramAuthorizedRequest>();
-+    const token = bearerToken(request);
-+    try {
-+      const identity = await this.auth.authenticate(token);
-+      const principal: StaffTelegramPrincipal = {
-+        kind: 'staff-telegram', staffId: identity.staffId, role: identity.role,
-+        authVersion: identity.authVersion, telegramUserId: identity.telegramUserId,
-+      };
-+      await this.authorization.authorize(principal, capability, GLOBAL_SCOPE);
-+      request.principal = principal;
-+      request.sessionToken = token;
-+      return true;
-+    } catch (error) { return mapAuthError(error); }
 +  }
 +}
 diff --git a/apps/api/tests/telegram-initdata.test.ts b/apps/api/tests/telegram-initdata.test.ts
@@ -1278,10 +906,10 @@ index 0000000..ac0dfd3
 +});
 diff --git a/apps/api/tests/telegram-auth-integration.test.ts b/apps/api/tests/telegram-auth-integration.test.ts
 new file mode 100644
-index 0000000..2596ac3
+index 0000000..2c96eaa
 --- /dev/null
 +++ b/apps/api/tests/telegram-auth-integration.test.ts
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,384 @@
 +import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 +import { readFileSync } from 'node:fs';
 +import { resolve } from 'node:path';
@@ -1304,6 +932,7 @@ index 0000000..2596ac3
 +  '20261120000700_staff_telegram_auth',
 +];
 +const digestOf = (token: string) => createHash('sha256').update(token).digest('hex');
++const connection = { host: '127.0.0.1', port: 55432 };
 +const telegramUserId = '279058397';
 +const signedInitData = (userId: number = 279058397): string => {
 +  const nowSeconds = Math.floor(Date.now() / 1000);
@@ -1315,6 +944,14 @@ index 0000000..2596ac3
 +  return all.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 +};
 +
++async function waitFor(what: string, check: () => Promise<boolean>, timeoutMs = 4000): Promise<void> {
++  const deadline = Date.now() + timeoutMs;
++  while (!(await check())) {
++    if (Date.now() >= deadline) { throw new Error(`Timed out waiting for ${what}`); }
++    await new Promise((resolve) => { setTimeout(resolve, 25); });
++  }
++}
++
 +integration('telegram staff authentication against isolated PostgreSQL', () => {
 +  let admin: Client | undefined;
 +  let fixture: Client;
@@ -1323,6 +960,7 @@ index 0000000..2596ac3
 +  const pools: Pool[] = [];
 +  let service: TelegramAuthService;
 +  let staffId: string;
++  let migratorAccess: { database: string; user: 'fixlevelup_migrator'; password: string } | undefined;
 +  let sourceSequence = 0;
 +  const source = () => `synthetic-source-${String(++sourceSequence)}`;
 +
@@ -1333,10 +971,10 @@ index 0000000..2596ac3
 +    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
 +    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
 +    if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
-+    const connection = { host: '127.0.0.1', port: 55432 };
 +    admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
 +    await admin.connect();
 +    const database = `fixlevelup_tg_auth_test_${randomBytes(12).toString('hex')}`;
++    migratorAccess = { database, user: 'fixlevelup_migrator', password: migratorPassword };
 +    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
 +    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
 +    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
@@ -1516,13 +1154,152 @@ index 0000000..2596ac3
 +    expect(() => new TelegramAuthService(runtime, { botToken, throttleSecret: 'tiny' })).toThrow(TelegramAuthError);
 +    expect(() => new TelegramAuthService(runtime, { botToken, throttleSecret: randomBytes(32), sourceLimit: 1 })).toThrow(TelegramAuthError);
 +  }, 30000);
++
++  // P02-05 hotfix regression: a session is pinned to the exact staff_telegram_links row
++  // (telegram_link_id). Re-binding the staff member to another Telegram identity must kill
++  // the old session and must not let the grace window resurrect it; only the new link
++  // carries a working session, and revoking that link kills it the same way.
++  it('pins the session to its exact link: re-bind kills the old session and only the new link works', async () => {
++    const rebindStaffId = randomUUID();
++    const linkA = randomUUID();
++    const linkB = randomUUID();
++    const userA = 700000101;
++    const userB = 700000102;
++    await fixture.query("INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, 'TECHNICIAN', 'ACTIVE', 0)", [rebindStaffId]);
++    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [linkA, rebindStaffId, userA]);
++    // Session A on link A.
++    const rawA = signedInitData(userA);
++    const sessionA = await service.exchange(rawA, source());
++    expect(sessionA).toMatchObject({ staffId: rebindStaffId, telegramUserId: String(userA) });
++    expect(await service.authenticate(sessionA.token)).toMatchObject({ staffId: rebindStaffId });
++    // Re-bind in one transaction: the partial unique active-per-staff index requires the
++    // revoke of A and the insert of B to commit together.
++    await fixture.query('BEGIN');
++    await fixture.query('UPDATE foundation.staff_telegram_links SET revoked_at = clock_timestamp() WHERE id = $1', [linkA]);
++    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [linkB, rebindStaffId, userB]);
++    await fixture.query('COMMIT');
++    // The staff member still has an active link, but the old session stays pinned to the
++    // revoked link A: the active link B must not silently carry it.
++    const active = await fixture.query<{ count: number }>(
++      'SELECT count(*)::int AS count FROM foundation.staff_telegram_links WHERE staff_id = $1 AND revoked_at IS NULL', [rebindStaffId]);
++    expect(active.rows[0]?.count).toBe(1);
++    const storedA = await fixture.query<{ revoked_at: Date | null; telegram_link_id: string }>(
++      'SELECT revoked_at, telegram_link_id FROM foundation.web_sessions WHERE initdata_digest = $1',
++      [verifyInitData(rawA, botToken).digest]);
++    expect(storedA.rowCount).toBe(1);
++    expect(storedA.rows[0]?.revoked_at).toBeNull();
++    expect(storedA.rows[0]?.telegram_link_id).toBe(linkA);
++    await expect(service.authenticate(sessionA.token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
++    // Replaying the old initData inside the grace window must not mint a session either.
++    await expect(service.exchange(rawA, source())).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
++    const digestRows = await fixture.query<{ count: number }>(
++      'SELECT count(*)::int AS count FROM foundation.web_sessions WHERE initdata_digest = $1', [verifyInitData(rawA, botToken).digest]);
++    expect(digestRows.rows[0]?.count).toBe(1);
++    const staffSessions = await fixture.query<{ count: number }>(
++      'SELECT count(*)::int AS count FROM foundation.web_sessions WHERE staff_id = $1', [rebindStaffId]);
++    expect(staffSessions.rows[0]?.count).toBe(1);
++    // Fresh initData B exchanges into a new session pinned to link B and keeps working
++    // while B is active.
++    const sessionB = await service.exchange(signedInitData(userB), source());
++    expect(sessionB).toMatchObject({ staffId: rebindStaffId, telegramUserId: String(userB) });
++    const storedB = await fixture.query<{ telegram_link_id: string }>(
++      'SELECT telegram_link_id FROM foundation.web_sessions WHERE token_hash = $1', [digestOf(sessionB.token)]);
++    expect(storedB.rows[0]?.telegram_link_id).toBe(linkB);
++    expect(await service.authenticate(sessionB.token)).toMatchObject({ staffId: rebindStaffId, telegramUserId: String(userB) });
++    expect(await service.authenticate(sessionB.token)).toMatchObject({ staffId: rebindStaffId, telegramUserId: String(userB) });
++    // Revoking link B kills session B exactly like revoking A killed session A.
++    await fixture.query('UPDATE foundation.staff_telegram_links SET revoked_at = clock_timestamp() WHERE id = $1', [linkB]);
++    await expect(service.authenticate(sessionB.token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
++  }, 30000);
++
++  // P02-05 hotfix regression (concurrency, real PostgreSQL): the in-flight exchange holds
++  // the staff row lock and the link row lock (taken in staff->link order), so a parallel
++  // rebind revoke (same staff->link order) queues behind it and lands only after the
++  // exchange commits; the freshly committed session then dies with its revoked link. No
++  // deadlock is possible: the exchange waits only on the fixture gate (released first),
++  // the revoke waits only on the exchange's staff lock, and the bare link UPDATE waits
++  // only on the exchange's link lock.
++  it('serializes a concurrent link revoke behind the in-flight exchange holding staff and link locks', async () => {
++    if (!migratorAccess) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
++    const concurrentStaffId = randomUUID();
++    const linkId = randomUUID();
++    await fixture.query("INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, 'TECHNICIAN', 'ACTIVE', 0)", [concurrentStaffId]);
++    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [linkId, concurrentStaffId, 700000103]);
++    const gate = new Client({ ...connection, ...migratorAccess });
++    const revoker = new Client({ ...connection, ...migratorAccess });
++    const linkUpdater = new Client({ ...connection, ...migratorAccess });
++    await gate.connect();
++    await revoker.connect();
++    await linkUpdater.connect();
++    try {
++      // Park the exchange on the session INSERT: by then it already holds the staff row
++      // lock and the link row lock.
++      await gate.query('BEGIN');
++      await gate.query('LOCK TABLE foundation.web_sessions IN EXCLUSIVE MODE');
++      const exchanged = service.exchange(signedInitData(700000103), source());
++      void exchanged.catch(() => undefined);
++      await waitFor('the exchange to block on the session insert after taking the staff and link locks', async () => {
++        const blocked = await fixture.query<{ count: number }>(
++          `SELECT count(*)::int AS count FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
++           WHERE a.datname = current_database() AND a.usename = 'fixlevelup_runtime'
++             AND l.relation = 'foundation.web_sessions'::regclass AND NOT l.granted`);
++        return (blocked.rows[0]?.count ?? 0) > 0;
++      });
++      // The concurrent rebind revoke: staff row first, then the link row — the same
++      // staff->link order the exchange uses. It queues on the staff lock and waits.
++      const revokerPid = (await revoker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid ?? 0;
++      const revoked = revoker.query(`
++        BEGIN;
++        SELECT id FROM foundation.staff WHERE id = '${concurrentStaffId}' FOR UPDATE;
++        UPDATE foundation.staff_telegram_links SET revoked_at = clock_timestamp() WHERE id = '${linkId}' AND revoked_at IS NULL;
++        COMMIT;`);
++      void revoked.catch(() => undefined);
++      await waitFor('the revoke transaction to wait on the staff row lock held by the exchange', async () => {
++        const waiting = await fixture.query<{ count: number }>(
++          'SELECT count(*)::int AS count FROM pg_locks WHERE pid = $1 AND NOT granted', [revokerPid]);
++        return (waiting.rows[0]?.count ?? 0) > 0;
++      });
++      // A bare link-row UPDATE (no staff lock) queues as well: the link row itself is
++      // locked by the exchange, not just the staff row.
++      const updaterPid = (await linkUpdater.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid ?? 0;
++      const touched = linkUpdater.query(
++        `UPDATE foundation.staff_telegram_links SET username = username WHERE id = '${linkId}'`);
++      void touched.catch(() => undefined);
++      await waitFor('the bare link update to wait on the link row lock held by the exchange', async () => {
++        const waiting = await fixture.query<{ count: number }>(
++          'SELECT count(*)::int AS count FROM pg_locks WHERE pid = $1 AND NOT granted', [updaterPid]);
++        return (waiting.rows[0]?.count ?? 0) > 0;
++      });
++      // Release the gate: the exchange commits first, then the waiting updates land after
++      // it. All three complete without a deadlock (40P01) because the lock order is
++      // staff->link everywhere and the gate is released first.
++      await gate.query('ROLLBACK');
++      const credential = await exchanged;
++      await touched;
++      await revoked;
++      const pinned = await fixture.query<{ telegram_link_id: string }>(
++        'SELECT telegram_link_id FROM foundation.web_sessions WHERE token_hash = $1', [digestOf(credential.token)]);
++      expect(pinned.rowCount).toBe(1);
++      expect(pinned.rows[0]?.telegram_link_id).toBe(linkId);
++      const link = await fixture.query<{ revoked_at: Date | null }>(
++        'SELECT revoked_at FROM foundation.staff_telegram_links WHERE id = $1', [linkId]);
++      expect(link.rows[0]?.revoked_at).not.toBeNull();
++      // The committed revoke kills the just-created session on the next authenticate.
++      await expect(service.authenticate(credential.token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
++    } finally {
++      await gate.query('ROLLBACK').catch(() => undefined);
++      await gate.end();
++      await revoker.end();
++      await linkUpdater.end();
++    }
++  }, 30000);
 +});
 diff --git a/prisma/migrations/20261120000700_staff_telegram_auth/migration.sql b/prisma/migrations/20261120000700_staff_telegram_auth/migration.sql
 new file mode 100644
-index 0000000..726155c
+index 0000000..c71480a
 --- /dev/null
 +++ b/prisma/migrations/20261120000700_staff_telegram_auth/migration.sql
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,83 @@
 +BEGIN;
 +
 +CREATE TABLE "foundation"."staff_telegram_links" (
@@ -1553,24 +1330,29 @@ index 0000000..726155c
 +CREATE INDEX "staff_telegram_links_staff_id_idx" ON "foundation"."staff_telegram_links"("staff_id");
 +
 +-- CRM rows keep the DEFAULT 'CRM'; TG exchange sets channel/initdata columns explicitly.
-+-- channel and initdata columns are immutable in a row: re-exchange inserts a new row
-+-- and revokes the old one. Existing UPDATE grants (token_hash, auth_version,
-+-- idle_expires_at, revoked_at) already cover TG renew/logout/auth_version invalidation.
++-- channel, initdata and telegram_link_id columns are immutable in a row: re-exchange inserts
++-- a new row and revokes the old one. telegram_link_id pins the session to the exact
++-- staff_telegram_links row used at exchange, so revoking that link (and re-binding a
++-- different Telegram id) invalidates the old session instead of silently surviving
++-- on any other active link of the same staff member.
 +-- TTL stays application policy (CRM 30m/12h, TG 2h/24h); the DB keeps only the shared
 +-- boundary CHECK web_sessions_expiry_check created in 20261120000500_web_auth.
 +ALTER TABLE "foundation"."web_sessions"
 +    ADD COLUMN "channel" VARCHAR(16) NOT NULL DEFAULT 'CRM',
 +    ADD COLUMN "initdata_digest" VARCHAR(64),
 +    ADD COLUMN "initdata_exchanged_at" TIMESTAMPTZ(6),
++    ADD COLUMN "telegram_link_id" UUID,
 +    ADD CONSTRAINT "web_sessions_channel_check" CHECK ("channel" IN ('CRM', 'STAFF_TELEGRAM')),
 +    ADD CONSTRAINT "web_sessions_initdata_digest_check"
 +        CHECK ("initdata_digest" IS NULL OR "initdata_digest" ~ '^[0-9a-f]{64}$'),
 +    ADD CONSTRAINT "web_sessions_channel_pair_check" CHECK (
-+        ("channel" = 'CRM' AND "initdata_digest" IS NULL AND "initdata_exchanged_at" IS NULL)
-+        OR ("channel" = 'STAFF_TELEGRAM' AND "initdata_digest" IS NOT NULL AND "initdata_exchanged_at" IS NOT NULL)
++        ("channel" = 'CRM' AND "initdata_digest" IS NULL AND "initdata_exchanged_at" IS NULL AND "telegram_link_id" IS NULL)
++        OR ("channel" = 'STAFF_TELEGRAM' AND "initdata_digest" IS NOT NULL AND "initdata_exchanged_at" IS NOT NULL AND "telegram_link_id" IS NOT NULL)
 +    ),
 +    ADD CONSTRAINT "web_sessions_initdata_exchanged_at_check"
-+        CHECK ("initdata_exchanged_at" IS NULL OR "initdata_exchanged_at" >= "created_at");
++        CHECK ("initdata_exchanged_at" IS NULL OR "initdata_exchanged_at" >= "created_at"),
++    ADD CONSTRAINT "web_sessions_telegram_link_id_fkey" FOREIGN KEY ("telegram_link_id")
++        REFERENCES "foundation"."staff_telegram_links"("id") ON DELETE RESTRICT ON UPDATE RESTRICT;
 +
 +-- Digest policy (owner-approved): single exchange with a 60-second grace window.
 +-- Deliberately a plain partial index, NOT unique: the application looks up an active
@@ -1591,8 +1373,8 @@ index 0000000..726155c
 +GRANT SELECT ("id", "staff_id", "telegram_user_id", "username", "linked_by", "created_at", "revoked_at"),
 +    UPDATE ("revoked_at", "username")
 +    ON "foundation"."staff_telegram_links" TO "fixlevelup_runtime";
-+GRANT SELECT ("channel", "initdata_digest", "initdata_exchanged_at"),
-+    INSERT ("channel", "initdata_digest", "initdata_exchanged_at")
++GRANT SELECT ("channel", "initdata_digest", "initdata_exchanged_at", "telegram_link_id"),
++    INSERT ("channel", "initdata_digest", "initdata_exchanged_at", "telegram_link_id")
 +    ON "foundation"."web_sessions" TO "fixlevelup_runtime";
 +
 +-- initData exchange throttling reuses foundation.web_auth_throttles/web_auth_attempts

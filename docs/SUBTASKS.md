@@ -173,6 +173,11 @@ production-тюнинг; источник запроса берётся из soc
   на сессию мастера: активная заранее созданная связь `staff_telegram_links`,
   активный сотрудник роли TECHNICIAN, digest `initData` вместо сырых данных,
   единичный обмен с 60-секундным grace-окном и отказ на повтор после него.
+  Сессия жёстко привязана к конкретной строке связи (`telegram_link_id`):
+  перепривязка сотрудника к другому Telegram-аккаунту гасит старую сессию,
+  и grace-окно не может её воскресить через новую активную связь. Обмен
+  блокирует строки staff и link в порядке staff → link, поэтому параллельный
+  отзыв связи сериализуется с обменом.
 - `apps/api/src/auth/telegram-auth.controller.ts` и
   `apps/api/src/authz/telegram-auth.guard.ts` — маршруты и guard для
   staff-telegram principal; bearer-токен только в памяти Mini App, без cookie
@@ -182,11 +187,14 @@ production-тюнинг; источник запроса берётся из soc
   а не JavaScript number.
 - `prisma/migrations/20261120000700_staff_telegram_auth/` — таблица
   `staff_telegram_links` с partial unique index на активную связь,
-  колонки `channel`/`initdata_digest`/`initdata_exchanged_at` в `web_sessions`
-  и column-level GRANT для runtime-роли без INSERT/DELETE связей.
+  колонки `channel`/`initdata_digest`/`initdata_exchanged_at`/`telegram_link_id`
+  в `web_sessions`, FK на строку связи и column-level GRANT для runtime-роли
+  без INSERT/DELETE связей.
 - Тесты: `telegram-initdata` (проверка подписи и полей), `telegram-auth-config`,
   `telegram-auth-http` и opt-in `telegram-auth-integration` на реальном
-  PostgreSQL под `FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1`.
+  PostgreSQL под `FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1`, включая две
+  регрессии hotfix: привязка сессии к точной связи при перепривязке и
+  сериализация параллельного отзыва связи с обменом.
 - Обновлён `packages/database-tooling/scripts/test-migrations.mjs` —
   седьмая миграция в цепочке fresh/upgrade/replay и проверки новых прав.
 

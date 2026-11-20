@@ -28,24 +28,29 @@ CREATE UNIQUE INDEX "staff_telegram_links_active_staff_key"
 CREATE INDEX "staff_telegram_links_staff_id_idx" ON "foundation"."staff_telegram_links"("staff_id");
 
 -- CRM rows keep the DEFAULT 'CRM'; TG exchange sets channel/initdata columns explicitly.
--- channel and initdata columns are immutable in a row: re-exchange inserts a new row
--- and revokes the old one. Existing UPDATE grants (token_hash, auth_version,
--- idle_expires_at, revoked_at) already cover TG renew/logout/auth_version invalidation.
+-- channel, initdata and telegram_link_id columns are immutable in a row: re-exchange inserts
+-- a new row and revokes the old one. telegram_link_id pins the session to the exact
+-- staff_telegram_links row used at exchange, so revoking that link (and re-binding a
+-- different Telegram id) invalidates the old session instead of silently surviving
+-- on any other active link of the same staff member.
 -- TTL stays application policy (CRM 30m/12h, TG 2h/24h); the DB keeps only the shared
 -- boundary CHECK web_sessions_expiry_check created in 20261120000500_web_auth.
 ALTER TABLE "foundation"."web_sessions"
     ADD COLUMN "channel" VARCHAR(16) NOT NULL DEFAULT 'CRM',
     ADD COLUMN "initdata_digest" VARCHAR(64),
     ADD COLUMN "initdata_exchanged_at" TIMESTAMPTZ(6),
+    ADD COLUMN "telegram_link_id" UUID,
     ADD CONSTRAINT "web_sessions_channel_check" CHECK ("channel" IN ('CRM', 'STAFF_TELEGRAM')),
     ADD CONSTRAINT "web_sessions_initdata_digest_check"
         CHECK ("initdata_digest" IS NULL OR "initdata_digest" ~ '^[0-9a-f]{64}$'),
     ADD CONSTRAINT "web_sessions_channel_pair_check" CHECK (
-        ("channel" = 'CRM' AND "initdata_digest" IS NULL AND "initdata_exchanged_at" IS NULL)
-        OR ("channel" = 'STAFF_TELEGRAM' AND "initdata_digest" IS NOT NULL AND "initdata_exchanged_at" IS NOT NULL)
+        ("channel" = 'CRM' AND "initdata_digest" IS NULL AND "initdata_exchanged_at" IS NULL AND "telegram_link_id" IS NULL)
+        OR ("channel" = 'STAFF_TELEGRAM' AND "initdata_digest" IS NOT NULL AND "initdata_exchanged_at" IS NOT NULL AND "telegram_link_id" IS NOT NULL)
     ),
     ADD CONSTRAINT "web_sessions_initdata_exchanged_at_check"
-        CHECK ("initdata_exchanged_at" IS NULL OR "initdata_exchanged_at" >= "created_at");
+        CHECK ("initdata_exchanged_at" IS NULL OR "initdata_exchanged_at" >= "created_at"),
+    ADD CONSTRAINT "web_sessions_telegram_link_id_fkey" FOREIGN KEY ("telegram_link_id")
+        REFERENCES "foundation"."staff_telegram_links"("id") ON DELETE RESTRICT ON UPDATE RESTRICT;
 
 -- Digest policy (owner-approved): single exchange with a 60-second grace window.
 -- Deliberately a plain partial index, NOT unique: the application looks up an active
@@ -66,8 +71,8 @@ REVOKE ALL ON "foundation"."staff_telegram_links" FROM PUBLIC;
 GRANT SELECT ("id", "staff_id", "telegram_user_id", "username", "linked_by", "created_at", "revoked_at"),
     UPDATE ("revoked_at", "username")
     ON "foundation"."staff_telegram_links" TO "fixlevelup_runtime";
-GRANT SELECT ("channel", "initdata_digest", "initdata_exchanged_at"),
-    INSERT ("channel", "initdata_digest", "initdata_exchanged_at")
+GRANT SELECT ("channel", "initdata_digest", "initdata_exchanged_at", "telegram_link_id"),
+    INSERT ("channel", "initdata_digest", "initdata_exchanged_at", "telegram_link_id")
     ON "foundation"."web_sessions" TO "fixlevelup_runtime";
 
 -- initData exchange throttling reuses foundation.web_auth_throttles/web_auth_attempts

@@ -93,6 +93,7 @@ model StaffTelegramLink {
   revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
   staff          Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   linkedByStaff  Staff?    @relation("StaffTelegramLinkLinkedBy", fields: [linkedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  sessions       WebSession[]
 
   @@index([staffId], map: "staff_telegram_links_staff_id_idx")
   @@map("staff_telegram_links")
@@ -107,6 +108,8 @@ model WebSession {
   channel             String    @default("CRM") @db.VarChar(16)
   initdataDigest      String?   @map("initdata_digest") @db.VarChar(64)
   initdataExchangedAt DateTime? @map("initdata_exchanged_at") @db.Timestamptz(6)
+  telegramLink        StaffTelegramLink? @relation(fields: [telegramLinkId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  telegramLinkId      String?   @map("telegram_link_id") @db.Uuid
   createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   idleExpiresAt       DateTime  @map("idle_expires_at") @db.Timestamptz(6)
   absoluteExpiresAt   DateTime  @map("absolute_expires_at") @db.Timestamptz(6)

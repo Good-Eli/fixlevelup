@@ -20,6 +20,7 @@ const migrations = [
   '20261120000700_staff_telegram_auth',
 ];
 const digestOf = (token: string) => createHash('sha256').update(token).digest('hex');
+const connection = { host: '127.0.0.1', port: 55432 };
 const telegramUserId = '279058397';
 const signedInitData = (userId: number = 279058397): string => {
   const nowSeconds = Math.floor(Date.now() / 1000);
@@ -31,6 +32,14 @@ const signedInitData = (userId: number = 279058397): string => {
   return all.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 };
 
+async function waitFor(what: string, check: () => Promise<boolean>, timeoutMs = 4000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() >= deadline) { throw new Error(`Timed out waiting for ${what}`); }
+    await new Promise((resolve) => { setTimeout(resolve, 25); });
+  }
+}
+
 integration('telegram staff authentication against isolated PostgreSQL', () => {
   let admin: Client | undefined;
   let fixture: Client;
@@ -39,6 +48,7 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
   const pools: Pool[] = [];
   let service: TelegramAuthService;
   let staffId: string;
+  let migratorAccess: { database: string; user: 'fixlevelup_migrator'; password: string } | undefined;
   let sourceSequence = 0;
   const source = () => `synthetic-source-${String(++sourceSequence)}`;
 
@@ -49,10 +59,10 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
     const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
     const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
     if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
-    const connection = { host: '127.0.0.1', port: 55432 };
     admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     const database = `fixlevelup_tg_auth_test_${randomBytes(12).toString('hex')}`;
+    migratorAccess = { database, user: 'fixlevelup_migrator', password: migratorPassword };
     await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
     await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
     await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
@@ -231,5 +241,144 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
     expect(() => new TelegramAuthService(runtime, { botToken: 'short', throttleSecret: randomBytes(32) })).toThrow(TelegramAuthError);
     expect(() => new TelegramAuthService(runtime, { botToken, throttleSecret: 'tiny' })).toThrow(TelegramAuthError);
     expect(() => new TelegramAuthService(runtime, { botToken, throttleSecret: randomBytes(32), sourceLimit: 1 })).toThrow(TelegramAuthError);
+  }, 30000);
+
+  // P02-05 hotfix regression: a session is pinned to the exact staff_telegram_links row
+  // (telegram_link_id). Re-binding the staff member to another Telegram identity must kill
+  // the old session and must not let the grace window resurrect it; only the new link
+  // carries a working session, and revoking that link kills it the same way.
+  it('pins the session to its exact link: re-bind kills the old session and only the new link works', async () => {
+    const rebindStaffId = randomUUID();
+    const linkA = randomUUID();
+    const linkB = randomUUID();
+    const userA = 700000101;
+    const userB = 700000102;
+    await fixture.query("INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, 'TECHNICIAN', 'ACTIVE', 0)", [rebindStaffId]);
+    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [linkA, rebindStaffId, userA]);
+    // Session A on link A.
+    const rawA = signedInitData(userA);
+    const sessionA = await service.exchange(rawA, source());
+    expect(sessionA).toMatchObject({ staffId: rebindStaffId, telegramUserId: String(userA) });
+    expect(await service.authenticate(sessionA.token)).toMatchObject({ staffId: rebindStaffId });
+    // Re-bind in one transaction: the partial unique active-per-staff index requires the
+    // revoke of A and the insert of B to commit together.
+    await fixture.query('BEGIN');
+    await fixture.query('UPDATE foundation.staff_telegram_links SET revoked_at = clock_timestamp() WHERE id = $1', [linkA]);
+    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [linkB, rebindStaffId, userB]);
+    await fixture.query('COMMIT');
+    // The staff member still has an active link, but the old session stays pinned to the
+    // revoked link A: the active link B must not silently carry it.
+    const active = await fixture.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM foundation.staff_telegram_links WHERE staff_id = $1 AND revoked_at IS NULL', [rebindStaffId]);
+    expect(active.rows[0]?.count).toBe(1);
+    const storedA = await fixture.query<{ revoked_at: Date | null; telegram_link_id: string }>(
+      'SELECT revoked_at, telegram_link_id FROM foundation.web_sessions WHERE initdata_digest = $1',
+      [verifyInitData(rawA, botToken).digest]);
+    expect(storedA.rowCount).toBe(1);
+    expect(storedA.rows[0]?.revoked_at).toBeNull();
+    expect(storedA.rows[0]?.telegram_link_id).toBe(linkA);
+    await expect(service.authenticate(sessionA.token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    // Replaying the old initData inside the grace window must not mint a session either.
+    await expect(service.exchange(rawA, source())).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    const digestRows = await fixture.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM foundation.web_sessions WHERE initdata_digest = $1', [verifyInitData(rawA, botToken).digest]);
+    expect(digestRows.rows[0]?.count).toBe(1);
+    const staffSessions = await fixture.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM foundation.web_sessions WHERE staff_id = $1', [rebindStaffId]);
+    expect(staffSessions.rows[0]?.count).toBe(1);
+    // Fresh initData B exchanges into a new session pinned to link B and keeps working
+    // while B is active.
+    const sessionB = await service.exchange(signedInitData(userB), source());
+    expect(sessionB).toMatchObject({ staffId: rebindStaffId, telegramUserId: String(userB) });
+    const storedB = await fixture.query<{ telegram_link_id: string }>(
+      'SELECT telegram_link_id FROM foundation.web_sessions WHERE token_hash = $1', [digestOf(sessionB.token)]);
+    expect(storedB.rows[0]?.telegram_link_id).toBe(linkB);
+    expect(await service.authenticate(sessionB.token)).toMatchObject({ staffId: rebindStaffId, telegramUserId: String(userB) });
+    expect(await service.authenticate(sessionB.token)).toMatchObject({ staffId: rebindStaffId, telegramUserId: String(userB) });
+    // Revoking link B kills session B exactly like revoking A killed session A.
+    await fixture.query('UPDATE foundation.staff_telegram_links SET revoked_at = clock_timestamp() WHERE id = $1', [linkB]);
+    await expect(service.authenticate(sessionB.token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+  }, 30000);
+
+  // P02-05 hotfix regression (concurrency, real PostgreSQL): the in-flight exchange holds
+  // the staff row lock and the link row lock (taken in staff->link order), so a parallel
+  // rebind revoke (same staff->link order) queues behind it and lands only after the
+  // exchange commits; the freshly committed session then dies with its revoked link. No
+  // deadlock is possible: the exchange waits only on the fixture gate (released first),
+  // the revoke waits only on the exchange's staff lock, and the bare link UPDATE waits
+  // only on the exchange's link lock.
+  it('serializes a concurrent link revoke behind the in-flight exchange holding staff and link locks', async () => {
+    if (!migratorAccess) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    const concurrentStaffId = randomUUID();
+    const linkId = randomUUID();
+    await fixture.query("INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, 'TECHNICIAN', 'ACTIVE', 0)", [concurrentStaffId]);
+    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [linkId, concurrentStaffId, 700000103]);
+    const gate = new Client({ ...connection, ...migratorAccess });
+    const revoker = new Client({ ...connection, ...migratorAccess });
+    const linkUpdater = new Client({ ...connection, ...migratorAccess });
+    await gate.connect();
+    await revoker.connect();
+    await linkUpdater.connect();
+    try {
+      // Park the exchange on the session INSERT: by then it already holds the staff row
+      // lock and the link row lock.
+      await gate.query('BEGIN');
+      await gate.query('LOCK TABLE foundation.web_sessions IN EXCLUSIVE MODE');
+      const exchanged = service.exchange(signedInitData(700000103), source());
+      void exchanged.catch(() => undefined);
+      await waitFor('the exchange to block on the session insert after taking the staff and link locks', async () => {
+        const blocked = await fixture.query<{ count: number }>(
+          `SELECT count(*)::int AS count FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+           WHERE a.datname = current_database() AND a.usename = 'fixlevelup_runtime'
+             AND l.relation = 'foundation.web_sessions'::regclass AND NOT l.granted`);
+        return (blocked.rows[0]?.count ?? 0) > 0;
+      });
+      // The concurrent rebind revoke: staff row first, then the link row — the same
+      // staff->link order the exchange uses. It queues on the staff lock and waits.
+      const revokerPid = (await revoker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid ?? 0;
+      const revoked = revoker.query(`
+        BEGIN;
+        SELECT id FROM foundation.staff WHERE id = '${concurrentStaffId}' FOR UPDATE;
+        UPDATE foundation.staff_telegram_links SET revoked_at = clock_timestamp() WHERE id = '${linkId}' AND revoked_at IS NULL;
+        COMMIT;`);
+      void revoked.catch(() => undefined);
+      await waitFor('the revoke transaction to wait on the staff row lock held by the exchange', async () => {
+        const waiting = await fixture.query<{ count: number }>(
+          'SELECT count(*)::int AS count FROM pg_locks WHERE pid = $1 AND NOT granted', [revokerPid]);
+        return (waiting.rows[0]?.count ?? 0) > 0;
+      });
+      // A bare link-row UPDATE (no staff lock) queues as well: the link row itself is
+      // locked by the exchange, not just the staff row.
+      const updaterPid = (await linkUpdater.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid ?? 0;
+      const touched = linkUpdater.query(
+        `UPDATE foundation.staff_telegram_links SET username = username WHERE id = '${linkId}'`);
+      void touched.catch(() => undefined);
+      await waitFor('the bare link update to wait on the link row lock held by the exchange', async () => {
+        const waiting = await fixture.query<{ count: number }>(
+          'SELECT count(*)::int AS count FROM pg_locks WHERE pid = $1 AND NOT granted', [updaterPid]);
+        return (waiting.rows[0]?.count ?? 0) > 0;
+      });
+      // Release the gate: the exchange commits first, then the waiting updates land after
+      // it. All three complete without a deadlock (40P01) because the lock order is
+      // staff->link everywhere and the gate is released first.
+      await gate.query('ROLLBACK');
+      const credential = await exchanged;
+      await touched;
+      await revoked;
+      const pinned = await fixture.query<{ telegram_link_id: string }>(
+        'SELECT telegram_link_id FROM foundation.web_sessions WHERE token_hash = $1', [digestOf(credential.token)]);
+      expect(pinned.rowCount).toBe(1);
+      expect(pinned.rows[0]?.telegram_link_id).toBe(linkId);
+      const link = await fixture.query<{ revoked_at: Date | null }>(
+        'SELECT revoked_at FROM foundation.staff_telegram_links WHERE id = $1', [linkId]);
+      expect(link.rows[0]?.revoked_at).not.toBeNull();
+      // The committed revoke kills the just-created session on the next authenticate.
+      await expect(service.authenticate(credential.token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    } finally {
+      await gate.query('ROLLBACK').catch(() => undefined);
+      await gate.end();
+      await revoker.end();
+      await linkUpdater.end();
+    }
   }, 30000);
 });
