@@ -1,35 +1,110 @@
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { createHash } from 'node:crypto';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
 // Gitleaks' default rules are pinned by the checksummed 8.30.1 binary. Never use
 // a repository baseline, custom allowlist or ambient GITLEAKS_* override.
+// Exactly one owner-approved false positive is declared in .gitleaksignore: the
+// historical patch line is a migration-name list, not a credential. Approval is
+// bound to this immutable commit/path/line/rule and to the SHA-256 of the blob,
+// so any edited, relocated or duplicated content stays an unexpected finding.
+export const APPROVED_EXCEPTION = Object.freeze({
+  fingerprint: '5ff927854947a07605677ffe74a0fc5bac607640:info/Полный diff P02-06.patch:generic-api-key:203',
+  commit: '5ff927854947a07605677ffe74a0fc5bac607640',
+  path: 'info/Полный diff P02-06.patch',
+  line: 203,
+  rule: 'generic-api-key',
+  blobSha256: '3b92bf6129eab412e5d786555986a8afe7e03954795a1c79422792d6f350ae26',
+});
+const RULE = /^[a-z0-9-]{1,100}$/;
+const IGNORE_NAME = '.gitleaksignore';
+// Repository-location variables could redirect Git away from the inspected tree.
+const GIT_LOCATION = /^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|PREFIX|CEILING_DIRECTORIES)$/i;
+function sha256(value) { return createHash('sha256').update(value).digest('hex'); }
 export function summarizeFindings(findings) {
   if (!Array.isArray(findings)) { throw new Error('Invalid scanner report'); }
   const counts = {};
   for (const finding of findings) {
-    if (typeof finding.RuleID !== 'string' || !/^[a-z0-9-]{1,100}$/.test(finding.RuleID)) { throw new Error('Invalid scanner rule'); }
+    if (typeof finding.RuleID !== 'string' || !RULE.test(finding.RuleID)) { throw new Error('Invalid scanner rule'); }
     counts[finding.RuleID] = (counts[finding.RuleID] ?? 0) + 1;
   }
   // No Match, Secret, author, email, commit message, source line or raw report.
   return { findings: findings.length, rules: counts };
 }
+function assertFinding(finding, scope) {
+  if (!finding || typeof finding !== 'object' || typeof finding.RuleID !== 'string' || !RULE.test(finding.RuleID)
+    || !Number.isInteger(finding.StartLine) || finding.StartLine < 1 || typeof finding.File !== 'string' || !finding.File) {
+    throw new Error('Invalid scanner finding');
+  }
+  if (scope === 'history' && (typeof finding.Commit !== 'string' || !/^[a-f0-9]{40,64}$/.test(finding.Commit))) { throw new Error('Invalid scanner finding'); }
+}
+function relativeTo(root, file) {
+  const path = relative(resolve(root), resolve(file));
+  return path && !path.startsWith('..') ? path.split(sep).join('/') : null;
+}
+// A finding is approved only with actual content evidence (blob SHA-256 checked
+// by the caller), the exact scope-specific fingerprint and at most one approval
+// per scope; anything else stays an unexpected finding for the gate.
+export function classifyScan(findings, { scope, root = null, exception = APPROVED_EXCEPTION, contentMatches } = {}) {
+  if (!Array.isArray(findings)) { throw new Error('Invalid scanner report'); }
+  if (scope !== 'repository' && scope !== 'history') { throw new Error('Invalid scanner scope'); }
+  if (typeof contentMatches !== 'boolean') { throw new Error('Missing scanner content evidence'); }
+  if (!exception || typeof exception.path !== 'string' || typeof exception.rule !== 'string' || !Number.isInteger(exception.line)) { throw new Error('Invalid scanner exception'); }
+  if (scope === 'repository' && typeof root !== 'string') { throw new Error('Invalid scanner root'); }
+  const unexpected = [];
+  let approved = 0;
+  for (const finding of findings) {
+    assertFinding(finding, scope);
+    const path = scope === 'repository' ? relativeTo(root, finding.File) : finding.File;
+    const matches = contentMatches && approved === 0 && path === exception.path && finding.StartLine === exception.line
+      && finding.RuleID === exception.rule && (scope !== 'history' || finding.Commit === exception.commit);
+    if (matches) { approved++; } else { unexpected.push(finding); }
+  }
+  const summary = summarizeFindings(unexpected);
+  return { findings: summary.findings, rules: summary.rules, approved, raw: findings.length };
+}
+// Only the single validated root declaration may exist. A nested declaration
+// (any case) could hide findings in the directory scan, so it is rejected.
+// `git ls-files -z` separates with '/' on every platform, so a backslash is a
+// literal filename character (possible on Linux): never rewrite or skip it.
+export function validateSourcePath(file) {
+  if (typeof file !== 'string' || !file || file.includes('\\')) { throw new Error('Unsafe tracked path'); }
+  const name = file.slice(file.lastIndexOf('/') + 1);
+  if (name.toLowerCase() === IGNORE_NAME && file !== IGNORE_NAME) { throw new Error('Unexpected nested secret scanner ignore'); }
+  return file;
+}
+export function validateIgnoreDeclaration(text, expected = APPROVED_EXCEPTION.fingerprint) {
+  if (typeof text !== 'string' || typeof expected !== 'string') { throw new Error('Secret scanner ignore declaration rejected'); }
+  const lines = text.split('\n').map(line => line.endsWith('\r') ? line.slice(0, -1) : line).filter(line => line.trim() !== '');
+  if (lines.length !== 1 || lines[0] !== expected) { throw new Error('Secret scanner ignore declaration rejected'); }
+  return lines[0];
+}
 export function scanRepository(binary, output) {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GITLEAKS_')));
-  const run = (command, args) => {
-    const result = spawnSync(command, args, { env, encoding: 'utf8', timeout: 300_000, maxBuffer: 32 * 1024 * 1024 });
+  // Resolve a caller-supplied path before any temporary working directory is used.
+  const scanner = /[\\/]/.test(binary) ? resolve(binary) : binary;
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GITLEAKS_') && !GIT_LOCATION.test(key)));
+  const root = resolve('.');
+  const execute = (command, args, options = {}) => {
+    const result = spawnSync(command, args, { env, timeout: 300_000, maxBuffer: 32 * 1024 * 1024, ...options });
     if (result.error || result.signal) { throw new Error('Secret scanner process failed'); }
     return result;
   };
-  const git = (...args) => {
+  const run = (command, args, options = {}) => execute(command, args, { encoding: 'utf8', ...options });
+  const git = (args) => {
     const result = run('git', args);
     if (result.status !== 0) { throw new Error('Secret scanner Git preflight failed'); }
     return result.stdout.trim();
   };
-  if (git('rev-parse', '--is-shallow-repository') !== 'false') { throw new Error('Full available Git history required'); }
-  if (run(binary, ['version']).stdout.trim() !== '8.30.1') { throw new Error('Unexpected secret scanner version'); }
+  if (git(['-C', root, 'rev-parse', '--is-shallow-repository']) !== 'false') { throw new Error('Full available Git history required'); }
+  if (run(scanner, ['version']).stdout.trim() !== '8.30.1') { throw new Error('Unexpected secret scanner version'); }
+  // The repository declaration must be exactly the approved line: extra, missing
+  // or reordered entries are rejected instead of being trusted or ignored.
+  const declaration = join(root, IGNORE_NAME);
+  if (!existsSync(declaration) || !lstatSync(declaration).isFile()) { throw new Error('Secret scanner ignore declaration rejected'); }
+  validateIgnoreDeclaration(readFileSync(declaration, 'utf8'));
   const temp = mkdtempSync(join(tmpdir(), 'fixlevelup-secret-scan-'));
   const snapshot = join(temp, 'tracked');
   mkdirSync(snapshot);
@@ -38,12 +113,12 @@ export function scanRepository(binary, output) {
   writeFileSync(ignore, '');
   // On a clean CI checkout this is the tracked tree. Locally include new,
   // non-ignored source too; ignored dotenv/data/caches are never traversed.
-  const listed = run('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard']);
+  const listed = run('git', ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard']);
   if (listed.status !== 0) { throw new Error('Unable to enumerate tracked source'); }
   let files = 0;
-  const root = resolve('.');
   for (const file of listed.stdout.split('\0').filter(Boolean)) {
-    const source = resolve(root, file), target = resolve(snapshot, file);
+    const path = validateSourcePath(file);
+    const source = resolve(root, path), target = resolve(snapshot, path);
     if (!source.startsWith(root + sep) || !target.startsWith(snapshot + sep)) { throw new Error('Unsafe tracked path'); }
     if (!existsSync(source)) { continue; } // Existing local user deletions are not restored.
     if (!lstatSync(source).isFile()) { throw new Error('Non-regular tracked path'); }
@@ -51,17 +126,32 @@ export function scanRepository(binary, output) {
     copyFileSync(source, target);
     files++;
   }
+  // Isolated mirror: history is scanned without the checkout's .gitleaksignore,
+  // which Gitleaks otherwise discovers from the repository root. The original
+  // repository is only read, and no ref is created or overwritten: a detached
+  // HEAD commit is passed explicitly to the scanner and to the commit count, so
+  // an existing refs/keepalive/* in the source can never be clobbered.
+  const history = join(temp, 'history.git');
+  const head = git(['-C', root, 'rev-parse', '--verify', 'HEAD']);
+  if (run('git', ['clone', '--mirror', '--no-hardlinks', '--quiet', root, history]).status !== 0) { throw new Error('Secret scanner Git isolation failed'); }
+  if (git(['-C', history, 'rev-parse', '--is-shallow-repository']) !== 'false') { throw new Error('Full available Git history required'); }
+  if (execute('git', ['-C', history, 'cat-file', '-e', `${head}^{commit}`]).status !== 0) { throw new Error('Secret scanner Git isolation failed'); }
+  const treeCopy = join(snapshot, APPROVED_EXCEPTION.path);
+  const treeMatches = existsSync(treeCopy) && lstatSync(treeCopy).isFile() && sha256(readFileSync(treeCopy)) === APPROVED_EXCEPTION.blobSha256;
+  const historyBlob = execute('git', ['-C', history, 'cat-file', 'blob', `${APPROVED_EXCEPTION.commit}:${APPROVED_EXCEPTION.path}`]);
+  const historyMatches = historyBlob.status === 0 && sha256(historyBlob.stdout) === APPROVED_EXCEPTION.blobSha256;
   const scans = [];
-  for (const [kind, args] of [['repository', ['dir', snapshot]], ['history', ['git', '.', '--log-opts=--all --full-history']]]) {
-    // Keep even redacted raw diagnostics in memory, never in the artifact tree.
-    const result = run(binary, [...args, '--config', config, '--gitleaks-ignore-path', ignore, '--ignore-gitleaks-allow', '--redact=100', '--no-banner', '--log-level', 'error', '--exit-code', '2', '--report-format', 'json', '--report-path', '-']);
+  for (const [kind, args] of [['repository', ['dir', snapshot]], ['history', ['git', history, `--log-opts=--all --full-history ${head}`]]]) {
+    // Every scanner run uses a sterile working directory; raw output stays in memory.
+    const result = run(scanner, [...args, '--config', config, '--gitleaks-ignore-path', ignore, '--ignore-gitleaks-allow', '--redact=100', '--no-banner', '--log-level', 'error', '--exit-code', '2', '--report-format', 'json', '--report-path', '-'], { cwd: temp });
     if (![0, 2].includes(result.status)) { throw new Error('Secret scanner failed safely; raw output suppressed'); }
-    const summary = summarizeFindings(JSON.parse(result.stdout));
-    if ((result.status === 2) !== (summary.findings > 0)) { throw new Error('Secret scanner result mismatch'); }
-    scans.push({ scope: kind, ...summary });
+    const findings = JSON.parse(result.stdout);
+    if ((result.status === 2) !== (Array.isArray(findings) && findings.length > 0)) { throw new Error('Secret scanner result mismatch'); }
+    scans.push({ scope: kind, ...classifyScan(findings, { scope: kind, root: snapshot, contentMatches: kind === 'repository' ? treeMatches : historyMatches }) });
   }
   const result = { tool: 'gitleaks', version: '8.30.1', redacted: true, sourceFiles: files,
-    history: 'all available refs, full history; shallow clones rejected', commits: Number(git('rev-list', '--all', '--count')),
+    history: 'all available refs, full history; shallow clones rejected', commits: Number(git(['-C', history, 'rev-list', '--count', '--all', head])),
+    exception: { declared: 1, approved: scans.reduce((sum, scan) => sum + scan.approved, 0) },
     scans, status: scans.every(scan => scan.findings === 0) ? 'passed' : 'failed' };
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, JSON.stringify(result, null, 2) + '\n');

@@ -1,116 +1,154 @@
 import { createHash } from 'node:crypto';
+import { ConflictException, HttpException, InternalServerErrorException } from '@nestjs/common';
 import type { Pool, PoolClient } from 'pg';
-import { HttpException, InternalServerErrorException } from '@nestjs/common';
 import type { Principal } from './principal.js';
-import type { StaffWebPrincipal } from './principal.js';
 import type { Capability, Scope } from './capability.js';
-import { isCapability } from './capability.js';
+import { isCapability, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES, scopeMatches } from './capability.js';
+import { lockAccessPolicy } from './rbac-lock.js';
 
 export type AuthorizationErrorCode = 'UNAUTHORIZED' | 'FORBIDDEN' | 'FAILED';
 export class AuthorizationError extends Error {
   constructor(readonly code: AuthorizationErrorCode) { super('Authorization failed'); this.name = 'AuthorizationError'; }
 }
-
-export interface StaffWriteContext {
-  readonly client: PoolClient;
-  readonly principal: StaffWebPrincipal;
-}
-
-/** DI-facing API of AuthorizationService, mirroring the WebAuthServiceApi pattern. */
+export interface SessionProof { readonly token: string; readonly kind: Principal['kind'] }
+export interface EffectiveRole { readonly id: string; readonly code: string; readonly type: 'SYSTEM' | 'CUSTOM' }
+export interface AccessView { readonly staffId: string; readonly role: EffectiveRole; readonly permissions: readonly Capability[] }
+export interface StaffWriteContext extends AccessView { readonly client: PoolClient; readonly principal: Principal }
+type Command<T> = (ctx: StaffWriteContext) => Promise<T>;
 export interface AuthorizationServiceApi {
   authorize(principal: Principal, capability: Capability, scope: Scope): Promise<void>;
-  read<T>(fn: (client: PoolClient) => Promise<T>): Promise<T>;
-  authorizeForWrite<T>(token: string, capability: Capability, scope: Scope, write: (context: StaffWriteContext) => Promise<T>): Promise<T>;
+  inspectAccess(proof: SessionProof): Promise<AccessView>;
+  authorizeForRead<T>(proof: SessionProof, capability: Capability, scope: Scope, read: Command<T>): Promise<T>;
+  authorizeForWrite<T>(proof: SessionProof, capability: Capability, scope: Scope, write: Command<T>): Promise<T>;
 }
 
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
-const hashToken = (token: string): string => createHash('sha256').update(token).digest('hex');
+interface IdentityRow { id: string; role: string; auth_version: number }
+interface PolicyRow {
+  id: string; code: string; role_type: string; permission_code: string | null;
+  scope_type: string | null; protected: boolean | null;
+}
+export function isSystemAdmin(role: EffectiveRole): boolean { return role.type === 'SYSTEM' && role.code === 'ADMIN'; }
+function requirePermission(view: AccessView, capability: Capability, scope: Scope): void {
+  if (!scopeMatches(capability, scope, view.staffId) || !view.permissions.includes(capability)) {
+    throw new AuthorizationError('FORBIDDEN');
+  }
+}
 
-interface StaffRow { id: string; role: 'ADMIN' | 'MANAGER'; auth_version: number }
-
-/**
- * Default-deny capability check. Grants come only from foundation.user_permissions;
- * no role gets implicit rights. authorize() verifies permissions for reads in a plain
- * READ COMMITTED transaction (the guard has just re-authenticated the session through
- * WebAuthService.authenticate). authorizeForWrite() re-verifies session, staff state and
- * permissions under the P02-03 lock order — staff row FOR UPDATE first, then the session
- * row FOR UPDATE, then the permissions read — and runs the caller's write on the same
- * client so revoke, deactivation and write serialize on the common authorization state.
- */
+/** No permission cache, plain unchecked read callback or channel-derived grants. A guard preflight
+ * is not authority for a later read/write: every protected projection and command takes
+ * the policy lock, verifies the specific session and reads the role on its own transaction. */
 export class AuthorizationService implements AuthorizationServiceApi {
   constructor(private readonly pool: Pick<Pool, 'connect'>) {}
 
-  private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  private async transaction<T>(mode: 'read' | 'write', fn: (client: PoolClient) => Promise<T>): Promise<T> {
     let client: PoolClient | undefined;
     let inTransaction = false;
     let discard = false;
     try {
       client = await this.pool.connect();
-      await client.query('BEGIN');
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       inTransaction = true;
+      await lockAccessPolicy(client, mode);
       const result = await fn(client);
       await client.query('COMMIT');
       inTransaction = false;
       return result;
     } catch (error) {
       if (client && inTransaction) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
-      // Safe, already-mapped errors propagate; raw driver errors never escape this boundary.
       if (error instanceof AuthorizationError || error instanceof HttpException) { throw error; }
+      if (error && typeof error === 'object' && 'code' in error &&
+        ['40001', '40P01', '55P03', '23505'].some((code) => code === error.code)) { throw new ConflictException(); }
       throw new InternalServerErrorException();
     } finally { client?.release(discard); }
   }
 
-  private async permitted(client: PoolClient, staffId: string, capability: Capability, scope: Scope): Promise<boolean> {
-    if (!isCapability(capability)) { return false; }
-    const result = await client.query(
-      `SELECT 1 FROM foundation.user_permissions
-       WHERE staff_id = $1 AND capability = $2 AND scope = $3 AND revoked_at IS NULL
-         AND valid_from <= clock_timestamp() AND (valid_until IS NULL OR valid_until > clock_timestamp())`,
-      [staffId, capability, scope.kind]);
-    return result.rowCount === 1;
+  private async policy(client: PoolClient, principal: Principal): Promise<AccessView> {
+    const result = await client.query<PolicyRow>(
+      `SELECT r.id, r.code, r.role_type, p.code AS permission_code, rp.scope_type, p.protected
+       FROM foundation.staff s
+       JOIN foundation.staff_role_assignments a ON a.staff_id=s.id AND a.revoked_at IS NULL
+       JOIN foundation.roles r ON r.id=a.role_id AND r.status='ACTIVE'
+       LEFT JOIN foundation.role_permissions rp ON rp.role_id=r.id AND rp.enabled
+       LEFT JOIN foundation.permissions p ON p.code=rp.permission_code AND p.active
+       WHERE s.id=$1 AND s.auth_version=$2 AND s.employment_state='ACTIVE' AND s.role=$3
+       ORDER BY p.code`, [principal.staffId, principal.authVersion, principal.role]);
+    const first = result.rows[0];
+    if (!first) {
+      // A guard authentication can precede a concurrent deactivation/role change.
+      // A stale identity is 401; a live identity with no valid assignment is 403.
+      const live = await client.query("SELECT 1 FROM foundation.staff WHERE id=$1 AND role=$2 AND auth_version=$3 AND employment_state='ACTIVE'",
+        [principal.staffId, principal.role, principal.authVersion]);
+      throw new AuthorizationError(live.rowCount === 1 ? 'FORBIDDEN' : 'UNAUTHORIZED');
+    }
+    if ((first.role_type !== 'SYSTEM' && first.role_type !== 'CUSTOM')
+        || (first.role_type === 'SYSTEM' && first.code !== principal.role)) { throw new AuthorizationError('FORBIDDEN'); }
+    const role: EffectiveRole = { id: first.id, code: first.code, type: first.role_type };
+    const permissions: Capability[] = [];
+    for (const row of result.rows) {
+      if (row.id !== role.id) { throw new AuthorizationError('FAILED'); }
+      const code = row.permission_code;
+      if (!isCapability(code)) { continue; } // unknown, disabled or missing catalog entry: deny
+      const protectedCode = PROTECTED_CAPABILITIES.includes(code);
+      if (row.scope_type !== PERMISSION_CONTRACT[code] || row.protected !== protectedCode
+        || (protectedCode && !isSystemAdmin(role))) { continue; }
+      permissions.push(code);
+    }
+    return { staffId: principal.staffId, role, permissions };
   }
 
-  /** Throws FORBIDDEN when the principal lacks the capability in scope. Default deny.
-   * Read path: no locks, plain READ COMMITTED; the guard has just re-verified the session.
-   */
+  /** Deliberately obtain the staff lock before the channel link and session locks,
+   * matching credential rotation/recovery and TG exchange. Revalidate token after waiting. */
+  private async lockedPrincipal(client: PoolClient, proof: SessionProof): Promise<Principal> {
+    if (!TOKEN.test(proof.token)) {
+      throw new AuthorizationError('UNAUTHORIZED');
+    }
+    const channel = proof.kind === 'staff-web' ? 'CRM' : 'STAFF_TELEGRAM';
+    const hash = createHash('sha256').update(proof.token).digest('hex');
+    const lookup = await client.query<{ staff_id: string; telegram_link_id: string | null }>(
+      'SELECT staff_id, telegram_link_id FROM foundation.web_sessions WHERE token_hash=$1 AND channel=$2', [hash, channel]);
+    const candidate = lookup.rows[0];
+    if (!candidate) { throw new AuthorizationError('UNAUTHORIZED'); }
+    const staff = (await client.query<IdentityRow>(
+      "SELECT id, role, auth_version FROM foundation.staff WHERE id=$1 AND employment_state='ACTIVE' FOR SHARE", [candidate.staff_id])).rows[0];
+    if (!staff) { throw new AuthorizationError('UNAUTHORIZED'); }
+    let principal: Principal;
+    if (proof.kind === 'staff-web' && (staff.role === 'ADMIN' || staff.role === 'MANAGER') && candidate.telegram_link_id === null) {
+      principal = { kind: proof.kind, staffId: staff.id, role: staff.role, authVersion: staff.auth_version };
+    } else if (proof.kind === 'staff-telegram' && staff.role === 'TECHNICIAN' && candidate.telegram_link_id) {
+      const link = (await client.query<{ telegram_user_id: string }>(
+        `SELECT telegram_user_id::text FROM foundation.staff_telegram_links
+         WHERE id=$1 AND staff_id=$2 AND revoked_at IS NULL FOR SHARE`, [candidate.telegram_link_id, staff.id])).rows[0];
+      if (!link) { throw new AuthorizationError('UNAUTHORIZED'); }
+      principal = { kind: proof.kind, staffId: staff.id, role: staff.role, authVersion: staff.auth_version, telegramUserId: link.telegram_user_id };
+    } else { throw new AuthorizationError('UNAUTHORIZED'); }
+    const session = await client.query(
+      `SELECT id FROM foundation.web_sessions WHERE token_hash=$1 AND channel=$2 AND staff_id=$3 AND auth_version=$4
+       AND telegram_link_id IS NOT DISTINCT FROM $5::uuid AND revoked_at IS NULL
+       AND idle_expires_at>clock_timestamp() AND absolute_expires_at>clock_timestamp() FOR SHARE`,
+      [hash, channel, staff.id, staff.auth_version, candidate.telegram_link_id]);
+    if (session.rowCount !== 1) { throw new AuthorizationError('UNAUTHORIZED'); }
+    return principal;
+  }
+
   async authorize(principal: Principal, capability: Capability, scope: Scope): Promise<void> {
-    await this.transaction(async (client) => {
-      if (!await this.permitted(client, principal.staffId, capability, scope)) { throw new AuthorizationError('FORBIDDEN'); }
+    await this.transaction('read', async (client) => { requirePermission(await this.policy(client, principal), capability, scope); });
+  }
+  async inspectAccess(proof: SessionProof): Promise<AccessView> {
+    return this.transaction('read', async (client) => this.policy(client, await this.lockedPrincipal(client, proof)));
+  }
+  private async execute<T>(mode: 'read' | 'write', proof: SessionProof, capability: Capability, scope: Scope, operation: Command<T>): Promise<T> {
+    return this.transaction(mode, async (client) => {
+      const principal = await this.lockedPrincipal(client, proof);
+      const view = await this.policy(client, principal);
+      requirePermission(view, capability, scope);
+      return operation({ ...view, client, principal });
     });
   }
-
-  /** Plain read transaction without locks for staff data queries after the guard's checks. */
-  async read<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    return this.transaction(fn);
+  authorizeForRead<T>(proof: SessionProof, capability: Capability, scope: Scope, read: Command<T>): Promise<T> {
+    return this.execute('read', proof, capability, scope, read);
   }
-
-  /** Lock staff before session, matching the WebAuthService recovery/password-change order. */
-  private async lockedPrincipal(client: PoolClient, token: string): Promise<StaffWebPrincipal> {
-    if (typeof token !== 'string' || !TOKEN.test(token)) { throw new AuthorizationError('UNAUTHORIZED'); }
-    const digest = hashToken(token);
-    const candidate = await client.query<{ staff_id: string }>('SELECT staff_id FROM foundation.web_sessions WHERE token_hash = $1', [digest]);
-    const staffId = candidate.rows[0]?.staff_id;
-    if (!staffId) { throw new AuthorizationError('UNAUTHORIZED'); }
-    const staff = await client.query<{ id: string }>("SELECT id FROM foundation.staff WHERE id = $1 AND employment_state = 'ACTIVE' AND role IN ('ADMIN', 'MANAGER') FOR UPDATE", [staffId]);
-    if (!staff.rows[0]) { throw new AuthorizationError('UNAUTHORIZED'); }
-    const result = await client.query<StaffRow>(
-      `SELECT s.id, s.role, s.auth_version FROM foundation.web_sessions ws
-       JOIN foundation.staff s ON s.id = ws.staff_id
-       WHERE ws.token_hash = $1 AND ws.staff_id = $2 AND ws.revoked_at IS NULL
-         AND ws.idle_expires_at > clock_timestamp() AND ws.absolute_expires_at > clock_timestamp()
-         AND ws.auth_version = s.auth_version AND s.employment_state = 'ACTIVE' AND s.role IN ('ADMIN', 'MANAGER')
-       FOR UPDATE OF ws`, [digest, staffId]);
-    const locked = result.rows[0];
-    if (!locked) { throw new AuthorizationError('UNAUTHORIZED'); }
-    return { kind: 'staff-web', staffId: locked.id, role: locked.role, authVersion: locked.auth_version };
-  }
-
-  /** Rechecks the session and permissions under locks, then runs the write in the same transaction. */
-  async authorizeForWrite<T>(token: string, capability: Capability, scope: Scope, write: (context: StaffWriteContext) => Promise<T>): Promise<T> {
-    return this.transaction(async (client) => {
-      const principal = await this.lockedPrincipal(client, token);
-      if (!await this.permitted(client, principal.staffId, capability, scope)) { throw new AuthorizationError('FORBIDDEN'); }
-      return write({ client, principal });
-    });
+  authorizeForWrite<T>(proof: SessionProof, capability: Capability, scope: Scope, write: Command<T>): Promise<T> {
+    return this.execute('write', proof, capability, scope, write);
   }
 }

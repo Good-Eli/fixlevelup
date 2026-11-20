@@ -1,18 +1,26 @@
-/** Fixed capability vocabulary for P02-04 (owner-approved enum). Unknown capability is always
- * denied; grants live in foundation.user_permissions and nothing is implicit for any role.
- */
-export const STAFF_CAPABILITIES = ['staff.read', 'staff.manage'] as const;
-export type Capability = (typeof STAFF_CAPABILITIES)[number];
-
-/** P02-04 has GLOBAL only; concrete CITY grants wait for P03 (DECISIONS §21). */
-export interface Scope {
-  readonly kind: 'GLOBAL';
-}
-export const GLOBAL_SCOPE: Scope = { kind: 'GLOBAL' };
-
+/** Known operation contracts, not grants. A new entry does not authorize anyone:
+ * the DB catalog, scope and an enabled permission on the current role must also match. */
+export const PERMISSION_CONTRACT = {
+  'staff.self.read': 'SELF', 'staff.self.update': 'SELF', 'staff.self.deactivate': 'SELF',
+  'staff.read': 'GLOBAL', 'staff.create': 'GLOBAL', 'staff.update': 'GLOBAL', 'staff.deactivate': 'GLOBAL',
+  'roles.read': 'GLOBAL', 'roles.create': 'GLOBAL', 'roles.update': 'GLOBAL', 'roles.archive': 'GLOBAL',
+  'roles.permissions.manage': 'GLOBAL', 'staff.role.assign': 'GLOBAL',
+} as const;
+export type Capability = keyof typeof PERMISSION_CONTRACT;
+export const STAFF_CAPABILITIES = Object.freeze(Object.keys(PERMISSION_CONTRACT) as Capability[]);
+export const PROTECTED_CAPABILITIES: readonly Capability[] = Object.freeze([
+  'roles.create', 'roles.update', 'roles.archive', 'roles.permissions.manage', 'staff.role.assign',
+]);
+export type Scope = { readonly kind: 'GLOBAL' } | { readonly kind: 'SELF'; readonly ownerId: string };
+export const GLOBAL_SCOPE = Object.freeze({ kind: 'GLOBAL' } as const);
 export function isCapability(value: unknown): value is Capability {
-  return value === 'staff.read' || value === 'staff.manage';
+  return typeof value === 'string' && Object.hasOwn(PERMISSION_CONTRACT, value);
 }
-
-/** Metadata key for @RequireCapability; read by StaffWebAuthGuard through Reflector. */
+export function staffScope(capability: Capability, ownerId: string): Scope {
+  return PERMISSION_CONTRACT[capability] === 'SELF' ? { kind: 'SELF', ownerId } : GLOBAL_SCOPE;
+}
+export function scopeMatches(capability: Capability, scope: Scope, staffId: string): boolean {
+  return isCapability(capability) && scope.kind === PERMISSION_CONTRACT[capability]
+    && (scope.kind === 'GLOBAL' || (!!staffId && scope.ownerId === staffId));
+}
 export const CAPABILITY_METADATA = Symbol('fixlevelup:require-capability');

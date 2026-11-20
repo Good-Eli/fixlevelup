@@ -4,18 +4,11 @@ import { resolve } from 'node:path';
 import { Client } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RuntimeDatabase } from '../src/infrastructure/database/runtime-database.js';
+import { authFixtureMigrations as migrations } from './auth-db-fixture.js';
 
 // Explicit opt-in: preserve the random fixture database and never modify the dev schema.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
 const root = resolve(import.meta.dirname, '../../..');
-const migrations = [
-  '20261120000100_technical_audit_outbox',
-  '20261120000200_technical_outbox_attempts',
-  '20261120000300_technical_outbox_leases',
-  '20261120000400_staff_identity',
-  '20261120000500_web_auth',
-  '20261120000600_authorization',
-];
 
 integration('web auth readiness against isolated PostgreSQL', () => {
   let admin: Client | undefined;
@@ -66,7 +59,14 @@ integration('web auth readiness against isolated PostgreSQL', () => {
     if (!fixture) { throw new Error('Missing isolated fixture'); }
     for (const [breakGrant, restoreGrant] of [
       ['REVOKE UPDATE (password_hash) ON foundation.staff_web_credentials FROM fixlevelup_runtime', 'GRANT UPDATE (password_hash) ON foundation.staff_web_credentials TO fixlevelup_runtime'],
-      ['GRANT UPDATE (role) ON foundation.staff TO fixlevelup_runtime', 'REVOKE UPDATE (role) ON foundation.staff FROM fixlevelup_runtime'],
+      ['GRANT UPDATE (id) ON foundation.staff TO fixlevelup_runtime', 'REVOKE UPDATE (id) ON foundation.staff FROM fixlevelup_runtime'],
+      ['GRANT SELECT (staff_id) ON foundation.user_permissions TO fixlevelup_runtime', 'REVOKE SELECT (staff_id) ON foundation.user_permissions FROM fixlevelup_runtime'],
+      ['GRANT UPDATE (protected) ON foundation.permissions TO fixlevelup_runtime', 'REVOKE UPDATE (protected) ON foundation.permissions FROM fixlevelup_runtime'],
+      ['GRANT SELECT ON foundation.roles TO fixlevelup_runtime', 'REVOKE SELECT ON foundation.roles FROM fixlevelup_runtime; GRANT SELECT(id,code,name,description,role_type,status,version,created_by,updated_by,created_at,updated_at) ON foundation.roles TO fixlevelup_runtime'],
+      ['REVOKE UPDATE (revoked_by) ON foundation.staff_role_assignments FROM fixlevelup_runtime', 'GRANT UPDATE (revoked_by) ON foundation.staff_role_assignments TO fixlevelup_runtime'],
+      ['GRANT MAINTAIN ON foundation.roles TO fixlevelup_runtime', 'REVOKE MAINTAIN ON foundation.roles FROM fixlevelup_runtime'],
+      ['GRANT SELECT(code) ON foundation.permissions TO fixlevelup_runtime WITH GRANT OPTION', 'REVOKE GRANT OPTION FOR SELECT(code) ON foundation.permissions FROM fixlevelup_runtime'],
+      ['ALTER TABLE foundation.staff DISABLE TRIGGER rbac_staff_current', 'ALTER TABLE foundation.staff ENABLE TRIGGER rbac_staff_current'],
       ['REVOKE EXECUTE ON FUNCTION foundation.cleanup_web_sessions() FROM fixlevelup_runtime', 'GRANT EXECUTE ON FUNCTION foundation.cleanup_web_sessions() TO fixlevelup_runtime'],
     ] as const) {
       await fixture.query(breakGrant);

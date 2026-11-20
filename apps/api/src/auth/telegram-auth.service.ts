@@ -184,9 +184,10 @@ export class TelegramAuthService {
         const rotated = await client.query<SessionRow>(
           `UPDATE foundation.web_sessions SET token_hash = $1
            WHERE id = $2 AND initdata_digest = $3 AND channel = 'STAFF_TELEGRAM' AND revoked_at IS NULL
+             AND auth_version = $4 AND idle_expires_at > clock_timestamp() AND absolute_expires_at > clock_timestamp()
              AND initdata_exchanged_at + interval '60 seconds' >= clock_timestamp()
            RETURNING id, staff_id, auth_version, idle_expires_at, absolute_expires_at`,
-          [hashToken(token), priorRow.id, verified.digest]);
+          [hashToken(token), priorRow.id, verified.digest, staff.auth_version]);
         const row = rotated.rows[0];
         if (!row) { await this.finish(client, reservations, true); return { ok: false, code: 'REPLAY' }; }
         await this.finish(client, reservations, false);

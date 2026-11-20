@@ -13,18 +13,11 @@ import type { DatabaseConfig } from '../src/infrastructure/database/runtime-data
 import { loadConfig } from '../src/runtime/config.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
+import { migrateAuthFixture } from './auth-db-fixture.js';
 
 // Explicit opt-in: preserve the random fixture database, never modify the dev schema.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
 const root = resolve(import.meta.dirname, '../../..');
-const migrations = [
-  '20261120000100_technical_audit_outbox',
-  '20261120000200_technical_outbox_attempts',
-  '20261120000300_technical_outbox_leases',
-  '20261120000400_staff_identity',
-  '20261120000500_web_auth',
-  '20261120000600_authorization',
-];
 const origin = 'https://crm.example.test';
 const cookieName = '__Host-fixlevelup_session';
 const oldPassword = 'Synthetic-E2E-Old-Password-2026!';
@@ -60,7 +53,7 @@ integration('web auth real HTTP against isolated PostgreSQL', () => {
     const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
     if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
     const connection = { host: '127.0.0.1' as const, port: 55432 };
-    admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
+    admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     const database = `fixlevelup_auth_e2e_test_${randomBytes(12).toString('hex')}`;
     await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
@@ -68,10 +61,7 @@ integration('web auth real HTTP against isolated PostgreSQL', () => {
     await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
     fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
     await fixture.connect();
-    await fixture.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
-    for (const migration of migrations) {
-      await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
-    }
+    await migrateAuthFixture(fixture, database);
     await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
     migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
     ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));

@@ -11,7 +11,7 @@ import { TelegramAuthError } from '../auth/telegram-auth.service.js';
 import { AUTHORIZATION_SERVICE } from './authorization.resources.js';
 import { AuthorizationError } from './authorization.service.js';
 import type { AuthorizationServiceApi } from './authorization.service.js';
-import { CAPABILITY_METADATA, GLOBAL_SCOPE } from './capability.js';
+import { CAPABILITY_METADATA, staffScope } from './capability.js';
 import type { Capability } from './capability.js';
 import type { StaffTelegramPrincipal } from './principal.js';
 
@@ -62,11 +62,8 @@ function mapAuthError(error: unknown): never {
   throw error;
 }
 
-/** Session recheck + default-deny capability gate for future staff Telegram (Mini App)
- * routes. P02-05 registers the guard as a provider to prove its wiring, but mounts no
- * route: master routes arrive in later phases. The channel of login adds no rights;
- * authorization is the same capability check as staff-web (DECISIONS §21).
- */
+/** Session recheck and capability preflight for the Mini App. The bearer channel
+ * authenticates a staff identity; rights come solely from the shared RBAC policy. */
 @Injectable()
 export class StaffTelegramAuthGuard implements CanActivate {
   constructor(
@@ -86,7 +83,7 @@ export class StaffTelegramAuthGuard implements CanActivate {
         kind: 'staff-telegram', staffId: identity.staffId, role: identity.role,
         authVersion: identity.authVersion, telegramUserId: identity.telegramUserId,
       };
-      await this.authorization.authorize(principal, capability, GLOBAL_SCOPE);
+      await this.authorization.authorize(principal, capability, staffScope(capability, principal.staffId));
       request.principal = principal;
       request.sessionToken = token;
       return true;

@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
+import { insertWebStaff, migrateAuthFixture, reassignFixture, spareAdmin } from './auth-db-fixture.js';
 
 // Opt in only on the documented local development PostgreSQL instance. Each run
 // creates three empty, randomly named databases; it never writes to dev tables.
@@ -14,7 +15,6 @@ const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1
 const root = resolve(import.meta.dirname, '../../..');
 const syntheticPassword = 'Synthetic-Password-Canary-2026!';
 const login = `bootstrap-${randomBytes(12).toString('hex')}`;
-const migrations = ['20261120000100_technical_audit_outbox', '20261120000400_staff_identity'];
 
 function required<T>(value: T | undefined): T {
   if (value === undefined) { throw new Error('Missing test fixture value'); }
@@ -43,7 +43,7 @@ describe('bootstrap password UTF-8 byte limits', () => {
 describe('compiled bootstrap CLI', () => {
   it('rejects non-TTY input without echoing credentials', () => {
     const result = spawnSync(process.execPath, [resolve(root, 'apps/api/dist/bootstrap/staff-bootstrap.js')], {
-      cwd: root, encoding: 'utf8', input: `${login}\n${syntheticPassword}\n${syntheticPassword}\n`, timeout: 10000,
+      cwd: root, env: { ...process.env, DB_PASSWORD: syntheticPassword }, encoding: 'utf8', input: `${login}\n${syntheticPassword}\n${syntheticPassword}\n`, timeout: 10000,
     });
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(1);
@@ -83,7 +83,7 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
     const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
     if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
     const connection = { host: '127.0.0.1', port: 55432 };
-    admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
+    admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     for (let i = 0; i < 3; i++) {
       // The name consists solely of a fixed prefix and cryptographic random hex.
@@ -94,10 +94,8 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
       const fixture = new Client({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
       fixtures.push(fixture);
       await fixture.connect();
-      for (const migration of migrations) {
-        await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
-      }
-      pools.push(new Pool({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword }));
+      await migrateAuthFixture(fixture, name);
+      pools.push(new Pool({ ...connection, application_name: 'fixture-bootstrap', database: name, user: 'fixlevelup_migrator', password: migratorPassword }));
       runtimePools.push(new Pool({ ...connection, database: name, user: 'fixlevelup_runtime', password: runtimePassword }));
     }
   }, 30000);
@@ -116,7 +114,7 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
       const failure = await bootstrapFirstAdmin(required(pools[0]), { login, password: syntheticPassword }).catch((error: unknown) => error);
       expect(failure).toMatchObject({ code: 'FAILED', message: 'Staff bootstrap failed' });
       expect(JSON.stringify(failure)).not.toContain(syntheticPassword);
-      for (const table of ['staff', 'staff_web_credentials', 'staff_bootstrap_marker', 'audit_logs']) {
+      for (const table of ['staff', 'staff_role_assignments', 'staff_web_credentials', 'staff_bootstrap_marker', 'audit_logs']) {
         const result = await required(fixtures[0]).query<{ count: number }>(`SELECT count(*)::int AS count FROM foundation.${table}`);
         expect(result.rows[0]?.count).toBe(0);
       }
@@ -141,39 +139,69 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
     if (!winner) { throw new Error('Expected one bootstrap winner'); }
     const staff = await required(fixtures[0]).query('SELECT id, role, employment_state, auth_version FROM foundation.staff');
     expect(staff.rows).toEqual([{ id: winner.value.staffId, role: 'ADMIN', employment_state: 'ACTIVE', auth_version: 0 }]);
+    const assignments = await required(fixtures[0]).query<{ role_id: string; code: string }>(
+      `SELECT a.role_id,r.code FROM foundation.staff_role_assignments a JOIN foundation.roles r ON r.id=a.role_id
+       WHERE a.staff_id=$1 AND a.revoked_at IS NULL AND r.role_type='SYSTEM' AND r.status='ACTIVE'`, [winner.value.staffId]);
+    expect(assignments.rows).toHaveLength(1);
+    expect(assignments.rows[0]?.code).toBe('ADMIN');
     const audit = await required(fixtures[0]).query('SELECT operation, correlation_id, details FROM foundation.audit_logs');
-    expect(audit.rows).toEqual([{ operation: 'STAFF_BOOTSTRAP', correlation_id: winner.value.correlationId, details: { staffId: winner.value.staffId } }]);
+    expect(audit.rows).toEqual([{ operation: 'STAFF_BOOTSTRAP', correlation_id: winner.value.correlationId, details: { staffId: winner.value.staffId, roleId: required(assignments.rows[0]).role_id } }]);
+    const spare = await spareAdmin(required(fixtures[0]), winner.value.staffId);
     await required(fixtures[0]).query("UPDATE foundation.staff SET employment_state = 'INACTIVE' WHERE id = $1", [winner.value.staffId]);
     await expect(bootstrapFirstAdmin(required(pools[0]), { login: `${login}-later`, password: syntheticPassword }))
       .rejects.toMatchObject({ code: 'ALREADY_INITIALIZED' });
-    expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff')).rows[0]?.count).toBe(1);
-    expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff_web_credentials')).rows[0]?.count).toBe(1);
+    expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff')).rows[0]?.count).toBe(2);
+    expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff_web_credentials')).rows[0]?.count).toBe(2);
     expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.audit_logs')).rows[0]?.count).toBe(1);
     expect((await required(fixtures[0]).query('SELECT id, staff_id FROM foundation.staff_bootstrap_marker')).rows)
       .toEqual([{ id: 1, staff_id: winner.value.staffId }]);
     // The durable marker still blocks replacement after the former admin loses the role.
-    await required(fixtures[0]).query("UPDATE foundation.staff SET role = 'MANAGER' WHERE id = $1", [winner.value.staffId]);
+    await reassignFixture(required(fixtures[0]), winner.value.staffId, 'MANAGER', spare);
     await expect(bootstrapFirstAdmin(required(pools[0]), { login: `${login}-role-changed`, password: syntheticPassword }))
       .rejects.toMatchObject({ code: 'ALREADY_INITIALIZED' });
-    expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff')).rows[0]?.count).toBe(1);
+    expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff')).rows[0]?.count).toBe(2);
     expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff_bootstrap_marker')).rows[0]?.count).toBe(1);
+  }, 30000);
+
+  it('does not wait on a compatible ROW EXCLUSIVE writer lock when no advisory lock is held', async () => {
+    const writer = required(fixtures[0]);
+    await writer.query('BEGIN');
+    let pending: Promise<unknown> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await writer.query('LOCK TABLE foundation.staff IN ROW EXCLUSIVE MODE');
+      pending = bootstrapFirstAdmin(required(pools[0]), { login: `${login}-compatible-lock`, password: syntheticPassword })
+        .then((value): unknown => value, (error: unknown): unknown => error);
+      const result = await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => { reject(new Error('Bootstrap failed to finish before writer released its table lock')); }, 8000);
+        }),
+      ]);
+      expect(result).toMatchObject({ code: 'ALREADY_INITIALIZED' });
+    } finally {
+      clearTimeout(deadline);
+      await writer.query('ROLLBACK');
+      await pending;
+    }
   }, 30000);
 
   it('waits for an independent uncommitted admin insertion and rejects after commit', async () => {
     const writer = required(fixtures[2]);
     const observer = required(runtimePools[2]);
-    const id = randomUUID();
+    const blocker = required((await writer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]).pid;
     await writer.query('BEGIN');
     let pending: Promise<unknown> | undefined;
     try {
-      await writer.query("INSERT INTO foundation.staff (id, role, employment_state) VALUES ($1, 'ADMIN', 'ACTIVE')", [id]);
+      const id = await insertWebStaff(writer);
       pending = bootstrapFirstAdmin(required(pools[2]), { login: `${login}-race`, password: syntheticPassword })
         .then((value): unknown => value, (error: unknown): unknown => error);
-      // Observe the actual blocked table lock, rather than assuming timing proves it.
+      // The independent INSERT holds the advisory lock. Observe the specific writer/contender edge.
       const deadline = Date.now() + 10000;
       let waiting = false;
       while (Date.now() < deadline && !waiting) {
-        const locks = await observer.query<{ waiting: boolean }>("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'foundation.staff'::regclass AND mode = 'ShareRowExclusiveLock' AND NOT granted) AS waiting");
+        const locks = await observer.query<{ waiting: boolean }>(`SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname=current_database() AND application_name='fixture-bootstrap'
+          AND $1=ANY(pg_blocking_pids(pid))) AS waiting`, [blocker]);
         waiting = locks.rows[0]?.waiting === true;
         if (!waiting) { await new Promise<void>((resolveDelay) => { setTimeout(resolveDelay, 25); }); }
       }
@@ -181,7 +209,9 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
       await writer.query('COMMIT');
       expect(await pending).toMatchObject({ code: 'ALREADY_INITIALIZED' });
       expect((await writer.query('SELECT id FROM foundation.staff')).rows).toEqual([{ id }]);
-      for (const table of ['staff_web_credentials', 'staff_bootstrap_marker', 'audit_logs']) {
+      expect((await writer.query('SELECT staff_id FROM foundation.staff_web_credentials')).rows).toEqual([{ staff_id: id }]);
+      expect((await writer.query('SELECT staff_id FROM foundation.staff_role_assignments')).rows).toEqual([{ staff_id: id }]);
+      for (const table of ['staff_bootstrap_marker', 'audit_logs']) {
         expect((await writer.query<{ count: number }>(`SELECT count(*)::int AS count FROM foundation.${table}`)).rows[0]?.count).toBe(0);
       }
     } finally {
@@ -192,8 +222,8 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
 
   it('stores verifiable Argon2id hashes with independently random salts', async () => {
     await bootstrapFirstAdmin(required(pools[1]), { login: `${login}-second`, password: syntheticPassword });
-    const first = required((await required(fixtures[0]).query<{ password_hash: string }>('SELECT password_hash FROM foundation.staff_web_credentials')).rows[0]).password_hash;
-    const second = required((await required(fixtures[1]).query<{ password_hash: string }>('SELECT password_hash FROM foundation.staff_web_credentials')).rows[0]).password_hash;
+    const first = required((await required(fixtures[0]).query<{ password_hash: string }>('SELECT c.password_hash FROM foundation.staff_web_credentials c JOIN foundation.staff_bootstrap_marker b ON b.staff_id=c.staff_id')).rows[0]).password_hash;
+    const second = required((await required(fixtures[1]).query<{ password_hash: string }>('SELECT c.password_hash FROM foundation.staff_web_credentials c JOIN foundation.staff_bootstrap_marker b ON b.staff_id=c.staff_id')).rows[0]).password_hash;
     expect(first).not.toBe(syntheticPassword);
     expect(first).not.toBe(second);
     expect(first.split('$')[4]).not.toBe(second.split('$')[4]);
@@ -211,14 +241,22 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
       await expect(db.query('INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1,$2,$3,$4)',
         [randomUUID(), role, state, version])).rejects.toMatchObject({ code: '23514' });
     }
-    await expect(db.query('INSERT INTO foundation.staff_web_credentials (staff_id, login, password_hash) VALUES ($1,$2,$3)',
-      [randomUUID(), 'missing-staff', 'hash'])).rejects.toMatchObject({ code: '23503' });
+    // Reuse a valid fixture hash so the credential format CHECK cannot mask the missing staff FK.
+    await expect(db.query(`INSERT INTO foundation.staff_web_credentials (staff_id, login, password_hash)
+      SELECT $1,$2,c.password_hash FROM foundation.staff_web_credentials c JOIN foundation.staff_bootstrap_marker b ON b.staff_id=c.staff_id`,
+      [randomUUID(), 'missing-staff'])).rejects.toMatchObject({ code: '23503', constraint: 'staff_web_credentials_staff_id_fkey' });
     for (const table of ['staff', 'staff_web_credentials', 'staff_bootstrap_marker']) {
       for (const privilege of ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) {
         const privileges = await db.query<{ allowed: boolean }>("SELECT has_table_privilege('fixlevelup_runtime', $1, $2) AS allowed", [`foundation.${table}`, privilege]);
         expect(privileges.rows[0]?.allowed).toBe(false);
       }
-      await expect(required(runtimePools[1]).query(`SELECT * FROM foundation.${table}`)).rejects.toMatchObject({ code: '42501' });
+      if (table === 'staff_bootstrap_marker') {
+        for (const privilege of ['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']) {
+          const acl = await db.query<{ allowed: boolean }>("SELECT has_any_column_privilege('fixlevelup_runtime',$1,$2) AS allowed", [`foundation.${table}`, privilege]);
+          expect(acl.rows[0]?.allowed).toBe(false);
+        }
+        await expect(required(runtimePools[1]).query(`SELECT * FROM foundation.${table}`)).rejects.toMatchObject({ code: '42501' });
+      }
     }
     const auditUpdate = await db.query<{ allowed: boolean }>("SELECT has_table_privilege('fixlevelup_runtime', 'foundation.audit_logs', 'UPDATE') AS allowed");
     expect(auditUpdate.rows[0]?.allowed).toBe(false);

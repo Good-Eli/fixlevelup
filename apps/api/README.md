@@ -72,9 +72,7 @@ corepack pnpm --filter @fixlevelup/api run staff:bootstrap
 аудит/состояние, не повторять вслепую. Параллельные bootstrap сериализуются;
 атомарный marker запрещает повтор даже после смены роли первого администратора.
 Если существовал администратор до первого запуска, повтор также отклоняется.
-Создание других администраторов сейчас не реализовано. Привилегированный SQL-доступ
-всё равно позволяет обходить приложение; когда добавится управление сотрудниками,
-необходимо отдельно пересмотреть привилегии, аудит и протокол блокировок.
+Новый администратор назначается через [RBAC API](../../docs/RBAC.md) активному сотруднику с уже существующим web credential; повторный bootstrap для этого не используется. Миграционный владелец БД остаётся доверенной стороной.
 
 Пароль хранится как Argon2id PHC с случайной солью; используется встроенный
 `node:crypto` Node 24, API Argon2 в этой версии экспериментальный. Доступ к самому
@@ -160,7 +158,7 @@ security/production approval или гарантия удержания БД п�
 - Один single-flight probe на запросы readiness, pool max2; connection/query/
   statement/lock timeout1000ms, без detached SQL после HTTP Promise.race.
   Shutdown останавливает новые probes, ждёт текущий, закрывает Prisma/pool.
-- При включённом web auth доступны его API-маршруты; business endpoints отсутствуют.
+- При включённом web auth доступны также [защищённые операции RBAC](../../docs/RBAC.md); Mini App self-service регистрируется только при настроенном Telegram exchange.
 - JSON parser включается только вместе с web auth, strict и ограничен 4 KiB;
   входные body не сохраняются и не логируются.
 - X-Powered-By отключён; health/errors имеют Cache-Control:no-store.
@@ -225,5 +223,4 @@ Integration tests требуют локальные dev/runtime secrets и ра�
 PostgreSQL55432. Они создают отдельную random p018b test DB из template0 с копией
 technical migrations и test-only _prisma_migrations stub, проверяют200→503 при
 CHECKtrue/недостающем INSERT/wrong-index-columns. Dev schema/grants не меняются.
-Test DB сохраняются. Ошибочный пароль, зависший TCPhandshake и pool shutdown
-проверяются без остановки Docker. Никаких write business endpoints здесь нет.
+Test DB сохраняются. Ошибочный пароль, зависший TCP handshake и pool shutdown проверяются без остановки Docker. Операции сотрудников, ролей и permissions описаны в [RBAC](../../docs/RBAC.md).

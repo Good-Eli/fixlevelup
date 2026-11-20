@@ -1,5 +1,6 @@
 import { argon2, randomBytes, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
+import { lockAccessPolicy } from '../authz/rbac-lock.js';
 
 export type BootstrapErrorCode = 'INVALID_INPUT' | 'ALREADY_INITIALIZED' | 'FAILED';
 
@@ -51,10 +52,10 @@ export async function bootstrapFirstAdmin(pool: Pick<Pool, 'connect'>, input: Bo
     client = await pool.connect();
     await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
     transaction = true;
-    // All first-admin bootstrap attempts must acquire this lock before checking.
-    await client.query('SELECT pg_advisory_xact_lock($1::bigint)', ['7063333137826641']);
-    // Serialize with all staff INSERT/UPDATE/DELETE, including non-cooperating writers.
-    await client.query('LOCK TABLE foundation.staff IN SHARE ROW EXCLUSIVE MODE');
+    // On schema 009 the BEFORE STATEMENT trigger makes even an independent staff
+    // INSERT take this key. An explicit table lock here would invert lock order
+    // with either a direct INSERT or an application command. No legacy fallback.
+    await lockAccessPolicy(client, 'write');
     const marker = await client.query('SELECT 1 FROM foundation.staff_bootstrap_marker WHERE id = $1', [1]);
     const existing = await client.query('SELECT 1 FROM foundation.staff WHERE role = $1 LIMIT 1', ['ADMIN']);
     if (marker.rows.length !== 0 || existing.rows.length !== 0) { throw new BootstrapError('ALREADY_INITIALIZED'); }
@@ -63,8 +64,15 @@ export async function bootstrapFirstAdmin(pool: Pick<Pool, 'connect'>, input: Bo
     await client.query('INSERT INTO foundation.staff_bootstrap_marker (id, staff_id) VALUES ($1, $2)', [1, staffId]);
     await client.query('INSERT INTO foundation.staff_web_credentials (staff_id, login, password_hash) VALUES ($1, $2, $3)',
       [staffId, input.login, passwordHash]);
+    // Explicit initial assignment: not an implicit grant on seeing staff.role='ADMIN'.
+    const assignment = await client.query<{ role_id: string }>(
+      `INSERT INTO foundation.staff_role_assignments (id, staff_id, role_id)
+       SELECT $1, $2, r.id FROM foundation.roles r WHERE r.role_type='SYSTEM' AND r.code='ADMIN' AND r.status='ACTIVE'
+       RETURNING role_id`, [randomUUID(), staffId]);
+    const roleId = assignment.rows[0]?.role_id;
+    if (assignment.rowCount !== 1 || !roleId) { throw new BootstrapError('FAILED'); }
     await client.query('INSERT INTO foundation.audit_logs (id, operation, correlation_id, details) VALUES ($1, $2, $3, $4::jsonb)',
-      [randomUUID(), 'STAFF_BOOTSTRAP', correlationId, JSON.stringify({ staffId })]);
+      [randomUUID(), 'STAFF_BOOTSTRAP', correlationId, JSON.stringify({ staffId, roleId })]);
     await client.query('COMMIT');
     transaction = false;
     return { staffId, correlationId };

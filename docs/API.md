@@ -117,19 +117,23 @@ Company settings — legal identity/security/retention/channel policies/primary 
 
 ## 5. Auth и сотрудники
 
+**Реализовано в P02:** серверные роли, права, назначения, CRM и Telegram self-service. Действующие методы, тела, ETag и коды отказов приведены в [контракте RBAC](RBAC.md#http-api). Ниже перечислены также проектные маршруты будущих модулей; наличие строки не означает реализацию.
+
 | Метод / путь | Доступ | Назначение |
 |---|---|---|
 | POST `/auth/login` | P, rate limit | login/password → server cookie, безопасная общая ошибка входа |
 | POST `/auth/logout` | Auth, CSRF | Отзыв текущей сессии |
 | POST `/auth/session/renew` | Auth, CSRF | Rotation/renew в пределах policy, не бессрочный refresh |
-| GET `/auth/me` | Auth | Минимальный профиль + capabilities/limits для UI, не подмена backend checks |
+| GET `/auth/me`, GET `/access` | Web-сессия | `/auth/me` + `X-Auth-Request: 1` возвращает identity и CSRF; `/access` возвращает только собственную действующую RBAC-роль и список прав для UI |
 | POST `/auth/password/change` | Web user, V | Проверка текущего credential, Argon2id, отзыв остальных sessions |
 | POST `/auth/telegram-miniapp` | P, rate limit | Raw initData → проверенная staff session; неизвестный/уволенный Telegram user не регистрируется автоматически |
-| GET/POST `/staff` | A или M+staff.manage | Список/создание заранее учтённых сотрудников; без дефолтного пароля |
-| GET/PATCH `/staff/{id}` | M/A + scoped capability, V | Контакты/состояние; role/permissions отдельно |
+| GET/POST `/staff` | `staff.read` / `staff.create` | Список / создание заранее учтённого сотрудника; сервер ограничивает тип цели, пароль не создаётся |
+| GET/PATCH `/staff/{id}` | `staff.read` / `staff.update` | Карточка / изменение только `displayName`; PATCH требует ETag |
+| GET/PATCH `/staff/self`, POST `/staff/self/deactivate` | соответствующие `staff.self.*` | Только владелец; канальный вариант Mini App: `/telegram/staff/self` |
 | POST `/staff/{id}/telegram-invitations` | M/A+staff.link, I | Временный токен для заранее созданного активного сотрудника; отдельный namespace, Telegram auth proof плюс intended employee proof/контролируемое подтверждение менеджером; один пересланный invite и валидный Telegram ID не доказывают employment identity |
-| POST `/staff/{id}/deactivate` | A или M+staff.manage, I,V | Блокировка sessions, проверка незавершённых назначений/alerts, история остаётся |
-| PUT `/staff/{id}/permissions` | A, V | Версионированные grants/limits; превышение прав менеджера невозможно |
+| POST `/staff/{id}/deactivate` | `staff.deactivate`, V | Деактивация без удаления истории, обе сессии теряют силу; защита последнего ADMIN |
+| PUT `/staff/{id}/role` | `staff.role.assign`, V | Изменение основной роли активной цели. Маршрута индивидуальных grants нет |
+| GET/POST `/roles`, GET/PATCH `/roles/{id}`, GET `/permissions`, PUT `/roles/{id}/permissions`, POST `/roles/{id}/archive` | По действию; изменения только SYSTEM ADMIN | [Точные URL, DTO и ограничения](RBAC.md#http-api) |
 | GET/PATCH `/technicians/{id}/profile` | M/A; T только self GET | Специализации, районы, готовность; проверка approved skills |
 | GET `/technicians/{id}/summary` | M/A+schedule.read в GLOBAL/CITY scope; T self redacted | Загрузка, текущие/исторические визиты, repairs/debt/report metrics с selected city/period/timezone/basis/asOf/definitionsVersion; global capacity не теряется при city projection, PII только при отдельном праве/времени доступа |
 

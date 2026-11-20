@@ -17,7 +17,7 @@ import { sessionToken } from '../auth/http.js';
 import { AUTHORIZATION_SERVICE } from './authorization.resources.js';
 import { AuthorizationError } from './authorization.service.js';
 import type { AuthorizationServiceApi } from './authorization.service.js';
-import { CAPABILITY_METADATA, GLOBAL_SCOPE } from './capability.js';
+import { CAPABILITY_METADATA, staffScope } from './capability.js';
 import type { Capability } from './capability.js';
 import type { StaffWebPrincipal } from './principal.js';
 
@@ -49,7 +49,7 @@ function mapAuthError(error: unknown): never {
 }
 
 /** Session recheck + default-deny capability gate for staff routes.
- * Mounted per-controller on the new /staff routes only; health and auth stay untouched.
+ * Mounted on protected CRM staff and role controllers; health and login stay independent.
  * 401 without a session, 403 without the capability; no metadata means a programming
  * error (the guard must not silently allow), so it fails loud with 500.
  */
@@ -72,7 +72,7 @@ export class StaffWebAuthGuard implements CanActivate {
       principal = { kind: 'staff-web', staffId: identity.staffId, role: identity.role, authVersion: identity.authVersion };
     } catch (error) { return mapAuthError(error); }
     try {
-      await this.authorization.authorize(principal, capability, GLOBAL_SCOPE);
+      await this.authorization.authorize(principal, capability, staffScope(capability, principal.staffId));
     } catch (error) { return mapAuthError(error); }
     request.principal = principal;
     request.sessionToken = token;

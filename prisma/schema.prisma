@@ -28,6 +28,13 @@ model Staff {
   role            String              @db.VarChar(16)
   employmentState String              @map("employment_state") @db.VarChar(16)
   authVersion        Int                   @default(0) @map("auth_version")
+  displayName        String?               @map("display_name") @db.VarChar(80)
+  profileVersion     Int                   @default(0) @map("profile_version")
+  createdRoles       Role[]                @relation("RoleCreatedBy")
+  updatedRoles       Role[]                @relation("RoleUpdatedBy")
+  roleAssignments    StaffRoleAssignment[] @relation("RoleSubject")
+  assignedRoles      StaffRoleAssignment[] @relation("RoleAssignedBy")
+  revokedRoles       StaffRoleAssignment[] @relation("RoleRevokedBy")
   webCredential      StaffWebCredential?
   bootstrapMarker    StaffBootstrapMarker?
   webSessions          WebSession[]
@@ -59,8 +66,72 @@ model StaffWebCredential {
   @@schema("foundation")
 }
 
-// Capabilities are plain strings validated in the application; no catalog table.
-// The partial unique index and period/scope CHECKs exist only in migration SQL.
+model Permission {
+  code        String           @id @db.VarChar(64)
+  module      String           @db.VarChar(32)
+  description String           @db.VarChar(500)
+  protected   Boolean          @default(false)
+  active      Boolean          @default(true)
+  grants      RolePermission[]
+
+  @@map("permissions")
+  @@schema("foundation")
+}
+
+model Role {
+  id          String                @id @db.Uuid
+  code        String                @unique(map: "roles_code_key") @db.VarChar(64)
+  name        String                @db.VarChar(80)
+  description String                @default("") @db.VarChar(500)
+  roleType    String                @default("CUSTOM") @map("role_type") @db.VarChar(16)
+  status      String                @default("ACTIVE") @db.VarChar(16)
+  version     Int                   @default(1)
+  createdBy   String?               @map("created_by") @db.Uuid
+  updatedBy   String?               @map("updated_by") @db.Uuid
+  createdAt   DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime              @default(now()) @map("updated_at") @db.Timestamptz(6)
+  creator     Staff?                @relation("RoleCreatedBy", fields: [createdBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
+  editor      Staff?                @relation("RoleUpdatedBy", fields: [updatedBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
+  grants      RolePermission[]
+  assignments StaffRoleAssignment[]
+
+  @@map("roles")
+  @@schema("foundation")
+}
+
+model RolePermission {
+  roleId         String     @map("role_id") @db.Uuid
+  permissionCode String     @map("permission_code") @db.VarChar(64)
+  scopeType      String     @map("scope_type") @db.VarChar(16)
+  enabled        Boolean    @default(true)
+  role           Role       @relation(fields: [roleId], references: [id], onUpdate: Restrict, onDelete: Restrict)
+  permission     Permission @relation(fields: [permissionCode], references: [code], onUpdate: Restrict, onDelete: Restrict)
+
+  @@id([roleId, permissionCode])
+  @@map("role_permissions")
+  @@schema("foundation")
+}
+
+// Partial unique active-staff index and deferred exactly-one-current check live in migration SQL.
+model StaffRoleAssignment {
+  id         String    @id @db.Uuid
+  staffId    String    @map("staff_id") @db.Uuid
+  roleId     String    @map("role_id") @db.Uuid
+  assignedBy String?   @map("assigned_by") @db.Uuid
+  revokedBy  String?   @map("revoked_by") @db.Uuid
+  assignedAt DateTime  @default(dbgenerated("statement_timestamp()")) @map("assigned_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  staff      Staff     @relation("RoleSubject", fields: [staffId], references: [id], onUpdate: Restrict, onDelete: Restrict)
+  role       Role      @relation(fields: [roleId], references: [id], onUpdate: Restrict, onDelete: Restrict)
+  assigner   Staff?    @relation("RoleAssignedBy", fields: [assignedBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
+  revoker    Staff?    @relation("RoleRevokedBy", fields: [revokedBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
+
+  @@index([roleId, staffId], map: "staff_role_assignments_role_staff_idx")
+  @@map("staff_role_assignments")
+  @@schema("foundation")
+}
+
+// P02 immutable legacy history; runtime cannot read it or issue individual grants.
 model UserPermission {
   id             String    @id @db.Uuid
   staffId        String    @map("staff_id") @db.Uuid

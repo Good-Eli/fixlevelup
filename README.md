@@ -2,7 +2,7 @@
 
 FixLevelUp — платформа для организации заявок на ремонт бытовой техники: клиентский приём заявок, рабочее место менеджера, инструменты мастеров и коммуникация через подключаемые каналы. Проект рассчитан на одну компанию с возможностью последовательно запускать новые города; это не multi-tenant SaaS.
 
-> **Текущее состояние:** технический foundation P01. Репозиторий содержит инфраструктурные заготовки, API/worker entrypoints, технические страницы Web и Mini App, tooling, миграции audit/outbox и CI proofs. Это ещё не готовая клиентская платформа: бизнес-модули, авторизация, каталог, заявки, CRM, расписание, сметы, реальные messenger adapters и production deployment не реализованы.
+> **Текущее состояние:** foundation P01 и контур доступа сотрудников P02: web-сессии, Telegram Mini App exchange и [управление доступом](docs/RBAC.md) в CRM (`/crm/access`). Каталог услуг, заявки, расписание, сметы и клиентские messenger adapters — не часть этой реализации. Production deployment и живые приёмки не выполнены.
 
 ## Технологический стек
 
@@ -102,7 +102,7 @@ Compose-файл: `infra/dev-s3/compose.yaml`. Секреты создаются
 ## Приложения
 
 - **API / worker:** [`apps/api/README.md`](apps/api/README.md). Технические health/readiness entrypoints и outbox infrastructure. Production business handlers отсутствуют. Entrypoints не загружают `.env` автоматически; нужные переменные передаются окружением явно.
-- **Web:** [`apps/web/README.md`](apps/web/README.md). Технический Next.js build/smoke target, не клиентский сайт и не CRM.
+- **Web:** [руководство Web](apps/web/README.md). Техническая страница и закрытый раздел CRM `/crm/access`. Для UI и `/api/v1` нужен один HTTPS origin; браузер не подключается к БД.
 - **Mini App:** [`apps/miniapp/README.md`](apps/miniapp/README.md). Технический React/Vite target будущего staff Telegram Mini App; Telegram SDK, initData validation и бизнес-интерфейс пока не подключены.
 
 ## CI и evidence
@@ -130,4 +130,4 @@ Workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Он запу�
 
 ## Roadmap boundary
 
-P02 (Auth and capabilities) не начинается автоматически после P01. Для каждого следующего этапа требуется отдельное разрешение владельца; успешный CI или наличие технического scaffold не заменяет такое разрешение.
+Контур сотрудников P02 не разрешает начало следующего этапа. Для P03 и последующих модулей требуется отдельное решение владельца; успешный CI не заменяет такое разрешение.

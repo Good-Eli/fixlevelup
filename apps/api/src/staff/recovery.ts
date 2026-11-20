@@ -1,5 +1,6 @@
 import { argon2, randomBytes, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
+import { lockAccessPolicy } from '../authz/rbac-lock.js';
 
 export interface RecoverAdminInput {
   readonly login: string;
@@ -39,10 +40,13 @@ export async function recoverAdmin(pool: Pick<Pool, 'connect'>, input: RecoverAd
     client = await pool.connect();
     await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
     transaction = true;
+    await lockAccessPolicy(client, 'write');
     const found = await client.query<{ id: string }>(
       `SELECT s.id FROM foundation.staff AS s
        JOIN foundation.staff_web_credentials AS c ON c.staff_id = s.id
-       WHERE c.login = $1 AND s.role = 'ADMIN' AND s.employment_state = 'ACTIVE'
+       JOIN foundation.staff_role_assignments a ON a.staff_id=s.id AND a.revoked_at IS NULL
+       JOIN foundation.roles r ON r.id=a.role_id AND r.role_type='SYSTEM' AND r.code='ADMIN' AND r.status='ACTIVE'
+       WHERE current_user='fixlevelup_migrator' AND c.login = $1 AND s.role = 'ADMIN' AND s.employment_state = 'ACTIVE'
        FOR UPDATE OF s, c`, [input.login]);
     const row = found.rows[0];
     if (found.rows.length !== 1 || !row) { throw new RecoveryError(); }

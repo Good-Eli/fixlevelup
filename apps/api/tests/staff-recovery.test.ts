@@ -6,6 +6,7 @@ import { Client, Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { recoverAdmin } from '../src/staff/recovery.js';
+import { migrateAuthFixture, reassignFixture, spareAdmin } from './auth-db-fixture.js';
 
 // Identical opt-in and isolation policy to staff-bootstrap.test.ts: only random,
 // newly created databases are changed, and they are retained rather than dropped.
@@ -14,7 +15,6 @@ const root = resolve(import.meta.dirname, '../../..');
 const oldPassword = 'Synthetic-Old-Password-Canary-2026!';
 const newPassword = 'Synthetic-New-Password-Canary-2026!';
 const login = `recovery-${randomBytes(12).toString('hex')}`;
-const migrations = ['20261120000100_technical_audit_outbox', '20261120000400_staff_identity'];
 
 async function verifyHash(encoded: string, password: string): Promise<boolean> {
   const parts = encoded.split('$');
@@ -73,6 +73,7 @@ integration('administrator recovery against isolated PostgreSQL', () => {
   const fixtures: Client[] = [];
   const pools: Pool[] = [];
   let staffId: string;
+  let spare: string;
 
   beforeAll(async () => {
     const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
@@ -82,7 +83,7 @@ integration('administrator recovery against isolated PostgreSQL', () => {
     const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
     if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
     const connection = { host: '127.0.0.1', port: 55432 };
-    admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
+    admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     const name = `fixlevelup_recovery_test_${randomBytes(12).toString('hex')}`;
     await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
@@ -91,17 +92,18 @@ integration('administrator recovery against isolated PostgreSQL', () => {
     fixture = new Client({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
     fixtures.push(fixture);
     await fixture.connect();
-    await fixture.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
-    for (const migration of migrations) {
-      await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
-    }
+    await migrateAuthFixture(fixture, name);
     pool = new Pool({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
     pools.push(pool);
     const runtime = new Pool({ ...connection, database: name, user: 'fixlevelup_runtime', password: runtimePassword });
     pools.push(runtime);
-    await expect(runtime.query('SELECT * FROM foundation.staff')).rejects.toMatchObject({ code: '42501' });
-    await expect(recoverAdmin(runtime, { login, password: newPassword })).rejects.toMatchObject({ name: 'RecoveryError', message: 'Staff recovery failed' });
     ({ staffId } = await bootstrapFirstAdmin(pool, { login, password: oldPassword }));
+    spare = await spareAdmin(fixture, staffId);
+    await expect(runtime.query('SELECT * FROM foundation.staff_bootstrap_marker')).rejects.toMatchObject({ code: '42501' });
+    // Valid, active, credentialed ADMIN exists: denial cannot be due to a missing target.
+    const before = (await fixture.query('SELECT password_hash FROM foundation.staff_web_credentials WHERE staff_id=$1', [staffId])).rows;
+    await expect(recoverAdmin(runtime, { login, password: newPassword })).rejects.toMatchObject({ name: 'RecoveryError', message: 'Staff recovery failed' });
+    expect((await fixture.query('SELECT password_hash FROM foundation.staff_web_credentials WHERE staff_id=$1', [staffId])).rows).toEqual(before);
   }, 30000);
 
   afterAll(async () => {
@@ -120,7 +122,7 @@ integration('administrator recovery against isolated PostgreSQL', () => {
       expect(after).not.toBe(before);
       expect(await verifyHash(after, newPassword)).toBe(true);
       expect(await verifyHash(after, oldPassword)).toBe(false);
-      expect((await fixture.query('SELECT id, role, employment_state, auth_version FROM foundation.staff')).rows)
+      expect((await fixture.query('SELECT id, role, employment_state, auth_version FROM foundation.staff WHERE id=$1', [staffId])).rows)
         .toEqual([{ id: staffId, role: 'ADMIN', employment_state: 'ACTIVE', auth_version: 1 }]);
       const audit = (await fixture.query<{ operation: string; correlation_id: string; details: unknown }>('SELECT operation, correlation_id, details FROM foundation.audit_logs WHERE operation = $1', ['STAFF_RECOVERY'])).rows;
       expect(audit).toHaveLength(1);
@@ -142,12 +144,14 @@ integration('administrator recovery against isolated PostgreSQL', () => {
     try {
       const snapshot = async () => ({
         staff: (await fixture.query('SELECT * FROM foundation.staff ORDER BY id')).rows,
+        assignments: (await fixture.query('SELECT * FROM foundation.staff_role_assignments ORDER BY id')).rows,
         credentials: (await fixture.query('SELECT * FROM foundation.staff_web_credentials ORDER BY staff_id')).rows,
         audit: (await fixture.query('SELECT * FROM foundation.audit_logs ORDER BY id')).rows,
         marker: (await fixture.query('SELECT * FROM foundation.staff_bootstrap_marker')).rows,
       });
       for (const [role, state, target] of [['ADMIN', 'ACTIVE', `${login}-missing`], ['ADMIN', 'INACTIVE', login], ['MANAGER', 'ACTIVE', login]] as const) {
-        await fixture.query('UPDATE foundation.staff SET role = $1, employment_state = $2 WHERE id = $3', [role, state, staffId]);
+        if (role === 'MANAGER') { await reassignFixture(fixture, staffId, role, spare); }
+        else { await fixture.query('UPDATE foundation.staff SET employment_state=$2 WHERE id=$1', [staffId, state]); }
         const before = await snapshot();
         const failure: unknown = await recoverAdmin(pool, { login: target, password: newPassword }).catch((error: unknown) => error);
         expect(failure).toMatchObject({ name: 'RecoveryError', message: 'Staff recovery failed' });
@@ -157,7 +161,7 @@ integration('administrator recovery against isolated PostgreSQL', () => {
       }
       expect(JSON.stringify(logs.flatMap((spy) => spy.mock.calls))).not.toContain(newPassword);
     } finally {
-      await fixture.query("UPDATE foundation.staff SET role = 'ADMIN', employment_state = 'ACTIVE' WHERE id = $1", [staffId]);
+      await reassignFixture(fixture, staffId, 'ADMIN', spare);
       for (const spy of logs) { spy.mockRestore(); }
     }
   }, 30000);

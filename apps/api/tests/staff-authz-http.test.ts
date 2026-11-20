@@ -1,219 +1,90 @@
 import 'reflect-metadata';
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import type { Server } from 'node:http';
 import { Controller, Get, UseGuards } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE } from '../src/auth/web-auth.controller.js';
 import { WebAuthError } from '../src/auth/web-auth.service.js';
 import { AUTHORIZATION_SERVICE } from '../src/authz/authorization.resources.js';
 import { AuthorizationError } from '../src/authz/authorization.service.js';
-import type { StaffWriteContext } from '../src/authz/authorization.service.js';
 import { StaffWebAuthGuard } from '../src/authz/authorization.guard.js';
 import { GLOBAL_SCOPE } from '../src/authz/capability.js';
-import type { StaffWebPrincipal } from '../src/authz/principal.js';
-import { StaffController, StaffService } from '../src/staff/staff.controller.js';
+import { StaffController } from '../src/staff/staff.controller.js';
+import { StaffService } from '../src/staff/staff.service.js';
 
 const origin = 'https://crm.example.test';
-const first = 'a'.repeat(43);
-const inactive = 'b'.repeat(43);
-const csrfSecret = 's'.repeat(32);
-const cookieName = '__Host-fixlevelup_session';
-const cookie = (token: string) => `${cookieName}=${token}`;
-const csrfFor = (token: string) => createHmac('sha256', csrfSecret).update('web-auth-csrf\0').update(token).digest('base64url');
-const identity = { staffId: 'staff-1', role: 'ADMIN' as const, authVersion: 1,
-  idleExpiresAt: new Date('2030-01-01T00:00:00Z'), absoluteExpiresAt: new Date('2030-01-01T12:00:00Z') };
-const principal: StaffWebPrincipal = { kind: 'staff-web', staffId: identity.staffId, role: identity.role, authVersion: identity.authVersion };
-const existingId = '9b6f6b2a-1f0e-4a3a-9c3d-111111111111';
-const missingId = '9b6f6b2a-1f0e-4a3a-9c3d-222222222222';
+const first = randomBytes(32).toString('base64url'); const stale = randomBytes(32).toString('base64url');
+const secret = randomBytes(32).toString('hex');
+const cookie = (token: string) => `__Host-fixlevelup_session=${token}`;
+const csrf = createHmac('sha256', secret).update('web-auth-csrf\0').update(first).digest('base64url');
+const principal = { kind: 'staff-web', staffId: randomUUID(), role: 'ADMIN', authVersion: 1 };
 const closers: (() => Promise<void>)[] = [];
 
-afterEach(async () => { for (const close of closers.splice(0)) { await close(); } vi.restoreAllMocks(); });
+afterEach(async () => { for (const close of closers.splice(0)) { await close(); } });
 
-interface StaffListRow { id: string; role: string; employment_state: string }
-interface StaffDetailRow { id: string; role: string; employment_state: string; auth_version: number }
-interface QueryResult<T> { rows: T[]; rowCount: number }
+@Controller('test/no-metadata') @UseGuards(StaffWebAuthGuard)
+class NoCapabilityController { @Get() open() { return { ok: true }; } }
 
-/** Test-only route behind the real guard but without capability metadata. */
-@Controller('test/no-metadata')
-@UseGuards(StaffWebAuthGuard)
-class NoCapabilityController {
-  @Get() open(): { ok: true } { return { ok: true }; }
-}
-
-async function setup(controllers: unknown[] = [StaffController], withAuthorization = true) {
-  const listRows: StaffListRow[] = [{ id: existingId, role: 'MANAGER', employment_state: 'ACTIVE' }];
-  const created: StaffDetailRow[] = [];
-  const staffInserts: unknown[][] = [];
-  const auditInserts: unknown[][] = [];
-  const client = {
-    query: vi.fn((sql: string, params?: unknown[]): QueryResult<StaffDetailRow | StaffListRow> => {
-      if (sql.startsWith('SELECT id, role, employment_state FROM foundation.staff')) {
-        return { rows: [...listRows], rowCount: listRows.length };
-      }
-      if (sql.startsWith('SELECT id, role, employment_state, auth_version FROM foundation.staff WHERE id = $1')) {
-        const row = listRows.find((entry) => entry.id === params?.[0]);
-        return row ? { rows: [{ ...row, auth_version: 0 }], rowCount: 1 } : { rows: [], rowCount: 0 };
-      }
-      if (sql.startsWith('INSERT INTO foundation.staff')) {
-        const row: StaffDetailRow = { id: randomUUID(), role: String(params?.[1]), employment_state: 'ACTIVE', auth_version: 0 };
-        created.push(row);
-        staffInserts.push(params ?? []);
-        return { rows: [row], rowCount: 1 };
-      }
-      if (sql.startsWith('INSERT INTO foundation.audit_logs')) {
-        auditInserts.push(params ?? []);
-        return { rows: [], rowCount: 1 };
-      }
-      throw new Error(`Unexpected query in mock: ${sql}`);
-    }),
-  };
-  const auth = {
-    authenticate: vi.fn((token: string) => { if (token !== first) { throw new WebAuthError('UNAUTHORIZED'); } return Promise.resolve(identity); }),
-  };
-  const authz = {
-    authorize: vi.fn(() => Promise.resolve()),
-    read: vi.fn(<T>(fn: (client: PoolClient) => Promise<T>) => fn(client as unknown as PoolClient)),
-    authorizeForWrite: vi.fn(<T>(_token: string, _capability: string, _scope: unknown, write: (context: StaffWriteContext) => Promise<T>) =>
-      write({ client: client as unknown as PoolClient, principal })),
-  };
-  const module = await Test.createTestingModule({ controllers: controllers as never[], providers: [
-    StaffService,
-    // The real guard instance: Reflector is framework-provided; the mocked service
-    // tokens below satisfy its DI, so every test executes the actual guard code.
-    StaffWebAuthGuard,
-    { provide: WEB_AUTH_SERVICE, useValue: auth },
+// Real guard, service, controller, cookies/headers and response filter mapping. No fake SQL
+// or query-shape matching. Successful commits and persisted DTO/audit evidence are tested on PG.
+async function setup(controllers = [StaffController, NoCapabilityController], withAuthorization = true) {
+  const auth = { authenticate: vi.fn((token: string) => {
+    if (token !== first) { throw new WebAuthError('UNAUTHORIZED'); } return Promise.resolve(principal);
+  }) };
+  const authz = { authorize: vi.fn(() => Promise.resolve()), authorizeForRead: vi.fn(), authorizeForWrite: vi.fn() };
+  const mod = await Test.createTestingModule({ controllers, providers: [StaffService, StaffWebAuthGuard,
+    { provide: WEB_AUTH_SERVICE, useValue: auth }, { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin, csrfSecret: secret } },
     ...(withAuthorization ? [{ provide: AUTHORIZATION_SERVICE, useValue: authz }] : []),
-    { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin, csrfSecret } },
   ] }).compile();
-  // Nest models the structural options as a class without methods.
   // eslint-disable-next-line @typescript-eslint/no-unsafe-class-instance-assignment
-  const app = module.createNestApplication({ logger: false });
-  await app.init();
-  closers.push(() => app.close());
-  return { server: app.getHttpServer() as Server, auth, authz, client, created, staffInserts, auditInserts };
+  const app = mod.createNestApplication({ logger: false }); await app.init(); closers.push(() => app.close());
+  const server = app.getHttpServer() as Server;
+  const create = () => request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first)).set('X-CSRF-Token', csrf);
+  return { server, auth, authz, create };
 }
 
 describe('staff authorization HTTP boundary', () => {
-  it('rejects missing, malformed or duplicated session cookies with 401 before any authorization', async () => {
+  it('rejects missing, malformed, duplicate and lost sessions before authorization', async () => {
     const { server, auth, authz } = await setup();
     await request(server).get('/api/v1/staff').expect(401);
-    await request(server).get('/api/v1/staff').set('Cookie', `${cookieName}=short`).expect(401);
-    await request(server).get('/api/v1/staff').set('Cookie', `${cookie(first)}; ${cookie(first)}`).expect(401);
-    expect(auth.authenticate).not.toHaveBeenCalled();
+    for (const bad of [cookie('short'), `${cookie(first)}; ${cookie(first)}`]) { await request(server).get('/api/v1/staff').set('Cookie', bad).expect(401); }
+    expect(auth.authenticate).not.toHaveBeenCalled(); await request(server).get('/api/v1/staff').set('Cookie', cookie(stale)).expect(401);
     expect(authz.authorize).not.toHaveBeenCalled();
   });
-
-  it('maps an inactive session to 401 and skips the permission lookup', async () => {
-    const { server, authz } = await setup();
-    await request(server).get('/api/v1/staff').set('Cookie', cookie(inactive)).expect(401);
-    expect(authz.authorize).not.toHaveBeenCalled();
-  });
-
-  it('returns the staff list behind the staff.read capability guard', async () => {
-    const { server, authz } = await setup();
-    const response = await request(server).get('/api/v1/staff').set('Cookie', cookie(first)).expect(200);
-    expect(response.headers['cache-control']).toBe('no-store');
-    expect(response.body).toMatchObject({ data: { items: [{ id: existingId, role: 'MANAGER', employmentState: 'ACTIVE' }], pageInfo: { nextCursor: null, hasMore: false } } });
-    expect(JSON.stringify(response.body)).not.toContain(first);
-    expect(authz.authorize).toHaveBeenCalledOnce();
-    expect(authz.authorize).toHaveBeenCalledWith(principal, 'staff.read', GLOBAL_SCOPE);
-  });
-
-  it('rejects a forged Origin on reads before touching the database', async () => {
-    const { server, authz } = await setup();
-    for (const badOrigin of ['https://sibling.example.test', 'https://crm.example.test.evil.test', 'null']) {
-      await request(server).get('/api/v1/staff').set('Cookie', cookie(first)).set('Origin', badOrigin).expect(403);
-    }
-    expect(authz.read).not.toHaveBeenCalled();
-  });
-
-  it('denies a valid session without the capability with 403 for reads and writes', async () => {
-    const { server, authz } = await setup();
-    authz.authorize.mockRejectedValueOnce(new AuthorizationError('FORBIDDEN'));
+  it('requires exact read and write capabilities; failed preflight never enters the transaction', async () => {
+    const { server, authz, create } = await setup(); authz.authorize.mockRejectedValue(new AuthorizationError('FORBIDDEN'));
     await request(server).get('/api/v1/staff').set('Cookie', cookie(first)).expect(403);
-    expect(authz.read).not.toHaveBeenCalled();
-    authz.authorize.mockRejectedValueOnce(new AuthorizationError('FORBIDDEN'));
-    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
-      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'TECHNICIAN' }).expect(403);
-    expect(authz.authorizeForWrite).not.toHaveBeenCalled();
+    expect(authz.authorize).toHaveBeenLastCalledWith(principal, 'staff.read', GLOBAL_SCOPE);
+    await create().send({ role: 'TECHNICIAN' }).expect(403);
+    expect(authz.authorize).toHaveBeenLastCalledWith(principal, 'staff.create', GLOBAL_SCOPE);
+    expect(authz.authorizeForRead).not.toHaveBeenCalled(); expect(authz.authorizeForWrite).not.toHaveBeenCalled();
   });
-
-  it('returns one staff member by id and 404/400 for missing or malformed ids', async () => {
-    const { server } = await setup();
-    const found = await request(server).get(`/api/v1/staff/${existingId}`).set('Cookie', cookie(first)).expect(200);
-    expect(found.body).toMatchObject({ data: { id: existingId, role: 'MANAGER', employmentState: 'ACTIVE' } });
-    const missing = await request(server).get(`/api/v1/staff/${missingId}`).set('Cookie', cookie(first)).expect(404);
-    expect(JSON.stringify(missing.body)).not.toContain(first);
-    await request(server).get('/api/v1/staff/not-a-uuid').set('Cookie', cookie(first)).expect(400);
-  });
-
-  it('requires exact Origin, JSON and the session CSRF token before any write', async () => {
-    const { server, authz } = await setup();
-    const body = { role: 'TECHNICIAN' };
-    await request(server).post('/api/v1/staff').set('Origin', 'https://evil.test').set('Cookie', cookie(first))
-      .set('X-CSRF-Token', csrfFor(first)).send(body).expect(403);
-    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
-      .set('X-CSRF-Token', 'wrong').send(body).expect(403);
-    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first)).send(body).expect(403);
-    expect(authz.authorizeForWrite).not.toHaveBeenCalled();
-  });
-
-  it('rejects roles outside the pre-registered vocabulary with 400', async () => {
-    const { server, authz } = await setup();
-    for (const role of ['ADMIN', 'SUPERUSER', '']) {
-      await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
-        .set('X-CSRF-Token', csrfFor(first)).send(role ? { role } : { role: '' }).expect(400);
+  it('rejects foreign origins, missing/wrong CSRF and non-JSON without reading or writing staff data', async () => {
+    const { server, authz, create } = await setup();
+    for (const bad of ['https://sibling.example.test', 'https://crm.example.test.evil.test', 'null']) {
+      await request(server).get('/api/v1/staff').set('Origin', bad).set('Cookie', cookie(first)).expect(403);
+      await create().set('Origin', bad).send({ role: 'TECHNICIAN' }).expect(403);
     }
-    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
-      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'TECHNICIAN', extra: true }).expect(400);
-    expect(authz.authorizeForWrite).not.toHaveBeenCalled();
+    await create().set('X-CSRF-Token', 'wrong').send({ role: 'TECHNICIAN' }).expect(403);
+    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first)).send({ role: 'TECHNICIAN' }).expect(403);
+    await create().type('text').send('{}').expect(400);
+    expect(authz.authorizeForRead).not.toHaveBeenCalled(); expect(authz.authorizeForWrite).not.toHaveBeenCalled();
   });
-
-  it('creates a pre-registered staff row with audit under the locked write recheck', async () => {
-    const { server, authz, created, auditInserts } = await setup();
-    const response = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
-      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'TECHNICIAN' }).expect(201);
-    expect(response.headers['etag']).toBe('"staff-v0"');
-    const row = created[0];
-    expect(row).toMatchObject({ role: 'TECHNICIAN', employment_state: 'ACTIVE', auth_version: 0 });
-    expect(response.body).toMatchObject({ data: { id: row?.id, role: 'TECHNICIAN', employmentState: 'ACTIVE' } });
-    expect(JSON.stringify(response.body)).not.toContain(first);
-    expect(authz.authorizeForWrite).toHaveBeenCalledOnce();
-    expect(auditInserts.length).toBe(1);
-    const details = JSON.parse(String(auditInserts[0]?.[3])) as { by: string; created: string };
-    expect(details).toEqual({ by: identity.staffId, created: row?.id });
+  it('rejects unknown roles, raw ADMIN create, malformed identifiers and extra fields', async () => {
+    const { server, authz, create } = await setup();
+    for (const body of [{ role: 'ADMIN' }, { role: 'SUPERUSER' }, { role: '' }, { role: 'TECHNICIAN', extra: true }]) { await create().send(body).expect(400); }
+    await request(server).get('/api/v1/staff/not-a-uuid').set('Cookie', cookie(first)).expect(400);
+    expect(authz.authorizeForRead).not.toHaveBeenCalled(); expect(authz.authorizeForWrite).not.toHaveBeenCalled();
   });
-
-  it('maps a locked-recheck denial to 403 without leaking data', async () => {
-    const { server, authz, created } = await setup();
-    (authz.authorizeForWrite).mockRejectedValueOnce(new AuthorizationError('FORBIDDEN'));
-    const response = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
-      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'TECHNICIAN' }).expect(403);
-    expect(JSON.stringify(response.body)).not.toContain(first);
-    expect(created).toEqual([]);
+  it.each([['FORBIDDEN', 403], ['UNAUTHORIZED', 401]] as const)('maps locked recheck %s to %s and never leaks credentials', async (code, status) => {
+    const { authz, create } = await setup(); authz.authorizeForWrite.mockRejectedValueOnce(new AuthorizationError(code));
+    const r = await create().send({ role: 'TECHNICIAN' }).expect(status);
+    expect(authz.authorizeForWrite).toHaveBeenCalledOnce(); expect(JSON.stringify(r.body).includes(first)).toBe(false);
   });
-
-  it('maps a locked-recheck session loss to 401', async () => {
-    const { server, authz } = await setup();
-    (authz.authorizeForWrite).mockRejectedValueOnce(new AuthorizationError('UNAUTHORIZED'));
-    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
-      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'MANAGER' }).expect(401);
-  });
-
-  it('fails closed with 500 when a guarded route lacks capability metadata', async () => {
-    const { server } = await setup([NoCapabilityController]);
-    // The real guard runs; missing @RequireCapability is a programming error and
-    // must never silently authorize the request.
-    await request(server).get('/test/no-metadata').set('Cookie', cookie(first)).expect(500);
-  });
-
-  it('does not silently skip authorization when the guard dependency is missing', async () => {
-    // Without AUTHORIZATION_SERVICE the application cannot even initialize:
-    // Nest fails during module compilation (fail-fast at startup), proving a
-    // missing guard dependency can never degrade into unauthenticated access.
-    await expect(setup([StaffController], false)).rejects.toThrow(/can't resolve dependencies/i);
+  it('fails closed on missing capability metadata or a missing authorization dependency', async () => {
+    const { server, authz } = await setup(); await request(server).get('/test/no-metadata').set('Cookie', cookie(first)).expect(500);
+    expect(authz.authorize).not.toHaveBeenCalled(); await expect(setup([StaffController], false)).rejects.toThrow(/can't resolve dependencies/i);
   });
 });

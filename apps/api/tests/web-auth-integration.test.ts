@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { WebAuthService } from '../src/auth/web-auth.service.js';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { recoverAdmin } from '../src/staff/recovery.js';
+import { inFixtureTransaction, insertWebStaff, migrateAuthFixture, reassignFixture, spareAdmin } from './auth-db-fixture.js';
 
 // Explicit opt-in only: create a random database, never alter or drop the dev database.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
@@ -14,14 +15,6 @@ const oldPassword = 'Synthetic-Web-Old-Password-2026!';
 const newPassword = 'Synthetic-Web-New-Password-2026!';
 const recoveredPassword = 'Synthetic-Web-Recovered-Password-2026!';
 const login = `web-${randomBytes(12).toString('hex')}`;
-const migrations = [
-  '20261120000100_technical_audit_outbox',
-  '20261120000200_technical_outbox_attempts',
-  '20261120000300_technical_outbox_leases',
-  '20261120000400_staff_identity',
-  '20261120000500_web_auth',
-  '20261120000600_authorization',
-];
 const digest = (token: string) => createHash('sha256').update(token).digest('hex');
 
 integration('web authentication against isolated PostgreSQL', () => {
@@ -33,6 +26,7 @@ integration('web authentication against isolated PostgreSQL', () => {
   const pools: Pool[] = [];
   let service: WebAuthService;
   let staffId: string;
+  let spare: string;
   let sourceSequence = 0;
   const source = () => `synthetic-source-${String(++sourceSequence)}`;
 
@@ -44,7 +38,7 @@ integration('web authentication against isolated PostgreSQL', () => {
     const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
     if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
     const connection = { host: '127.0.0.1', port: 55432 };
-    admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
+    admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     const database = `fixlevelup_web_auth_test_${randomBytes(12).toString('hex')}`;
     await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
@@ -53,14 +47,12 @@ integration('web authentication against isolated PostgreSQL', () => {
     fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
     clients.push(fixture);
     await fixture.connect();
-    await fixture.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
-    for (const migration of migrations) {
-      await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
-    }
+    await migrateAuthFixture(fixture, database);
     migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
     runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword });
     pools.push(migrator, runtime);
     ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));
+    spare = await spareAdmin(fixture, staffId);
     service = new WebAuthService(runtime, { throttleSecret: randomBytes(32) });
   }, 30000);
 
@@ -78,7 +70,7 @@ integration('web authentication against isolated PostgreSQL', () => {
 
   it('uses runtime grants and denies privileged staff writes', async () => {
     await expect(runtime.query('SELECT id FROM foundation.staff WHERE id = $1', [staffId])).resolves.toMatchObject({ rowCount: 1 });
-    await expect(runtime.query("UPDATE foundation.staff SET role = 'TECHNICIAN' WHERE id = $1", [staffId])).rejects.toMatchObject({ code: '42501' });
+    await expect(runtime.query("UPDATE foundation.staff SET id=id WHERE id = $1", [staffId])).rejects.toMatchObject({ code: '42501' });
     await expect(runtime.query('SELECT * FROM foundation.staff_bootstrap_marker')).rejects.toMatchObject({ code: '42501' });
   });
 
@@ -92,10 +84,10 @@ integration('web authentication against isolated PostgreSQL', () => {
     try {
       await fixture.query("UPDATE foundation.staff SET employment_state = 'INACTIVE' WHERE id = $1", [staffId]);
       await expect(service.login(login, oldPassword, source())).rejects.toMatchObject({ code: 'INVALID_CREDENTIALS' });
-      await fixture.query("UPDATE foundation.staff SET employment_state = 'ACTIVE', role = 'TECHNICIAN' WHERE id = $1", [staffId]);
+      await reassignFixture(fixture, staffId, 'TECHNICIAN', spare);
       await expect(service.login(login, oldPassword, source())).rejects.toMatchObject({ code: 'INVALID_CREDENTIALS' });
     } finally {
-      await fixture.query("UPDATE foundation.staff SET employment_state = 'ACTIVE', role = 'ADMIN' WHERE id = $1", [staffId]);
+      await reassignFixture(fixture, staffId, 'ADMIN', spare);
     }
   }, 30000);
 
@@ -181,13 +173,15 @@ integration('web authentication against isolated PostgreSQL', () => {
       }
       await expect(service.authenticate(token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
     }
-    for (const update of ["employment_state = 'INACTIVE'", "role = 'TECHNICIAN'", 'auth_version = auth_version + 1']) {
+    for (const reason of ['inactive', 'technician', 'version']) {
       const { token } = await service.login(login, oldPassword, source());
       try {
-        await fixture.query(`UPDATE foundation.staff SET ${update} WHERE id = $1`, [staffId]);
+        if (reason === 'technician') { await reassignFixture(fixture, staffId, 'TECHNICIAN', spare); }
+        else if (reason === 'inactive') { await fixture.query("UPDATE foundation.staff SET employment_state='INACTIVE' WHERE id=$1", [staffId]); }
+        else { await fixture.query('UPDATE foundation.staff SET auth_version=auth_version+1 WHERE id=$1', [staffId]); }
         await expect(service.authenticate(token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
       } finally {
-        await fixture.query("UPDATE foundation.staff SET employment_state = 'ACTIVE', role = 'ADMIN' WHERE id = $1", [staffId]);
+        await reassignFixture(fixture, staffId, 'ADMIN', spare);
       }
     }
   }, 30000);
@@ -243,11 +237,8 @@ integration('web authentication against isolated PostgreSQL', () => {
     }
     const limited = new WebAuthService(runtime, { throttleSecret: randomBytes(32), sourceLimit: 5 });
     const shared = source();
-    // Make a second synthetic staff member with the same synthetic password hash.
-    const otherId = randomUUID();
     const otherLogin = `${login}-second`;
-    await fixture.query("INSERT INTO foundation.staff (id, role, employment_state) VALUES ($1, 'MANAGER', 'ACTIVE')", [otherId]);
-    await fixture.query('INSERT INTO foundation.staff_web_credentials (staff_id, login, password_hash) SELECT $1, $2, password_hash FROM foundation.staff_web_credentials WHERE staff_id = $3', [otherId, otherLogin, staffId]);
+    await inFixtureTransaction(fixture, () => insertWebStaff(fixture, 'MANAGER', otherLogin, oldPassword, spare));
     const other = await limited.login(otherLogin, oldPassword, source());
     for (let i = 0; i < 3; i++) {
       await expect(limited.changePassword(session.token, 'Synthetic-Wrong-Password!', newPassword, shared, session.authVersion + 6)).rejects.toMatchObject({ code: 'INVALID_CREDENTIALS' });

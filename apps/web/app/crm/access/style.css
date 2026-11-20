@@ -1,0 +1,21 @@
+.desk { color: #142b37; max-width: 55rem; margin: 2rem auto; padding: 0 1rem 4rem; font: 1rem/1.5 system-ui, sans-serif; overflow-wrap: anywhere; }
+.desk h1, .desk h2, .desk h3 { line-height: 1.2; }
+.desk .eyebrow { color: #455763; font-weight: 650; }
+.desk header { border-bottom: .2rem solid #20675f; margin-bottom: 1rem; }
+.desk .workspace { border: none; padding: 0; margin: 0; min-width: 0; }
+.desk .panel, .desk details { border: 1px solid #afc2c7; border-radius: .45rem; padding: 1rem; margin: 1rem 0; }
+.desk form, .desk .actions-stack { display: grid; gap: .6rem; justify-items: start; margin: 1rem 0; }
+.desk label { display: grid; gap: .2rem; max-width: 100%; }
+.desk input:not([type=checkbox]), .desk textarea, .desk select { box-sizing: border-box; max-width: 100%; font: inherit; padding: .35rem; }
+.desk input:not([type=checkbox]), .desk textarea { width: min(28rem, 68vw); }
+.desk button { font: inherit; color: #103c39; background: #edf6f3; border: 1px solid #7c9c97; border-radius: .25rem; padding: .35rem .65rem; cursor: pointer; }
+.desk button[aria-pressed=true] { background: #155e56; color: white; }
+.desk button:disabled { color: #54626a; background: #eee; cursor: default; }
+.desk nav, .desk .actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+.desk .danger { color: #761e18; background: #fff2ef; }
+.desk .notice { border-left: .3rem solid #856300; padding: .6rem; background: #fffae9; }
+.desk .permission { display: flex; align-items: start; margin: .45rem 0; }
+.desk small { display: block; color: #465961; }
+.desk ul { padding-inline-start: 1.2rem; }.desk li { margin-bottom: .35rem; }
+.desk dt { font-weight: 650; }.desk dd { margin-inline-start: 0; margin-bottom: .4rem; }
+.desk fieldset { min-width: 0; }.desk summary { cursor: pointer; }

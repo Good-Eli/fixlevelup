@@ -1,118 +1,99 @@
-import { randomUUID } from 'node:crypto';
-import {
-  BadRequestException, Controller, ForbiddenException, Get, Header, HttpCode, Inject, Injectable,
-  InternalServerErrorException, NotFoundException, Param, Post, Req, Res, UnauthorizedException, UseGuards,
-} from '@nestjs/common';
-import type { PoolClient } from 'pg';
+import { BadRequestException, Controller, Get, Header, HttpCode, Inject, Injectable, Param, Patch, Post, Put, Req, Res, UseGuards } from '@nestjs/common';
 import type { ServerResponse } from 'node:http';
 import { WEB_AUTH_HTTP_CONFIG } from '../auth/web-auth.controller.js';
 import type { WebAuthHttpConfig } from '../auth/web-auth.controller.js';
-import { bodyFields, envelope, etag, expectExactOrigin, requireMutation, sessionToken } from '../auth/http.js';
-import type { StaffRequest } from '../auth/http.js';
-import { AuthorizationError } from '../authz/authorization.service.js';
-import type { AuthorizationServiceApi } from '../authz/authorization.service.js';
-import { AUTHORIZATION_SERVICE } from '../authz/authorization.resources.js';
+import { bodyFields, envelope, etag } from '../auth/http.js';
 import { StaffWebAuthGuard } from '../authz/authorization.guard.js';
-import type { AuthorizedRequest } from '../authz/authorization.guard.js';
+import { StaffTelegramAuthGuard } from '../authz/telegram-auth.guard.js';
 import { RequireCapability } from '../authz/require-capability.decorator.js';
-import { GLOBAL_SCOPE } from '../authz/capability.js';
+import { authFailure, expectedVersion, mutation, proof, readOrigin, uuid } from '../authz/rbac-http.js';
+import type { RbacRequest } from '../authz/rbac-http.js';
+import { displayName } from './staff-policy.js';
+import { StaffService } from './staff.service.js';
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-type StaffRoleValue = 'ADMIN' | 'MANAGER' | 'TECHNICIAN';
-interface StaffListRow { id: string; role: StaffRoleValue; employment_state: 'ACTIVE' | 'INACTIVE' }
-interface StaffRow { id: string; role: StaffRoleValue; employment_state: 'ACTIVE' | 'INACTIVE'; auth_version: number }
-function toDto(row: StaffListRow): { id: string; role: StaffRoleValue; employmentState: 'ACTIVE' | 'INACTIVE' } {
-  return { id: row.id, role: row.role, employmentState: row.employment_state };
+export { StaffService } from './staff.service.js';
+export function staffResult<T extends { version: number }>(res: ServerResponse, value: T) {
+  res.setHeader('ETag', etag(value.version));
+  return envelope(value);
 }
-/** Service authorization errors map to safe statuses; anything else propagates to the filter. */
-function mapAuthorizationError(error: unknown): never {
-  if (!(error instanceof AuthorizationError)) { throw error; }
-  switch (error.code) {
-    case 'UNAUTHORIZED': throw new UnauthorizedException();
-    case 'FORBIDDEN': throw new ForbiddenException();
-    default: throw new InternalServerErrorException();
-  }
+export function profileBody(body: unknown): string { return displayName(bodyFields(body, ['displayName'])['displayName']); }
+function createBody(body: unknown) {
+  const withName = body !== null && typeof body === 'object' && Object.hasOwn(body, 'displayName');
+  const fields = bodyFields(body, withName ? ['role', 'displayName'] : ['role']);
+  const role = fields['role'];
+  if (role !== 'MANAGER' && role !== 'TECHNICIAN') { throw new BadRequestException(); }
+  return { role, displayName: withName ? displayName(fields['displayName']) : null } as const;
 }
 
-/** Staff data access on the authorization pool. Reads run lockless after the guard's
- * checks; the create write runs inside authorizeForWrite under the staff→session lock order.
- */
+/** No client-controlled owner ID. proof() and service transaction both verify
+ * the actual channel; an absent guard cannot result in a data read or mutation. */
+function selfTarget(req: RbacRequest) {
+  return { kind: 'self', id: uuid(req.principal?.staffId) } as const;
+}
+
+/** Thin transport adapter. Concrete controllers have disjoint paths and guards;
+ * neither the channel nor inherited route metadata implies an RBAC permission. */
 @Injectable()
-export class StaffService {
-  constructor(@Inject(AUTHORIZATION_SERVICE) private readonly authorization: AuthorizationServiceApi) {}
-
-  async list(): Promise<StaffListRow[]> {
-    return this.authorization.read(async (client: PoolClient) =>
-      (await client.query<StaffListRow>('SELECT id, role, employment_state FROM foundation.staff ORDER BY id')).rows);
-  }
-
-  async get(id: string): Promise<StaffRow> {
-    return this.authorization.read(async (client: PoolClient) => {
-      const result = await client.query<StaffRow>('SELECT id, role, employment_state, auth_version FROM foundation.staff WHERE id = $1', [id]);
-      const row = result.rows[0];
-      if (!row) { throw new NotFoundException(); }
-      return row;
-    });
-  }
-
-  async create(token: string, actorStaffId: string, role: 'MANAGER' | 'TECHNICIAN'): Promise<StaffRow> {
-    return this.authorization.authorizeForWrite(token, 'staff.manage', GLOBAL_SCOPE, async ({ client }) => {
-      const result = await client.query<StaffRow>(
-        `INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, $2, 'ACTIVE', 0)
-         RETURNING id, role, employment_state, auth_version`, [randomUUID(), role]);
-      const row = result.rows[0];
-      if (!row) { throw new AuthorizationError('FAILED'); }
-      await client.query('INSERT INTO foundation.audit_logs (id, operation, correlation_id, details) VALUES ($1, $2, $3, $4::jsonb)',
-        [randomUUID(), 'STAFF_CREATED', randomUUID(), JSON.stringify({ by: actorStaffId, created: row.id })]);
-      return row;
-    });
-  }
-}
-
-/** Staff routes behind the shared capability guard; 401 without a session, 403 without
- * the capability, 404 for a missing staff id. POST /staff is a plain pre-registered
- * profile INSERT without Idempotency-Key (lead decision): no external side effects,
- * a repeat creates a second staff row.
- */
-@Controller('api/v1/staff')
-@UseGuards(StaffWebAuthGuard)
-export class StaffController {
-  constructor(
-    private readonly staff: StaffService,
-    @Inject(WEB_AUTH_HTTP_CONFIG) private readonly config: WebAuthHttpConfig,
-  ) {}
+abstract class StaffHttpAdapter {
+  constructor(@Inject(StaffService) private readonly staff: StaffService, @Inject(WEB_AUTH_HTTP_CONFIG) private readonly config: WebAuthHttpConfig) {}
 
   @Get() @RequireCapability('staff.read') @Header('Cache-Control', 'no-store')
-  async list(@Req() req: AuthorizedRequest) {
-    expectExactOrigin(req, this.config.origin);
-    try {
-      const items = (await this.staff.list()).map(toDto);
-      return envelope({ items, pageInfo: { nextCursor: null, hasMore: false } });
-    } catch (error) { return mapAuthorizationError(error); }
+  async list(@Req() req: RbacRequest) {
+    readOrigin(req, this.config);
+    const items = await this.staff.list(proof(req)).catch(authFailure);
+    return envelope({ items, pageInfo: { nextCursor: null, hasMore: false } });
   }
-
+  // Nest registers handlers in declaration order: fixed /self paths precede /:id.
+  @Get('self') @RequireCapability('staff.self.read') @Header('Cache-Control', 'no-store')
+  async getSelf(@Req() req: RbacRequest, @Res({ passthrough: true }) res: ServerResponse) {
+    readOrigin(req, this.config);
+    return staffResult(res, await this.staff.get(proof(req), selfTarget(req)).catch(authFailure));
+  }
+  @Patch('self') @RequireCapability('staff.self.update') @Header('Cache-Control', 'no-store')
+  async updateSelf(@Req() req: RbacRequest, @Res({ passthrough: true }) res: ServerResponse) {
+    mutation(req, this.config);
+    return staffResult(res, await this.staff.update(proof(req), selfTarget(req), expectedVersion(req, 'staff'), profileBody(req.body)).catch(authFailure));
+  }
+  @Post('self/deactivate') @HttpCode(200) @RequireCapability('staff.self.deactivate') @Header('Cache-Control', 'no-store')
+  async deactivateSelf(@Req() req: RbacRequest, @Res({ passthrough: true }) res: ServerResponse) {
+    mutation(req, this.config);
+    bodyFields(req.body, []);
+    return staffResult(res, await this.staff.deactivate(proof(req), selfTarget(req), expectedVersion(req, 'staff')).catch(authFailure));
+  }
   @Get(':id') @RequireCapability('staff.read') @Header('Cache-Control', 'no-store')
-  async get(@Req() req: AuthorizedRequest, @Param('id') id: string) {
-    expectExactOrigin(req, this.config.origin);
-    if (!UUID.test(id)) { throw new BadRequestException(); }
-    try {
-      return envelope(toDto(await this.staff.get(id)));
-    } catch (error) { return mapAuthorizationError(error); }
+  async get(@Req() req: RbacRequest, @Param('id') id: string, @Res({ passthrough: true }) res: ServerResponse) {
+    readOrigin(req, this.config);
+    return staffResult(res, await this.staff.get(proof(req), { kind: 'general', id: uuid(id) }).catch(authFailure));
   }
-
-  @Post() @HttpCode(201) @RequireCapability('staff.manage') @Header('Cache-Control', 'no-store')
-  async create(@Req() req: StaffRequest & AuthorizedRequest, @Res({ passthrough: true }) res: ServerResponse) {
-    const token = req.sessionToken ?? sessionToken(req);
-    requireMutation(req, token, this.config);
-    const fields = bodyFields(req.body, ['role']);
-    const role = fields['role'];
-    if (role !== 'MANAGER' && role !== 'TECHNICIAN') { throw new BadRequestException(); }
-    const actor = req.principal;
-    if (!actor) { throw new AuthorizationError('FAILED'); }
-    try {
-      const created = await this.staff.create(token, actor.staffId, role);
-      res.setHeader('ETag', etag(created.auth_version));
-      return envelope({ id: created.id, role: created.role, employmentState: created.employment_state });
-    } catch (error) { return mapAuthorizationError(error); }
+  @Post() @HttpCode(201) @RequireCapability('staff.create') @Header('Cache-Control', 'no-store')
+  async create(@Req() req: RbacRequest, @Res({ passthrough: true }) res: ServerResponse) {
+    mutation(req, this.config);
+    const { role, displayName: name } = createBody(req.body);
+    return staffResult(res, await this.staff.create(proof(req), role, name).catch(authFailure));
+  }
+  @Patch(':id') @RequireCapability('staff.update') @Header('Cache-Control', 'no-store')
+  async update(@Req() req: RbacRequest, @Param('id') id: string, @Res({ passthrough: true }) res: ServerResponse) {
+    mutation(req, this.config);
+    return staffResult(res, await this.staff.update(proof(req), { kind: 'general', id: uuid(id) }, expectedVersion(req, 'staff'), profileBody(req.body)).catch(authFailure));
+  }
+  @Post(':id/deactivate') @HttpCode(200) @RequireCapability('staff.deactivate') @Header('Cache-Control', 'no-store')
+  async deactivate(@Req() req: RbacRequest, @Param('id') id: string, @Res({ passthrough: true }) res: ServerResponse) {
+    mutation(req, this.config);
+    bodyFields(req.body, []);
+    return staffResult(res, await this.staff.deactivate(proof(req), { kind: 'general', id: uuid(id) }, expectedVersion(req, 'staff')).catch(authFailure));
+  }
+  @Put(':id/role') @HttpCode(200) @RequireCapability('staff.role.assign') @Header('Cache-Control', 'no-store')
+  async assign(@Req() req: RbacRequest, @Param('id') id: string, @Res({ passthrough: true }) res: ServerResponse) {
+    mutation(req, this.config);
+    const roleId = uuid(bodyFields(req.body, ['roleId'])['roleId']);
+    return staffResult(res, await this.staff.assign(proof(req), uuid(id), expectedVersion(req, 'staff'), roleId).catch(authFailure));
   }
 }
+
+@Controller('api/v1/staff')
+@UseGuards(StaffWebAuthGuard)
+export class StaffController extends StaffHttpAdapter {}
+
+@Controller('api/v1/telegram/staff')
+@UseGuards(StaffTelegramAuthGuard)
+export class TelegramStaffController extends StaffHttpAdapter {}

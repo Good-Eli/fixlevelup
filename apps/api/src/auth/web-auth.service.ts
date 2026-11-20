@@ -145,7 +145,7 @@ export class WebAuthService {
   private async lockedSession(client: PoolClient, token: string): Promise<SessionRow> {
     if (typeof token !== 'string' || !TOKEN.test(token)) { throw new WebAuthError('UNAUTHORIZED'); }
     const digest = hashToken(token);
-    const candidate = await client.query<{ staff_id: string }>('SELECT staff_id FROM foundation.web_sessions WHERE token_hash = $1', [digest]);
+    const candidate = await client.query<{ staff_id: string }>("SELECT staff_id FROM foundation.web_sessions WHERE token_hash = $1 AND channel = 'CRM'", [digest]);
     const staffId = candidate.rows[0]?.staff_id;
     if (!staffId) { throw new WebAuthError('UNAUTHORIZED'); }
     const staff = await client.query<{ id: string }>("SELECT id FROM foundation.staff WHERE id = $1 AND employment_state = 'ACTIVE' AND role IN ('ADMIN', 'MANAGER') FOR UPDATE", [staffId]);
@@ -153,7 +153,7 @@ export class WebAuthService {
     const result = await client.query<SessionRow>(
       `SELECT ws.id, ws.staff_id, s.role, s.auth_version, ws.idle_expires_at, ws.absolute_expires_at
        FROM foundation.web_sessions ws JOIN foundation.staff s ON s.id = ws.staff_id
-       WHERE ws.token_hash = $1 AND ws.staff_id = $2 AND ws.revoked_at IS NULL
+       WHERE ws.token_hash = $1 AND ws.staff_id = $2 AND ws.channel = 'CRM' AND ws.revoked_at IS NULL
          AND ws.idle_expires_at > clock_timestamp() AND ws.absolute_expires_at > clock_timestamp()
          AND ws.auth_version = s.auth_version AND s.employment_state = 'ACTIVE' AND s.role IN ('ADMIN', 'MANAGER')
        FOR UPDATE OF ws`, [digest, staffId]);

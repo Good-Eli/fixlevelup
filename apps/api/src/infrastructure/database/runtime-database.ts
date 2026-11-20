@@ -168,7 +168,26 @@ export class RuntimeDatabase implements OnModuleDestroy {
         ('user_permissions','capability','varchar',true,68), ('user_permissions','scope','varchar',true,20),
         ('user_permissions','valid_from','timestamptz',true,6), ('user_permissions','valid_until','timestamptz',false,6),
         ('user_permissions','revoked_at','timestamptz',false,6), ('user_permissions','granted_by','uuid',false,-1),
-        ('user_permissions','created_at','timestamptz',true,6)
+        ('user_permissions','created_at','timestamptz',true,6),
+        ('staff_telegram_links','id','uuid',true,-1), ('staff_telegram_links','staff_id','uuid',true,-1),
+        ('staff_telegram_links','telegram_user_id','int8',true,-1),
+        ('staff_telegram_links','username','varchar',false,68), ('staff_telegram_links','linked_by','uuid',false,-1),
+        ('staff_telegram_links','created_at','timestamptz',true,6), ('staff_telegram_links','revoked_at','timestamptz',false,6),
+        ('web_sessions','channel','varchar',true,20), ('web_sessions','initdata_digest','varchar',false,68),
+        ('web_sessions','initdata_exchanged_at','timestamptz',false,6), ('web_sessions','telegram_link_id','uuid',false,-1),
+        ('staff','display_name','varchar',false,84), ('staff','profile_version','int4',true,-1),
+        ('permissions','code','varchar',true,68), ('permissions','module','varchar',true,36), ('permissions','description','varchar',true,504),
+        ('permissions','protected','bool',true,-1), ('permissions','active','bool',true,-1),
+        ('roles','id','uuid',true,-1), ('roles','code','varchar',true,68), ('roles','name','varchar',true,84),
+        ('roles','description','varchar',true,504), ('roles','role_type','varchar',true,20), ('roles','status','varchar',true,20),
+        ('roles','version','int4',true,-1), ('roles','created_at','timestamptz',true,6), ('roles','updated_at','timestamptz',true,6),
+        ('roles','created_by','uuid',false,-1), ('roles','updated_by','uuid',false,-1),
+        ('role_permissions','role_id','uuid',true,-1), ('role_permissions','permission_code','varchar',true,68),
+        ('role_permissions','scope_type','varchar',true,20), ('role_permissions','enabled','bool',true,-1),
+        ('staff_role_assignments','id','uuid',true,-1), ('staff_role_assignments','staff_id','uuid',true,-1),
+        ('staff_role_assignments','role_id','uuid',true,-1), ('staff_role_assignments','assigned_at','timestamptz',true,6),
+        ('staff_role_assignments','assigned_by','uuid',false,-1), ('staff_role_assignments','revoked_at','timestamptz',false,6),
+        ('staff_role_assignments','revoked_by','uuid',false,-1)
       ), required_privileges(table_name, column_name, privilege) AS (VALUES
         ('staff','id','SELECT'), ('staff','role','SELECT'), ('staff','employment_state','SELECT'), ('staff','auth_version','SELECT'), ('staff','auth_version','UPDATE'),
         ('staff','id','INSERT'), ('staff','role','INSERT'), ('staff','employment_state','INSERT'), ('staff','auth_version','INSERT'),
@@ -180,12 +199,36 @@ export class RuntimeDatabase implements OnModuleDestroy {
         ('web_auth_attempts','id','SELECT'), ('web_auth_attempts','key_hash','SELECT'), ('web_auth_attempts','reserved_at','SELECT'), ('web_auth_attempts','expires_at','SELECT'), ('web_auth_attempts','failed_at','SELECT'), ('web_auth_attempts','completed_at','SELECT'),
         ('web_auth_attempts','id','INSERT'), ('web_auth_attempts','key_hash','INSERT'), ('web_auth_attempts','reserved_at','INSERT'), ('web_auth_attempts','expires_at','INSERT'), ('web_auth_attempts','failed_at','INSERT'), ('web_auth_attempts','completed_at','INSERT'),
         ('web_auth_attempts','expires_at','UPDATE'), ('web_auth_attempts','failed_at','UPDATE'), ('web_auth_attempts','completed_at','UPDATE'),
-        ('user_permissions','id','SELECT'), ('user_permissions','staff_id','SELECT'), ('user_permissions','capability','SELECT'), ('user_permissions','scope','SELECT'),
-        ('user_permissions','valid_from','SELECT'), ('user_permissions','valid_until','SELECT'), ('user_permissions','revoked_at','SELECT'), ('user_permissions','granted_by','SELECT'), ('user_permissions','created_at','SELECT'),
-        ('user_permissions','id','INSERT'), ('user_permissions','staff_id','INSERT'), ('user_permissions','capability','INSERT'), ('user_permissions','scope','INSERT'),
-        ('user_permissions','valid_from','INSERT'), ('user_permissions','valid_until','INSERT'), ('user_permissions','granted_by','INSERT'), ('user_permissions','created_at','INSERT'),
-        ('user_permissions','valid_until','UPDATE'), ('user_permissions','revoked_at','UPDATE')
+        ('staff','display_name','SELECT'), ('staff','profile_version','SELECT'), ('staff','display_name','INSERT'),
+        ('staff','display_name','UPDATE'), ('staff','role','UPDATE'), ('staff','profile_version','UPDATE'),
+        ('staff','employment_state','UPDATE'),
+        ('staff_telegram_links','id','SELECT'), ('staff_telegram_links','staff_id','SELECT'),
+        ('staff_telegram_links','telegram_user_id','SELECT'), ('staff_telegram_links','username','SELECT'),
+        ('staff_telegram_links','linked_by','SELECT'), ('staff_telegram_links','created_at','SELECT'),
+        ('staff_telegram_links','revoked_at','SELECT'),
+        ('staff_telegram_links','revoked_at','UPDATE'), ('staff_telegram_links','username','UPDATE'),
+        ('web_sessions','channel','SELECT'), ('web_sessions','initdata_digest','SELECT'),
+        ('web_sessions','initdata_exchanged_at','SELECT'), ('web_sessions','telegram_link_id','SELECT'),
+        ('web_sessions','channel','INSERT'), ('web_sessions','initdata_digest','INSERT'),
+        ('web_sessions','initdata_exchanged_at','INSERT'), ('web_sessions','telegram_link_id','INSERT'),
+        ('roles','id','INSERT'), ('roles','code','INSERT'), ('roles','name','INSERT'), ('roles','description','INSERT'), ('roles','created_by','INSERT'), ('roles','updated_by','INSERT'),
+        ('roles','name','UPDATE'), ('roles','description','UPDATE'), ('roles','status','UPDATE'), ('roles','version','UPDATE'), ('roles','updated_at','UPDATE'), ('roles','updated_by','UPDATE'),
+        ('role_permissions','role_id','INSERT'), ('role_permissions','permission_code','INSERT'), ('role_permissions','enabled','INSERT'), ('role_permissions','scope_type','INSERT'),
+        ('role_permissions','enabled','UPDATE'),
+        ('staff_role_assignments','id','INSERT'), ('staff_role_assignments','staff_id','INSERT'), ('staff_role_assignments','role_id','INSERT'), ('staff_role_assignments','assigned_by','INSERT'),
+        ('staff_role_assignments','revoked_at','UPDATE'), ('staff_role_assignments','revoked_by','UPDATE')
+        UNION ALL SELECT table_name, column_name, 'SELECT' FROM expected_columns
+          WHERE table_name IN ('roles','permissions','role_permissions','staff_role_assignments')
       ), expected_constraints(table_name, name, kind) AS (VALUES
+        ('staff_web_credentials','staff_web_credentials_supported_check','c'),
+        ('permissions','permissions_pkey','p'), ('permissions','permissions_metadata_check','c'), ('permissions','permissions_protected_active_check','c'),
+        ('roles','roles_pkey','p'), ('roles','roles_identity_check','c'), ('roles','roles_metadata_check','c'),
+        ('role_permissions','role_permissions_pkey','p'), ('role_permissions','role_permissions_role_id_fkey','f'),
+        ('role_permissions','role_permissions_permission_code_fkey','f'), ('role_permissions','role_permissions_scope_check','c'),
+        ('staff_role_assignments','staff_role_assignments_pkey','p'), ('staff_role_assignments','staff_role_assignments_staff_id_fkey','f'),
+        ('staff_role_assignments','staff_role_assignments_role_id_fkey','f'), ('staff_role_assignments','staff_role_assignments_assigned_by_fkey','f'),
+        ('staff_role_assignments','staff_role_assignments_revoked_by_fkey','f'), ('staff_role_assignments','staff_role_assignments_period_check','c'),
+        ('staff_role_assignments','staff_role_assignments_actor_check','c'), ('staff','staff_display_name_check','c'), ('staff','staff_profile_version_check','c'),
         ('staff','staff_pkey','p'), ('staff','staff_role_check','c'), ('staff','staff_employment_state_check','c'), ('staff','staff_auth_version_check','c'),
         ('staff_web_credentials','staff_web_credentials_pkey','p'), ('staff_web_credentials','staff_web_credentials_staff_id_fkey','f'), ('staff_web_credentials','staff_web_credentials_login_check','c'), ('staff_web_credentials','staff_web_credentials_password_hash_check','c'),
         ('staff_bootstrap_marker','staff_bootstrap_marker_pkey','p'), ('staff_bootstrap_marker','staff_bootstrap_marker_singleton_check','c'), ('staff_bootstrap_marker','staff_bootstrap_marker_staff_id_fkey','f'),
@@ -193,12 +236,18 @@ export class RuntimeDatabase implements OnModuleDestroy {
         ('web_auth_throttles','web_auth_throttles_pkey','p'), ('web_auth_throttles','web_auth_throttles_key_hash_check','c'),
         ('web_auth_attempts','web_auth_attempts_pkey','p'), ('web_auth_attempts','web_auth_attempts_key_hash_fkey','f'), ('web_auth_attempts','web_auth_attempts_expiry_check','c'), ('web_auth_attempts','web_auth_attempts_completion_check','c'),
         ('user_permissions','user_permissions_pkey','p'), ('user_permissions','user_permissions_staff_id_fkey','f'), ('user_permissions','user_permissions_granted_by_fkey','f'),
-        ('user_permissions','user_permissions_capability_check','c'), ('user_permissions','user_permissions_scope_check','c'), ('user_permissions','user_permissions_validity_check','c'), ('user_permissions','user_permissions_revoked_at_check','c')
+        ('user_permissions','user_permissions_capability_check','c'), ('user_permissions','user_permissions_scope_check','c'), ('user_permissions','user_permissions_validity_check','c'), ('user_permissions','user_permissions_revoked_at_check','c'),
+        ('staff_telegram_links','staff_telegram_links_pkey','p'), ('staff_telegram_links','staff_telegram_links_staff_id_fkey','f'), ('staff_telegram_links','staff_telegram_links_linked_by_fkey','f'),
+        ('staff_telegram_links','staff_telegram_links_telegram_user_id_check','c'), ('staff_telegram_links','staff_telegram_links_username_check','c'), ('staff_telegram_links','staff_telegram_links_revoked_at_check','c'),
+        ('web_sessions','web_sessions_channel_check','c'), ('web_sessions','web_sessions_initdata_digest_check','c'), ('web_sessions','web_sessions_channel_pair_check','c'),
+        ('web_sessions','web_sessions_initdata_exchanged_at_check','c'), ('web_sessions','web_sessions_telegram_link_id_fkey','f')
       ), expected_indexes(table_name, name, unique_index, columns) AS (VALUES
         ('staff_web_credentials','staff_web_credentials_login_key',true,'login'), ('staff_bootstrap_marker','staff_bootstrap_marker_staff_id_key',true,'staff_id'),
         ('web_sessions','web_sessions_token_hash_key',true,'token_hash'), ('web_sessions','web_sessions_staff_id_idx',false,'staff_id'), ('web_sessions','web_sessions_absolute_expiry_idx',false,'absolute_expires_at'),
         ('web_auth_attempts','web_auth_attempts_key_expiry_idx',false,'key_hash, expires_at'), ('web_auth_attempts','web_auth_attempts_expiry_idx',false,'expires_at'),
-        ('user_permissions','user_permissions_staff_id_idx',false,'staff_id')
+        ('user_permissions','user_permissions_staff_id_idx',false,'staff_id'),
+        ('staff_telegram_links','staff_telegram_links_staff_id_idx',false,'staff_id'),
+        ('roles','roles_code_key',true,'code'), ('staff_role_assignments','staff_role_assignments_role_staff_idx',false,'role_id, staff_id')
       )
       SELECT
         NOT EXISTS (SELECT 1 FROM expected_columns e WHERE NOT EXISTS (
@@ -207,12 +256,12 @@ export class RuntimeDatabase implements OnModuleDestroy {
             AND t.typname=e.type_name AND a.attnotnull=e.not_null AND a.atttypmod=e.modifier))
         AND NOT EXISTS (SELECT 1 FROM required_privileges e WHERE NOT has_column_privilege(current_user, format('foundation.%I',e.table_name), e.column_name,e.privilege))
         AND NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT table_name FROM expected_columns) e
-          WHERE has_table_privilege(current_user,format('foundation.%I',e.table_name),'DELETE,TRUNCATE,REFERENCES,TRIGGER'))
+          WHERE has_table_privilege(current_user,format('foundation.%I',e.table_name),'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN'))
         AND NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT table_name FROM expected_columns) e
           JOIN pg_namespace n ON n.nspname='foundation' JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=e.table_name
           JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
           CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')) p(privilege)
-          WHERE has_column_privilege(current_user,c.oid,a.attname,p.privilege)
+          WHERE has_column_privilege(current_user,c.oid,a.attname,p.privilege || ' WITH GRANT OPTION') OR has_column_privilege(current_user,c.oid,a.attname,p.privilege)
             AND NOT EXISTS (SELECT 1 FROM required_privileges r WHERE r.table_name=e.table_name AND r.column_name=a.attname AND r.privilege=p.privilege))
         AND NOT EXISTS (SELECT 1 FROM expected_constraints e WHERE NOT EXISTS (
           SELECT 1 FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -221,6 +270,41 @@ export class RuntimeDatabase implements OnModuleDestroy {
           SELECT 1 FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
           WHERE n.nspname='foundation' AND t.relname=e.table_name AND idx.relname=e.name AND i.indisvalid AND i.indisunique=e.unique_index
             AND pg_get_indexdef(i.indexrelid)=format('CREATE %sINDEX %I ON foundation.%I USING btree (%s)', CASE WHEN e.unique_index THEN 'UNIQUE ' ELSE '' END,e.name,e.table_name,e.columns)))
+        AND NOT EXISTS (SELECT FROM (VALUES
+          ('staff','rbac_staff_write','rbac_lock_write'),('staff','rbac_staff_current','rbac_check_staff'),
+          ('roles','rbac_role_write','rbac_lock_write'),('roles','rbac_guard_role','rbac_guard_role'),
+          ('permissions','rbac_catalog_write','rbac_lock_write'),('permissions','rbac_guard_catalog','rbac_guard_catalog'),
+          ('role_permissions','rbac_grant_write','rbac_lock_write'),('role_permissions','rbac_guard_grant','rbac_guard_grant'),
+          ('staff_role_assignments','rbac_assignment_write','rbac_lock_write'),('staff_role_assignments','rbac_guard_assignment','rbac_guard_assignment'),
+          ('staff_role_assignments','rbac_assignment_current','rbac_check_staff'),('staff_web_credentials','rbac_credential_removal','rbac_lock_write'),
+          ('staff_web_credentials','rbac_credential_current','rbac_check_staff')) required(tab,trig,fn)
+          WHERE NOT EXISTS (SELECT FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
+            WHERE t.tgrelid=to_regclass(format('foundation.%I', required.tab)) AND t.tgname=required.trig AND t.tgenabled IN ('O','A') AND NOT t.tgisinternal
+              AND p.pronamespace='foundation'::regnamespace AND p.proname=required.fn AND NOT p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog']
+              AND NOT has_function_privilege(current_user,p.oid,'EXECUTE')
+              AND (required.fn<>'rbac_check_staff' OR (t.tgdeferrable AND t.tginitdeferred))))
+        AND (SELECT count(*) FROM pg_index i WHERE i.indexrelid=to_regclass('foundation.staff_role_assignments_current_key')
+             AND i.indisunique AND i.indisvalid AND pg_get_indexdef(i.indexrelid)='CREATE UNIQUE INDEX staff_role_assignments_current_key ON foundation.staff_role_assignments USING btree (staff_id) WHERE (revoked_at IS NULL)')=1
+        AND (SELECT count(*) FROM foundation.roles WHERE role_type='SYSTEM' AND status='ACTIVE' AND code IN ('ADMIN','MANAGER','TECHNICIAN'))=3
+        AND NOT EXISTS (SELECT FROM unnest(ARRAY['staff.role.assign','roles.create','roles.update','roles.archive','roles.permissions.manage']) req(code)
+          WHERE NOT EXISTS (SELECT FROM foundation.roles r JOIN foundation.role_permissions rp ON rp.role_id=r.id
+            JOIN foundation.permissions p ON p.code=rp.permission_code AND p.code=req.code AND p.protected AND p.active
+            WHERE r.role_type='SYSTEM' AND r.code='ADMIN' AND r.status='ACTIVE' AND rp.enabled AND rp.scope_type='GLOBAL'))
+        AND (SELECT count(*) FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid
+             JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+             WHERE n.nspname='foundation' AND t.relname='staff_telegram_links' AND idx.relname='staff_telegram_links_active_key'
+               AND i.indisvalid AND i.indisunique
+               AND pg_get_indexdef(i.indexrelid)='CREATE UNIQUE INDEX staff_telegram_links_active_key ON foundation.staff_telegram_links USING btree (telegram_user_id) WHERE (revoked_at IS NULL)') = 1
+        AND (SELECT count(*) FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid
+             JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+             WHERE n.nspname='foundation' AND t.relname='staff_telegram_links' AND idx.relname='staff_telegram_links_active_staff_key'
+               AND i.indisvalid AND i.indisunique
+               AND pg_get_indexdef(i.indexrelid)='CREATE UNIQUE INDEX staff_telegram_links_active_staff_key ON foundation.staff_telegram_links USING btree (staff_id) WHERE (revoked_at IS NULL)') = 1
+        AND (SELECT count(*) FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid
+             JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+             WHERE n.nspname='foundation' AND t.relname='web_sessions' AND idx.relname='web_sessions_initdata_digest_idx'
+               AND i.indisvalid AND NOT i.indisunique
+               AND pg_get_indexdef(i.indexrelid)='CREATE INDEX web_sessions_initdata_digest_idx ON foundation.web_sessions USING btree (initdata_digest) WHERE (initdata_digest IS NOT NULL)') = 1
         AND NOT EXISTS (SELECT 1 FROM unnest(ARRAY['cleanup_web_auth_attempts','cleanup_web_auth_throttles','cleanup_web_sessions']) f(name)
           WHERE NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
             WHERE n.nspname='foundation' AND p.proname=f.name AND p.pronargs=0 AND p.prosecdef

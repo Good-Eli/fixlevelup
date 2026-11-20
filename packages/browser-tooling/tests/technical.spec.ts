@@ -63,7 +63,7 @@ async function instrumentPage(page: Page) {
   };
 }
 
-async function assertDocument(page: Page, title: string) {
+async function assertDocument(page: Page, title: string, hasCrmLink = false) {
   await expect(page).toHaveTitle(title);
   await expect(page.locator('html')).toHaveAttribute('lang', 'ru');
   await expect(page.locator('meta[name="robots"]')).toHaveAttribute('content', /\bnoindex\b/i);
@@ -72,9 +72,13 @@ async function assertDocument(page: Page, title: string) {
   );
   await expect(page.locator('main')).toHaveCount(1);
   await expect(page.getByRole('heading', { level: 1 })).toHaveText(title);
-  await expect(page.locator('form, input, textarea, select, button, a, [role="button"], [role="link"]'))
+  await expect(page.locator('form, input, textarea, select, button, [role="button"]'))
     .toHaveCount(0);
 
+  await expect(page.locator('a, [role="link"]')).toHaveCount(hasCrmLink ? 1 : 0);
+  if (hasCrmLink) {
+    await expect(page.getByRole('link', { name: 'Сотрудники и доступ — вход в CRM' })).toHaveAttribute('href', '/crm/access');
+  }
   // String evaluation avoids adding DOM libraries to the Node tooling tsconfig.
   const hasHorizontalOverflow = await page.evaluate<boolean>(
     'Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) > document.documentElement.clientWidth',
@@ -92,12 +96,14 @@ function assertNavigation(response: Response | null) {
 
 test('web production technical foundation', async ({ page }, testInfo) => {
   const instrumentation = await instrumentPage(page);
+  let privateRequests = 0;
+  page.on('request', request => { if (/^\/(crm\/access|api\/v1)(?:\/|$)/.test(new URL(request.url()).pathname)) { privateRequests++; } });
   const response = assertNavigation(await page.goto(`${webOrigin}/`, { waitUntil: 'networkidle' }));
   expect(response.headers()['x-powered-by'], 'Web does not expose a powered-by header').toBeUndefined();
 
-  await assertDocument(page, 'Техническая проверка web');
+  await assertDocument(page, 'Техническая проверка web', true);
   await expect(page.locator('main p')).toHaveText(
-    'Сборочный стенд P01-01.3. Клиентские функции и CRM ещё не реализованы.',
+    'Сборочный стенд P01-01.3. Для работы с сотрудниками требуется вход в закрытую CRM.',
   );
   const output = page.getByTestId('web-foundation');
   await expect(output).toBeVisible();
@@ -107,11 +113,12 @@ test('web production technical foundation', async ({ page }, testInfo) => {
 
   const reloaded = assertNavigation(await page.reload({ waitUntil: 'networkidle' }));
   expect(reloaded.headers()['x-powered-by']).toBeUndefined();
-  await assertDocument(page, 'Техническая проверка web');
+  await assertDocument(page, 'Техническая проверка web', true);
   await expect(output).toBeVisible();
   await expect(output).toHaveText(initialOutput ?? 'web-foundation-ok');
   await page.screenshot({ path: testInfo.outputPath('web.png'), fullPage: true, animations: 'disabled' });
   instrumentation.assertClean();
+  expect(privateRequests, 'The public page does not prefetch the CRM or call private APIs').toBe(0);
 });
 
 test('Mini App production JavaScript mount', async ({ page }, testInfo) => {

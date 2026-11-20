@@ -12,7 +12,10 @@ import { StaffTelegramAuthGuard } from './authz/telegram-auth.guard.js';
 import { TELEGRAM_AUTH_SERVICE, TelegramAuthController } from './auth/telegram-auth.controller.js';
 import { TelegramAuthResources } from './auth/telegram-auth.resources.js';
 import type { TelegramAuthConfig } from './auth/telegram-auth.config.js';
-import { StaffController, StaffService } from './staff/staff.controller.js';
+import { AccessController } from './authz/access.controller.js';
+import { StaffController, TelegramStaffController } from './staff/staff.controller.js';
+import { StaffService } from './staff/staff.service.js';
+import { PermissionsController, RolesController, RolesService, TelegramPermissionsController, TelegramRolesController } from './roles/index.js';
 
 @Module({})
 export class AppModule {
@@ -20,15 +23,14 @@ export class AppModule {
     if ((webAuth || telegramAuth) && !database) { throw new Error('Web authentication requires a database'); }
     if (telegramAuth && !webAuth) { throw new Error('Telegram authentication requires web authentication configuration'); }
     const controllers = webAuth
-      ? [HealthController, WebAuthController, StaffController, ...(telegramAuth ? [TelegramAuthController] : [])]
+      ? [HealthController, WebAuthController, AccessController, StaffController, RolesController,
+          PermissionsController, ...(telegramAuth ? [TelegramAuthController, TelegramStaffController, TelegramRolesController, TelegramPermissionsController] : [])]
       : [HealthController];
     const providers = [
       HealthService, { provide: RuntimeDatabase, useFactory: () => new RuntimeDatabase(database, Boolean(webAuth)) },
       ...(webAuth && database ? [
-        StaffService,
-        // Explicit DI registration of the class-reference guard: Nest resolves it
-        // from the module injector; registration makes missing dependencies fail
-        // at startup instead of at first request, and proves the guard is wired.
+        StaffService, RolesService,
+        // Explicit DI registration makes missing security dependencies a startup failure.
         StaffWebAuthGuard,
         { provide: WebAuthResources, useFactory: () => new WebAuthResources(database, webAuth) },
         { provide: WEB_AUTH_SERVICE, useFactory: (resources: WebAuthResources) => resources.service, inject: [WebAuthResources] },
@@ -36,8 +38,7 @@ export class AppModule {
         { provide: AuthorizationResources, useFactory: () => new AuthorizationResources(database) },
         { provide: AUTHORIZATION_SERVICE, useFactory: (resources: AuthorizationResources) => resources.service, inject: [AuthorizationResources] },
         ...(telegramAuth ? [
-          // Same fail-fast provider registration as StaffWebAuthGuard: no master
-          // routes are mounted yet, but the guard's wiring is verified at startup.
+          // No bearer routes without a configured exchange and guard.
           StaffTelegramAuthGuard,
           { provide: TelegramAuthResources, useFactory: () => new TelegramAuthResources(database, telegramAuth, webAuth.throttleSecret) },
           { provide: TELEGRAM_AUTH_SERVICE, useFactory: (resources: TelegramAuthResources) => resources.service, inject: [TelegramAuthResources] },

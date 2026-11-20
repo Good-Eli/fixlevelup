@@ -15,7 +15,7 @@ export class AuthorizationResources implements OnModuleDestroy {
 
   constructor(database: DatabaseConfig) {
     this.pool = new Pool({ ...database, max: 4, connectionTimeoutMillis: 1000,
-      query_timeout: 5000, statement_timeout: 5000, idleTimeoutMillis: 1000,
+      query_timeout: 5500, statement_timeout: 5000, idleTimeoutMillis: 1000, options: '-c lock_timeout=4500',
       application_name: 'fixlevelup-authz' });
     this.pool.on('error', () => { /* Never log raw driver errors. */ });
     this.service = new AuthorizationService(this.pool);
