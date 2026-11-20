@@ -7,6 +7,7 @@ import type { WebAuthConfig } from './auth/web-auth.config.js';
 import { WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE, WebAuthController } from './auth/web-auth.controller.js';
 import { WebAuthResources } from './auth/web-auth.resources.js';
 import { AUTHORIZATION_SERVICE, AuthorizationResources } from './authz/authorization.resources.js';
+import { StaffWebAuthGuard } from './authz/authorization.guard.js';
 import { StaffController, StaffService } from './staff/staff.controller.js';
 
 @Module({})
@@ -18,6 +19,10 @@ export class AppModule {
       HealthService, { provide: RuntimeDatabase, useFactory: () => new RuntimeDatabase(database, Boolean(webAuth)) },
       ...(webAuth && database ? [
         StaffService,
+        // Explicit DI registration of the class-reference guard: Nest resolves it
+        // from the module injector; registration makes missing dependencies fail
+        // at startup instead of at first request, and proves the guard is wired.
+        StaffWebAuthGuard,
         { provide: WebAuthResources, useFactory: () => new WebAuthResources(database, webAuth) },
         { provide: WEB_AUTH_SERVICE, useFactory: (resources: WebAuthResources) => resources.service, inject: [WebAuthResources] },
         { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin: webAuth.origin, csrfSecret: webAuth.csrfSecret } },

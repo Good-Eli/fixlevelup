@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { createHmac, randomUUID } from 'node:crypto';
 import type { Server } from 'node:http';
+import { Controller, Get, UseGuards } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { PoolClient } from 'pg';
 import request from 'supertest';
@@ -10,6 +11,7 @@ import { WebAuthError } from '../src/auth/web-auth.service.js';
 import { AUTHORIZATION_SERVICE } from '../src/authz/authorization.resources.js';
 import { AuthorizationError } from '../src/authz/authorization.service.js';
 import type { StaffWriteContext } from '../src/authz/authorization.service.js';
+import { StaffWebAuthGuard } from '../src/authz/authorization.guard.js';
 import { GLOBAL_SCOPE } from '../src/authz/capability.js';
 import type { StaffWebPrincipal } from '../src/authz/principal.js';
 import { StaffController, StaffService } from '../src/staff/staff.controller.js';
@@ -34,7 +36,14 @@ interface StaffListRow { id: string; role: string; employment_state: string }
 interface StaffDetailRow { id: string; role: string; employment_state: string; auth_version: number }
 interface QueryResult<T> { rows: T[]; rowCount: number }
 
-async function setup() {
+/** Test-only route behind the real guard but without capability metadata. */
+@Controller('test/no-metadata')
+@UseGuards(StaffWebAuthGuard)
+class NoCapabilityController {
+  @Get() open(): { ok: true } { return { ok: true }; }
+}
+
+async function setup(controllers: unknown[] = [StaffController], withAuthorization = true) {
   const listRows: StaffListRow[] = [{ id: existingId, role: 'MANAGER', employment_state: 'ACTIVE' }];
   const created: StaffDetailRow[] = [];
   const staffInserts: unknown[][] = [];
@@ -70,10 +79,13 @@ async function setup() {
     authorizeForWrite: vi.fn(<T>(_token: string, _capability: string, _scope: unknown, write: (context: StaffWriteContext) => Promise<T>) =>
       write({ client: client as unknown as PoolClient, principal })),
   };
-  const module = await Test.createTestingModule({ controllers: [StaffController], providers: [
+  const module = await Test.createTestingModule({ controllers: controllers as never[], providers: [
     StaffService,
+    // The real guard instance: Reflector is framework-provided; the mocked service
+    // tokens below satisfy its DI, so every test executes the actual guard code.
+    StaffWebAuthGuard,
     { provide: WEB_AUTH_SERVICE, useValue: auth },
-    { provide: AUTHORIZATION_SERVICE, useValue: authz },
+    ...(withAuthorization ? [{ provide: AUTHORIZATION_SERVICE, useValue: authz }] : []),
     { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin, csrfSecret } },
   ] }).compile();
   // Nest models the structural options as a class without methods.
@@ -189,5 +201,19 @@ describe('staff authorization HTTP boundary', () => {
     (authz.authorizeForWrite).mockRejectedValueOnce(new AuthorizationError('UNAUTHORIZED'));
     await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
       .set('X-CSRF-Token', csrfFor(first)).send({ role: 'MANAGER' }).expect(401);
+  });
+
+  it('fails closed with 500 when a guarded route lacks capability metadata', async () => {
+    const { server } = await setup([NoCapabilityController]);
+    // The real guard runs; missing @RequireCapability is a programming error and
+    // must never silently authorize the request.
+    await request(server).get('/test/no-metadata').set('Cookie', cookie(first)).expect(500);
+  });
+
+  it('does not silently skip authorization when the guard dependency is missing', async () => {
+    // Without AUTHORIZATION_SERVICE the application cannot even initialize:
+    // Nest fails during module compilation (fail-fast at startup), proving a
+    // missing guard dependency can never degrade into unauthenticated access.
+    await expect(setup([StaffController], false)).rejects.toThrow(/can't resolve dependencies/i);
   });
 });

@@ -142,16 +142,20 @@ production-тюнинг; источник запроса берётся из soc
   и права перепроверяются под блокировками (staff → session → permissions)
   в одной транзакции с самой записью.
 - `apps/api/src/authz/authorization.guard.ts` — guard и
-  `@RequireCapability`; отказ по умолчанию, безопасные 401/403.
+  `@RequireCapability`; отказ по умолчанию, безопасные 401/403. Guard
+  зарегистрирован в DI явно: отсутствие зависимости падает при старте
+  приложения, а не при первом запросе, и не может выродиться в доступ без
+  проверки прав. Отсутствие метаданных capability на защищённом маршруте даёт
+  500, а не молчаливое разрешение.
 - `apps/api/src/staff/staff.controller.ts` — `GET /api/v1/staff`
   (`staff.read`) и `POST /api/v1/staff` (`staff.manage`).
 - `prisma/migrations/20261120000600_authorization/` — таблица
   `user_permissions`, partial unique index на активный грант и column-level
   GRANT для runtime-роли; `staff` получил INSERT только четырёх столбцов.
-- Тесты: `staff-authz-http` (11) и opt-in `staff-authz-e2e` (6) под
-  `FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1`; обновлён
-  `packages/database-tooling/scripts/test-migrations.mjs` (шестая миграция
-  в цепочке fresh/upgrade/replay и проверки новых прав).
+- Тесты: `staff-authz-http` (13, включая два fail-closed случая для guard)
+  и opt-in `staff-authz-e2e` (6) под `FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1`;
+  обновлён `packages/database-tooling/scripts/test-migrations.mjs` (шестая
+  миграция в цепочке fresh/upgrade/replay и проверки новых прав).
 
 Принятые ограничения: capability-словарь минимален и расширяется только
 отдельным решением; CITY-scope грантов ждёт P03; матрица §13 остаётся

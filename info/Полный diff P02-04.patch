@@ -1,324 +1,26 @@
 diff --git a/apps/api/src/app.module.ts b/apps/api/src/app.module.ts
-index d9aa17e..bf861b7 100644
+index bf861b7..162e803 100644
 --- a/apps/api/src/app.module.ts
 +++ b/apps/api/src/app.module.ts
-@@ -6,18 +6,23 @@ import { HealthController, HealthService } from './health/health.controller.js';
- import type { WebAuthConfig } from './auth/web-auth.config.js';
+@@ -7,6 +7,7 @@ import type { WebAuthConfig } from './auth/web-auth.config.js';
  import { WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE, WebAuthController } from './auth/web-auth.controller.js';
  import { WebAuthResources } from './auth/web-auth.resources.js';
-+import { AUTHORIZATION_SERVICE, AuthorizationResources } from './authz/authorization.resources.js';
-+import { StaffController, StaffService } from './staff/staff.controller.js';
+ import { AUTHORIZATION_SERVICE, AuthorizationResources } from './authz/authorization.resources.js';
++import { StaffWebAuthGuard } from './authz/authorization.guard.js';
+ import { StaffController, StaffService } from './staff/staff.controller.js';
  
  @Module({})
- export class AppModule {
-   static register(database?: DatabaseConfig, webAuth?: WebAuthConfig): DynamicModule {
-     if (webAuth && !database) { throw new Error('Web authentication requires a database'); }
--    const controllers = webAuth ? [HealthController, WebAuthController] : [HealthController];
-+    const controllers = webAuth ? [HealthController, WebAuthController, StaffController] : [HealthController];
-     const providers = [
+@@ -18,6 +19,10 @@ export class AppModule {
        HealthService, { provide: RuntimeDatabase, useFactory: () => new RuntimeDatabase(database, Boolean(webAuth)) },
        ...(webAuth && database ? [
-+        StaffService,
+         StaffService,
++        // Explicit DI registration of the class-reference guard: Nest resolves it
++        // from the module injector; registration makes missing dependencies fail
++        // at startup instead of at first request, and proves the guard is wired.
++        StaffWebAuthGuard,
          { provide: WebAuthResources, useFactory: () => new WebAuthResources(database, webAuth) },
          { provide: WEB_AUTH_SERVICE, useFactory: (resources: WebAuthResources) => resources.service, inject: [WebAuthResources] },
          { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin: webAuth.origin, csrfSecret: webAuth.csrfSecret } },
-+        { provide: AuthorizationResources, useFactory: () => new AuthorizationResources(database) },
-+        { provide: AUTHORIZATION_SERVICE, useFactory: (resources: AuthorizationResources) => resources.service, inject: [AuthorizationResources] },
-       ] : []),
-     ];
-     return { module: AppModule, controllers, providers };
-diff --git a/apps/api/src/infrastructure/database/runtime-database.ts b/apps/api/src/infrastructure/database/runtime-database.ts
-index 0b1b8b3..cbd070e 100644
---- a/apps/api/src/infrastructure/database/runtime-database.ts
-+++ b/apps/api/src/infrastructure/database/runtime-database.ts
-@@ -163,9 +163,15 @@ export class RuntimeDatabase implements OnModuleDestroy {
-         ('web_auth_throttles','key_hash','varchar',true,68),
-         ('web_auth_attempts','id','uuid',true,-1), ('web_auth_attempts','key_hash','varchar',true,68),
-         ('web_auth_attempts','reserved_at','timestamptz',true,6), ('web_auth_attempts','expires_at','timestamptz',true,6),
--        ('web_auth_attempts','failed_at','timestamptz',false,6), ('web_auth_attempts','completed_at','timestamptz',false,6)
-+        ('web_auth_attempts','failed_at','timestamptz',false,6), ('web_auth_attempts','completed_at','timestamptz',false,6),
-+        ('user_permissions','id','uuid',true,-1), ('user_permissions','staff_id','uuid',true,-1),
-+        ('user_permissions','capability','varchar',true,68), ('user_permissions','scope','varchar',true,20),
-+        ('user_permissions','valid_from','timestamptz',true,6), ('user_permissions','valid_until','timestamptz',false,6),
-+        ('user_permissions','revoked_at','timestamptz',false,6), ('user_permissions','granted_by','uuid',false,-1),
-+        ('user_permissions','created_at','timestamptz',true,6)
-       ), required_privileges(table_name, column_name, privilege) AS (VALUES
-         ('staff','id','SELECT'), ('staff','role','SELECT'), ('staff','employment_state','SELECT'), ('staff','auth_version','SELECT'), ('staff','auth_version','UPDATE'),
-+        ('staff','id','INSERT'), ('staff','role','INSERT'), ('staff','employment_state','INSERT'), ('staff','auth_version','INSERT'),
-         ('staff_web_credentials','staff_id','SELECT'), ('staff_web_credentials','login','SELECT'), ('staff_web_credentials','password_hash','SELECT'), ('staff_web_credentials','password_hash','UPDATE'),
-         ('web_sessions','id','SELECT'), ('web_sessions','staff_id','SELECT'), ('web_sessions','token_hash','SELECT'), ('web_sessions','auth_version','SELECT'), ('web_sessions','created_at','SELECT'), ('web_sessions','idle_expires_at','SELECT'), ('web_sessions','absolute_expires_at','SELECT'), ('web_sessions','revoked_at','SELECT'),
-         ('web_sessions','id','INSERT'), ('web_sessions','staff_id','INSERT'), ('web_sessions','token_hash','INSERT'), ('web_sessions','auth_version','INSERT'), ('web_sessions','created_at','INSERT'), ('web_sessions','idle_expires_at','INSERT'), ('web_sessions','absolute_expires_at','INSERT'), ('web_sessions','revoked_at','INSERT'),
-@@ -173,18 +179,26 @@ export class RuntimeDatabase implements OnModuleDestroy {
-         ('web_auth_throttles','key_hash','SELECT'), ('web_auth_throttles','key_hash','INSERT'), ('web_auth_throttles','key_hash','UPDATE'),
-         ('web_auth_attempts','id','SELECT'), ('web_auth_attempts','key_hash','SELECT'), ('web_auth_attempts','reserved_at','SELECT'), ('web_auth_attempts','expires_at','SELECT'), ('web_auth_attempts','failed_at','SELECT'), ('web_auth_attempts','completed_at','SELECT'),
-         ('web_auth_attempts','id','INSERT'), ('web_auth_attempts','key_hash','INSERT'), ('web_auth_attempts','reserved_at','INSERT'), ('web_auth_attempts','expires_at','INSERT'), ('web_auth_attempts','failed_at','INSERT'), ('web_auth_attempts','completed_at','INSERT'),
--        ('web_auth_attempts','expires_at','UPDATE'), ('web_auth_attempts','failed_at','UPDATE'), ('web_auth_attempts','completed_at','UPDATE')
-+        ('web_auth_attempts','expires_at','UPDATE'), ('web_auth_attempts','failed_at','UPDATE'), ('web_auth_attempts','completed_at','UPDATE'),
-+        ('user_permissions','id','SELECT'), ('user_permissions','staff_id','SELECT'), ('user_permissions','capability','SELECT'), ('user_permissions','scope','SELECT'),
-+        ('user_permissions','valid_from','SELECT'), ('user_permissions','valid_until','SELECT'), ('user_permissions','revoked_at','SELECT'), ('user_permissions','granted_by','SELECT'), ('user_permissions','created_at','SELECT'),
-+        ('user_permissions','id','INSERT'), ('user_permissions','staff_id','INSERT'), ('user_permissions','capability','INSERT'), ('user_permissions','scope','INSERT'),
-+        ('user_permissions','valid_from','INSERT'), ('user_permissions','valid_until','INSERT'), ('user_permissions','granted_by','INSERT'), ('user_permissions','created_at','INSERT'),
-+        ('user_permissions','valid_until','UPDATE'), ('user_permissions','revoked_at','UPDATE')
-       ), expected_constraints(table_name, name, kind) AS (VALUES
-         ('staff','staff_pkey','p'), ('staff','staff_role_check','c'), ('staff','staff_employment_state_check','c'), ('staff','staff_auth_version_check','c'),
-         ('staff_web_credentials','staff_web_credentials_pkey','p'), ('staff_web_credentials','staff_web_credentials_staff_id_fkey','f'), ('staff_web_credentials','staff_web_credentials_login_check','c'), ('staff_web_credentials','staff_web_credentials_password_hash_check','c'),
-         ('staff_bootstrap_marker','staff_bootstrap_marker_pkey','p'), ('staff_bootstrap_marker','staff_bootstrap_marker_singleton_check','c'), ('staff_bootstrap_marker','staff_bootstrap_marker_staff_id_fkey','f'),
-         ('web_sessions','web_sessions_pkey','p'), ('web_sessions','web_sessions_staff_id_fkey','f'), ('web_sessions','web_sessions_token_hash_check','c'), ('web_sessions','web_sessions_auth_version_check','c'), ('web_sessions','web_sessions_expiry_check','c'), ('web_sessions','web_sessions_revoked_at_check','c'),
-         ('web_auth_throttles','web_auth_throttles_pkey','p'), ('web_auth_throttles','web_auth_throttles_key_hash_check','c'),
--        ('web_auth_attempts','web_auth_attempts_pkey','p'), ('web_auth_attempts','web_auth_attempts_key_hash_fkey','f'), ('web_auth_attempts','web_auth_attempts_expiry_check','c'), ('web_auth_attempts','web_auth_attempts_completion_check','c')
-+        ('web_auth_attempts','web_auth_attempts_pkey','p'), ('web_auth_attempts','web_auth_attempts_key_hash_fkey','f'), ('web_auth_attempts','web_auth_attempts_expiry_check','c'), ('web_auth_attempts','web_auth_attempts_completion_check','c'),
-+        ('user_permissions','user_permissions_pkey','p'), ('user_permissions','user_permissions_staff_id_fkey','f'), ('user_permissions','user_permissions_granted_by_fkey','f'),
-+        ('user_permissions','user_permissions_capability_check','c'), ('user_permissions','user_permissions_scope_check','c'), ('user_permissions','user_permissions_validity_check','c'), ('user_permissions','user_permissions_revoked_at_check','c')
-       ), expected_indexes(table_name, name, unique_index, columns) AS (VALUES
-         ('staff_web_credentials','staff_web_credentials_login_key',true,'login'), ('staff_bootstrap_marker','staff_bootstrap_marker_staff_id_key',true,'staff_id'),
-         ('web_sessions','web_sessions_token_hash_key',true,'token_hash'), ('web_sessions','web_sessions_staff_id_idx',false,'staff_id'), ('web_sessions','web_sessions_absolute_expiry_idx',false,'absolute_expires_at'),
--        ('web_auth_attempts','web_auth_attempts_key_expiry_idx',false,'key_hash, expires_at'), ('web_auth_attempts','web_auth_attempts_expiry_idx',false,'expires_at')
-+        ('web_auth_attempts','web_auth_attempts_key_expiry_idx',false,'key_hash, expires_at'), ('web_auth_attempts','web_auth_attempts_expiry_idx',false,'expires_at'),
-+        ('user_permissions','user_permissions_staff_id_idx',false,'staff_id')
-       )
-       SELECT
-         NOT EXISTS (SELECT 1 FROM expected_columns e WHERE NOT EXISTS (
-diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
-index 7d8f554..7f94437 100644
---- a/docs/ROADMAP.md
-+++ b/docs/ROADMAP.md
-@@ -120,12 +120,12 @@ Edges отражают engineering dependencies; MLIVE→P14 относится
- 
- ### P02 — сотрудники, Auth и capabilities
- 
--**P02-01 и P02-02 приняты владельцем; P02-03 разрешён к реализации.** P02-04 и последующие подэтапы требуют отдельного разрешения. Канонические решения и границы proposed contracts — [DECISIONS §21](DECISIONS.md#21-p02-01--модель-доступа-и-контракт-каналов); матрица §13 остаётся на согласование. Для web-сессии владелец согласовал idle TTL 30 минут, абсолютный TTL 12 часов и атомарный renew с ротацией токена без продления абсолютного TTL; logout отзывает текущую сессию, смена пароля — остальные, recovery через auth_version — все. Принята защита от пяти неудач по идентификатору за 15 минут с дополнительным лимитом источника. Остальные части Q03/Q12 и proof привязки не закрыты.
-+**P02-01/P02-02/P02-03 приняты владельцем; P02-04 разрешён к реализации.** P02-05 и последующие подэтапы требуют отдельного разрешения. Канонические решения и границы proposed contracts — [DECISIONS §21](DECISIONS.md#21-p02-01--модель-доступа-и-контракт-каналов); матрица §13 остаётся на согласование. Для web-сессии владелец согласовал idle TTL 30 минут, абсолютный TTL 12 часов и атомарный renew с ротацией токена без продления абсолютного TTL; logout отзывает текущую сессию, смена пароля — остальные, recovery через auth_version — все. Принята защита от пяти неудач по идентификатору за 15 минут с дополнительным лимитом источника. Остальные части Q03/Q12 и proof привязки не закрыты.
- 
- | Подэтап | Граница и критерий приёмки | Зависимости и открытые решения |
- |---|---|---|
- | P02-01 — Contracts & Minimal Access Model | Только документы: принципы principal/authn/authz, разделение staff/customer, общий контракт и граница адаптеров, уровни проверок, план; owner facts отдельно от предложений. Нет кода/DDL/deps/подключений. | P01 foundation; Q03/Q12/Q17 фиксируются открытыми, а не решаются молчаливо. |
--| P02-02 — учётные записи и bootstrap | Минимальная identity-модель и защищённый bootstrap A без default password и открытой регистрации; fresh/upgrade и ограничения на реальной test PostgreSQL. Мастеру автоматически не создаётся web credential. | P02-01; согласовать безопасную процедуру bootstrap и данные модели. |
-+| P02-02 — учётные записи и bootstrap | Минимальная identity-модель и защищённый bootstrap A без default password и открытой регистрации; fresh/upgrade и ограничения на реальной test PostgreSQL. Мастеру автоматически не создаётся web credential. | Принят с отложенным gate: ручная проверка bootstrap/recovery в доступной человеку интерактивной консоли не выполнена и обязательна перед первым реальным использованием этих CLI в рабочей среде. Автоматизированные pseudo-TTY проверки её не заменяют. |
- | P02-03 — веб-аутентификация M/A | Login/logout/renew/password/revoke для менеджера и администратора; тесты неверных credentials, brute force, cookie/CSRF, expiry/revoke и безопасных ошибок. | P02-02; web session TTL/rotation/recovery согласованы владельцем выше, прочие части Q12 остаются открыты. |
- | P02-04 — общая серверная авторизация | Единый типизированный principal и проверки staff capability либо customer request grant, scope/state/ownership, default deny; deny самоэскалации, 401/403/404/no IDOR, recheck при replay/write. | P02-01/02; P02-03 даёт web principal. Матрица §13/делегирование требуют согласования; конкретные CITY grants/FK — после P03. |
- | P02-05 — Telegram-аутентификация мастера | Проверить raw initData и действующую заранее созданную staff link; выдать отзывную staff session. Unknown/inactive/forged/expired и запрещённый replay denied; безопасный intended-employee proof при привязке, один пересланный invite недостаточен. Без автоматического web login. | P02-02/04; Q12 TTL и политика exchange, согласованный staff proof; официальный алгоритм перепроверить. Offline tests без токена; реальный Mini App staging отдельно после доступов. Не клиентский TG-бот. |
-diff --git a/packages/database-tooling/scripts/test-migrations.mjs b/packages/database-tooling/scripts/test-migrations.mjs
-index ddbe23d..cadb4d2 100644
---- a/packages/database-tooling/scripts/test-migrations.mjs
-+++ b/packages/database-tooling/scripts/test-migrations.mjs
-@@ -20,12 +20,19 @@ async function checkViolation(client, sql, values = []) {
-   catch (error) { assert(error.code === '23514', `Expected custom CHECK violation, got ${error.code}`); checkDenials += 1; return; }
-   throw new Error('Invalid CHECK input accepted');
- }
--const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth'];
-+let uniqueViolations = 0;
-+async function uniqueViolation(client, sql, values = []) {
-+  try { await client.query(sql, values); }
-+  catch (error) { assert(error.code === '23505', `Expected unique_violation, got ${error.code}`); uniqueViolations += 1; return; }
-+  throw new Error('Duplicate row accepted');
-+}
-+const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth', '20261120000600_authorization'];
- const expectedChecks = [
-   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
-   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
-   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check',
-   'staff_web_credentials_login_check', 'staff_web_credentials_password_hash_check', 'staff_bootstrap_marker_singleton_check',
-+  'user_permissions_capability_check', 'user_permissions_scope_check', 'user_permissions_validity_check', 'user_permissions_revoked_at_check',
-   'web_sessions_token_hash_check', 'web_sessions_auth_version_check', 'web_sessions_expiry_check', 'web_sessions_revoked_at_check',
-   'web_auth_throttles_key_hash_check', 'web_auth_attempts_expiry_check', 'web_auth_attempts_completion_check',
- ];
-@@ -37,16 +44,18 @@ const upgrade = `fixlevelup_p017a_upgrade_${suffix}`;
- const upgradeSecond = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
- const upgradeThird = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
- const upgradeFourth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
-+const upgradeFifth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
- const shadow = `fixlevelup_p017a_shadow_${suffix}`;
- const historyRoot = resolve(root, `node_modules/.cache/p017a-${suffix}`);
- const firstHistory = resolve(historyRoot, 'first/migrations');
- const secondHistory = resolve(historyRoot, 'second/migrations');
- const thirdHistory = resolve(historyRoot, 'third/migrations');
- const fourthHistory = resolve(historyRoot, 'fourth/migrations');
-+const fifthHistory = resolve(historyRoot, 'fifth/migrations');
- try {
--  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, shadow]) { await prepareDatabase(client, database, true); }
--  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${shadow}`);
--  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)]]) {
-+  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, shadow]) { await prepareDatabase(client, database, true); }
-+  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${shadow}`);
-+  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)]]) {
-     mkdirSync(history, { recursive: true });
-     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
-     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
-@@ -159,7 +168,41 @@ try {
-     command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeFourth, 0, shadow);
-     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeFourth);
-   } finally { await fourthReader.end(); }
--  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
-+  // Preserve synthetic staff, credentials, web sessions and user permissions across the authorization migration.
-+  command(['migrate', 'deploy'], upgradeFifth, 0, undefined, fifthHistory);
-+  const fifthReader = connection('fixlevelup_migrator', passwords.fixlevelup_migrator, upgradeFifth);
-+  await fifthReader.connect();
-+  try {
-+    const fifthStaffId = randomUUID();
-+    await fifthReader.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES($1,'TECHNICIAN','ACTIVE',2)", [fifthStaffId]);
-+    await fifthReader.query("INSERT INTO foundation.staff_web_credentials(staff_id,login,password_hash) VALUES($1,'fifth-synthetic-login','fifth-synthetic-hash')", [fifthStaffId]);
-+    await fifthReader.query("INSERT INTO foundation.web_sessions(id,staff_id,token_hash,auth_version,idle_expires_at,absolute_expires_at) VALUES($1,$2,$3,2,CURRENT_TIMESTAMP+INTERVAL '1 hour',CURRENT_TIMESTAMP+INTERVAL '30 days')", [randomUUID(), fifthStaffId, '1'.repeat(64)]);
-+    const existingTables = ['staff', 'staff_web_credentials', 'web_sessions'];
-+    const existingBefore = [];
-+    for (const table of existingTables) { existingBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
-+    command(['migrate', 'deploy'], upgradeFifth);
-+    for (const [index, table] of existingTables.entries()) {
-+      const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
-+      assert(JSON.stringify(after) === JSON.stringify(existingBefore[index]), `Fifth-to-latest upgrade changed ${table} data`);
-+    }
-+    await fifthReader.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,valid_until,granted_by) VALUES($1,$2,'FIFTH_SYNTHETIC','GLOBAL',CURRENT_TIMESTAMP+INTERVAL '7 days',$2)", [randomUUID(), fifthStaffId]);
-+    const fifthTables = [...existingTables, 'user_permissions'];
-+    const fifthBefore = [];
-+    for (const table of fifthTables) { fifthBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
-+    const fifthHistoryRows = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
-+    assert(fifthHistoryRows.rowCount === migrations.length && JSON.stringify(fifthHistoryRows.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
-+      && fifthHistoryRows.rows.every((entry) => entry.finished_at !== null), 'Fifth-to-latest history mismatch');
-+    command(['migrate', 'deploy'], upgradeFifth);
-+    const fifthReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
-+    assert(JSON.stringify(fifthReplay.rows) === JSON.stringify(fifthHistoryRows.rows), 'Fifth-to-latest replay changed history');
-+    for (const [index, table] of fifthTables.entries()) {
-+      const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
-+      assert(JSON.stringify(after) === JSON.stringify(fifthBefore[index]), `Fifth-to-latest replay changed ${table} data`);
-+    }
-+    command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeFifth, 0, shadow);
-+    command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeFifth);
-+  } finally { await fifthReader.end(); }
-+  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/fifth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
-   command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], fresh, 0, shadow);
-   command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
-   const runtimeStaffId = randomUUID();
-@@ -203,10 +246,11 @@ try {
-       && grants.rows.every((column) => column.writable === workerColumns.includes(column.attname)), 'Runtime outbox column grants mismatch');
-     const tableGrant = await runtime.query("SELECT has_table_privilege(current_user,'foundation.outbox_events','UPDATE') AS writable, has_any_column_privilege(current_user,'foundation.audit_logs','UPDATE') AS audit_writable");
-     assert(!tableGrant.rows[0].writable && !tableGrant.rows[0].audit_writable, 'Runtime broad UPDATE/audit UPDATE unexpectedly allowed');
--    for (const [table, allowed] of [['staff', ['auth_version']], ['staff_web_credentials', ['password_hash']]]) {
--      const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
--      assert(columns.rows.filter((column) => column.writable).length === allowed.length
--        && columns.rows.every((column) => column.writable === allowed.includes(column.attname)), `Runtime ${table} column grants mismatch`);
-+    for (const [table, updatable, insertable] of [['staff', ['auth_version'], ['id', 'role', 'employment_state', 'auth_version']], ['staff_web_credentials', ['password_hash'], []]]) {
-+      const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'INSERT') AS insertable,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
-+      assert(columns.rows.filter((column) => column.writable).length === updatable.length
-+        && columns.rows.every((column) => column.writable === updatable.includes(column.attname)
-+          && column.insertable === insertable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
-       const broad = await runtime.query("SELECT has_table_privilege(current_user,$1,'UPDATE') AS writable", [`foundation.${table}`]);
-       assert(!broad.rows[0].writable, `Runtime ${table} broad UPDATE unexpectedly allowed`);
-     }
-@@ -215,15 +259,38 @@ try {
-     const staff = await runtime.query('SELECT s.id,s.role,s.employment_state,s.auth_version,c.login,c.password_hash FROM foundation.staff s JOIN foundation.staff_web_credentials c ON c.staff_id=s.id WHERE s.id=$1', [runtimeStaffId]);
-     assert(staff.rows[0]?.auth_version === 2 && staff.rows[0].role === 'ADMIN' && staff.rows[0].employment_state === 'ACTIVE'
-       && staff.rows[0].login === 'runtime-synthetic' && staff.rows[0].password_hash === 'updated-synthetic-hash', 'Runtime scoped staff reads/writes failed');
-+    // POST /staff guard: only id/role/employment_state/auth_version are runtime-insertable on staff.
-+    const guardStaffId = randomUUID();
-+    await runtime.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES($1,'TECHNICIAN','ACTIVE',1)", [guardStaffId]);
-+    const guardStaff = await runtime.query('SELECT id,role,employment_state,auth_version FROM foundation.staff WHERE id=$1', [guardStaffId]);
-+    assert(guardStaff.rows[0]?.id === guardStaffId && guardStaff.rows[0].role === 'TECHNICIAN'
-+      && guardStaff.rows[0].employment_state === 'ACTIVE' && guardStaff.rows[0].auth_version === 1, 'Runtime scoped staff INSERT failed');
-+    // Column-scoped user_permissions writes: INSERT excludes revoked_at, UPDATE covers valid_until/revoked_at.
-+    const permissionId = randomUUID();
-+    await runtime.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [permissionId, runtimeStaffId]);
-+    const permission = (await runtime.query('SELECT capability,scope,valid_from,valid_until,revoked_at,granted_by,created_at FROM foundation.user_permissions WHERE id=$1', [permissionId])).rows[0];
-+    assert(permission?.capability === 'RUNTIME_SYNTHETIC' && permission.scope === 'GLOBAL' && permission.valid_from instanceof Date
-+      && permission.valid_until === null && permission.revoked_at === null && permission.granted_by === null
-+      && permission.created_at instanceof Date, 'Runtime user permission INSERT/defaults failed');
-+    // Partial unique index user_permissions_active_key: one non-revoked row per (staff,capability,scope).
-+    await uniqueViolation(runtime, "INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [randomUUID(), runtimeStaffId]);
-+    // Re-grant: revoke the old row, then insert a fresh active one in the same flow.
-+    await runtime.query('UPDATE foundation.user_permissions SET revoked_at=CURRENT_TIMESTAMP WHERE id=$1', [permissionId]);
-+    const regrantedId = randomUUID();
-+    await runtime.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [regrantedId, runtimeStaffId]);
-+    const permissions = await runtime.query('SELECT id,revoked_at FROM foundation.user_permissions WHERE staff_id=$1 AND capability=$2 AND scope=$3 ORDER BY revoked_at NULLS FIRST', [runtimeStaffId, 'RUNTIME_SYNTHETIC', 'GLOBAL']);
-+    assert(permissions.rowCount === 2 && permissions.rows[0].id === regrantedId && permissions.rows[0].revoked_at === null
-+      && permissions.rows[1].id === permissionId && permissions.rows[1].revoked_at !== null, 'Re-grant via revoke plus insert failed');
-     const webGrants = [
--      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
--      ['web_auth_throttles', ['key_hash'], ['key_hash']],
--      ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
-+      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
-+      ['web_auth_throttles', ['key_hash'], ['key_hash'], ['key_hash']],
-+      ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
-+      ['user_permissions', ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'revoked_at', 'granted_by', 'created_at'], ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'granted_by', 'created_at'], ['valid_until', 'revoked_at']],
-     ];
--    for (const [table, readable, writable] of webGrants) {
-+    for (const [table, readable, insertable, writable] of webGrants) {
-       const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'SELECT') AS readable,has_column_privilege(current_user,a.attrelid,a.attnum,'INSERT') AS insertable,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
-       assert(columns.rows.length === readable.length && columns.rows.every((column) => column.readable === readable.includes(column.attname)
--        && column.insertable === readable.includes(column.attname) && column.writable === writable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
-+        && column.insertable === insertable.includes(column.attname) && column.writable === writable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
-       const broad = await runtime.query("SELECT has_table_privilege(current_user,$1,'UPDATE') AS writable,has_table_privilege(current_user,$1,'DELETE') AS deletable", [`foundation.${table}`]);
-       assert(!broad.rows[0].writable && !broad.rows[0].deletable, `Runtime ${table} broad grants unexpectedly allowed`);
-     }
-@@ -313,16 +380,21 @@ try {
-       "UPDATE foundation.staff SET role='MANAGER'", "UPDATE foundation.staff SET employment_state='INACTIVE'",
-       "UPDATE foundation.staff_web_credentials SET login='forbidden'", 'UPDATE foundation.staff SET id=id',
-       'UPDATE foundation.staff_web_credentials SET staff_id=staff_id',
--      ...['staff', 'staff_web_credentials', 'staff_bootstrap_marker'].flatMap((table) => [
-+      ...['staff_web_credentials', 'staff_bootstrap_marker'].flatMap((table) => [
-         `INSERT INTO foundation.${table} DEFAULT VALUES`, `DELETE FROM foundation.${table}`,
-       ]),
-+      'DELETE FROM foundation.staff',
-       'SELECT * FROM foundation.staff_bootstrap_marker', 'UPDATE foundation.staff_bootstrap_marker SET id=id',
-       ...['web_sessions', 'web_auth_throttles', 'web_auth_attempts'].map((table) => `DELETE FROM foundation.${table}`),
-       'UPDATE foundation.web_sessions SET staff_id=staff_id', 'UPDATE foundation.web_sessions SET absolute_expires_at=absolute_expires_at',
-       'UPDATE foundation.web_auth_attempts SET key_hash=key_hash', 'UPDATE foundation.web_auth_attempts SET reserved_at=reserved_at',
-+      'DELETE FROM foundation.user_permissions',
-+      'UPDATE foundation.user_permissions SET id=id', 'UPDATE foundation.user_permissions SET staff_id=staff_id',
-+      'UPDATE foundation.user_permissions SET capability=capability', 'UPDATE foundation.user_permissions SET scope=scope',
-+      `INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,revoked_at) VALUES(gen_random_uuid(),'${runtimeStaffId}','RUNTIME_REVOKED','GLOBAL',CURRENT_TIMESTAMP)`,
-     ];
-     for (const sql of privilegeDenials) { await denied(runtime, sql); }
--    console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials and ${privilegeDenials.length} privilege denials: PASS`);
-+    console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials, ${uniqueViolations} unique violations and ${privilegeDenials.length} privilege denials: PASS`);
-   } finally { await runtime.end(); }
-   console.log('P01-01.9A migration integration proofs: PASS. Test databases retained; no dev data reset.');
- } catch (error) {
-diff --git a/prisma/schema.prisma b/prisma/schema.prisma
-index cb818b6..c5b0594 100644
---- a/prisma/schema.prisma
-+++ b/prisma/schema.prisma
-@@ -27,10 +27,12 @@ model Staff {
-   id              String              @id @db.Uuid
-   role            String              @db.VarChar(16)
-   employmentState String              @map("employment_state") @db.VarChar(16)
--  authVersion     Int                 @default(0) @map("auth_version")
--  webCredential   StaffWebCredential?
--  bootstrapMarker StaffBootstrapMarker?
--  webSessions     WebSession[]
-+  authVersion        Int                   @default(0) @map("auth_version")
-+  webCredential      StaffWebCredential?
-+  bootstrapMarker    StaffBootstrapMarker?
-+  webSessions        WebSession[]
-+  permissions        UserPermission[]
-+  grantedPermissions UserPermission[]      @relation("UserPermissionGrantedBy")
- 
-   @@map("staff")
-   @@schema("foundation")
-@@ -55,6 +57,26 @@ model StaffWebCredential {
-   @@schema("foundation")
- }
- 
-+// Capabilities are plain strings validated in the application; no catalog table.
-+// The partial unique index and period/scope CHECKs exist only in migration SQL.
-+model UserPermission {
-+  id             String    @id @db.Uuid
-+  staffId        String    @map("staff_id") @db.Uuid
-+  capability     String    @db.VarChar(64)
-+  scope          String    @db.VarChar(16)
-+  validFrom      DateTime  @default(now()) @map("valid_from") @db.Timestamptz(6)
-+  validUntil     DateTime? @map("valid_until") @db.Timestamptz(6)
-+  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
-+  grantedBy      String?   @map("granted_by") @db.Uuid
-+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-+  staff          Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
-+  grantedByStaff Staff?    @relation("UserPermissionGrantedBy", fields: [grantedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
-+
-+  @@index([staffId], map: "user_permissions_staff_id_idx")
-+  @@map("user_permissions")
-+  @@schema("foundation")
-+}
-+
- model WebSession {
-   id                String    @id @db.Uuid
-   staffId           String    @map("staff_id") @db.Uuid
 diff --git a/apps/api/src/auth/http.ts b/apps/api/src/auth/http.ts
 new file mode 100644
 index 0000000..69b8d96
@@ -852,13 +554,14 @@ index 0000000..2f3dfe4
 +}
 diff --git a/apps/api/tests/staff-authz-http.test.ts b/apps/api/tests/staff-authz-http.test.ts
 new file mode 100644
-index 0000000..fc829ad
+index 0000000..9df43e5
 --- /dev/null
 +++ b/apps/api/tests/staff-authz-http.test.ts
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,219 @@
 +import 'reflect-metadata';
 +import { createHmac, randomUUID } from 'node:crypto';
 +import type { Server } from 'node:http';
++import { Controller, Get, UseGuards } from '@nestjs/common';
 +import { Test } from '@nestjs/testing';
 +import type { PoolClient } from 'pg';
 +import request from 'supertest';
@@ -868,6 +571,7 @@ index 0000000..fc829ad
 +import { AUTHORIZATION_SERVICE } from '../src/authz/authorization.resources.js';
 +import { AuthorizationError } from '../src/authz/authorization.service.js';
 +import type { StaffWriteContext } from '../src/authz/authorization.service.js';
++import { StaffWebAuthGuard } from '../src/authz/authorization.guard.js';
 +import { GLOBAL_SCOPE } from '../src/authz/capability.js';
 +import type { StaffWebPrincipal } from '../src/authz/principal.js';
 +import { StaffController, StaffService } from '../src/staff/staff.controller.js';
@@ -892,7 +596,14 @@ index 0000000..fc829ad
 +interface StaffDetailRow { id: string; role: string; employment_state: string; auth_version: number }
 +interface QueryResult<T> { rows: T[]; rowCount: number }
 +
-+async function setup() {
++/** Test-only route behind the real guard but without capability metadata. */
++@Controller('test/no-metadata')
++@UseGuards(StaffWebAuthGuard)
++class NoCapabilityController {
++  @Get() open(): { ok: true } { return { ok: true }; }
++}
++
++async function setup(controllers: unknown[] = [StaffController], withAuthorization = true) {
 +  const listRows: StaffListRow[] = [{ id: existingId, role: 'MANAGER', employment_state: 'ACTIVE' }];
 +  const created: StaffDetailRow[] = [];
 +  const staffInserts: unknown[][] = [];
@@ -928,10 +639,13 @@ index 0000000..fc829ad
 +    authorizeForWrite: vi.fn(<T>(_token: string, _capability: string, _scope: unknown, write: (context: StaffWriteContext) => Promise<T>) =>
 +      write({ client: client as unknown as PoolClient, principal })),
 +  };
-+  const module = await Test.createTestingModule({ controllers: [StaffController], providers: [
++  const module = await Test.createTestingModule({ controllers: controllers as never[], providers: [
 +    StaffService,
++    // The real guard instance: Reflector is framework-provided; the mocked service
++    // tokens below satisfy its DI, so every test executes the actual guard code.
++    StaffWebAuthGuard,
 +    { provide: WEB_AUTH_SERVICE, useValue: auth },
-+    { provide: AUTHORIZATION_SERVICE, useValue: authz },
++    ...(withAuthorization ? [{ provide: AUTHORIZATION_SERVICE, useValue: authz }] : []),
 +    { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin, csrfSecret } },
 +  ] }).compile();
 +  // Nest models the structural options as a class without methods.
@@ -1047,6 +761,20 @@ index 0000000..fc829ad
 +    (authz.authorizeForWrite).mockRejectedValueOnce(new AuthorizationError('UNAUTHORIZED'));
 +    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
 +      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'MANAGER' }).expect(401);
++  });
++
++  it('fails closed with 500 when a guarded route lacks capability metadata', async () => {
++    const { server } = await setup([NoCapabilityController]);
++    // The real guard runs; missing @RequireCapability is a programming error and
++    // must never silently authorize the request.
++    await request(server).get('/test/no-metadata').set('Cookie', cookie(first)).expect(500);
++  });
++
++  it('does not silently skip authorization when the guard dependency is missing', async () => {
++    // Without AUTHORIZATION_SERVICE the application cannot even initialize:
++    // Nest fails during module compilation (fail-fast at startup), proving a
++    // missing guard dependency can never degrade into unauthenticated access.
++    await expect(setup([StaffController], false)).rejects.toThrow(/can't resolve dependencies/i);
 +  });
 +});
 diff --git a/apps/api/tests/staff-authz-e2e.test.ts b/apps/api/tests/staff-authz-e2e.test.ts
