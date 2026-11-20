@@ -1,0 +1,81 @@
+name: fixlevelup-linux-integration
+
+services:
+  postgres:
+    image: postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402
+    platform: linux/amd64
+    container_name: fixlevelup-linux-integration-postgres
+    command: ["postgres", "-p", "55432", "-c", "listen_addresses=127.0.0.1"]
+    environment:
+      POSTGRES_DB: fixlevelup_dev
+      POSTGRES_USER: fixlevelup_dev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate isolated integration credentials}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    networks:
+      - integration-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 55432 -U fixlevelup_dev -d fixlevelup_dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  garage:
+    image: dxflrs/garage:v2.5.0@sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5
+    platform: linux/amd64
+    container_name: fixlevelup-linux-integration-garage
+    network_mode: service:postgres
+    command: ["/garage", "server", "--single-node"]
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?Generate isolated integration credentials}
+      GARAGE_LOG_FORMAT: json
+      RUST_LOG: error
+      NO_COLOR: "1"
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  runner:
+    build:
+      context: ../..
+      dockerfile: infra/linux-integration/Dockerfile
+    image: fixlevelup-linux-integration:p0111b
+    platform: linux/amd64
+    container_name: fixlevelup-linux-integration-runner
+    network_mode: service:postgres
+    cpus: 2
+    mem_limit: 4g
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate isolated credentials}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Generate isolated credentials}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Generate isolated credentials}
+      S3_READONLY_ACCESS_KEY_ID: ${S3_READONLY_ACCESS_KEY_ID:?Generate isolated credentials}
+      S3_READONLY_SECRET_ACCESS_KEY: ${S3_READONLY_SECRET_ACCESS_KEY:?Generate isolated credentials}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      garage:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+    name: fixlevelup-linux-integration-postgres-data
+  garage-meta:
+    name: fixlevelup-linux-integration-garage-meta
+  garage-data:
+    name: fixlevelup-linux-integration-garage-data
+
+networks:
+  integration-net:
+    name: fixlevelup-linux-integration-net
+    internal: true
