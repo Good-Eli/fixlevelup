@@ -178,10 +178,11 @@ export class TelegramAuthService {
            WHERE l.id = $1 AND l.staff_id = $2 AND l.telegram_user_id = $3::bigint AND l.revoked_at IS NULL
            FOR UPDATE OF l`, [priorRow.telegram_link_id, priorRow.staff_id, verified.telegramUserId]);
         if (priorLink.rowCount !== 1) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
-        // Grace window: same session, rotated token, idle refreshed, absolute TTL unchanged.
+        // Grace window: same session, rotated token only. TTLs are untouched here —
+        // a replay must not extend the idle window; sliding idle happens only in
+        // authenticate(). Absolute TTL never moves anywhere.
         const rotated = await client.query<SessionRow>(
-          `UPDATE foundation.web_sessions SET token_hash = $1,
-             idle_expires_at = LEAST(absolute_expires_at, clock_timestamp() + interval '2 hours')
+          `UPDATE foundation.web_sessions SET token_hash = $1
            WHERE id = $2 AND initdata_digest = $3 AND channel = 'STAFF_TELEGRAM' AND revoked_at IS NULL
              AND initdata_exchanged_at + interval '60 seconds' >= clock_timestamp()
            RETURNING id, staff_id, auth_version, idle_expires_at, absolute_expires_at`,
@@ -199,9 +200,10 @@ export class TelegramAuthService {
         };
       }
       // New exchange: only a pre-existing active staff Telegram link authorizes a session;
-      // unknown Telegram users are never registered automatically. The link row is
-      // locked (after staff) so a concurrent revoke of this exact link serializes
-      // against the exchange; the link id is pinned immutably into the session.
+      // unknown Telegram users are never registered automatically. The initial SELECT is
+      // advisory only; the link row is re-verified under its FOR UPDATE lock (after staff)
+      // so a revoke landing between the initial lookup and this lock fails closed here,
+      // never creating a session from a stale read. Lock order stays staff → link → session.
       const link = await client.query<LinkRow>(
         `SELECT l.id, l.staff_id, l.telegram_user_id::text AS telegram_user_id
          FROM foundation.staff_telegram_links l
@@ -211,7 +213,11 @@ export class TelegramAuthService {
       if (!linked) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
       const staff = await this.lockedStaff(client, linked.staff_id);
       if (!staff) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
-      await client.query('SELECT 1 FROM foundation.staff_telegram_links WHERE id = $1 FOR UPDATE', [linked.id]);
+      const relink = await client.query(
+        `SELECT 1 FROM foundation.staff_telegram_links l
+         WHERE l.id = $1 AND l.staff_id = $2 AND l.telegram_user_id = $3::bigint AND l.revoked_at IS NULL
+         FOR UPDATE OF l`, [linked.id, staff.id, verified.telegramUserId]);
+      if (relink.rowCount !== 1) { await this.finish(client, reservations, true); return { ok: false, code: 'UNAUTHORIZED' }; }
       const inserted = await client.query<SessionRow>(
         `INSERT INTO foundation.web_sessions (id, staff_id, token_hash, auth_version, created_at,
            idle_expires_at, absolute_expires_at, channel, initdata_digest, initdata_exchanged_at, telegram_link_id)

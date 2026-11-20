@@ -22,10 +22,16 @@ const migrations = [
 const digestOf = (token: string) => createHash('sha256').update(token).digest('hex');
 const connection = { host: '127.0.0.1', port: 55432 };
 const telegramUserId = '279058397';
+// auth_date has one-second resolution, so two calls in the same second would otherwise
+// produce an identical digest and turn an intended "new exchange" into a grace replay.
+// A per-call query_id keeps every call a distinct digest; tests that need a stable digest
+// for replay capture one raw string and reuse it.
+let initDataSequence = 0;
 const signedInitData = (userId: number = 279058397): string => {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const user = JSON.stringify({ id: userId, first_name: 'Synthetic', username: 'synthetic_master' });
-  const pairs: [string, string][] = [['user', user], ['auth_date', String(nowSeconds)]];
+  const queryId = `AAH${String(++initDataSequence).padStart(6, '0')}`;
+  const pairs: [string, string][] = [['user', user], ['auth_date', String(nowSeconds)], ['query_id', queryId]];
   const dcs = pairs.slice().sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join('\n');
   const hash = createHmac('sha256', createHmac('sha256', 'WebAppData').update(botToken).digest()).update(dcs).digest('hex');
   const all: [string, string][] = [...pairs, ['hash', hash]];
@@ -106,13 +112,17 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
   }, 30000);
 
   it('replays the same initData within grace: same session row, rotated token, absolute TTL unchanged', async () => {
-    const first = await service.exchange(signedInitData(), source());
-    const second = await service.exchange(signedInitData(), source());
+    // One raw string for every call: signedInitData() embeds auth_date with one-second
+    // resolution, so calling it repeatedly can straddle a second boundary and produce a
+    // different digest — that would make this a second exchange instead of a grace replay.
+    const raw = signedInitData();
+    const first = await service.exchange(raw, source());
+    const second = await service.exchange(raw, source());
     expect(second.staffId).toBe(first.staffId);
     expect(second.token).not.toBe(first.token);
     const rows = await fixture.query<{ token_hash: string }>(
       'SELECT token_hash FROM foundation.web_sessions WHERE initdata_digest = $1',
-      [verifyInitData(signedInitData(), botToken).digest]);
+      [verifyInitData(raw, botToken).digest]);
     expect(rows.rowCount).toBe(1);
     expect(rows.rows[0]?.token_hash).toBe(digestOf(second.token));
     expect(second.absoluteExpiresAt).toEqual(first.absoluteExpiresAt);
@@ -380,5 +390,90 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
       await revoker.end();
       await linkUpdater.end();
     }
+  }, 30000);
+
+  // P02-05 hotfix 2 (recheck under lock): a revoke landing between the exchange's
+  // initial link lookup and the FOR UPDATE recheck must fail closed — no session row,
+  // no credential. The exchange parks on the link lock itself (staff lock already held),
+  // the revoke lands while it waits, and the recheck (same id, same staff, same telegram
+  // id, still active) refuses to proceed.
+  it('refuses the exchange when the link is revoked between the initial lookup and the lock recheck', async () => {
+    if (!migratorAccess) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    const lateStaffId = randomUUID();
+    const lateLinkId = randomUUID();
+    await fixture.query("INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, 'TECHNICIAN', 'ACTIVE', 0)", [lateStaffId]);
+    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [lateLinkId, lateStaffId, 700000104]);
+    const staffLocker = new Client({ ...connection, ...migratorAccess });
+    const revoker = new Client({ ...connection, ...migratorAccess });
+    await staffLocker.connect();
+    await revoker.connect();
+    try {
+      // Hold the staff row lock so the exchange reaches it, takes it, and then hits
+      // the link lock held by the revoker's open transaction.
+      await staffLocker.query('BEGIN');
+      await staffLocker.query("SELECT id FROM foundation.staff WHERE id = $1 FOR UPDATE", [lateStaffId]);
+      // Start the exchange: it queues on the staff lock before touching the link.
+      const exchanged = service.exchange(signedInitData(700000104), source());
+      void exchanged.catch(() => undefined);
+      await waitFor('the exchange to wait on the staff row lock', async () => {
+        const waiting = await fixture.query<{ count: number }>(
+          `SELECT count(*)::int AS count FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+           WHERE a.datname = current_database() AND a.usename = 'fixlevelup_runtime' AND NOT l.granted`);
+        return (waiting.rows[0]?.count ?? 0) > 0;
+      });
+      // Lock the link and revoke it in a transaction that commits while the exchange
+      // is still in flight (it either waits on this lock or re-reads the revoked row).
+      await revoker.query('BEGIN');
+      await revoker.query('SELECT id FROM foundation.staff_telegram_links WHERE id = $1 FOR UPDATE', [lateLinkId]);
+      await revoker.query('UPDATE foundation.staff_telegram_links SET revoked_at = clock_timestamp() WHERE id = $1', [lateLinkId]);
+      await staffLocker.query('ROLLBACK');
+      await revoker.query('COMMIT');
+      // The recheck under the lock (or the fresh read of the committed revocation)
+      // refuses the exchange: no credential, no session row.
+      await expect(exchanged).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      const sessions = await fixture.query<{ count: number }>(
+        "SELECT count(*)::int AS count FROM foundation.web_sessions WHERE staff_id = $1 AND channel = 'STAFF_TELEGRAM'", [lateStaffId]);
+      expect(sessions.rows[0]?.count).toBe(0);
+    } finally {
+      await staffLocker.query('ROLLBACK').catch(() => undefined);
+      await revoker.query('ROLLBACK').catch(() => undefined);
+      await staffLocker.end();
+      await revoker.end();
+    }
+  }, 30000);
+
+  // P02-05 hotfix 3 (grace must not extend TTLs): a grace replay rotates the token only;
+  // idle and absolute expiry stay byte-identical, the new token works, the old one dies.
+  it('rotates the token on a grace replay without extending either TTL', async () => {
+    if (!migratorAccess) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    const graceStaffId = randomUUID();
+    const graceLinkId = randomUUID();
+    await fixture.query("INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, 'TECHNICIAN', 'ACTIVE', 0)", [graceStaffId]);
+    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [graceLinkId, graceStaffId, 700000105]);
+    const raw = signedInitData(700000105);
+    const first = await service.exchange(raw, source());
+    const before = await fixture.query<{ idle_expires_at: Date; absolute_expires_at: Date }>(
+      'SELECT idle_expires_at, absolute_expires_at FROM foundation.web_sessions WHERE token_hash = $1', [digestOf(first.token)]);
+    const initialTtls = before.rows[0];
+    if (!initialTtls) { throw new Error('Missing grace session row'); }
+    // Small clock shift to prove a changed value would be caught: sleep 20ms so a
+    // recomputed idle window would differ if the implementation ever refreshed it.
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    const second = await service.exchange(raw, source());
+    expect(second.token).not.toBe(first.token);
+    expect(second.staffId).toBe(first.staffId);
+    const after = await fixture.query<{ idle_expires_at: Date; absolute_expires_at: Date; telegram_link_id: string }>(
+      'SELECT idle_expires_at, absolute_expires_at, telegram_link_id FROM foundation.web_sessions WHERE token_hash = $1', [digestOf(second.token)]);
+    const replayedRow = after.rows[0];
+    if (!replayedRow) { throw new Error('Missing rotated session row'); }
+    expect(replayedRow.telegram_link_id).toBe(graceLinkId);
+    expect(replayedRow.idle_expires_at).toEqual(initialTtls.idle_expires_at);
+    expect(replayedRow.absolute_expires_at).toEqual(initialTtls.absolute_expires_at);
+    const rows = await fixture.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM foundation.web_sessions WHERE staff_id = $1 AND channel = 'STAFF_TELEGRAM' AND initdata_digest = $2",
+      [graceStaffId, verifyInitData(raw, botToken).digest]);
+    expect(rows.rows[0]?.count).toBe(1);
+    await expect(service.authenticate(second.token)).resolves.toMatchObject({ staffId: graceStaffId });
+    await expect(service.authenticate(first.token)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
   }, 30000);
 });
