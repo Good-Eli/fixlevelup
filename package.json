@@ -19,6 +19,7 @@
     "s3:test": "vitest run packages/storage-tooling/tests",
     "s3:init": "corepack pnpm --filter @fixlevelup/storage-tooling run init",
     "s3:bootstrap": "corepack pnpm --filter @fixlevelup/storage-tooling run bootstrap",
+    "backup:drill": "node packages/storage-tooling/scripts/restore-drill.mjs",
     "lint": "corepack pnpm run db:generate && eslint . --max-warnings 0",
     "typecheck": "corepack pnpm run db:generate && corepack pnpm --filter @fixlevelup/database-tooling run typecheck && corepack pnpm --filter @fixlevelup/storage-tooling run typecheck && tsc --noEmit && corepack pnpm --filter @fixlevelup/api run typecheck && corepack pnpm --filter @fixlevelup/web run typecheck && corepack pnpm --filter @fixlevelup/miniapp run typecheck",
     "build": "corepack pnpm run db:generate && corepack pnpm --filter @fixlevelup/api run build && corepack pnpm --filter @fixlevelup/web run build && corepack pnpm --filter @fixlevelup/miniapp run build",

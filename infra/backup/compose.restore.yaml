@@ -1,0 +1,39 @@
+name: fixlevelup-restore-s3-${RESTORE_SUFFIX:?Set unique restore suffix}
+
+services:
+  garage:
+    image: dxflrs/garage:v2.5.0@sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5
+    platform: linux/amd64
+    container_name: fixlevelup-restore-s3-${RESTORE_SUFFIX:?Set unique restore suffix}
+    restart: "no"
+    command: ["/garage", "server", "--single-node"]
+    environment:
+      GARAGE_RPC_SECRET: ${RESTORE_RPC_SECRET:?Set isolated RPC secret}
+      GARAGE_LOG_FORMAT: json
+      RUST_LOG: error
+      NO_COLOR: "1"
+    ports:
+      - "127.0.0.1:13900:3900"
+    volumes:
+      - ./garage-restore.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    networks:
+      - restore-net
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  garage-meta:
+    name: fixlevelup-restore-s3-${RESTORE_SUFFIX}-meta
+  garage-data:
+    name: fixlevelup-restore-s3-${RESTORE_SUFFIX}-data
+
+networks:
+  restore-net:
+    name: fixlevelup-restore-s3-${RESTORE_SUFFIX}-net
+    driver: bridge
