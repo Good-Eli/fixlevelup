@@ -1,6 +1,6 @@
 # Дорожная карта реализации и критерии приёмки
 
-**Статус на 20.11.2026; бизнес-дорожная карта R3.2 от 19.11.2026 сохранена.** P01 технически готов к приёмке с ограничениями, но его приёмка владельцем не заявлена завершённой. F01–F05 и F07 — PASS; F06 — PARTIAL с открытыми release gates до коммерческого распространения и production. Эти gates не блокируют отдельно разрешённую работу следующего этапа на synthetic data. [GitHub Actions run 44677729359](https://github.com/Good-Eli/fixlevelup/actions/runs/44677729359) на commit `1165f0d950984c2555e61aceef681640ff0e075d`: четыре CI jobs success и опубликованы artifacts. Это не готовность продукта или production. Следующий этап P02 требует **отдельного разрешения владельца**. Актуальные критерии и ограничения — в [Preflight P01](PREFLIGHT_P01.md). Текущие подтверждённые решения владельца/AS-MAX-01 — [DECISIONS §20](DECISIONS.md#20-решения-владельца-r32); историческая фиксация §18 сохранена. Источники: [ТЗ](../info/ТЗ.md), расширение владельца Telegram/VK/MAX, аудит Claude; см. [архитектуру](ARCHITECTURE.md), [модель БД](DATABASE.md), [API](API.md), [решения и platform evidence](DECISIONS.md).
+**Статус на 20.11.2026; бизнес-дорожная карта R3.2 от 19.11.2026 сохранена.** Локальный closeout P01 зафиксирован в `0ffc7c28d257ee9a4ee57c747efd8d354556639f`; документальный preflight сохраняет формулировку рекомендации к приёмке с ограничениями. F01–F05 и F07 — PASS; F06 — PARTIAL с открытыми release gates до коммерческого распространения и production; synthetic разработку они не блокируют. [GitHub Actions run 44677729359](https://github.com/Good-Eli/fixlevelup/actions/runs/44677729359) на commit `1165f0d950984c2555e61aceef681640ff0e075d` — четыре CI jobs success; это не проверка текущего HEAD и не готовность к production. Владелец разрешил **только документальный P02-01**; каждый следующий подэтап требует отдельного разрешения. Критерии P01 — [Preflight P01](PREFLIGHT_P01.md); текущие решения доступа и канальный контракт — [DECISIONS §21](DECISIONS.md#21-p02-01--модель-доступа-и-контракт-каналов), ранее принятые решения/AS-MAX-01 — [DECISIONS §20](DECISIONS.md#20-решения-владельца-r32). Источники: [ТЗ](../info/ТЗ.md), расширение владельца Telegram/VK/MAX, аудит Claude; см. [архитектуру](ARCHITECTURE.md), [модель БД](DATABASE.md), [API](API.md), [решения](DECISIONS.md).
 
 ## 1. Состояние, границы и Definition of Done
 
@@ -32,7 +32,7 @@ flowchart LR
   ACC --> VK
   ACC --> MAX
   MAX --> MLIVE[P07-MAX-LIVE Позднее подключение и live acceptance]
-  ADM --> MLIVE
+  ADM -. только необходимые configuration/evidence компоненты, без MAX publication .-> MLIVE
   P04 --> A[P09A Availability]
   P05 --> A
   P06 --> B[P09B Dispatch]
@@ -47,8 +47,10 @@ flowchart LR
   VK -. если VK публикуется .-> P08B
   MAX -. если MAX публикуется .-> P08B
   MLIVE -. actual readiness только при публикации MAX .-> P08B
-  TG --> P10[Telegram Mini App]
+  P02 --> P10[Telegram Mini App мастера]
   B --> P10
+  P02 --> MTG[P09B-MTG Менеджерский staff бот]
+  B --> MTG
   UX --> P10
   P04 --> QA[P11A Quote API и CRM]
   P05 --> QA
@@ -109,7 +111,7 @@ Edges отражают engineering dependencies; MLIVE→P14 относится 
 
 ### P01 — foundation, Git, CI, proof ограничений
 
-- **Статус:** P01 технически готов к приёмке с ограничениями; приёмка владельцем не заявлена завершённой. F01–F05 и F07 — PASS, F06 — PARTIAL. Его release gates не блокируют отдельно разрешённый следующий этап на synthetic data, но должны быть закрыты до коммерческого распространения и production. Подробные статусы F01–F07, evidence и оставшиеся действия — [Preflight P01](PREFLIGHT_P01.md).
+- **Статус:** локальный commit документационного closeout присутствует; [Preflight P01](PREFLIGHT_P01.md) сохраняет историческую формулировку рекомендации к приёмке с ограничениями и сам по себе не подтверждает формальную приёмку. F01–F05 и F07 — PASS, F06 — PARTIAL. Его release gates не блокируют отдельно разрешённую работу на synthetic data, но должны быть закрыты до коммерческого распространения и production. Подробные статусы, evidence и оставшиеся действия — в preflight.
 - **Результат/модули:** monorepo/pnpm12 workspace/TS6+ESLint10, API и worker entrypoints/health, dev PostgreSQL 18.7 и Garage 2.5.0 S3, технические migrations/audit/outbox и CI. Vitest/Supertest — основной тестовый контур, Playwright — отдельный browser smoke. Geo contract подтверждён documentary/synthetic FK proof **до domain migrations**; city CRM/settings/prices и реальные заявки не реализованы.
 - **Фактические проверки:** frozen/offline install, lint/typecheck/build, real PostgreSQL fresh/upgrade/replay/drift, constraints/privileges, транзакционный audit/outbox и worker fencing; отдельно local synthetic DB+objects backup/restore и Linux signals/browser smoke. Актуальный remote [run 44677729359](https://github.com/Good-Eli/fixlevelup/actions/runs/44677729359) на `1165f0d950984c2555e61aceef681640ff0e075d`: четыре jobs success и опубликованы artifacts. CI подтверждает проверенный SHA, а не будущие изменения; synthetic drill не является production backup.
 - **Оставшиеся release gates F06:** корневой [README](../README.md) подготовлен; технический license inventory и review 29 записей не являются юридическим одобрением. До коммерческого распространения и production необходимы инспекция точного архива `@visx/vendor@4.0.0-alpha.0` и архивов всех platform variants Lightning CSS, artifact-level SBOM/notices, включая native Sharp/libvips, и legal/distribution review фактических release artifacts и обязательств. См. [license review](THIRD_PARTY_LICENSE_REVIEW.md). Эти gates не блокируют отдельно разрешённую работу на synthetic data.
@@ -118,13 +120,18 @@ Edges отражают engineering dependencies; MLIVE→P14 относится 
 
 ### P02 — сотрудники, Auth и capabilities
 
-**Следующий этап не начат; для его начала требуется отдельное разрешение владельца.**
+**Разрешён только P02-01 — документирование; P02-02 и последующие подэтапы не начаты и требуют отдельного разрешения владельца.** Канонические решения и границы proposed contracts — [DECISIONS §21](DECISIONS.md#21-p02-01--модель-доступа-и-контракт-каналов); матрица §13 остаётся на согласование. Q03/Q12 и proof привязки — gates только для зависимых решений, не основание выдумывать policy.
 
-- **Результат/модули:** bootstrapA без default password, login/logout/renew/password/revoke, staff activation/leave/fired, capabilities DEC§13, staff invitation proof; Auth/Staff/Audit/CRM auth.
-- **Зависимости:** P01, Q12 boundaries/session policies, Q03 dual identity rules.
-- **Тесты:** role×capability×scope×state, 401/403/404/no IDOR, CSRF/cookies, brute force, deny role escalation/self permissions, current auth_version every request, disabled user live sessions.
-- **Критерий:** каждая unauthorized операция отвергнута backend, включая «спрятанную» кнопку; audit.self только actor filter/redacted, employee history не удаляется.
-- **Риски:** shared staff/customer identity, token-only invitation, blocked employee stale session.
+| Подэтап | Граница и критерий приёмки | Зависимости и открытые решения |
+|---|---|---|
+| P02-01 — Contracts & Minimal Access Model | Только документы: принципы principal/authn/authz, разделение staff/customer, общий контракт и граница адаптеров, уровни проверок, план; owner facts отдельно от предложений. Нет кода/DDL/deps/подключений. | P01 foundation; Q03/Q12/Q17 фиксируются открытыми, а не решаются молчаливо. |
+| P02-02 — учётные записи и bootstrap | Минимальная identity-модель и защищённый bootstrap A без default password и открытой регистрации; fresh/upgrade и ограничения на реальной test PostgreSQL. Мастеру автоматически не создаётся web credential. | P02-01; согласовать безопасную процедуру bootstrap и данные модели. |
+| P02-03 — веб-аутентификация M/A | Login/logout/renew/password/revoke для менеджера и администратора; тесты неверных credentials, brute force, cookie/CSRF, expiry/revoke и безопасных ошибок. | P02-02; Q12: согласовать session TTL/rotation/recovery до реализации зависящей policy. |
+| P02-04 — общая серверная авторизация | Единый типизированный principal и проверки staff capability либо customer request grant, scope/state/ownership, default deny; deny самоэскалации, 401/403/404/no IDOR, recheck при replay/write. | P02-01/02; P02-03 даёт web principal. Матрица §13/делегирование требуют согласования; конкретные CITY grants/FK — после P03. |
+| P02-05 — Telegram-аутентификация мастера | Проверить raw initData и действующую заранее созданную staff link; выдать отзывную staff session. Unknown/inactive/forged/expired и запрещённый replay denied; безопасный intended-employee proof при привязке, один пересланный invite недостаточен. Без автоматического web login. | P02-02/04; Q12 TTL и политика exchange, согласованный staff proof; официальный алгоритм перепроверить. Offline tests без токена; реальный Mini App staging отдельно после доступов. Не клиентский TG-бот. |
+| P02-06 — жизненный цикл/security-регрессия | Deactivate/revoke и смена прав действуют на доступные staff-входы и связи; history сохраняется, audit безопасен, matrix role×capability×scope×state и stale session/IDOR/CSRF проходят. Конкурентный revoke/write проверяет порядок фиксации и отсутствие write после уже зафиксированного revoke; in-flight внешняя отправка имеет отдельное ограничение. При добавлении manager bot в P09B-MTG повторить эти проверки для него. | P02-03/04/05; точные разрешения и Q12 на затрагиваемый scope. |
+
+Проверки на synthetic fixtures не являются live-подключением. Единственный серверный authorization mechanism различает staff capabilities и клиентские request grants, не превращая один вид прав в другой. Пределы unit/contract, stub, real API и staging — DEC§21.
 
 ### P03 — settings/legal/files и типизированные справочники
 
@@ -160,26 +167,28 @@ Edges отражают engineering dependencies; MLIVE→P14 относится 
 
 ### P07 — Channels core, templates, inbox/outbox и routing
 
+**P02-01 уточнение:** P07-core и каждый из P07-TG/VK/MAX — конкретные engineering-подэтапы целевого scope, а не неопределённое будущее. Их разработка и synthetic mock/stub tests не требуют реальных аккаунтов/токенов; каждый real API test и live/staging acceptance проводится отдельно после получения доступов и разрешения. Детали общего контракта и границы тестов — [DECISIONS §21](DECISIONS.md#21-p02-01--модель-доступа-и-контракт-каналов). P07-core зависит от необходимых моделей P02/P03/P05 и решений Q17/Q18/Q20; адаптеры после стабильного core могут разрабатываться независимо. Полная проверка confirm/reschedule/cancel записи зависит от P09B, а не заменяется synthetic command fixtures.
+
 - **Результат/модули:** accounts/endpoints/links/grants/preferences/permission epochs/challenges/action tokens, shared commands, inbox/fanout/deliveries/attempts/fenced jobs, versioned template allowlists DEC§16, routing/manager alerts; CustomerMessaging/Notifications/Legal.
 - **Зависимости:** P05/P02/P03, Q17/Q18/Q20, platform-independent domain contracts; реальные providers подключаются отдельно ниже. TG/VK/MAX/регистрации не blocker foundationP01, не dependencies technical build proof.
 - **Тесты:** dual proof/no forwarded-link auth, no duplicate account/endpoint grant, cross-channel competing actions one domain result, revoke vs pending send, re-route generation, wrong role/internal message, arbitrary payload denied; crash after external accepted before SENT допускает message duplicate но не booking/payment duplicate; stale worker lease fencing.
 - **Критерий:** каждый §11 event→approved template/audience/allowlist, unknown variable rejected; manager routing works с2 recipients и без duty assignee (CRM queue), cleanup raw inbox retains dedupe/domain IDs, fallback только explicit scoped grant, PHONE не включается от failure.
 - **Риски:** technical allow ошибочно равен consent, max best-effort dedupe объявлен exact, message accepted выдан за customer CONFIRM. No real functionality ready до adapter tests.
 
-### P07-TG — клиентский Telegram и staff transport
+### P07-TG — клиентский Telegram adapter
 
-- **Результат/модули:** BotFather config+verified webhook/start/help/callback renderer/permission updates, staff TG invitations separate; Telegram adapter вызывает те же application commands.
-- **Зависимости:** P07/P00-ACCESS-TG, raw official docs initData/Bot API доступны до реализации, approved bot account/token secrets/HTTPS.
-- **Тесты:** wrong/missing secret, update_id duplicate/reorder, token reissue/expiry, start required, callback query answer vs domain outcome, rate limits/403/429/timeouts, MiniApp rights отдельно P10.
-- **Критерий:** live staging customer bind/confirm/reschedule/cancel/notifications+quote sample проходят без PII в deep links/payload, исходные Telegram tests2/3/21 сохранены; secret rotation после cutoff rejects old.
+- **Результат/модули:** BotFather config+verified webhook/start/help/callback renderer/permission updates для клиентского сценария; Telegram adapter вызывает те же application commands. Служебная manager identity и bot flow выделены в P09B-MTG, а не являются клиентским grant; мастерский Mini App — P02-05/P10.
+- **Зависимости:** P07/P00-ACCESS-TG и актуальный Bot API contract для offline реализации; approved bot account/token secrets/HTTPS требуются только для реального подключения и live. Staff initData относится к P02-05, Mini App UI — P10.
+- **Тесты:** synthetic wrong/missing secret, update_id duplicate/reorder, token reissue/expiry, start required, callback query answer vs domain outcome, rate limits/403/429/timeouts. Real API и staging отдельно.
+- **Критерий offline:** adapter и общие команды проходят contract/stub tests без сети и PII в deep links/payload. **Критерий live:** после доступа и отдельного разрешения — staging customer bind/notifications и реальные confirm/reschedule/cancel после P09B, quote sample после готовности смет; исходные Telegram tests2/3/21 сохранены, secret rotation после cutoff rejects old.
 - **Риски:** индекс docs не security specification, stolen initData, stop не замечен, wrong bot namespace.
 
 ### P07-VK — сообщество VK
 
 - **Результат/модули:** community token rights/events, Callback confirmation+secret/group/version, message_new/event/allow/deny normalization, keyboard/render/send/eventAnswer, stable random_id retry; только VK adapter.
-- **Зависимости:** P07/P00-ACCESS-VK/Q22, реальный admin доступ/разрешения, current quotas/rules, client_info support.
+- **Зависимости:** P07/P00-ACCESS-VK и доступный актуальный API contract для offline реализации; Q22, реальный admin доступ/разрешения и фактические quotas/client_info — для проверки реального подключения, не для synthetic разработки.
 - **Тесты:** confirmation response не ordinary ok, wrong group/secret/schema, top-level event_id duplicates, object.event_id timely answer, ref не permission, allow/deny reorder fail-closed, send denied/privacy/rate limits/random_id same retry, no community join prerequisite.
-- **Критерий:** live staging dual binding+4 новых client actions/updates через common commands; без отдельных VK pricing/state rules; access/applicability evidence stored без secrets.
+- **Критерий offline:** общие команды и VK adapter проходят fixtures/stub tests, без отдельных VK pricing/state rules. **Критерий live:** после доступа и отдельного разрешения — staging binding, сообщения и применимые client actions/updates; полные сценарии записи после P09B. Access/applicability evidence stored без secrets.
 - **Риски:** monthly limits/token model неопределённы, ref limit не найден, callback version меняется, bot policy блокирует канал.
 
 ### P07-MAX — изолированный MAX adapter по официальному API
@@ -203,8 +212,8 @@ Edges отражают engineering dependencies; MLIVE→P14 относится 
 ### P07-MAX-LIVE — отложенные регистрация, подключение и live acceptance
 
 - **Результат/модули:** фактические MAX профиль/verification owner, бот/moderation, действующие secret refs, actual purpose/protocol permission evidence, connection config/checks+live test. **Сейчас не выполняется.**
-- **Зависимости:** отдельное позднее разрешение на реальные connection операции; P07-MAX и deferred operational checklist Q21 (не новый MAX business/legal approval вопрос). Owner self-employed/RF residency уже факт, не open business status. P07-ADM publication может выполняться после readiness, не dependency permission получения.
-- **Проверки:** реальный HTTPS443/trusted chain/Authorization/current official host, hooks/secrets/retry, зарегистрированные цели SERVICE+needed actions/binding и lawful customer opt-in, permitted staging E2E confirm/reschedule/cancel/notifications. Фактическая среда/credential version отражены в acceptance evidence.
+- **Зависимости:** отдельное позднее разрешение на реальные connection операции; P07-MAX и deferred operational checklist Q21 (не новый MAX business/legal approval вопрос). Для записи readiness/live evidence нужны соответствующие компоненты P07-ADM, но не завершение его полной приёмки и не публикация MAX. Публикация enabled MAX следует только после live acceptance; это устраняет цикл. Owner self-employed/RF residency уже факт, не open business status.
+- **Проверки:** реальный HTTPS443/trusted chain/Authorization/current official host, hooks/secrets/retry, зарегистрированные цели SERVICE+needed actions/binding и lawful customer opt-in, permitted staging E2E. Полные confirm/reschedule/cancel требуют P09B; ранняя transport/binding/notification проверка не объявляется полной booking-приёмкой. Фактическая среда/credential version отражены в acceptance evidence.
 - **Критерий:** все реальные prerequisites выполнены до live sends; успешный live staging test перед public offer/production. После него admin вправе publish A-enabled option, но не обязан. Принять AS-MAX-01 за evidence/перескочить блокирующее условие нельзя.
 - **Риски:** отказ/задержка/лимит bot квоты, изменение terms/допустимого protocol, поэтому MAX остаётся unavailable для реальных отправок; core/TG/VK/isolated adapter при этом не блокируются.
 
@@ -219,10 +228,17 @@ Edges отражают engineering dependencies; MLIVE→P14 относится 
 ### P09B — назначения, версии визитов и customer confirmation
 
 - **Результат/модули:** city-scoped stable visits/immutable plans с city/area/address versions+visit timezone, current city+zone eligibility техников, reservations/history, manager candidates/manual assign/reschedule/reassign, customer confirm/change/cancel/STOP pending, tech acknowledgement, CRM calendar drag-drop/technician summary/workload.
-- **Зависимости:** P09A/P06/P07+адаптеры для live all-channel acceptance, Q04/Q05/Q12/Q19. Изолированный DB/API можно раньше отдельным scope.
+- **Зависимости:** P09A/P06/P07 и Q04/Q05/Q12/Q19 для доменной реализации. Адаптеры и реальные platform connections нужны только для соответствующей live all-channel acceptance; они не prerequisite изолированной реализации P09B. Напротив, полная live-проверка подтверждения/переноса/отмены через канал требует готового P09B, поэтому ранний transport/binding smoke не объявляется полной приёмкой записи.
 - **Тесты:**2 managers race, shift/absence/deactivate vs assign, failed reschedule old remains, same UUID/new version/old ack invalid, after departure immutable actuals/new linked visit, changing address new rechecked plan, cancellation guard по lifecycle включая PAUSED/WAITING_PARTS returns, confirmation vs cancel cross-channels.
 - **Критерий:** максимум разрешённой capacity, no autoassign, один current visit per request по принятому Q05; confirmed/tech ACK обе текущие до depart; future cancel releases booking не теряя order, поздний STOP не заявляется выполненным до outcome. Technician summary совпадает с calendar/query definitions.
 - **Риски:** versioned actions без epoch, клиентская отмена обходит safe-stop, passive indefinite reservation.
+
+### P09B-MTG — оперативный Telegram-интерфейс менеджера и mobile web
+
+- **Место и границы:** отдельный согласуемый staff transport после P09B, не клиентский P07-TG и не Mini App мастера P10. Рекомендуется обычный служебный бот с inline-кнопками и адаптивная страница заявки существующей CRM; отдельный manager Mini App/мобильное приложение и мобильная аналитика вне scope. Проверить достаточность бота, не считать её доказанной. Общий контракт — [DECISIONS §21](DECISIONS.md#мобильное-распределение-менеджером-предложение-p02-01).
+- **Зависимости:** P02-02/03/04 и правила staff identity, P05/P06, P09A/P09B candidates/assign и утверждённые Q04/Q05/Q12/Q19; UX и согласованная процедура привязки. Не требуется реализация P10, клиентского P07-TG или подключение VK/MAX. Engineering без Telegram credentials допускается на synthetic fixtures/stub; для реального подключения и отправки — отдельное разрешение и staff bot access.
+- **Offline-критерий:** активный менеджер безопасно связывает Telegram с web-учётной записью через proposal с подтверждением обеих сторон; ID/пересланная ссылка/чужой subject не дают link. Сценарий уведомление → заявка → подходящие мастера → выбор → подтверждение вызывает ту же P09B операцию, что mobile web; список не резервирует мастера. Тесты проверяют scope/active/capability, eligibility, время/coverage/capacity, version/expiry/revoke, duplicate callbacks, одновременное назначение двумя менеджерами, audit/history, idempotency и отсутствие ПД в кнопках/логах. Deep link требует web login и проверки доступа; клиентские и staff identities изолированы. Блокировка/ошибка доставки сохраняют заявку и дают CRM/ops alert; uncertain send не считается точно недоставленным.
+- **Отдельная live-приёмка:** с реальным staff bot и тестовыми участниками проверить авторизованную привязку, защиту от пересланного challenge, сообщение, кнопки/ответы, назначение, конфликт и заблокированного бота, а также web-переход/авторизацию. Статус live ставится только после фактического результата; stub tests его не заменяют. Решения о TTL, допустимых данных уведомления и escalation без получателей согласуются до реализации соответствующих частей.
 
 ### P08A — сайт и формы: инженерная готовность
 
@@ -243,7 +259,7 @@ Edges отражают engineering dependencies; MLIVE→P14 относится 
 ### P10 — Telegram Mini App мастера
 
 - **Результат/модули:** verified initData exchange, Сегодня/Заказы/Расписание/Доступность/История/Профиль, ack/decline/depart/arrive/diagnostics/parts pause, private files; staff Telegram только.
-- **Зависимости:** P02/P03/P07-TG/P09B/UX/Q12/официальный алгоритм validation; этот интерфейс не зависит от VK/MAX Mini Apps.
+- **Зависимости:** P02/P03/P09B/UX/Q12 и проверенный официальный алгоритм staff initData; отдельный staff transport при необходимости, не клиентский P07-TG. Этот интерфейс не зависит от VK/MAX Mini Apps или менеджерского бота.
 - **Тесты:**forged/expired/future/replayed initData/session limit/revoke, unauthorized user не auto-register, чужие/current old assignments, PII temporal redaction, offline/loading/empty/retry, explicit customer confirm guard.
 - **Критерий:** активный назначенный мастер работает с реальным backend, не видит чужое/исторический полный адрес, не создаёт смену вне утверждения; expiry/exchange retries не создают бесконечные sessions.
 - **Риски:** initDataUnsafe, cookie/bearer cross-surface confusion, staff invitation только по украденному link, UI обещает ещё не готовую смету.
@@ -414,4 +430,4 @@ Edges отражают engineering dependencies; MLIVE→P14 относится 
 
 Реальные город/название/контакты/IANA zone/office+staff hours/зоны/прайс+детали/diagnostics/travel/надбавки/лимиты/express/warranty/Avito и legal документы заполнены владельцем; не hardcoded fake values. Platform evidence current, staging/prod separate, TLS/secrets outside Git, service/auth permissions и message opt-in каждой площадки подтверждены. Полная приёмка всех3 либо explicit partial pilot decision Q23. Все **69 сценариев:25 исходных+20 M+12 X+12 N** и вложенные G01–G07 географии учтены в release evidence (PASS либо явный применимый BLOCKED/отдельно принятый partial-scope outcome; BLOCKED не означает PASS), RPO/RTO и нагрузочный профиль приняты. Назначены ops/privacy/incident owners, independent alerts, DB+objects backup/restore/deletion ledger tested. Applicable legal/fiscal/incident notification duties подтвердил юрист, no overclaimed legal audit.
 
-**После представления P01-12C остановиться на приёмку.** P02 и любая следующая работа требуют отдельного явного разрешения владельца и решения gates выбранного этапа. Исторические документы R2/R3.2 сами по себе не разрешают регистрацию bots/сообществ, production-операции или новое расширение scope.
+**После представления P02-01 остановиться на приёмку.** P02-02 и любая следующая работа требуют отдельного явного разрешения владельца и решения gates выбранного этапа. Исторические документы R2/R3.2 сами по себе не разрешают регистрацию bots/сообществ, production-операции или новое расширение scope.
