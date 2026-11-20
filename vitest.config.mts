@@ -9,7 +9,7 @@ export default defineConfig({
   test: {
     name: 'foundation',
     environment: 'node',
-    include: ['packages/tooling/tests/**/*.test.ts', 'apps/api/tests/**/*.test.ts', 'apps/web/tests/**/*.test.ts', 'apps/miniapp/tests/**/*.test.ts', 'apps/miniapp/tests/**/*.test.tsx'],
+    include: ['packages/storage-tooling/tests/**/*.test.ts', 'packages/tooling/tests/**/*.test.ts', 'apps/api/tests/**/*.test.ts', 'apps/web/tests/**/*.test.ts', 'apps/miniapp/tests/**/*.test.ts', 'apps/miniapp/tests/**/*.test.tsx'],
     globals: false,
     passWithNoTests: false,
     maxWorkers: 2,

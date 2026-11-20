@@ -1,0 +1,17 @@
+{
+  "name": "@fixlevelup/storage-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "init": "node scripts/init.mjs",
+    "bootstrap": "node scripts/bootstrap.mjs",
+    "test": "corepack pnpm --dir ../.. run s3:test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-s3": "3.1172.0",
+    "@aws-sdk/s3-request-presigner": "3.1172.0",
+    "@fixlevelup/tooling": "workspace:*"
+  }
+}

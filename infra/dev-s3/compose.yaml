@@ -1,0 +1,39 @@
+name: fixlevelup-dev-s3
+
+services:
+  garage:
+    image: dxflrs/garage:v2.5.0@sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5
+    platform: linux/amd64
+    container_name: fixlevelup-dev-s3
+    restart: unless-stopped
+    command: ["/garage", "server", "--single-node"]
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?Run local init first}
+      GARAGE_LOG_FORMAT: json
+      RUST_LOG: error
+      NO_COLOR: "1"
+    ports:
+      - "127.0.0.1:3900:3900"
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    networks:
+      - garage-net
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  garage-meta:
+    name: fixlevelup-dev-s3-meta
+  garage-data:
+    name: fixlevelup-dev-s3-data
+
+networks:
+  garage-net:
+    name: fixlevelup-dev-s3-net
+    driver: bridge
