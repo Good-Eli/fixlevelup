@@ -111,10 +111,45 @@ corepack pnpm --filter @fixlevelup/api run staff:recover
 ровно нужной учётной записи; при неопределённом commit сначала проверяет audit,
 а не повторяет без проверки. Техническое окружение с credential после работы
 закрывается/очищается; новый пароль вводит непосредственно доверенный владелец
-или получает его по отдельно согласованному защищённому каналу. Реальный вход
-проверяется только после реализации P02-03; здесь сессий ещё нет и увеличение
-`auth_version` само по себе не отзывает несуществующие сессии. Будущая auth
-обязана проверять актуальную версию и поддерживать отзыв.
+или получает его по отдельно согласованному защищённому каналу. P02-03 web auth
+при проверке сессии сверяет актуальный `auth_version`; восстановление увеличивает
+его и тем самым делает старые web-сессии недействительными.
+
+## P02-03: web auth менеджера и администратора
+
+Web auth по умолчанию отключена: `/auth/*` отсутствуют. Для явного включения вместе
+с настроенной runtime-БД задать `WEB_AUTH_ENABLED=1`, `WEB_AUTH_ORIGIN` — точный
+HTTPS origin браузера без пути и завершающего `/`, `WEB_AUTH_CSRF_SECRET` и
+`WEB_AUTH_THROTTLE_SECRET` — два независимых криптографически случайных значения
+по 32 байта в lowercase hex. Частичная/невалидная конфигурация и одинаковые
+секреты отклоняются при запуске; значения не печатать и не хранить в Git. Все
+экземпляры API используют одни и те же секреты; их ротация инвалидирует CSRF или
+меняет идентичность rate-limit ключей. Вход доступен только ACTIVE ADMIN/MANAGER.
+
+Сервер хранит SHA-256 от случайного session token; cookie `__Host-...` требует
+HTTPS на одном origin, Secure/HttpOnly/SameSite=Strict/Path=/ без Domain. Клиент
+использует `POST /api/v1/auth/login` с JSON и `X-CSRF-Token: login`, затем для
+`POST /api/v1/auth/session/renew`, `/api/v1/auth/logout` и
+`/api/v1/auth/password/change` передаёт session-bound CSRF из ответа или
+`GET /api/v1/auth/me` и точный Origin. `GET /me` требует `X-Auth-Request: 1`;
+password change требует актуальный `If-Match` из ETag. Все ответы —
+no-store, cookie-токен не возвращается в JSON. Сессия истекает через 30 минут
+бездействия или 12 часов с входа; renew атомарно меняет токен и не продлевает
+абсолютный предел. Одновременный renew только один раз успешен; потерянный ответ
+может потребовать повторного входа. Logout отзывает текущую сессию; смена пароля
+сохраняет текущую, но инвалидирует другие через актуальный `auth_version`.
+
+Пять неудачных проверок по одному точному login в любые 15 минут блокируют дальнейшие
+попытки; отдельный source-лимит — 50 на 15 минут. Проверки смены пароля также
+ограничены. События хранятся в PostgreSQL под HMAC-ключами. Резервирование до
+Argon2 учитывает параллельные попытки; успешные освобождают слот, сбой процесса
+удерживает незавершённый резерв до истечения. Источник — прямой socket address,
+не X-Forwarded-For; за reverse proxy все клиенты могут разделить один лимит. Для
+реального proxy и публикации необходима отдельная проверенная доверенная схема
+source IP. При ошибке хранилища доступ закрыт. Включённый API каждые 10 секунд запускает
+ограниченную очистку истёкших попыток и ключей и сессий, истёкших более 30 дней
+назад; каждая функция удаляет не более 100 записей за вызов. Это не полноценный
+security/production approval или гарантия удержания БД при произвольной нагрузке.
 
 ## Поведение
 
@@ -125,8 +160,9 @@ corepack pnpm --filter @fixlevelup/api run staff:recover
 - Один single-flight probe на запросы readiness, pool max2; connection/query/
   statement/lock timeout1000ms, без detached SQL после HTTP Promise.race.
   Shutdown останавливает новые probes, ждёт текущий, закрывает Prisma/pool.
-- Другие маршруты: безопасный problem response, business endpoints отсутствуют.
-- Body parser отключён; входные body не сохраняются/не логируются.
+- При включённом web auth доступны его API-маршруты; business endpoints отсутствуют.
+- JSON parser включается только вместе с web auth, strict и ограничен 4 KiB;
+  входные body не сохраняются и не логируются.
 - X-Powered-By отключён; health/errors имеют Cache-Control:no-store.
 - Error response содержит только type/title/status/code и server-generated requestId.
 - SafeLogger через Nest ConsoleLogger пишет только fixed event+role, без raw
@@ -179,10 +215,11 @@ runtime проверяются позднее. Никаких production shutdow
 Readiness проверяет required columns/type/nullability, PK/CHECK definitions,
 required indexes и subset runtime privileges без чтения _prisma_migrations.
 Это НЕ полный drift/security audit: typmods/defaults, дополнительные объекты,
-functions и вся история миграций не сравниваются. P02-02 staff-таблицы и их ACL
-не входят в этот технический readiness probe: успешный health/ready не доказывает,
-что identity migration применена или права на неё корректны. Exact catalog definitions
-привязаны к текущей PG18.7 и требуют review при обновлении major/minor.
+functions и вся история миграций не сравниваются. При включённом web auth probe
+дополнительно проверяет наличие необходимых identity/auth-таблиц, столбцов,
+основных ограничений/индексов и ACL; это не полная проверка всех SQL-выражений и
+безопасности схемы. Exact catalog definitions привязаны к текущей PG18.7 и требуют
+review при обновлении major/minor.
 
 Integration tests требуют локальные dev/runtime secrets и работающую FixLevelUp
 PostgreSQL55432. Они создают отдельную random p018b test DB из template0 с копией

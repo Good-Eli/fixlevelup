@@ -22,6 +22,23 @@ const database: DatabaseConfig = { host: '127.0.0.1', port: 55432, database: 'fi
 const config = loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' });
 
 describe('API runtime database readiness', () => {
+  it('mocked auth readiness fails closed on missing schema or privileges', async () => {
+    const db = new RuntimeDatabase(undefined, true);
+    const internal = db as unknown as { client: { $queryRaw: (parts: TemplateStringsArray) => Promise<{ ready: boolean }[]> }; authReady: () => Promise<boolean> };
+    let ready = false;
+    let sql = '';
+    internal.client = { $queryRaw: (parts) => { sql = parts.join(''); return Promise.resolve([{ ready }]); } };
+    expect(await internal.authReady()).toBe(false);
+    ready = true;
+    expect(await internal.authReady()).toBe(true);
+    expect(sql).toContain('expected_columns');
+    expect(sql).toContain('required_privileges');
+    expect(sql).toContain('expected_constraints');
+    expect(sql).toContain('expected_indexes');
+    expect(sql).toContain('cleanup_web_auth_throttles');
+    expect(sql).not.toContain(password);
+  });
+
   it('requires explicit safe runtime DB configuration without echoing secrets', () => {
     const env = { DB_HOST: '127.0.0.1', DB_PORT: '55432', DB_NAME: 'fixlevelup_dev', DB_USER: 'fixlevelup_runtime', DB_PASSWORD: password };
     expect(loadDatabaseConfig(env)).toEqual(database);

@@ -4,12 +4,14 @@ import { loadConfig } from '../runtime/config.js';
 import { SafeLogger } from '../runtime/safe-logger.js';
 import { registerShutdown } from '../runtime/lifecycle.js';
 import { loadDatabaseConfig } from '../infrastructure/database/runtime-database.js';
+import { loadWebAuthConfig } from '../auth/web-auth.config.js';
 
 const logger = new SafeLogger('api');
 try {
   const config = loadConfig(process.env);
   const database = loadDatabaseConfig(process.env);
-  const app = await createApi(config, logger, database);
+  const webAuth = loadWebAuthConfig(process.env);
+  const app = await createApi(config, logger, database, webAuth);
   registerShutdown(app, config, logger);
   logger.event('started');
 } catch {
