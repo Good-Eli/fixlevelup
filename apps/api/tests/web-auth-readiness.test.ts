@@ -14,6 +14,7 @@ const migrations = [
   '20261120000300_technical_outbox_leases',
   '20261120000400_staff_identity',
   '20261120000500_web_auth',
+  '20261120000600_authorization',
 ];
 
 integration('web auth readiness against isolated PostgreSQL', () => {

@@ -1,0 +1,1463 @@
+diff --git a/apps/api/src/app.module.ts b/apps/api/src/app.module.ts
+index d9aa17e..bf861b7 100644
+--- a/apps/api/src/app.module.ts
++++ b/apps/api/src/app.module.ts
+@@ -6,18 +6,23 @@ import { HealthController, HealthService } from './health/health.controller.js';
+ import type { WebAuthConfig } from './auth/web-auth.config.js';
+ import { WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE, WebAuthController } from './auth/web-auth.controller.js';
+ import { WebAuthResources } from './auth/web-auth.resources.js';
++import { AUTHORIZATION_SERVICE, AuthorizationResources } from './authz/authorization.resources.js';
++import { StaffController, StaffService } from './staff/staff.controller.js';
+ 
+ @Module({})
+ export class AppModule {
+   static register(database?: DatabaseConfig, webAuth?: WebAuthConfig): DynamicModule {
+     if (webAuth && !database) { throw new Error('Web authentication requires a database'); }
+-    const controllers = webAuth ? [HealthController, WebAuthController] : [HealthController];
++    const controllers = webAuth ? [HealthController, WebAuthController, StaffController] : [HealthController];
+     const providers = [
+       HealthService, { provide: RuntimeDatabase, useFactory: () => new RuntimeDatabase(database, Boolean(webAuth)) },
+       ...(webAuth && database ? [
++        StaffService,
+         { provide: WebAuthResources, useFactory: () => new WebAuthResources(database, webAuth) },
+         { provide: WEB_AUTH_SERVICE, useFactory: (resources: WebAuthResources) => resources.service, inject: [WebAuthResources] },
+         { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin: webAuth.origin, csrfSecret: webAuth.csrfSecret } },
++        { provide: AuthorizationResources, useFactory: () => new AuthorizationResources(database) },
++        { provide: AUTHORIZATION_SERVICE, useFactory: (resources: AuthorizationResources) => resources.service, inject: [AuthorizationResources] },
+       ] : []),
+     ];
+     return { module: AppModule, controllers, providers };
+diff --git a/apps/api/src/infrastructure/database/runtime-database.ts b/apps/api/src/infrastructure/database/runtime-database.ts
+index 0b1b8b3..cbd070e 100644
+--- a/apps/api/src/infrastructure/database/runtime-database.ts
++++ b/apps/api/src/infrastructure/database/runtime-database.ts
+@@ -163,9 +163,15 @@ export class RuntimeDatabase implements OnModuleDestroy {
+         ('web_auth_throttles','key_hash','varchar',true,68),
+         ('web_auth_attempts','id','uuid',true,-1), ('web_auth_attempts','key_hash','varchar',true,68),
+         ('web_auth_attempts','reserved_at','timestamptz',true,6), ('web_auth_attempts','expires_at','timestamptz',true,6),
+-        ('web_auth_attempts','failed_at','timestamptz',false,6), ('web_auth_attempts','completed_at','timestamptz',false,6)
++        ('web_auth_attempts','failed_at','timestamptz',false,6), ('web_auth_attempts','completed_at','timestamptz',false,6),
++        ('user_permissions','id','uuid',true,-1), ('user_permissions','staff_id','uuid',true,-1),
++        ('user_permissions','capability','varchar',true,68), ('user_permissions','scope','varchar',true,20),
++        ('user_permissions','valid_from','timestamptz',true,6), ('user_permissions','valid_until','timestamptz',false,6),
++        ('user_permissions','revoked_at','timestamptz',false,6), ('user_permissions','granted_by','uuid',false,-1),
++        ('user_permissions','created_at','timestamptz',true,6)
+       ), required_privileges(table_name, column_name, privilege) AS (VALUES
+         ('staff','id','SELECT'), ('staff','role','SELECT'), ('staff','employment_state','SELECT'), ('staff','auth_version','SELECT'), ('staff','auth_version','UPDATE'),
++        ('staff','id','INSERT'), ('staff','role','INSERT'), ('staff','employment_state','INSERT'), ('staff','auth_version','INSERT'),
+         ('staff_web_credentials','staff_id','SELECT'), ('staff_web_credentials','login','SELECT'), ('staff_web_credentials','password_hash','SELECT'), ('staff_web_credentials','password_hash','UPDATE'),
+         ('web_sessions','id','SELECT'), ('web_sessions','staff_id','SELECT'), ('web_sessions','token_hash','SELECT'), ('web_sessions','auth_version','SELECT'), ('web_sessions','created_at','SELECT'), ('web_sessions','idle_expires_at','SELECT'), ('web_sessions','absolute_expires_at','SELECT'), ('web_sessions','revoked_at','SELECT'),
+         ('web_sessions','id','INSERT'), ('web_sessions','staff_id','INSERT'), ('web_sessions','token_hash','INSERT'), ('web_sessions','auth_version','INSERT'), ('web_sessions','created_at','INSERT'), ('web_sessions','idle_expires_at','INSERT'), ('web_sessions','absolute_expires_at','INSERT'), ('web_sessions','revoked_at','INSERT'),
+@@ -173,18 +179,26 @@ export class RuntimeDatabase implements OnModuleDestroy {
+         ('web_auth_throttles','key_hash','SELECT'), ('web_auth_throttles','key_hash','INSERT'), ('web_auth_throttles','key_hash','UPDATE'),
+         ('web_auth_attempts','id','SELECT'), ('web_auth_attempts','key_hash','SELECT'), ('web_auth_attempts','reserved_at','SELECT'), ('web_auth_attempts','expires_at','SELECT'), ('web_auth_attempts','failed_at','SELECT'), ('web_auth_attempts','completed_at','SELECT'),
+         ('web_auth_attempts','id','INSERT'), ('web_auth_attempts','key_hash','INSERT'), ('web_auth_attempts','reserved_at','INSERT'), ('web_auth_attempts','expires_at','INSERT'), ('web_auth_attempts','failed_at','INSERT'), ('web_auth_attempts','completed_at','INSERT'),
+-        ('web_auth_attempts','expires_at','UPDATE'), ('web_auth_attempts','failed_at','UPDATE'), ('web_auth_attempts','completed_at','UPDATE')
++        ('web_auth_attempts','expires_at','UPDATE'), ('web_auth_attempts','failed_at','UPDATE'), ('web_auth_attempts','completed_at','UPDATE'),
++        ('user_permissions','id','SELECT'), ('user_permissions','staff_id','SELECT'), ('user_permissions','capability','SELECT'), ('user_permissions','scope','SELECT'),
++        ('user_permissions','valid_from','SELECT'), ('user_permissions','valid_until','SELECT'), ('user_permissions','revoked_at','SELECT'), ('user_permissions','granted_by','SELECT'), ('user_permissions','created_at','SELECT'),
++        ('user_permissions','id','INSERT'), ('user_permissions','staff_id','INSERT'), ('user_permissions','capability','INSERT'), ('user_permissions','scope','INSERT'),
++        ('user_permissions','valid_from','INSERT'), ('user_permissions','valid_until','INSERT'), ('user_permissions','granted_by','INSERT'), ('user_permissions','created_at','INSERT'),
++        ('user_permissions','valid_until','UPDATE'), ('user_permissions','revoked_at','UPDATE')
+       ), expected_constraints(table_name, name, kind) AS (VALUES
+         ('staff','staff_pkey','p'), ('staff','staff_role_check','c'), ('staff','staff_employment_state_check','c'), ('staff','staff_auth_version_check','c'),
+         ('staff_web_credentials','staff_web_credentials_pkey','p'), ('staff_web_credentials','staff_web_credentials_staff_id_fkey','f'), ('staff_web_credentials','staff_web_credentials_login_check','c'), ('staff_web_credentials','staff_web_credentials_password_hash_check','c'),
+         ('staff_bootstrap_marker','staff_bootstrap_marker_pkey','p'), ('staff_bootstrap_marker','staff_bootstrap_marker_singleton_check','c'), ('staff_bootstrap_marker','staff_bootstrap_marker_staff_id_fkey','f'),
+         ('web_sessions','web_sessions_pkey','p'), ('web_sessions','web_sessions_staff_id_fkey','f'), ('web_sessions','web_sessions_token_hash_check','c'), ('web_sessions','web_sessions_auth_version_check','c'), ('web_sessions','web_sessions_expiry_check','c'), ('web_sessions','web_sessions_revoked_at_check','c'),
+         ('web_auth_throttles','web_auth_throttles_pkey','p'), ('web_auth_throttles','web_auth_throttles_key_hash_check','c'),
+-        ('web_auth_attempts','web_auth_attempts_pkey','p'), ('web_auth_attempts','web_auth_attempts_key_hash_fkey','f'), ('web_auth_attempts','web_auth_attempts_expiry_check','c'), ('web_auth_attempts','web_auth_attempts_completion_check','c')
++        ('web_auth_attempts','web_auth_attempts_pkey','p'), ('web_auth_attempts','web_auth_attempts_key_hash_fkey','f'), ('web_auth_attempts','web_auth_attempts_expiry_check','c'), ('web_auth_attempts','web_auth_attempts_completion_check','c'),
++        ('user_permissions','user_permissions_pkey','p'), ('user_permissions','user_permissions_staff_id_fkey','f'), ('user_permissions','user_permissions_granted_by_fkey','f'),
++        ('user_permissions','user_permissions_capability_check','c'), ('user_permissions','user_permissions_scope_check','c'), ('user_permissions','user_permissions_validity_check','c'), ('user_permissions','user_permissions_revoked_at_check','c')
+       ), expected_indexes(table_name, name, unique_index, columns) AS (VALUES
+         ('staff_web_credentials','staff_web_credentials_login_key',true,'login'), ('staff_bootstrap_marker','staff_bootstrap_marker_staff_id_key',true,'staff_id'),
+         ('web_sessions','web_sessions_token_hash_key',true,'token_hash'), ('web_sessions','web_sessions_staff_id_idx',false,'staff_id'), ('web_sessions','web_sessions_absolute_expiry_idx',false,'absolute_expires_at'),
+-        ('web_auth_attempts','web_auth_attempts_key_expiry_idx',false,'key_hash, expires_at'), ('web_auth_attempts','web_auth_attempts_expiry_idx',false,'expires_at')
++        ('web_auth_attempts','web_auth_attempts_key_expiry_idx',false,'key_hash, expires_at'), ('web_auth_attempts','web_auth_attempts_expiry_idx',false,'expires_at'),
++        ('user_permissions','user_permissions_staff_id_idx',false,'staff_id')
+       )
+       SELECT
+         NOT EXISTS (SELECT 1 FROM expected_columns e WHERE NOT EXISTS (
+diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
+index 7d8f554..7f94437 100644
+--- a/docs/ROADMAP.md
++++ b/docs/ROADMAP.md
+@@ -120,12 +120,12 @@ Edges отражают engineering dependencies; MLIVE→P14 относится
+ 
+ ### P02 — сотрудники, Auth и capabilities
+ 
+-**P02-01 и P02-02 приняты владельцем; P02-03 разрешён к реализации.** P02-04 и последующие подэтапы требуют отдельного разрешения. Канонические решения и границы proposed contracts — [DECISIONS §21](DECISIONS.md#21-p02-01--модель-доступа-и-контракт-каналов); матрица §13 остаётся на согласование. Для web-сессии владелец согласовал idle TTL 30 минут, абсолютный TTL 12 часов и атомарный renew с ротацией токена без продления абсолютного TTL; logout отзывает текущую сессию, смена пароля — остальные, recovery через auth_version — все. Принята защита от пяти неудач по идентификатору за 15 минут с дополнительным лимитом источника. Остальные части Q03/Q12 и proof привязки не закрыты.
++**P02-01/P02-02/P02-03 приняты владельцем; P02-04 разрешён к реализации.** P02-05 и последующие подэтапы требуют отдельного разрешения. Канонические решения и границы proposed contracts — [DECISIONS §21](DECISIONS.md#21-p02-01--модель-доступа-и-контракт-каналов); матрица §13 остаётся на согласование. Для web-сессии владелец согласовал idle TTL 30 минут, абсолютный TTL 12 часов и атомарный renew с ротацией токена без продления абсолютного TTL; logout отзывает текущую сессию, смена пароля — остальные, recovery через auth_version — все. Принята защита от пяти неудач по идентификатору за 15 минут с дополнительным лимитом источника. Остальные части Q03/Q12 и proof привязки не закрыты.
+ 
+ | Подэтап | Граница и критерий приёмки | Зависимости и открытые решения |
+ |---|---|---|
+ | P02-01 — Contracts & Minimal Access Model | Только документы: принципы principal/authn/authz, разделение staff/customer, общий контракт и граница адаптеров, уровни проверок, план; owner facts отдельно от предложений. Нет кода/DDL/deps/подключений. | P01 foundation; Q03/Q12/Q17 фиксируются открытыми, а не решаются молчаливо. |
+-| P02-02 — учётные записи и bootstrap | Минимальная identity-модель и защищённый bootstrap A без default password и открытой регистрации; fresh/upgrade и ограничения на реальной test PostgreSQL. Мастеру автоматически не создаётся web credential. | P02-01; согласовать безопасную процедуру bootstrap и данные модели. |
++| P02-02 — учётные записи и bootstrap | Минимальная identity-модель и защищённый bootstrap A без default password и открытой регистрации; fresh/upgrade и ограничения на реальной test PostgreSQL. Мастеру автоматически не создаётся web credential. | Принят с отложенным gate: ручная проверка bootstrap/recovery в доступной человеку интерактивной консоли не выполнена и обязательна перед первым реальным использованием этих CLI в рабочей среде. Автоматизированные pseudo-TTY проверки её не заменяют. |
+ | P02-03 — веб-аутентификация M/A | Login/logout/renew/password/revoke для менеджера и администратора; тесты неверных credentials, brute force, cookie/CSRF, expiry/revoke и безопасных ошибок. | P02-02; web session TTL/rotation/recovery согласованы владельцем выше, прочие части Q12 остаются открыты. |
+ | P02-04 — общая серверная авторизация | Единый типизированный principal и проверки staff capability либо customer request grant, scope/state/ownership, default deny; deny самоэскалации, 401/403/404/no IDOR, recheck при replay/write. | P02-01/02; P02-03 даёт web principal. Матрица §13/делегирование требуют согласования; конкретные CITY grants/FK — после P03. |
+ | P02-05 — Telegram-аутентификация мастера | Проверить raw initData и действующую заранее созданную staff link; выдать отзывную staff session. Unknown/inactive/forged/expired и запрещённый replay denied; безопасный intended-employee proof при привязке, один пересланный invite недостаточен. Без автоматического web login. | P02-02/04; Q12 TTL и политика exchange, согласованный staff proof; официальный алгоритм перепроверить. Offline tests без токена; реальный Mini App staging отдельно после доступов. Не клиентский TG-бот. |
+diff --git a/packages/database-tooling/scripts/test-migrations.mjs b/packages/database-tooling/scripts/test-migrations.mjs
+index ddbe23d..cadb4d2 100644
+--- a/packages/database-tooling/scripts/test-migrations.mjs
++++ b/packages/database-tooling/scripts/test-migrations.mjs
+@@ -20,12 +20,19 @@ async function checkViolation(client, sql, values = []) {
+   catch (error) { assert(error.code === '23514', `Expected custom CHECK violation, got ${error.code}`); checkDenials += 1; return; }
+   throw new Error('Invalid CHECK input accepted');
+ }
+-const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth'];
++let uniqueViolations = 0;
++async function uniqueViolation(client, sql, values = []) {
++  try { await client.query(sql, values); }
++  catch (error) { assert(error.code === '23505', `Expected unique_violation, got ${error.code}`); uniqueViolations += 1; return; }
++  throw new Error('Duplicate row accepted');
++}
++const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth', '20261120000600_authorization'];
+ const expectedChecks = [
+   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
+   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
+   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check',
+   'staff_web_credentials_login_check', 'staff_web_credentials_password_hash_check', 'staff_bootstrap_marker_singleton_check',
++  'user_permissions_capability_check', 'user_permissions_scope_check', 'user_permissions_validity_check', 'user_permissions_revoked_at_check',
+   'web_sessions_token_hash_check', 'web_sessions_auth_version_check', 'web_sessions_expiry_check', 'web_sessions_revoked_at_check',
+   'web_auth_throttles_key_hash_check', 'web_auth_attempts_expiry_check', 'web_auth_attempts_completion_check',
+ ];
+@@ -37,16 +44,18 @@ const upgrade = `fixlevelup_p017a_upgrade_${suffix}`;
+ const upgradeSecond = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+ const upgradeThird = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+ const upgradeFourth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
++const upgradeFifth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+ const shadow = `fixlevelup_p017a_shadow_${suffix}`;
+ const historyRoot = resolve(root, `node_modules/.cache/p017a-${suffix}`);
+ const firstHistory = resolve(historyRoot, 'first/migrations');
+ const secondHistory = resolve(historyRoot, 'second/migrations');
+ const thirdHistory = resolve(historyRoot, 'third/migrations');
+ const fourthHistory = resolve(historyRoot, 'fourth/migrations');
++const fifthHistory = resolve(historyRoot, 'fifth/migrations');
+ try {
+-  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, shadow]) { await prepareDatabase(client, database, true); }
+-  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${shadow}`);
+-  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)]]) {
++  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, shadow]) { await prepareDatabase(client, database, true); }
++  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${shadow}`);
++  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)]]) {
+     mkdirSync(history, { recursive: true });
+     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
+     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
+@@ -159,7 +168,41 @@ try {
+     command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeFourth, 0, shadow);
+     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeFourth);
+   } finally { await fourthReader.end(); }
+-  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
++  // Preserve synthetic staff, credentials, web sessions and user permissions across the authorization migration.
++  command(['migrate', 'deploy'], upgradeFifth, 0, undefined, fifthHistory);
++  const fifthReader = connection('fixlevelup_migrator', passwords.fixlevelup_migrator, upgradeFifth);
++  await fifthReader.connect();
++  try {
++    const fifthStaffId = randomUUID();
++    await fifthReader.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES($1,'TECHNICIAN','ACTIVE',2)", [fifthStaffId]);
++    await fifthReader.query("INSERT INTO foundation.staff_web_credentials(staff_id,login,password_hash) VALUES($1,'fifth-synthetic-login','fifth-synthetic-hash')", [fifthStaffId]);
++    await fifthReader.query("INSERT INTO foundation.web_sessions(id,staff_id,token_hash,auth_version,idle_expires_at,absolute_expires_at) VALUES($1,$2,$3,2,CURRENT_TIMESTAMP+INTERVAL '1 hour',CURRENT_TIMESTAMP+INTERVAL '30 days')", [randomUUID(), fifthStaffId, '1'.repeat(64)]);
++    const existingTables = ['staff', 'staff_web_credentials', 'web_sessions'];
++    const existingBefore = [];
++    for (const table of existingTables) { existingBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
++    command(['migrate', 'deploy'], upgradeFifth);
++    for (const [index, table] of existingTables.entries()) {
++      const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
++      assert(JSON.stringify(after) === JSON.stringify(existingBefore[index]), `Fifth-to-latest upgrade changed ${table} data`);
++    }
++    await fifthReader.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,valid_until,granted_by) VALUES($1,$2,'FIFTH_SYNTHETIC','GLOBAL',CURRENT_TIMESTAMP+INTERVAL '7 days',$2)", [randomUUID(), fifthStaffId]);
++    const fifthTables = [...existingTables, 'user_permissions'];
++    const fifthBefore = [];
++    for (const table of fifthTables) { fifthBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
++    const fifthHistoryRows = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
++    assert(fifthHistoryRows.rowCount === migrations.length && JSON.stringify(fifthHistoryRows.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
++      && fifthHistoryRows.rows.every((entry) => entry.finished_at !== null), 'Fifth-to-latest history mismatch');
++    command(['migrate', 'deploy'], upgradeFifth);
++    const fifthReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
++    assert(JSON.stringify(fifthReplay.rows) === JSON.stringify(fifthHistoryRows.rows), 'Fifth-to-latest replay changed history');
++    for (const [index, table] of fifthTables.entries()) {
++      const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
++      assert(JSON.stringify(after) === JSON.stringify(fifthBefore[index]), `Fifth-to-latest replay changed ${table} data`);
++    }
++    command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeFifth, 0, shadow);
++    command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeFifth);
++  } finally { await fifthReader.end(); }
++  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/fifth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
+   command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], fresh, 0, shadow);
+   command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
+   const runtimeStaffId = randomUUID();
+@@ -203,10 +246,11 @@ try {
+       && grants.rows.every((column) => column.writable === workerColumns.includes(column.attname)), 'Runtime outbox column grants mismatch');
+     const tableGrant = await runtime.query("SELECT has_table_privilege(current_user,'foundation.outbox_events','UPDATE') AS writable, has_any_column_privilege(current_user,'foundation.audit_logs','UPDATE') AS audit_writable");
+     assert(!tableGrant.rows[0].writable && !tableGrant.rows[0].audit_writable, 'Runtime broad UPDATE/audit UPDATE unexpectedly allowed');
+-    for (const [table, allowed] of [['staff', ['auth_version']], ['staff_web_credentials', ['password_hash']]]) {
+-      const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
+-      assert(columns.rows.filter((column) => column.writable).length === allowed.length
+-        && columns.rows.every((column) => column.writable === allowed.includes(column.attname)), `Runtime ${table} column grants mismatch`);
++    for (const [table, updatable, insertable] of [['staff', ['auth_version'], ['id', 'role', 'employment_state', 'auth_version']], ['staff_web_credentials', ['password_hash'], []]]) {
++      const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'INSERT') AS insertable,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
++      assert(columns.rows.filter((column) => column.writable).length === updatable.length
++        && columns.rows.every((column) => column.writable === updatable.includes(column.attname)
++          && column.insertable === insertable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
+       const broad = await runtime.query("SELECT has_table_privilege(current_user,$1,'UPDATE') AS writable", [`foundation.${table}`]);
+       assert(!broad.rows[0].writable, `Runtime ${table} broad UPDATE unexpectedly allowed`);
+     }
+@@ -215,15 +259,38 @@ try {
+     const staff = await runtime.query('SELECT s.id,s.role,s.employment_state,s.auth_version,c.login,c.password_hash FROM foundation.staff s JOIN foundation.staff_web_credentials c ON c.staff_id=s.id WHERE s.id=$1', [runtimeStaffId]);
+     assert(staff.rows[0]?.auth_version === 2 && staff.rows[0].role === 'ADMIN' && staff.rows[0].employment_state === 'ACTIVE'
+       && staff.rows[0].login === 'runtime-synthetic' && staff.rows[0].password_hash === 'updated-synthetic-hash', 'Runtime scoped staff reads/writes failed');
++    // POST /staff guard: only id/role/employment_state/auth_version are runtime-insertable on staff.
++    const guardStaffId = randomUUID();
++    await runtime.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES($1,'TECHNICIAN','ACTIVE',1)", [guardStaffId]);
++    const guardStaff = await runtime.query('SELECT id,role,employment_state,auth_version FROM foundation.staff WHERE id=$1', [guardStaffId]);
++    assert(guardStaff.rows[0]?.id === guardStaffId && guardStaff.rows[0].role === 'TECHNICIAN'
++      && guardStaff.rows[0].employment_state === 'ACTIVE' && guardStaff.rows[0].auth_version === 1, 'Runtime scoped staff INSERT failed');
++    // Column-scoped user_permissions writes: INSERT excludes revoked_at, UPDATE covers valid_until/revoked_at.
++    const permissionId = randomUUID();
++    await runtime.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [permissionId, runtimeStaffId]);
++    const permission = (await runtime.query('SELECT capability,scope,valid_from,valid_until,revoked_at,granted_by,created_at FROM foundation.user_permissions WHERE id=$1', [permissionId])).rows[0];
++    assert(permission?.capability === 'RUNTIME_SYNTHETIC' && permission.scope === 'GLOBAL' && permission.valid_from instanceof Date
++      && permission.valid_until === null && permission.revoked_at === null && permission.granted_by === null
++      && permission.created_at instanceof Date, 'Runtime user permission INSERT/defaults failed');
++    // Partial unique index user_permissions_active_key: one non-revoked row per (staff,capability,scope).
++    await uniqueViolation(runtime, "INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [randomUUID(), runtimeStaffId]);
++    // Re-grant: revoke the old row, then insert a fresh active one in the same flow.
++    await runtime.query('UPDATE foundation.user_permissions SET revoked_at=CURRENT_TIMESTAMP WHERE id=$1', [permissionId]);
++    const regrantedId = randomUUID();
++    await runtime.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [regrantedId, runtimeStaffId]);
++    const permissions = await runtime.query('SELECT id,revoked_at FROM foundation.user_permissions WHERE staff_id=$1 AND capability=$2 AND scope=$3 ORDER BY revoked_at NULLS FIRST', [runtimeStaffId, 'RUNTIME_SYNTHETIC', 'GLOBAL']);
++    assert(permissions.rowCount === 2 && permissions.rows[0].id === regrantedId && permissions.rows[0].revoked_at === null
++      && permissions.rows[1].id === permissionId && permissions.rows[1].revoked_at !== null, 'Re-grant via revoke plus insert failed');
+     const webGrants = [
+-      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
+-      ['web_auth_throttles', ['key_hash'], ['key_hash']],
+-      ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
++      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
++      ['web_auth_throttles', ['key_hash'], ['key_hash'], ['key_hash']],
++      ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
++      ['user_permissions', ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'revoked_at', 'granted_by', 'created_at'], ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'granted_by', 'created_at'], ['valid_until', 'revoked_at']],
+     ];
+-    for (const [table, readable, writable] of webGrants) {
++    for (const [table, readable, insertable, writable] of webGrants) {
+       const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'SELECT') AS readable,has_column_privilege(current_user,a.attrelid,a.attnum,'INSERT') AS insertable,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
+       assert(columns.rows.length === readable.length && columns.rows.every((column) => column.readable === readable.includes(column.attname)
+-        && column.insertable === readable.includes(column.attname) && column.writable === writable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
++        && column.insertable === insertable.includes(column.attname) && column.writable === writable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
+       const broad = await runtime.query("SELECT has_table_privilege(current_user,$1,'UPDATE') AS writable,has_table_privilege(current_user,$1,'DELETE') AS deletable", [`foundation.${table}`]);
+       assert(!broad.rows[0].writable && !broad.rows[0].deletable, `Runtime ${table} broad grants unexpectedly allowed`);
+     }
+@@ -313,16 +380,21 @@ try {
+       "UPDATE foundation.staff SET role='MANAGER'", "UPDATE foundation.staff SET employment_state='INACTIVE'",
+       "UPDATE foundation.staff_web_credentials SET login='forbidden'", 'UPDATE foundation.staff SET id=id',
+       'UPDATE foundation.staff_web_credentials SET staff_id=staff_id',
+-      ...['staff', 'staff_web_credentials', 'staff_bootstrap_marker'].flatMap((table) => [
++      ...['staff_web_credentials', 'staff_bootstrap_marker'].flatMap((table) => [
+         `INSERT INTO foundation.${table} DEFAULT VALUES`, `DELETE FROM foundation.${table}`,
+       ]),
++      'DELETE FROM foundation.staff',
+       'SELECT * FROM foundation.staff_bootstrap_marker', 'UPDATE foundation.staff_bootstrap_marker SET id=id',
+       ...['web_sessions', 'web_auth_throttles', 'web_auth_attempts'].map((table) => `DELETE FROM foundation.${table}`),
+       'UPDATE foundation.web_sessions SET staff_id=staff_id', 'UPDATE foundation.web_sessions SET absolute_expires_at=absolute_expires_at',
+       'UPDATE foundation.web_auth_attempts SET key_hash=key_hash', 'UPDATE foundation.web_auth_attempts SET reserved_at=reserved_at',
++      'DELETE FROM foundation.user_permissions',
++      'UPDATE foundation.user_permissions SET id=id', 'UPDATE foundation.user_permissions SET staff_id=staff_id',
++      'UPDATE foundation.user_permissions SET capability=capability', 'UPDATE foundation.user_permissions SET scope=scope',
++      `INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,revoked_at) VALUES(gen_random_uuid(),'${runtimeStaffId}','RUNTIME_REVOKED','GLOBAL',CURRENT_TIMESTAMP)`,
+     ];
+     for (const sql of privilegeDenials) { await denied(runtime, sql); }
+-    console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials and ${privilegeDenials.length} privilege denials: PASS`);
++    console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials, ${uniqueViolations} unique violations and ${privilegeDenials.length} privilege denials: PASS`);
+   } finally { await runtime.end(); }
+   console.log('P01-01.9A migration integration proofs: PASS. Test databases retained; no dev data reset.');
+ } catch (error) {
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index cb818b6..c5b0594 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -27,10 +27,12 @@ model Staff {
+   id              String              @id @db.Uuid
+   role            String              @db.VarChar(16)
+   employmentState String              @map("employment_state") @db.VarChar(16)
+-  authVersion     Int                 @default(0) @map("auth_version")
+-  webCredential   StaffWebCredential?
+-  bootstrapMarker StaffBootstrapMarker?
+-  webSessions     WebSession[]
++  authVersion        Int                   @default(0) @map("auth_version")
++  webCredential      StaffWebCredential?
++  bootstrapMarker    StaffBootstrapMarker?
++  webSessions        WebSession[]
++  permissions        UserPermission[]
++  grantedPermissions UserPermission[]      @relation("UserPermissionGrantedBy")
+ 
+   @@map("staff")
+   @@schema("foundation")
+@@ -55,6 +57,26 @@ model StaffWebCredential {
+   @@schema("foundation")
+ }
+ 
++// Capabilities are plain strings validated in the application; no catalog table.
++// The partial unique index and period/scope CHECKs exist only in migration SQL.
++model UserPermission {
++  id             String    @id @db.Uuid
++  staffId        String    @map("staff_id") @db.Uuid
++  capability     String    @db.VarChar(64)
++  scope          String    @db.VarChar(16)
++  validFrom      DateTime  @default(now()) @map("valid_from") @db.Timestamptz(6)
++  validUntil     DateTime? @map("valid_until") @db.Timestamptz(6)
++  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
++  grantedBy      String?   @map("granted_by") @db.Uuid
++  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
++  staff          Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
++  grantedByStaff Staff?    @relation("UserPermissionGrantedBy", fields: [grantedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
++
++  @@index([staffId], map: "user_permissions_staff_id_idx")
++  @@map("user_permissions")
++  @@schema("foundation")
++}
++
+ model WebSession {
+   id                String    @id @db.Uuid
+   staffId           String    @map("staff_id") @db.Uuid
+diff --git a/apps/api/src/auth/http.ts b/apps/api/src/auth/http.ts
+new file mode 100644
+index 0000000..69b8d96
+--- /dev/null
++++ b/apps/api/src/auth/http.ts
+@@ -0,0 +1,85 @@
++import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
++import type { IncomingMessage } from 'node:http';
++import { BadRequestException, ForbiddenException, InternalServerErrorException, UnauthorizedException } from '@nestjs/common';
++import type { WebAuthHttpConfig } from './web-auth.controller.js';
++
++/** Shared HTTP-boundary helpers for authenticated staff routes; extracted from the
++ * P02-03 patterns in web-auth.controller.ts without changing that accepted controller.
++ * The host must keep enforcing a size-limited strict JSON parser and no untrusted CORS.
++ */
++export type StaffRequest = IncomingMessage & { body?: unknown };
++
++/** Reject duplicate security-sensitive headers instead of relying on Node's header merging. */
++export function header(req: StaffRequest, name: string): string | undefined {
++  let value: string | undefined;
++  for (let i = 0; i < req.rawHeaders.length; i += 2) {
++    if (req.rawHeaders[i]?.toLowerCase() === name) {
++      if (value !== undefined) { throw new BadRequestException(); }
++      value = req.rawHeaders[i + 1];
++    }
++  }
++  return value;
++}
++
++export const SESSION_COOKIE_NAME = '__Host-fixlevelup_session';
++const TOKEN = /^[A-Za-z0-9_-]{43}$/;
++
++/** Reads the single session cookie; duplicates or a malformed token fail with 401. */
++export function sessionToken(req: StaffRequest): string {
++  const cookies = header(req, 'cookie');
++  let token: string | undefined;
++  for (const part of cookies?.split(';') ?? []) {
++    const index = part.indexOf('=');
++    if (index < 0 || part.slice(0, index).trim() !== SESSION_COOKIE_NAME) { continue; }
++    if (token !== undefined) { throw new UnauthorizedException(); }
++    token = part.slice(index + 1).trim();
++  }
++  if (!token || !TOKEN.test(token)) { throw new UnauthorizedException(); }
++  return token;
++}
++
++export function bodyFields(body: unknown, keys: readonly string[]): Record<string, string> {
++  if (body === null || typeof body !== 'object' || Array.isArray(body)) { throw new BadRequestException(); }
++  const obj = body as Record<string, unknown>;
++  const actual = Object.keys(obj);
++  if (actual.length !== keys.length || keys.some((key) => !Object.hasOwn(obj, key) || typeof obj[key] !== 'string' || obj[key].length > 1024)) {
++    throw new BadRequestException();
++  }
++  return obj as Record<string, string>;
++}
++
++export function etag(version: number): string {
++  if (!Number.isSafeInteger(version) || version < 0) { throw new InternalServerErrorException(); }
++  return `"staff-v${String(version)}"`;
++}
++
++export function envelope<T>(data: T): { data: T; meta: { requestId: string } } {
++  return { data, meta: { requestId: randomUUID() } };
++}
++
++export function expectExactOrigin(req: StaffRequest, origin: string): void {
++  const supplied = header(req, 'origin');
++  if (supplied !== undefined && supplied !== origin) { throw new ForbiddenException(); }
++}
++
++/** Session-bound CSRF check for mutations, identical to the P02-03 token contract:
++ * HMAC-SHA256 over the 'web-auth-csrf\0' domain and the session token, so the csrfToken
++ * returned by /auth/login and /auth/me works for staff routes unchanged.
++ */
++export function requireSessionCsrf(req: StaffRequest, token: string, csrfSecret: string): void {
++  const expected = createHmac('sha256', csrfSecret).update('web-auth-csrf\0').update(token).digest('base64url');
++  const supplied = header(req, 'x-csrf-token');
++  if (!supplied || !/^[A-Za-z0-9_-]+$/.test(supplied) || supplied.length !== expected.length
++    || !timingSafeEqual(Buffer.from(supplied, 'utf8'), Buffer.from(expected, 'utf8'))) {
++    throw new ForbiddenException();
++  }
++}
++
++/** Full mutation barrier for staff writes: exact browser Origin, JSON UTF-8 body and
++ * the session-bound CSRF token. Reads use expectExactOrigin only.
++ */
++export function requireMutation(req: StaffRequest, token: string, config: WebAuthHttpConfig): void {
++  if (header(req, 'origin') !== config.origin) { throw new ForbiddenException(); }
++  if (!/^application\/json(?:\s*;\s*charset\s*=\s*utf-8)?$/i.test(header(req, 'content-type') ?? '')) { throw new BadRequestException(); }
++  requireSessionCsrf(req, token, config.csrfSecret);
++}
+diff --git a/apps/api/src/authz/principal.ts b/apps/api/src/authz/principal.ts
+new file mode 100644
+index 0000000..64f87f4
+--- /dev/null
++++ b/apps/api/src/authz/principal.ts
+@@ -0,0 +1,15 @@
++import type { WebRole } from '../auth/web-auth.service.js';
++
++/** Server-trusted principal created only by the authentication guard from a validated session.
++ * Client-supplied display names, phones or channel subjects never become principal fields.
++ * staff-web comes from the P02-03 cookie session; staff-telegram (P02-05) and customer
++ * request-scoped principals extend the Principal union with their own kind, never with staff roles.
++ */
++export interface StaffWebPrincipal {
++  readonly kind: 'staff-web';
++  readonly staffId: string;
++  readonly role: WebRole;
++  readonly authVersion: number;
++}
++
++export type Principal = StaffWebPrincipal;
+diff --git a/apps/api/src/authz/capability.ts b/apps/api/src/authz/capability.ts
+new file mode 100644
+index 0000000..f4d4e8e
+--- /dev/null
++++ b/apps/api/src/authz/capability.ts
+@@ -0,0 +1,18 @@
++/** Fixed capability vocabulary for P02-04 (owner-approved enum). Unknown capability is always
++ * denied; grants live in foundation.user_permissions and nothing is implicit for any role.
++ */
++export const STAFF_CAPABILITIES = ['staff.read', 'staff.manage'] as const;
++export type Capability = (typeof STAFF_CAPABILITIES)[number];
++
++/** P02-04 has GLOBAL only; concrete CITY grants wait for P03 (DECISIONS §21). */
++export interface Scope {
++  readonly kind: 'GLOBAL';
++}
++export const GLOBAL_SCOPE: Scope = { kind: 'GLOBAL' };
++
++export function isCapability(value: unknown): value is Capability {
++  return value === 'staff.read' || value === 'staff.manage';
++}
++
++/** Metadata key for @RequireCapability; read by StaffWebAuthGuard through Reflector. */
++export const CAPABILITY_METADATA = Symbol('fixlevelup:require-capability');
+diff --git a/apps/api/src/authz/authorization.service.ts b/apps/api/src/authz/authorization.service.ts
+new file mode 100644
+index 0000000..6f37ccf
+--- /dev/null
++++ b/apps/api/src/authz/authorization.service.ts
+@@ -0,0 +1,115 @@
++import { createHash } from 'node:crypto';
++import type { Pool, PoolClient } from 'pg';
++import { HttpException, InternalServerErrorException } from '@nestjs/common';
++import type { StaffWebPrincipal } from './principal.js';
++import type { Capability, Scope } from './capability.js';
++import { isCapability } from './capability.js';
++
++export type AuthorizationErrorCode = 'UNAUTHORIZED' | 'FORBIDDEN' | 'FAILED';
++export class AuthorizationError extends Error {
++  constructor(readonly code: AuthorizationErrorCode) { super('Authorization failed'); this.name = 'AuthorizationError'; }
++}
++
++export interface StaffWriteContext {
++  readonly client: PoolClient;
++  readonly principal: StaffWebPrincipal;
++}
++
++/** DI-facing API of AuthorizationService, mirroring the WebAuthServiceApi pattern. */
++export interface AuthorizationServiceApi {
++  authorize(principal: StaffWebPrincipal, capability: Capability, scope: Scope): Promise<void>;
++  read<T>(fn: (client: PoolClient) => Promise<T>): Promise<T>;
++  authorizeForWrite<T>(token: string, capability: Capability, scope: Scope, write: (context: StaffWriteContext) => Promise<T>): Promise<T>;
++}
++
++const TOKEN = /^[A-Za-z0-9_-]{43}$/;
++const hashToken = (token: string): string => createHash('sha256').update(token).digest('hex');
++
++interface StaffRow { id: string; role: 'ADMIN' | 'MANAGER'; auth_version: number }
++
++/**
++ * Default-deny capability check. Grants come only from foundation.user_permissions;
++ * no role gets implicit rights. authorize() verifies permissions for reads in a plain
++ * READ COMMITTED transaction (the guard has just re-authenticated the session through
++ * WebAuthService.authenticate). authorizeForWrite() re-verifies session, staff state and
++ * permissions under the P02-03 lock order — staff row FOR UPDATE first, then the session
++ * row FOR UPDATE, then the permissions read — and runs the caller's write on the same
++ * client so revoke, deactivation and write serialize on the common authorization state.
++ */
++export class AuthorizationService implements AuthorizationServiceApi {
++  constructor(private readonly pool: Pick<Pool, 'connect'>) {}
++
++  private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
++    let client: PoolClient | undefined;
++    let inTransaction = false;
++    let discard = false;
++    try {
++      client = await this.pool.connect();
++      await client.query('BEGIN');
++      inTransaction = true;
++      const result = await fn(client);
++      await client.query('COMMIT');
++      inTransaction = false;
++      return result;
++    } catch (error) {
++      if (client && inTransaction) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
++      // Safe, already-mapped errors propagate; raw driver errors never escape this boundary.
++      if (error instanceof AuthorizationError || error instanceof HttpException) { throw error; }
++      throw new InternalServerErrorException();
++    } finally { client?.release(discard); }
++  }
++
++  private async permitted(client: PoolClient, staffId: string, capability: Capability, scope: Scope): Promise<boolean> {
++    if (!isCapability(capability)) { return false; }
++    const result = await client.query(
++      `SELECT 1 FROM foundation.user_permissions
++       WHERE staff_id = $1 AND capability = $2 AND scope = $3 AND revoked_at IS NULL
++         AND valid_from <= clock_timestamp() AND (valid_until IS NULL OR valid_until > clock_timestamp())`,
++      [staffId, capability, scope.kind]);
++    return result.rowCount === 1;
++  }
++
++  /** Throws FORBIDDEN when the principal lacks the capability in scope. Default deny.
++   * Read path: no locks, plain READ COMMITTED; the guard has just re-verified the session.
++   */
++  async authorize(principal: StaffWebPrincipal, capability: Capability, scope: Scope): Promise<void> {
++    await this.transaction(async (client) => {
++      if (!await this.permitted(client, principal.staffId, capability, scope)) { throw new AuthorizationError('FORBIDDEN'); }
++    });
++  }
++
++  /** Plain read transaction without locks for staff data queries after the guard's checks. */
++  async read<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
++    return this.transaction(fn);
++  }
++
++  /** Lock staff before session, matching the WebAuthService recovery/password-change order. */
++  private async lockedPrincipal(client: PoolClient, token: string): Promise<StaffWebPrincipal> {
++    if (typeof token !== 'string' || !TOKEN.test(token)) { throw new AuthorizationError('UNAUTHORIZED'); }
++    const digest = hashToken(token);
++    const candidate = await client.query<{ staff_id: string }>('SELECT staff_id FROM foundation.web_sessions WHERE token_hash = $1', [digest]);
++    const staffId = candidate.rows[0]?.staff_id;
++    if (!staffId) { throw new AuthorizationError('UNAUTHORIZED'); }
++    const staff = await client.query<{ id: string }>("SELECT id FROM foundation.staff WHERE id = $1 AND employment_state = 'ACTIVE' AND role IN ('ADMIN', 'MANAGER') FOR UPDATE", [staffId]);
++    if (!staff.rows[0]) { throw new AuthorizationError('UNAUTHORIZED'); }
++    const result = await client.query<StaffRow>(
++      `SELECT s.id, s.role, s.auth_version FROM foundation.web_sessions ws
++       JOIN foundation.staff s ON s.id = ws.staff_id
++       WHERE ws.token_hash = $1 AND ws.staff_id = $2 AND ws.revoked_at IS NULL
++         AND ws.idle_expires_at > clock_timestamp() AND ws.absolute_expires_at > clock_timestamp()
++         AND ws.auth_version = s.auth_version AND s.employment_state = 'ACTIVE' AND s.role IN ('ADMIN', 'MANAGER')
++       FOR UPDATE OF ws`, [digest, staffId]);
++    const locked = result.rows[0];
++    if (!locked) { throw new AuthorizationError('UNAUTHORIZED'); }
++    return { kind: 'staff-web', staffId: locked.id, role: locked.role, authVersion: locked.auth_version };
++  }
++
++  /** Rechecks the session and permissions under locks, then runs the write in the same transaction. */
++  async authorizeForWrite<T>(token: string, capability: Capability, scope: Scope, write: (context: StaffWriteContext) => Promise<T>): Promise<T> {
++    return this.transaction(async (client) => {
++      const principal = await this.lockedPrincipal(client, token);
++      if (!await this.permitted(client, principal.staffId, capability, scope)) { throw new AuthorizationError('FORBIDDEN'); }
++      return write({ client, principal });
++    });
++  }
++}
+diff --git a/apps/api/src/authz/authorization.resources.ts b/apps/api/src/authz/authorization.resources.ts
+new file mode 100644
+index 0000000..f068c3a
+--- /dev/null
++++ b/apps/api/src/authz/authorization.resources.ts
+@@ -0,0 +1,27 @@
++import type { OnModuleDestroy } from '@nestjs/common';
++import { Pool } from 'pg';
++import type { DatabaseConfig } from '../infrastructure/database/runtime-database.js';
++import { AuthorizationService } from './authorization.service.js';
++
++/** DI token for the authorization service API consumed by the guard and controllers. */
++export const AUTHORIZATION_SERVICE = Symbol('AUTHORIZATION_SERVICE');
++
++/** A separate bounded pool isolates authorization queries from other pools; raw driver
++ * errors and credentials are never logged, matching WebAuthResources.
++ */
++export class AuthorizationResources implements OnModuleDestroy {
++  private readonly pool: Pool;
++  readonly service: AuthorizationService;
++
++  constructor(database: DatabaseConfig) {
++    this.pool = new Pool({ ...database, max: 4, connectionTimeoutMillis: 1000,
++      query_timeout: 5000, statement_timeout: 5000, idleTimeoutMillis: 1000,
++      application_name: 'fixlevelup-authz' });
++    this.pool.on('error', () => { /* Never log raw driver errors. */ });
++    this.service = new AuthorizationService(this.pool);
++  }
++
++  async onModuleDestroy(): Promise<void> {
++    await this.pool.end();
++  }
++}
+diff --git a/apps/api/src/authz/authorization.guard.ts b/apps/api/src/authz/authorization.guard.ts
+new file mode 100644
+index 0000000..830d78f
+--- /dev/null
++++ b/apps/api/src/authz/authorization.guard.ts
+@@ -0,0 +1,81 @@
++import {
++  BadRequestException,
++  ForbiddenException,
++  HttpException,
++  Inject,
++  Injectable,
++  InternalServerErrorException,
++  UnauthorizedException,
++} from '@nestjs/common';
++import type { CanActivate, ExecutionContext } from '@nestjs/common';
++import type { IncomingMessage } from 'node:http';
++import { Reflector } from '@nestjs/core';
++import { WEB_AUTH_SERVICE } from '../auth/web-auth.controller.js';
++import type { WebAuthServiceApi } from '../auth/web-auth.controller.js';
++import { WebAuthError } from '../auth/web-auth.service.js';
++import { sessionToken } from '../auth/http.js';
++import { AUTHORIZATION_SERVICE } from './authorization.resources.js';
++import { AuthorizationError } from './authorization.service.js';
++import type { AuthorizationServiceApi } from './authorization.service.js';
++import { CAPABILITY_METADATA, GLOBAL_SCOPE } from './capability.js';
++import type { Capability } from './capability.js';
++import type { StaffWebPrincipal } from './principal.js';
++
++/** Request shape the guard fills in; controllers read the principal from here. */
++export type AuthorizedRequest = IncomingMessage & {
++  principal?: StaffWebPrincipal;
++  sessionToken?: string;
++};
++
++/** Same safe mapping as the P02-03 controller boundary: no raw service errors in logs. */
++function mapAuthError(error: unknown): never {
++  if (error instanceof WebAuthError) {
++    switch (error.code) {
++      case 'UNAUTHORIZED': throw new UnauthorizedException();
++      case 'RATE_LIMITED': throw new HttpException('Too Many Requests', 429);
++      case 'INVALID_INPUT': throw new BadRequestException();
++      case 'STALE': throw new HttpException('Precondition Failed', 412);
++      default: throw new InternalServerErrorException();
++    }
++  }
++  if (error instanceof AuthorizationError) {
++    switch (error.code) {
++      case 'UNAUTHORIZED': throw new UnauthorizedException();
++      case 'FORBIDDEN': throw new ForbiddenException();
++      default: throw new InternalServerErrorException();
++    }
++  }
++  throw error;
++}
++
++/** Session recheck + default-deny capability gate for staff routes.
++ * Mounted per-controller on the new /staff routes only; health and auth stay untouched.
++ * 401 without a session, 403 without the capability; no metadata means a programming
++ * error (the guard must not silently allow), so it fails loud with 500.
++ */
++@Injectable()
++export class StaffWebAuthGuard implements CanActivate {
++  constructor(
++    private readonly reflector: Reflector,
++    @Inject(WEB_AUTH_SERVICE) private readonly auth: WebAuthServiceApi,
++    @Inject(AUTHORIZATION_SERVICE) private readonly authorization: AuthorizationServiceApi,
++  ) {}
++
++  async canActivate(context: ExecutionContext): Promise<boolean> {
++    const capability = this.reflector.getAllAndOverride<Capability | undefined>(CAPABILITY_METADATA, [context.getHandler(), context.getClass()]);
++    if (!capability) { throw new InternalServerErrorException(); }
++    const request = context.switchToHttp().getRequest<AuthorizedRequest>();
++    const token = sessionToken(request);
++    let principal: StaffWebPrincipal;
++    try {
++      const identity = await this.auth.authenticate(token);
++      principal = { kind: 'staff-web', staffId: identity.staffId, role: identity.role, authVersion: identity.authVersion };
++    } catch (error) { return mapAuthError(error); }
++    try {
++      await this.authorization.authorize(principal, capability, GLOBAL_SCOPE);
++    } catch (error) { return mapAuthError(error); }
++    request.principal = principal;
++    request.sessionToken = token;
++    return true;
++  }
++}
+diff --git a/apps/api/src/authz/require-capability.decorator.ts b/apps/api/src/authz/require-capability.decorator.ts
+new file mode 100644
+index 0000000..fc8fb6a
+--- /dev/null
++++ b/apps/api/src/authz/require-capability.decorator.ts
+@@ -0,0 +1,24 @@
++import { createParamDecorator, InternalServerErrorException, SetMetadata } from '@nestjs/common';
++import type { ExecutionContext } from '@nestjs/common';
++import { CAPABILITY_METADATA, isCapability } from './capability.js';
++import type { Capability } from './capability.js';
++import type { AuthorizedRequest } from './authorization.guard.js';
++import type { StaffWebPrincipal } from './principal.js';
++
++/** Route-level capability requirement; read by StaffWebAuthGuard via Reflector.
++ * Class-level requirements are overridden by the handler-level one.
++ */
++export const RequireCapability = (capability: Capability): MethodDecorator & ClassDecorator => {
++  if (!isCapability(capability)) { throw new Error('Unknown capability'); }
++  return SetMetadata(CAPABILITY_METADATA, capability);
++};
++
++/** Injects the guard-verified staff-web principal; use only on routes behind StaffWebAuthGuard. */
++export const CurrentPrincipal = createParamDecorator(
++  (_data: unknown, context: ExecutionContext): StaffWebPrincipal => {
++    const request = context.switchToHttp().getRequest<AuthorizedRequest>();
++    const principal = request.principal;
++    if (!principal) { throw new InternalServerErrorException(); }
++    return principal;
++  },
++);
+diff --git a/apps/api/src/staff/staff.controller.ts b/apps/api/src/staff/staff.controller.ts
+new file mode 100644
+index 0000000..2f3dfe4
+--- /dev/null
++++ b/apps/api/src/staff/staff.controller.ts
+@@ -0,0 +1,118 @@
++import { randomUUID } from 'node:crypto';
++import {
++  BadRequestException, Controller, ForbiddenException, Get, Header, HttpCode, Inject, Injectable,
++  InternalServerErrorException, NotFoundException, Param, Post, Req, Res, UnauthorizedException, UseGuards,
++} from '@nestjs/common';
++import type { PoolClient } from 'pg';
++import type { ServerResponse } from 'node:http';
++import { WEB_AUTH_HTTP_CONFIG } from '../auth/web-auth.controller.js';
++import type { WebAuthHttpConfig } from '../auth/web-auth.controller.js';
++import { bodyFields, envelope, etag, expectExactOrigin, requireMutation, sessionToken } from '../auth/http.js';
++import type { StaffRequest } from '../auth/http.js';
++import { AuthorizationError } from '../authz/authorization.service.js';
++import type { AuthorizationServiceApi } from '../authz/authorization.service.js';
++import { AUTHORIZATION_SERVICE } from '../authz/authorization.resources.js';
++import { StaffWebAuthGuard } from '../authz/authorization.guard.js';
++import type { AuthorizedRequest } from '../authz/authorization.guard.js';
++import { RequireCapability } from '../authz/require-capability.decorator.js';
++import { GLOBAL_SCOPE } from '../authz/capability.js';
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++type StaffRoleValue = 'ADMIN' | 'MANAGER' | 'TECHNICIAN';
++interface StaffListRow { id: string; role: StaffRoleValue; employment_state: 'ACTIVE' | 'INACTIVE' }
++interface StaffRow { id: string; role: StaffRoleValue; employment_state: 'ACTIVE' | 'INACTIVE'; auth_version: number }
++function toDto(row: StaffListRow): { id: string; role: StaffRoleValue; employmentState: 'ACTIVE' | 'INACTIVE' } {
++  return { id: row.id, role: row.role, employmentState: row.employment_state };
++}
++/** Service authorization errors map to safe statuses; anything else propagates to the filter. */
++function mapAuthorizationError(error: unknown): never {
++  if (!(error instanceof AuthorizationError)) { throw error; }
++  switch (error.code) {
++    case 'UNAUTHORIZED': throw new UnauthorizedException();
++    case 'FORBIDDEN': throw new ForbiddenException();
++    default: throw new InternalServerErrorException();
++  }
++}
++
++/** Staff data access on the authorization pool. Reads run lockless after the guard's
++ * checks; the create write runs inside authorizeForWrite under the staff→session lock order.
++ */
++@Injectable()
++export class StaffService {
++  constructor(@Inject(AUTHORIZATION_SERVICE) private readonly authorization: AuthorizationServiceApi) {}
++
++  async list(): Promise<StaffListRow[]> {
++    return this.authorization.read(async (client: PoolClient) =>
++      (await client.query<StaffListRow>('SELECT id, role, employment_state FROM foundation.staff ORDER BY id')).rows);
++  }
++
++  async get(id: string): Promise<StaffRow> {
++    return this.authorization.read(async (client: PoolClient) => {
++      const result = await client.query<StaffRow>('SELECT id, role, employment_state, auth_version FROM foundation.staff WHERE id = $1', [id]);
++      const row = result.rows[0];
++      if (!row) { throw new NotFoundException(); }
++      return row;
++    });
++  }
++
++  async create(token: string, actorStaffId: string, role: 'MANAGER' | 'TECHNICIAN'): Promise<StaffRow> {
++    return this.authorization.authorizeForWrite(token, 'staff.manage', GLOBAL_SCOPE, async ({ client }) => {
++      const result = await client.query<StaffRow>(
++        `INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, $2, 'ACTIVE', 0)
++         RETURNING id, role, employment_state, auth_version`, [randomUUID(), role]);
++      const row = result.rows[0];
++      if (!row) { throw new AuthorizationError('FAILED'); }
++      await client.query('INSERT INTO foundation.audit_logs (id, operation, correlation_id, details) VALUES ($1, $2, $3, $4::jsonb)',
++        [randomUUID(), 'STAFF_CREATED', randomUUID(), JSON.stringify({ by: actorStaffId, created: row.id })]);
++      return row;
++    });
++  }
++}
++
++/** Staff routes behind the shared capability guard; 401 without a session, 403 without
++ * the capability, 404 for a missing staff id. POST /staff is a plain pre-registered
++ * profile INSERT without Idempotency-Key (lead decision): no external side effects,
++ * a repeat creates a second staff row.
++ */
++@Controller('api/v1/staff')
++@UseGuards(StaffWebAuthGuard)
++export class StaffController {
++  constructor(
++    private readonly staff: StaffService,
++    @Inject(WEB_AUTH_HTTP_CONFIG) private readonly config: WebAuthHttpConfig,
++  ) {}
++
++  @Get() @RequireCapability('staff.read') @Header('Cache-Control', 'no-store')
++  async list(@Req() req: AuthorizedRequest) {
++    expectExactOrigin(req, this.config.origin);
++    try {
++      const items = (await this.staff.list()).map(toDto);
++      return envelope({ items, pageInfo: { nextCursor: null, hasMore: false } });
++    } catch (error) { return mapAuthorizationError(error); }
++  }
++
++  @Get(':id') @RequireCapability('staff.read') @Header('Cache-Control', 'no-store')
++  async get(@Req() req: AuthorizedRequest, @Param('id') id: string) {
++    expectExactOrigin(req, this.config.origin);
++    if (!UUID.test(id)) { throw new BadRequestException(); }
++    try {
++      return envelope(toDto(await this.staff.get(id)));
++    } catch (error) { return mapAuthorizationError(error); }
++  }
++
++  @Post() @HttpCode(201) @RequireCapability('staff.manage') @Header('Cache-Control', 'no-store')
++  async create(@Req() req: StaffRequest & AuthorizedRequest, @Res({ passthrough: true }) res: ServerResponse) {
++    const token = req.sessionToken ?? sessionToken(req);
++    requireMutation(req, token, this.config);
++    const fields = bodyFields(req.body, ['role']);
++    const role = fields['role'];
++    if (role !== 'MANAGER' && role !== 'TECHNICIAN') { throw new BadRequestException(); }
++    const actor = req.principal;
++    if (!actor) { throw new AuthorizationError('FAILED'); }
++    try {
++      const created = await this.staff.create(token, actor.staffId, role);
++      res.setHeader('ETag', etag(created.auth_version));
++      return envelope({ id: created.id, role: created.role, employmentState: created.employment_state });
++    } catch (error) { return mapAuthorizationError(error); }
++  }
++}
+diff --git a/apps/api/tests/staff-authz-http.test.ts b/apps/api/tests/staff-authz-http.test.ts
+new file mode 100644
+index 0000000..fc829ad
+--- /dev/null
++++ b/apps/api/tests/staff-authz-http.test.ts
+@@ -0,0 +1,193 @@
++import 'reflect-metadata';
++import { createHmac, randomUUID } from 'node:crypto';
++import type { Server } from 'node:http';
++import { Test } from '@nestjs/testing';
++import type { PoolClient } from 'pg';
++import request from 'supertest';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE } from '../src/auth/web-auth.controller.js';
++import { WebAuthError } from '../src/auth/web-auth.service.js';
++import { AUTHORIZATION_SERVICE } from '../src/authz/authorization.resources.js';
++import { AuthorizationError } from '../src/authz/authorization.service.js';
++import type { StaffWriteContext } from '../src/authz/authorization.service.js';
++import { GLOBAL_SCOPE } from '../src/authz/capability.js';
++import type { StaffWebPrincipal } from '../src/authz/principal.js';
++import { StaffController, StaffService } from '../src/staff/staff.controller.js';
++
++const origin = 'https://crm.example.test';
++const first = 'a'.repeat(43);
++const inactive = 'b'.repeat(43);
++const csrfSecret = 's'.repeat(32);
++const cookieName = '__Host-fixlevelup_session';
++const cookie = (token: string) => `${cookieName}=${token}`;
++const csrfFor = (token: string) => createHmac('sha256', csrfSecret).update('web-auth-csrf\0').update(token).digest('base64url');
++const identity = { staffId: 'staff-1', role: 'ADMIN' as const, authVersion: 1,
++  idleExpiresAt: new Date('2030-01-01T00:00:00Z'), absoluteExpiresAt: new Date('2030-01-01T12:00:00Z') };
++const principal: StaffWebPrincipal = { kind: 'staff-web', staffId: identity.staffId, role: identity.role, authVersion: identity.authVersion };
++const existingId = '9b6f6b2a-1f0e-4a3a-9c3d-111111111111';
++const missingId = '9b6f6b2a-1f0e-4a3a-9c3d-222222222222';
++const closers: (() => Promise<void>)[] = [];
++
++afterEach(async () => { for (const close of closers.splice(0)) { await close(); } vi.restoreAllMocks(); });
++
++interface StaffListRow { id: string; role: string; employment_state: string }
++interface StaffDetailRow { id: string; role: string; employment_state: string; auth_version: number }
++interface QueryResult<T> { rows: T[]; rowCount: number }
++
++async function setup() {
++  const listRows: StaffListRow[] = [{ id: existingId, role: 'MANAGER', employment_state: 'ACTIVE' }];
++  const created: StaffDetailRow[] = [];
++  const staffInserts: unknown[][] = [];
++  const auditInserts: unknown[][] = [];
++  const client = {
++    query: vi.fn((sql: string, params?: unknown[]): QueryResult<StaffDetailRow | StaffListRow> => {
++      if (sql.startsWith('SELECT id, role, employment_state FROM foundation.staff')) {
++        return { rows: [...listRows], rowCount: listRows.length };
++      }
++      if (sql.startsWith('SELECT id, role, employment_state, auth_version FROM foundation.staff WHERE id = $1')) {
++        const row = listRows.find((entry) => entry.id === params?.[0]);
++        return row ? { rows: [{ ...row, auth_version: 0 }], rowCount: 1 } : { rows: [], rowCount: 0 };
++      }
++      if (sql.startsWith('INSERT INTO foundation.staff')) {
++        const row: StaffDetailRow = { id: randomUUID(), role: String(params?.[1]), employment_state: 'ACTIVE', auth_version: 0 };
++        created.push(row);
++        staffInserts.push(params ?? []);
++        return { rows: [row], rowCount: 1 };
++      }
++      if (sql.startsWith('INSERT INTO foundation.audit_logs')) {
++        auditInserts.push(params ?? []);
++        return { rows: [], rowCount: 1 };
++      }
++      throw new Error(`Unexpected query in mock: ${sql}`);
++    }),
++  };
++  const auth = {
++    authenticate: vi.fn((token: string) => { if (token !== first) { throw new WebAuthError('UNAUTHORIZED'); } return Promise.resolve(identity); }),
++  };
++  const authz = {
++    authorize: vi.fn(() => Promise.resolve()),
++    read: vi.fn(<T>(fn: (client: PoolClient) => Promise<T>) => fn(client as unknown as PoolClient)),
++    authorizeForWrite: vi.fn(<T>(_token: string, _capability: string, _scope: unknown, write: (context: StaffWriteContext) => Promise<T>) =>
++      write({ client: client as unknown as PoolClient, principal })),
++  };
++  const module = await Test.createTestingModule({ controllers: [StaffController], providers: [
++    StaffService,
++    { provide: WEB_AUTH_SERVICE, useValue: auth },
++    { provide: AUTHORIZATION_SERVICE, useValue: authz },
++    { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin, csrfSecret } },
++  ] }).compile();
++  // Nest models the structural options as a class without methods.
++  // eslint-disable-next-line @typescript-eslint/no-unsafe-class-instance-assignment
++  const app = module.createNestApplication({ logger: false });
++  await app.init();
++  closers.push(() => app.close());
++  return { server: app.getHttpServer() as Server, auth, authz, client, created, staffInserts, auditInserts };
++}
++
++describe('staff authorization HTTP boundary', () => {
++  it('rejects missing, malformed or duplicated session cookies with 401 before any authorization', async () => {
++    const { server, auth, authz } = await setup();
++    await request(server).get('/api/v1/staff').expect(401);
++    await request(server).get('/api/v1/staff').set('Cookie', `${cookieName}=short`).expect(401);
++    await request(server).get('/api/v1/staff').set('Cookie', `${cookie(first)}; ${cookie(first)}`).expect(401);
++    expect(auth.authenticate).not.toHaveBeenCalled();
++    expect(authz.authorize).not.toHaveBeenCalled();
++  });
++
++  it('maps an inactive session to 401 and skips the permission lookup', async () => {
++    const { server, authz } = await setup();
++    await request(server).get('/api/v1/staff').set('Cookie', cookie(inactive)).expect(401);
++    expect(authz.authorize).not.toHaveBeenCalled();
++  });
++
++  it('returns the staff list behind the staff.read capability guard', async () => {
++    const { server, authz } = await setup();
++    const response = await request(server).get('/api/v1/staff').set('Cookie', cookie(first)).expect(200);
++    expect(response.headers['cache-control']).toBe('no-store');
++    expect(response.body).toMatchObject({ data: { items: [{ id: existingId, role: 'MANAGER', employmentState: 'ACTIVE' }], pageInfo: { nextCursor: null, hasMore: false } } });
++    expect(JSON.stringify(response.body)).not.toContain(first);
++    expect(authz.authorize).toHaveBeenCalledOnce();
++    expect(authz.authorize).toHaveBeenCalledWith(principal, 'staff.read', GLOBAL_SCOPE);
++  });
++
++  it('rejects a forged Origin on reads before touching the database', async () => {
++    const { server, authz } = await setup();
++    for (const badOrigin of ['https://sibling.example.test', 'https://crm.example.test.evil.test', 'null']) {
++      await request(server).get('/api/v1/staff').set('Cookie', cookie(first)).set('Origin', badOrigin).expect(403);
++    }
++    expect(authz.read).not.toHaveBeenCalled();
++  });
++
++  it('denies a valid session without the capability with 403 for reads and writes', async () => {
++    const { server, authz } = await setup();
++    authz.authorize.mockRejectedValueOnce(new AuthorizationError('FORBIDDEN'));
++    await request(server).get('/api/v1/staff').set('Cookie', cookie(first)).expect(403);
++    expect(authz.read).not.toHaveBeenCalled();
++    authz.authorize.mockRejectedValueOnce(new AuthorizationError('FORBIDDEN'));
++    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
++      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'TECHNICIAN' }).expect(403);
++    expect(authz.authorizeForWrite).not.toHaveBeenCalled();
++  });
++
++  it('returns one staff member by id and 404/400 for missing or malformed ids', async () => {
++    const { server } = await setup();
++    const found = await request(server).get(`/api/v1/staff/${existingId}`).set('Cookie', cookie(first)).expect(200);
++    expect(found.body).toMatchObject({ data: { id: existingId, role: 'MANAGER', employmentState: 'ACTIVE' } });
++    const missing = await request(server).get(`/api/v1/staff/${missingId}`).set('Cookie', cookie(first)).expect(404);
++    expect(JSON.stringify(missing.body)).not.toContain(first);
++    await request(server).get('/api/v1/staff/not-a-uuid').set('Cookie', cookie(first)).expect(400);
++  });
++
++  it('requires exact Origin, JSON and the session CSRF token before any write', async () => {
++    const { server, authz } = await setup();
++    const body = { role: 'TECHNICIAN' };
++    await request(server).post('/api/v1/staff').set('Origin', 'https://evil.test').set('Cookie', cookie(first))
++      .set('X-CSRF-Token', csrfFor(first)).send(body).expect(403);
++    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
++      .set('X-CSRF-Token', 'wrong').send(body).expect(403);
++    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first)).send(body).expect(403);
++    expect(authz.authorizeForWrite).not.toHaveBeenCalled();
++  });
++
++  it('rejects roles outside the pre-registered vocabulary with 400', async () => {
++    const { server, authz } = await setup();
++    for (const role of ['ADMIN', 'SUPERUSER', '']) {
++      await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
++        .set('X-CSRF-Token', csrfFor(first)).send(role ? { role } : { role: '' }).expect(400);
++    }
++    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
++      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'TECHNICIAN', extra: true }).expect(400);
++    expect(authz.authorizeForWrite).not.toHaveBeenCalled();
++  });
++
++  it('creates a pre-registered staff row with audit under the locked write recheck', async () => {
++    const { server, authz, created, auditInserts } = await setup();
++    const response = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
++      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'TECHNICIAN' }).expect(201);
++    expect(response.headers['etag']).toBe('"staff-v0"');
++    const row = created[0];
++    expect(row).toMatchObject({ role: 'TECHNICIAN', employment_state: 'ACTIVE', auth_version: 0 });
++    expect(response.body).toMatchObject({ data: { id: row?.id, role: 'TECHNICIAN', employmentState: 'ACTIVE' } });
++    expect(JSON.stringify(response.body)).not.toContain(first);
++    expect(authz.authorizeForWrite).toHaveBeenCalledOnce();
++    expect(auditInserts.length).toBe(1);
++    const details = JSON.parse(String(auditInserts[0]?.[3])) as { by: string; created: string };
++    expect(details).toEqual({ by: identity.staffId, created: row?.id });
++  });
++
++  it('maps a locked-recheck denial to 403 without leaking data', async () => {
++    const { server, authz, created } = await setup();
++    (authz.authorizeForWrite).mockRejectedValueOnce(new AuthorizationError('FORBIDDEN'));
++    const response = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
++      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'TECHNICIAN' }).expect(403);
++    expect(JSON.stringify(response.body)).not.toContain(first);
++    expect(created).toEqual([]);
++  });
++
++  it('maps a locked-recheck session loss to 401', async () => {
++    const { server, authz } = await setup();
++    (authz.authorizeForWrite).mockRejectedValueOnce(new AuthorizationError('UNAUTHORIZED'));
++    await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', cookie(first))
++      .set('X-CSRF-Token', csrfFor(first)).send({ role: 'MANAGER' }).expect(401);
++  });
++});
+diff --git a/apps/api/tests/staff-authz-e2e.test.ts b/apps/api/tests/staff-authz-e2e.test.ts
+new file mode 100644
+index 0000000..5d2d502
+--- /dev/null
++++ b/apps/api/tests/staff-authz-e2e.test.ts
+@@ -0,0 +1,358 @@
++import 'reflect-metadata';
++import { randomBytes, randomUUID } from 'node:crypto';
++import { readFileSync } from 'node:fs';
++import type { Server } from 'node:http';
++import { resolve } from 'node:path';
++import { ConsoleLogger } from '@nestjs/common';
++import { Client, Pool } from 'pg';
++import request from 'supertest';
++import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
++import type { WebAuthConfig } from '../src/auth/web-auth.config.js';
++import { createApi } from '../src/bootstrap/factories.js';
++import type { DatabaseConfig } from '../src/infrastructure/database/runtime-database.js';
++import { loadConfig } from '../src/runtime/config.js';
++import { SafeLogger } from '../src/runtime/safe-logger.js';
++import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
++import { hashPassword } from '../src/staff/password.js';
++
++// Real-HTTP staff authorization e2e on the real guard, real SQL and the real staff
++// controller. Covers default deny, capability grants, the POST /staff write path with
++// audit rows, the mandatory DECISIONS §21 concurrent revoke/write serialization test,
++// actor deactivation and response hygiene. Opt-in like web-auth-e2e.test.ts: the suite
++// never runs against the dev schema and always builds its own random database.
++const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
++const root = resolve(import.meta.dirname, '../../..');
++const connection = { host: '127.0.0.1' as const, port: 55432 };
++const migrations = [
++  '20261120000100_technical_audit_outbox',
++  '20261120000200_technical_outbox_attempts',
++  '20261120000300_technical_outbox_leases',
++  '20261120000400_staff_identity',
++  '20261120000500_web_auth',
++  '20261120000600_authorization',
++];
++const origin = 'https://crm.example.test';
++const cookieName = '__Host-fixlevelup_session';
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++const adminPassword = 'Synthetic-E2E-Admin-Password-2026!';
++const managerPassword = 'Synthetic-E2E-Manager-Password-2026!';
++const adminLogin = `e2e-${randomBytes(12).toString('hex')}`;
++const managerLogin = `e2e-${randomBytes(12).toString('hex')}`;
++
++function csrf(body: unknown): string {
++  if (typeof body !== 'object' || body === null || !('data' in body) || typeof body.data !== 'object' || body.data === null || !('csrfToken' in body.data) || typeof body.data.csrfToken !== 'string') { throw new Error('Missing CSRF token'); }
++  return body.data.csrfToken;
++}
++
++function session(headers: Record<string, unknown>): { cookie: string; token: string } {
++  const setCookie = headers['set-cookie'];
++  if (!Array.isArray(setCookie) || setCookie.length !== 1 || typeof setCookie[0] !== 'string') { throw new Error('Missing session cookie'); }
++  const match = new RegExp(`^${cookieName}=([A-Za-z0-9_-]{43}); Path=/; HttpOnly; Secure; SameSite=Strict$`).exec(setCookie[0]);
++  if (!match?.[1]) { throw new Error('Invalid session cookie'); }
++  return { cookie: `${cookieName}=${match[1]}`, token: match[1] };
++}
++
++function itemCount(body: unknown): number {
++  if (typeof body !== 'object' || body === null || !('data' in body) || typeof body.data !== 'object' || body.data === null || !('items' in body.data) || !Array.isArray(body.data.items)) { throw new Error('Missing staff list'); }
++  return body.data.items.length;
++}
++
++interface StaffDto { id: string; role: string; employmentState: string }
++
++/** Validates the list envelope into typed DTOs; no `any` crosses this boundary. */
++function staffDtos(body: unknown): StaffDto[] {
++  if (typeof body !== 'object' || body === null || !('data' in body) || typeof body.data !== 'object' || body.data === null || !('items' in body.data) || !Array.isArray(body.data.items)) { throw new Error('Missing staff list'); }
++  const items: StaffDto[] = [];
++  for (const entry of body.data.items) {
++    if (typeof entry !== 'object' || entry === null) { throw new Error('Invalid staff list item'); }
++    const record = entry as Record<string, unknown>;
++    const id = record['id'];
++    const role = record['role'];
++    const employmentState = record['employmentState'];
++    if (typeof id !== 'string' || typeof role !== 'string' || typeof employmentState !== 'string') { throw new Error('Invalid staff list item'); }
++    items.push({ id, role, employmentState });
++  }
++  return items;
++}
++
++function createdId(body: unknown): string {
++  if (typeof body !== 'object' || body === null || !('data' in body) || typeof body.data !== 'object' || body.data === null || !('id' in body.data) || typeof body.data.id !== 'string') { throw new Error('Missing created staff id'); }
++  return body.data.id;
++}
++
++function createLoggerSpy() {
++  return vi.spyOn(ConsoleLogger.prototype, 'log').mockImplementation(() => undefined);
++}
++
++async function waitFor(what: string, check: () => Promise<boolean>, timeoutMs = 4000): Promise<void> {
++  const deadline = Date.now() + timeoutMs;
++  while (!(await check())) {
++    if (Date.now() >= deadline) { throw new Error(`Timed out waiting for ${what}`); }
++    await new Promise((resolve) => { setTimeout(resolve, 25); });
++  }
++}
++
++integration('staff authorization real HTTP against isolated PostgreSQL', () => {
++  let admin: Client | undefined;
++  let fixture: Client | undefined;
++  let migrator: Pool | undefined;
++  let app: Awaited<ReturnType<typeof createApi>> | undefined;
++  let server: Server;
++  let logs: ReturnType<typeof createLoggerSpy> | undefined;
++  let migratorAccess: { database: string; user: 'fixlevelup_migrator'; password: string } | undefined;
++  let adminStaffId: string;
++  let managerId: string;
++  let managerCookie: string;
++  let managerToken: string;
++  let managerCsrf: string;
++  let createEtag: string;
++  const responses: unknown[] = [];
++  const cacheControls: string[] = [];
++  const collect = (body: unknown): void => { responses.push(body); };
++
++  beforeAll(async () => {
++    logs = createLoggerSpy();
++    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
++    const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
++    const postgresPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
++    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
++    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
++    if (!postgresPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
++    admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: postgresPassword });
++    await admin.connect();
++    const database = `fixlevelup_staff_authz_e2e_${randomBytes(12).toString('hex')}`;
++    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
++    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
++    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
++    fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
++    await fixture.connect();
++    await fixture.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
++    for (const migration of migrations) {
++      await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
++    }
++    await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
++    migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
++    ({ staffId: adminStaffId } = await bootstrapFirstAdmin(migrator, { login: adminLogin, password: adminPassword }));
++    // The acting principal: a fixture MANAGER with real web credentials but zero grants.
++    managerId = randomUUID();
++    await fixture.query('INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, $2, $3, $4)',
++      [managerId, 'MANAGER', 'ACTIVE', 0]);
++    await fixture.query('INSERT INTO foundation.staff_web_credentials (staff_id, login, password_hash) VALUES ($1, $2, $3)',
++      [managerId, managerLogin, await hashPassword(managerPassword)]);
++    const dbConfig = { ...connection, database, user: 'fixlevelup_runtime' as const, password: runtimePassword } as DatabaseConfig;
++    const webAuth: WebAuthConfig = { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
++    app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'), dbConfig, webAuth);
++    server = app.getHttpServer() as Server;
++    migratorAccess = { database, user: 'fixlevelup_migrator' as const, password: migratorPassword };
++    const loggedIn = await request(server).post('/api/v1/auth/login').set('Origin', origin).set('X-CSRF-Token', 'login')
++      .send({ login: managerLogin, password: managerPassword }).expect(200);
++    collect(loggedIn.body);
++    cacheControls.push(loggedIn.headers['cache-control'] ?? '');
++    ({ cookie: managerCookie, token: managerToken } = session(loggedIn.headers));
++    managerCsrf = csrf(loggedIn.body);
++  }, 30000);
++
++  afterAll(async () => {
++    try { await app?.close(); }
++    finally {
++      try { await migrator?.end(); }
++      finally {
++        try { await fixture?.end(); }
++        finally { await admin?.end(); vi.restoreAllMocks(); }
++      }
++    }
++  });
++
++  it('denies a MANAGER session without grants (default deny on the real guard and SQL)', async () => {
++    if (!fixture) { throw new Error('Missing isolated fixture'); }
++    const db = fixture;
++    // Precondition evidence: the manager exists but holds no user_permissions rows.
++    const grants = await db.query<{ count: string }>('SELECT count(*) AS count FROM foundation.user_permissions WHERE staff_id = $1', [managerId]);
++    expect(Number(grants.rows[0]?.count ?? 0)).toBe(0);
++    // The session itself is valid (403, not 401): authentication passed, authorization failed.
++    const denied = await request(server).get('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie).expect(403);
++    collect(denied.body);
++    cacheControls.push(denied.headers['cache-control'] ?? '');
++    expect(denied.body).toMatchObject({ status: 403, code: 'REQUEST_REJECTED' });
++  });
++
++  it('unlocks reads with a valid staff.read grant while staff.manage writes stay 403', async () => {
++    if (!fixture) { throw new Error('Missing isolated fixture'); }
++    const db = fixture;
++    await db.query('INSERT INTO foundation.user_permissions (id, staff_id, capability, scope, valid_from, granted_by) VALUES ($1, $2, $3, $4, clock_timestamp(), $5)',
++      [randomUUID(), managerId, 'staff.read', 'GLOBAL', adminStaffId]);
++    const list = await request(server).get('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie).expect(200);
++    collect(list.body);
++    expect(list.headers['cache-control']).toBe('no-store');
++    cacheControls.push('no-store');
++    expect(itemCount(list.body)).toBe(2);
++    // ORDER BY id is unpredictable for random UUIDs, so compare deterministically by role.
++    const items = staffDtos(list.body).sort((a, b) => a.role.localeCompare(b.role));
++    expect(items).toEqual([
++      { id: adminStaffId, role: 'ADMIN', employmentState: 'ACTIVE' },
++      { id: managerId, role: 'MANAGER', employmentState: 'ACTIVE' },
++    ]);
++    expect(list.body).toMatchObject({ data: { pageInfo: { nextCursor: null, hasMore: false } } });
++    const found = await request(server).get(`/api/v1/staff/${managerId}`).set('Origin', origin).set('Cookie', managerCookie).expect(200);
++    collect(found.body);
++    expect(found.headers['cache-control']).toBe('no-store');
++    cacheControls.push('no-store');
++    expect(found.body).toMatchObject({ data: { id: managerId, role: 'MANAGER', employmentState: 'ACTIVE' } });
++    const missing = await request(server).get(`/api/v1/staff/${randomUUID()}`).set('Origin', origin).set('Cookie', managerCookie).expect(404);
++    collect(missing.body);
++    const malformed = await request(server).get('/api/v1/staff/not-a-uuid').set('Origin', origin).set('Cookie', managerCookie).expect(400);
++    collect(malformed.body);
++    const write = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie)
++      .set('X-CSRF-Token', managerCsrf).send({ role: 'TECHNICIAN' }).expect(403);
++    collect(write.body);
++    const technicians = await db.query<{ count: string }>('SELECT count(*) AS count FROM foundation.staff WHERE role = $1', ['TECHNICIAN']);
++    expect(Number(technicians.rows[0]?.count ?? 0)).toBe(0);
++  });
++
++  it('creates staff rows with audit entries under staff.manage; a repeat POST creates a second row', async () => {
++    if (!fixture) { throw new Error('Missing isolated fixture'); }
++    const db = fixture;
++    await db.query('INSERT INTO foundation.user_permissions (id, staff_id, capability, scope, valid_from, granted_by) VALUES ($1, $2, $3, $4, clock_timestamp(), $5)',
++      [randomUUID(), managerId, 'staff.manage', 'GLOBAL', adminStaffId]);
++    const first = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie)
++      .set('X-CSRF-Token', managerCsrf).send({ role: 'TECHNICIAN' }).expect(201);
++    collect(first.body);
++    createEtag = first.headers['etag'] ?? '';
++    expect(first.headers['cache-control']).toBe('no-store');
++    cacheControls.push('no-store');
++    const id = createdId(first.body);
++    expect(UUID.test(id)).toBe(true);
++    expect(first.body).toMatchObject({ data: { role: 'TECHNICIAN', employmentState: 'ACTIVE' } });
++    const row = await db.query<{ role: string; employment_state: string; auth_version: number }>(
++      'SELECT role, employment_state, auth_version FROM foundation.staff WHERE id = $1', [id]);
++    expect(row.rows[0]).toMatchObject({ role: 'TECHNICIAN', employment_state: 'ACTIVE', auth_version: 0 });
++    const audit = await db.query<{ details: { by: string; created: string } }>(
++      "SELECT details FROM foundation.audit_logs WHERE operation = 'STAFF_CREATED' AND details->>'created' = $1", [id]);
++    expect(audit.rowCount).toBe(1);
++    expect(audit.rows[0]?.details).toMatchObject({ by: managerId, created: id });
++    // No idempotency by lead decision: a repeated identical POST creates a second row.
++    const repeat = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie)
++      .set('X-CSRF-Token', managerCsrf).send({ role: 'TECHNICIAN' }).expect(201);
++    collect(repeat.body);
++    expect(createdId(repeat.body)).not.toBe(id);
++    const technicians = await db.query<{ count: string }>('SELECT count(*) AS count FROM foundation.staff WHERE role = $1', ['TECHNICIAN']);
++    expect(Number(technicians.rows[0]?.count ?? 0)).toBe(2);
++    const audits = await db.query<{ count: string }>("SELECT count(*) AS count FROM foundation.audit_logs WHERE operation = 'STAFF_CREATED'");
++    expect(Number(audits.rows[0]?.count ?? 0)).toBe(2);
++  });
++
++  // Mandatory DECISIONS §21 test: the protected write and a concurrent revoke serialize on
++  // the same staff row lock. The write transaction is paused on a fixture EXCLUSIVE lock on
++  // audit_logs AFTER authorizeForWrite already holds the actor's staff row FOR UPDATE and has
++  // inserted the new staff row. The revoke transaction then takes the same staff row FOR
++  // UPDATE and demonstrably waits. Releasing the pause commits the write first (201), the
++  // revoke commits after it, and the next POST is rejected with 403 and writes nothing.
++  it('serializes a concurrent revoke behind the in-flight staff write (DECISIONS §21)', async () => {
++    if (!fixture || !migratorAccess) { throw new Error('Missing isolated fixture'); }
++    const db = fixture;
++    const locker = new Client({ ...connection, ...migratorAccess });
++    const revoker = new Client({ ...connection, ...migratorAccess });
++    await locker.connect();
++    await revoker.connect();
++    try {
++      await locker.query('BEGIN');
++      await locker.query('LOCK TABLE foundation.audit_logs IN EXCLUSIVE MODE');
++      let inFlightId = '';
++      const creation = new Promise<void>((resolve, reject) => {
++        request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie)
++          .set('X-CSRF-Token', managerCsrf).send({ role: 'TECHNICIAN' })
++          .end((error, response) => {
++            if (error || response.status !== 201) { reject(new Error('Expected the in-flight write to commit as 201')); return; }
++            collect(response.body);
++            inFlightId = createdId(response.body);
++            resolve();
++          });
++      });
++      void creation.catch(() => undefined);
++      // Wait until the write transaction holds the staff row lock and blocks on the audit insert.
++      await waitFor('the write transaction to block on the audit lock', async () => {
++        const blocked = await db.query<{ count: number }>(
++          `SELECT count(*)::int AS count FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
++           WHERE a.datname = current_database() AND a.usename = 'fixlevelup_runtime' AND a.application_name = 'fixlevelup-authz'
++             AND l.relation = 'foundation.audit_logs'::regclass AND NOT l.granted`);
++        return (blocked.rows[0]?.count ?? 0) > 0;
++      });
++      // The concurrent revoke: same staff row FOR UPDATE, then the revoke itself. The simple
++      // protocol runs BEGIN/SELECT/UPDATE/COMMIT as one in-flight transaction; the SELECT
++      // queues behind the write transaction's staff lock and waits.
++      const revokerPid = (await revoker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid ?? 0;
++      const revokeDone = revoker.query(`
++        BEGIN;
++        SELECT id FROM foundation.staff WHERE id = '${managerId}' FOR UPDATE;
++        UPDATE foundation.user_permissions SET revoked_at = clock_timestamp()
++          WHERE staff_id = '${managerId}' AND capability = 'staff.manage' AND revoked_at IS NULL;
++        COMMIT;`);
++      void revokeDone.catch(() => undefined);
++      await waitFor('the revoke transaction to wait on the staff row lock', async () => {
++        const waiting = await db.query<{ count: number }>('SELECT count(*)::int AS count FROM pg_locks WHERE pid = $1 AND NOT granted', [revokerPid]);
++        return (waiting.rows[0]?.count ?? 0) > 0;
++      });
++      // Release the pause: the write commits first, then the revoke takes the staff lock.
++      await locker.query('ROLLBACK');
++      await creation;
++      await revokeDone;
++      const grant = await db.query<{ revoked_at: Date | null }>(
++        'SELECT revoked_at FROM foundation.user_permissions WHERE staff_id = $1 AND capability = $2', [managerId, 'staff.manage']);
++      const revokedAt = grant.rows[0]?.revoked_at;
++      const audit = await db.query<{ occurred_at: Date }>(
++        "SELECT occurred_at FROM foundation.audit_logs WHERE operation = 'STAFF_CREATED' AND details->>'created' = $1", [inFlightId]);
++      const occurredAt = audit.rows[0]?.occurred_at;
++      if (!revokedAt || !occurredAt) { throw new Error('Missing revoke or audit evidence'); }
++      // Ordering proof on the same server clock: the write was fixed before the revoke.
++      expect(revokedAt.getTime()).toBeGreaterThan(occurredAt.getTime());
++      const snapshot = async (): Promise<{ staff: number; audit: number }> => {
++        const staff = await db.query<{ count: number }>("SELECT count(*)::int AS count FROM foundation.staff WHERE role = 'TECHNICIAN'");
++        const rows = await db.query<{ count: number }>("SELECT count(*)::int AS count FROM foundation.audit_logs WHERE operation = 'STAFF_CREATED'");
++        return { staff: staff.rows[0]?.count ?? 0, audit: rows.rows[0]?.count ?? 0 };
++      };
++      expect(await snapshot()).toEqual({ staff: 3, audit: 3 });
++      const denied = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie)
++        .set('X-CSRF-Token', managerCsrf).send({ role: 'TECHNICIAN' }).expect(403);
++      collect(denied.body);
++      // No write happens after the revoke is fixed: neither a staff row nor an audit row.
++      expect(await snapshot()).toEqual({ staff: 3, audit: 3 });
++    } finally {
++      await locker.query('ROLLBACK').catch(() => undefined);
++      await locker.end();
++      await revoker.end();
++    }
++  }, 30000);
++
++  it('turns every staff route into 401 after the actor is deactivated', async () => {
++    if (!fixture) { throw new Error('Missing isolated fixture'); }
++    const db = fixture;
++    // staff.read is still granted here; only the employment state changes.
++    const stillActive = await request(server).get('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie).expect(200);
++    collect(stillActive.body);
++    await db.query("UPDATE foundation.staff SET employment_state = 'INACTIVE' WHERE id = $1", [managerId]);
++    const list = await request(server).get('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie).expect(401);
++    collect(list.body);
++    cacheControls.push(list.headers['cache-control'] ?? '');
++    const detail = await request(server).get(`/api/v1/staff/${managerId}`).set('Origin', origin).set('Cookie', managerCookie).expect(401);
++    collect(detail.body);
++    cacheControls.push(detail.headers['cache-control'] ?? '');
++    const write = await request(server).post('/api/v1/staff').set('Origin', origin).set('Cookie', managerCookie)
++      .set('X-CSRF-Token', managerCsrf).send({ role: 'TECHNICIAN' }).expect(401);
++    collect(write.body);
++    cacheControls.push(write.headers['cache-control'] ?? '');
++  });
++
++  it('keeps the staff-v0 ETag and no-store, and keeps secrets out of bodies and logs', async () => {
++    if (!fixture || !logs) { throw new Error('Missing isolated fixture'); }
++    const db = fixture;
++    expect(createEtag).toBe('"staff-v0"');
++    expect(cacheControls.length).toBeGreaterThanOrEqual(8);
++    for (const value of cacheControls) { expect(value).toBe('no-store'); }
++    const hashes = await db.query<{ password_hash: string }>('SELECT password_hash FROM foundation.staff_web_credentials WHERE staff_id = $1', [managerId]);
++    const hash = hashes.rows[0]?.password_hash;
++    const serialized = JSON.stringify({ responses, logs: logs.mock.calls });
++    for (const secret of [adminLogin, managerLogin, adminPassword, managerPassword, managerToken, hash]) {
++      if (secret) { expect(serialized).not.toContain(secret); }
++    }
++  });
++});
+diff --git a/prisma/migrations/20261120000600_authorization/migration.sql b/prisma/migrations/20261120000600_authorization/migration.sql
+new file mode 100644
+index 0000000..ae1d7ad
+--- /dev/null
++++ b/prisma/migrations/20261120000600_authorization/migration.sql
+@@ -0,0 +1,42 @@
++BEGIN;
++
++CREATE TABLE "foundation"."user_permissions" (
++    "id" UUID NOT NULL,
++    "staff_id" UUID NOT NULL,
++    "capability" VARCHAR(64) NOT NULL,
++    "scope" VARCHAR(16) NOT NULL,
++    "valid_from" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "valid_until" TIMESTAMPTZ(6),
++    "revoked_at" TIMESTAMPTZ(6),
++    "granted_by" UUID,
++    "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    CONSTRAINT "user_permissions_pkey" PRIMARY KEY ("id"),
++    CONSTRAINT "user_permissions_staff_id_fkey" FOREIGN KEY ("staff_id")
++        REFERENCES "foundation"."staff"("id") ON DELETE RESTRICT ON UPDATE RESTRICT,
++    CONSTRAINT "user_permissions_granted_by_fkey" FOREIGN KEY ("granted_by")
++        REFERENCES "foundation"."staff"("id") ON DELETE RESTRICT ON UPDATE RESTRICT,
++    CONSTRAINT "user_permissions_capability_check" CHECK (length(trim("capability")) > 0),
++    CONSTRAINT "user_permissions_scope_check" CHECK ("scope" IN ('GLOBAL')),
++    CONSTRAINT "user_permissions_validity_check" CHECK ("valid_until" IS NULL OR "valid_until" > "valid_from"),
++    CONSTRAINT "user_permissions_revoked_at_check" CHECK ("revoked_at" IS NULL OR "revoked_at" >= "created_at")
++);
++-- One non-revoked row per (staff, capability, scope); time validity is enforced by the
++-- application per query because now() is not IMMUTABLE and cannot appear in an index
++-- predicate. Re-granting revokes the old row and inserts a new one in one transaction.
++CREATE UNIQUE INDEX "user_permissions_active_key"
++    ON "foundation"."user_permissions"("staff_id", "capability", "scope") WHERE "revoked_at" IS NULL;
++CREATE INDEX "user_permissions_staff_id_idx" ON "foundation"."user_permissions"("staff_id");
++
++REVOKE ALL ON "foundation"."user_permissions" FROM PUBLIC;
++
++-- SELECT/INSERT/UPDATE are strictly column-scoped; no DELETE or TRUNCATE.
++GRANT SELECT ("id", "staff_id", "capability", "scope", "valid_from", "valid_until", "revoked_at", "granted_by", "created_at"),
++    INSERT ("id", "staff_id", "capability", "scope", "valid_from", "valid_until", "granted_by", "created_at"),
++    UPDATE ("valid_until", "revoked_at")
++    ON "foundation"."user_permissions" TO "fixlevelup_runtime";
++-- POST /staff guard needs to create pre-registered staff rows; UPDATE of
++-- role/employment_state stays reserved for the P02-06 lifecycle.
++GRANT INSERT ("id", "role", "employment_state", "auth_version")
++    ON "foundation"."staff" TO "fixlevelup_runtime";
++
++COMMIT;

@@ -27,10 +27,12 @@ model Staff {
   id              String              @id @db.Uuid
   role            String              @db.VarChar(16)
   employmentState String              @map("employment_state") @db.VarChar(16)
-  authVersion     Int                 @default(0) @map("auth_version")
-  webCredential   StaffWebCredential?
-  bootstrapMarker StaffBootstrapMarker?
-  webSessions     WebSession[]
+  authVersion        Int                   @default(0) @map("auth_version")
+  webCredential      StaffWebCredential?
+  bootstrapMarker    StaffBootstrapMarker?
+  webSessions        WebSession[]
+  permissions        UserPermission[]
+  grantedPermissions UserPermission[]      @relation("UserPermissionGrantedBy")
 
   @@map("staff")
   @@schema("foundation")
@@ -52,6 +54,26 @@ model StaffWebCredential {
   staff        Staff  @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
 
   @@map("staff_web_credentials")
+  @@schema("foundation")
+}
+
+// Capabilities are plain strings validated in the application; no catalog table.
+// The partial unique index and period/scope CHECKs exist only in migration SQL.
+model UserPermission {
+  id             String    @id @db.Uuid
+  staffId        String    @map("staff_id") @db.Uuid
+  capability     String    @db.VarChar(64)
+  scope          String    @db.VarChar(16)
+  validFrom      DateTime  @default(now()) @map("valid_from") @db.Timestamptz(6)
+  validUntil     DateTime? @map("valid_until") @db.Timestamptz(6)
+  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
+  grantedBy      String?   @map("granted_by") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  staff          Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  grantedByStaff Staff?    @relation("UserPermissionGrantedBy", fields: [grantedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([staffId], map: "user_permissions_staff_id_idx")
+  @@map("user_permissions")
   @@schema("foundation")
 }
 

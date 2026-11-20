@@ -163,9 +163,15 @@ export class RuntimeDatabase implements OnModuleDestroy {
         ('web_auth_throttles','key_hash','varchar',true,68),
         ('web_auth_attempts','id','uuid',true,-1), ('web_auth_attempts','key_hash','varchar',true,68),
         ('web_auth_attempts','reserved_at','timestamptz',true,6), ('web_auth_attempts','expires_at','timestamptz',true,6),
-        ('web_auth_attempts','failed_at','timestamptz',false,6), ('web_auth_attempts','completed_at','timestamptz',false,6)
+        ('web_auth_attempts','failed_at','timestamptz',false,6), ('web_auth_attempts','completed_at','timestamptz',false,6),
+        ('user_permissions','id','uuid',true,-1), ('user_permissions','staff_id','uuid',true,-1),
+        ('user_permissions','capability','varchar',true,68), ('user_permissions','scope','varchar',true,20),
+        ('user_permissions','valid_from','timestamptz',true,6), ('user_permissions','valid_until','timestamptz',false,6),
+        ('user_permissions','revoked_at','timestamptz',false,6), ('user_permissions','granted_by','uuid',false,-1),
+        ('user_permissions','created_at','timestamptz',true,6)
       ), required_privileges(table_name, column_name, privilege) AS (VALUES
         ('staff','id','SELECT'), ('staff','role','SELECT'), ('staff','employment_state','SELECT'), ('staff','auth_version','SELECT'), ('staff','auth_version','UPDATE'),
+        ('staff','id','INSERT'), ('staff','role','INSERT'), ('staff','employment_state','INSERT'), ('staff','auth_version','INSERT'),
         ('staff_web_credentials','staff_id','SELECT'), ('staff_web_credentials','login','SELECT'), ('staff_web_credentials','password_hash','SELECT'), ('staff_web_credentials','password_hash','UPDATE'),
         ('web_sessions','id','SELECT'), ('web_sessions','staff_id','SELECT'), ('web_sessions','token_hash','SELECT'), ('web_sessions','auth_version','SELECT'), ('web_sessions','created_at','SELECT'), ('web_sessions','idle_expires_at','SELECT'), ('web_sessions','absolute_expires_at','SELECT'), ('web_sessions','revoked_at','SELECT'),
         ('web_sessions','id','INSERT'), ('web_sessions','staff_id','INSERT'), ('web_sessions','token_hash','INSERT'), ('web_sessions','auth_version','INSERT'), ('web_sessions','created_at','INSERT'), ('web_sessions','idle_expires_at','INSERT'), ('web_sessions','absolute_expires_at','INSERT'), ('web_sessions','revoked_at','INSERT'),
@@ -173,18 +179,26 @@ export class RuntimeDatabase implements OnModuleDestroy {
         ('web_auth_throttles','key_hash','SELECT'), ('web_auth_throttles','key_hash','INSERT'), ('web_auth_throttles','key_hash','UPDATE'),
         ('web_auth_attempts','id','SELECT'), ('web_auth_attempts','key_hash','SELECT'), ('web_auth_attempts','reserved_at','SELECT'), ('web_auth_attempts','expires_at','SELECT'), ('web_auth_attempts','failed_at','SELECT'), ('web_auth_attempts','completed_at','SELECT'),
         ('web_auth_attempts','id','INSERT'), ('web_auth_attempts','key_hash','INSERT'), ('web_auth_attempts','reserved_at','INSERT'), ('web_auth_attempts','expires_at','INSERT'), ('web_auth_attempts','failed_at','INSERT'), ('web_auth_attempts','completed_at','INSERT'),
-        ('web_auth_attempts','expires_at','UPDATE'), ('web_auth_attempts','failed_at','UPDATE'), ('web_auth_attempts','completed_at','UPDATE')
+        ('web_auth_attempts','expires_at','UPDATE'), ('web_auth_attempts','failed_at','UPDATE'), ('web_auth_attempts','completed_at','UPDATE'),
+        ('user_permissions','id','SELECT'), ('user_permissions','staff_id','SELECT'), ('user_permissions','capability','SELECT'), ('user_permissions','scope','SELECT'),
+        ('user_permissions','valid_from','SELECT'), ('user_permissions','valid_until','SELECT'), ('user_permissions','revoked_at','SELECT'), ('user_permissions','granted_by','SELECT'), ('user_permissions','created_at','SELECT'),
+        ('user_permissions','id','INSERT'), ('user_permissions','staff_id','INSERT'), ('user_permissions','capability','INSERT'), ('user_permissions','scope','INSERT'),
+        ('user_permissions','valid_from','INSERT'), ('user_permissions','valid_until','INSERT'), ('user_permissions','granted_by','INSERT'), ('user_permissions','created_at','INSERT'),
+        ('user_permissions','valid_until','UPDATE'), ('user_permissions','revoked_at','UPDATE')
       ), expected_constraints(table_name, name, kind) AS (VALUES
         ('staff','staff_pkey','p'), ('staff','staff_role_check','c'), ('staff','staff_employment_state_check','c'), ('staff','staff_auth_version_check','c'),
         ('staff_web_credentials','staff_web_credentials_pkey','p'), ('staff_web_credentials','staff_web_credentials_staff_id_fkey','f'), ('staff_web_credentials','staff_web_credentials_login_check','c'), ('staff_web_credentials','staff_web_credentials_password_hash_check','c'),
         ('staff_bootstrap_marker','staff_bootstrap_marker_pkey','p'), ('staff_bootstrap_marker','staff_bootstrap_marker_singleton_check','c'), ('staff_bootstrap_marker','staff_bootstrap_marker_staff_id_fkey','f'),
         ('web_sessions','web_sessions_pkey','p'), ('web_sessions','web_sessions_staff_id_fkey','f'), ('web_sessions','web_sessions_token_hash_check','c'), ('web_sessions','web_sessions_auth_version_check','c'), ('web_sessions','web_sessions_expiry_check','c'), ('web_sessions','web_sessions_revoked_at_check','c'),
         ('web_auth_throttles','web_auth_throttles_pkey','p'), ('web_auth_throttles','web_auth_throttles_key_hash_check','c'),
-        ('web_auth_attempts','web_auth_attempts_pkey','p'), ('web_auth_attempts','web_auth_attempts_key_hash_fkey','f'), ('web_auth_attempts','web_auth_attempts_expiry_check','c'), ('web_auth_attempts','web_auth_attempts_completion_check','c')
+        ('web_auth_attempts','web_auth_attempts_pkey','p'), ('web_auth_attempts','web_auth_attempts_key_hash_fkey','f'), ('web_auth_attempts','web_auth_attempts_expiry_check','c'), ('web_auth_attempts','web_auth_attempts_completion_check','c'),
+        ('user_permissions','user_permissions_pkey','p'), ('user_permissions','user_permissions_staff_id_fkey','f'), ('user_permissions','user_permissions_granted_by_fkey','f'),
+        ('user_permissions','user_permissions_capability_check','c'), ('user_permissions','user_permissions_scope_check','c'), ('user_permissions','user_permissions_validity_check','c'), ('user_permissions','user_permissions_revoked_at_check','c')
       ), expected_indexes(table_name, name, unique_index, columns) AS (VALUES
         ('staff_web_credentials','staff_web_credentials_login_key',true,'login'), ('staff_bootstrap_marker','staff_bootstrap_marker_staff_id_key',true,'staff_id'),
         ('web_sessions','web_sessions_token_hash_key',true,'token_hash'), ('web_sessions','web_sessions_staff_id_idx',false,'staff_id'), ('web_sessions','web_sessions_absolute_expiry_idx',false,'absolute_expires_at'),
-        ('web_auth_attempts','web_auth_attempts_key_expiry_idx',false,'key_hash, expires_at'), ('web_auth_attempts','web_auth_attempts_expiry_idx',false,'expires_at')
+        ('web_auth_attempts','web_auth_attempts_key_expiry_idx',false,'key_hash, expires_at'), ('web_auth_attempts','web_auth_attempts_expiry_idx',false,'expires_at'),
+        ('user_permissions','user_permissions_staff_id_idx',false,'staff_id')
       )
       SELECT
         NOT EXISTS (SELECT 1 FROM expected_columns e WHERE NOT EXISTS (

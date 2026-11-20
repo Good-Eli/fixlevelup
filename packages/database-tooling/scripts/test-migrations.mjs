@@ -20,12 +20,19 @@ async function checkViolation(client, sql, values = []) {
   catch (error) { assert(error.code === '23514', `Expected custom CHECK violation, got ${error.code}`); checkDenials += 1; return; }
   throw new Error('Invalid CHECK input accepted');
 }
-const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth'];
+let uniqueViolations = 0;
+async function uniqueViolation(client, sql, values = []) {
+  try { await client.query(sql, values); }
+  catch (error) { assert(error.code === '23505', `Expected unique_violation, got ${error.code}`); uniqueViolations += 1; return; }
+  throw new Error('Duplicate row accepted');
+}
+const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth', '20261120000600_authorization'];
 const expectedChecks = [
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check',
   'staff_web_credentials_login_check', 'staff_web_credentials_password_hash_check', 'staff_bootstrap_marker_singleton_check',
+  'user_permissions_capability_check', 'user_permissions_scope_check', 'user_permissions_validity_check', 'user_permissions_revoked_at_check',
   'web_sessions_token_hash_check', 'web_sessions_auth_version_check', 'web_sessions_expiry_check', 'web_sessions_revoked_at_check',
   'web_auth_throttles_key_hash_check', 'web_auth_attempts_expiry_check', 'web_auth_attempts_completion_check',
 ];
@@ -37,16 +44,18 @@ const upgrade = `fixlevelup_p017a_upgrade_${suffix}`;
 const upgradeSecond = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const upgradeThird = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const upgradeFourth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+const upgradeFifth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const shadow = `fixlevelup_p017a_shadow_${suffix}`;
 const historyRoot = resolve(root, `node_modules/.cache/p017a-${suffix}`);
 const firstHistory = resolve(historyRoot, 'first/migrations');
 const secondHistory = resolve(historyRoot, 'second/migrations');
 const thirdHistory = resolve(historyRoot, 'third/migrations');
 const fourthHistory = resolve(historyRoot, 'fourth/migrations');
+const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
-  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, shadow]) { await prepareDatabase(client, database, true); }
-  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${shadow}`);
-  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)]]) {
+  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, shadow]) { await prepareDatabase(client, database, true); }
+  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${shadow}`);
+  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -159,7 +168,41 @@ try {
     command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeFourth, 0, shadow);
     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeFourth);
   } finally { await fourthReader.end(); }
-  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
+  // Preserve synthetic staff, credentials, web sessions and user permissions across the authorization migration.
+  command(['migrate', 'deploy'], upgradeFifth, 0, undefined, fifthHistory);
+  const fifthReader = connection('fixlevelup_migrator', passwords.fixlevelup_migrator, upgradeFifth);
+  await fifthReader.connect();
+  try {
+    const fifthStaffId = randomUUID();
+    await fifthReader.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES($1,'TECHNICIAN','ACTIVE',2)", [fifthStaffId]);
+    await fifthReader.query("INSERT INTO foundation.staff_web_credentials(staff_id,login,password_hash) VALUES($1,'fifth-synthetic-login','fifth-synthetic-hash')", [fifthStaffId]);
+    await fifthReader.query("INSERT INTO foundation.web_sessions(id,staff_id,token_hash,auth_version,idle_expires_at,absolute_expires_at) VALUES($1,$2,$3,2,CURRENT_TIMESTAMP+INTERVAL '1 hour',CURRENT_TIMESTAMP+INTERVAL '30 days')", [randomUUID(), fifthStaffId, '1'.repeat(64)]);
+    const existingTables = ['staff', 'staff_web_credentials', 'web_sessions'];
+    const existingBefore = [];
+    for (const table of existingTables) { existingBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
+    command(['migrate', 'deploy'], upgradeFifth);
+    for (const [index, table] of existingTables.entries()) {
+      const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
+      assert(JSON.stringify(after) === JSON.stringify(existingBefore[index]), `Fifth-to-latest upgrade changed ${table} data`);
+    }
+    await fifthReader.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,valid_until,granted_by) VALUES($1,$2,'FIFTH_SYNTHETIC','GLOBAL',CURRENT_TIMESTAMP+INTERVAL '7 days',$2)", [randomUUID(), fifthStaffId]);
+    const fifthTables = [...existingTables, 'user_permissions'];
+    const fifthBefore = [];
+    for (const table of fifthTables) { fifthBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
+    const fifthHistoryRows = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(fifthHistoryRows.rowCount === migrations.length && JSON.stringify(fifthHistoryRows.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
+      && fifthHistoryRows.rows.every((entry) => entry.finished_at !== null), 'Fifth-to-latest history mismatch');
+    command(['migrate', 'deploy'], upgradeFifth);
+    const fifthReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(JSON.stringify(fifthReplay.rows) === JSON.stringify(fifthHistoryRows.rows), 'Fifth-to-latest replay changed history');
+    for (const [index, table] of fifthTables.entries()) {
+      const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
+      assert(JSON.stringify(after) === JSON.stringify(fifthBefore[index]), `Fifth-to-latest replay changed ${table} data`);
+    }
+    command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeFifth, 0, shadow);
+    command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeFifth);
+  } finally { await fifthReader.end(); }
+  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/fifth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
   command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], fresh, 0, shadow);
   command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
   const runtimeStaffId = randomUUID();
@@ -203,10 +246,11 @@ try {
       && grants.rows.every((column) => column.writable === workerColumns.includes(column.attname)), 'Runtime outbox column grants mismatch');
     const tableGrant = await runtime.query("SELECT has_table_privilege(current_user,'foundation.outbox_events','UPDATE') AS writable, has_any_column_privilege(current_user,'foundation.audit_logs','UPDATE') AS audit_writable");
     assert(!tableGrant.rows[0].writable && !tableGrant.rows[0].audit_writable, 'Runtime broad UPDATE/audit UPDATE unexpectedly allowed');
-    for (const [table, allowed] of [['staff', ['auth_version']], ['staff_web_credentials', ['password_hash']]]) {
-      const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
-      assert(columns.rows.filter((column) => column.writable).length === allowed.length
-        && columns.rows.every((column) => column.writable === allowed.includes(column.attname)), `Runtime ${table} column grants mismatch`);
+    for (const [table, updatable, insertable] of [['staff', ['auth_version'], ['id', 'role', 'employment_state', 'auth_version']], ['staff_web_credentials', ['password_hash'], []]]) {
+      const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'INSERT') AS insertable,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
+      assert(columns.rows.filter((column) => column.writable).length === updatable.length
+        && columns.rows.every((column) => column.writable === updatable.includes(column.attname)
+          && column.insertable === insertable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
       const broad = await runtime.query("SELECT has_table_privilege(current_user,$1,'UPDATE') AS writable", [`foundation.${table}`]);
       assert(!broad.rows[0].writable, `Runtime ${table} broad UPDATE unexpectedly allowed`);
     }
@@ -215,15 +259,38 @@ try {
     const staff = await runtime.query('SELECT s.id,s.role,s.employment_state,s.auth_version,c.login,c.password_hash FROM foundation.staff s JOIN foundation.staff_web_credentials c ON c.staff_id=s.id WHERE s.id=$1', [runtimeStaffId]);
     assert(staff.rows[0]?.auth_version === 2 && staff.rows[0].role === 'ADMIN' && staff.rows[0].employment_state === 'ACTIVE'
       && staff.rows[0].login === 'runtime-synthetic' && staff.rows[0].password_hash === 'updated-synthetic-hash', 'Runtime scoped staff reads/writes failed');
+    // POST /staff guard: only id/role/employment_state/auth_version are runtime-insertable on staff.
+    const guardStaffId = randomUUID();
+    await runtime.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES($1,'TECHNICIAN','ACTIVE',1)", [guardStaffId]);
+    const guardStaff = await runtime.query('SELECT id,role,employment_state,auth_version FROM foundation.staff WHERE id=$1', [guardStaffId]);
+    assert(guardStaff.rows[0]?.id === guardStaffId && guardStaff.rows[0].role === 'TECHNICIAN'
+      && guardStaff.rows[0].employment_state === 'ACTIVE' && guardStaff.rows[0].auth_version === 1, 'Runtime scoped staff INSERT failed');
+    // Column-scoped user_permissions writes: INSERT excludes revoked_at, UPDATE covers valid_until/revoked_at.
+    const permissionId = randomUUID();
+    await runtime.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [permissionId, runtimeStaffId]);
+    const permission = (await runtime.query('SELECT capability,scope,valid_from,valid_until,revoked_at,granted_by,created_at FROM foundation.user_permissions WHERE id=$1', [permissionId])).rows[0];
+    assert(permission?.capability === 'RUNTIME_SYNTHETIC' && permission.scope === 'GLOBAL' && permission.valid_from instanceof Date
+      && permission.valid_until === null && permission.revoked_at === null && permission.granted_by === null
+      && permission.created_at instanceof Date, 'Runtime user permission INSERT/defaults failed');
+    // Partial unique index user_permissions_active_key: one non-revoked row per (staff,capability,scope).
+    await uniqueViolation(runtime, "INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [randomUUID(), runtimeStaffId]);
+    // Re-grant: revoke the old row, then insert a fresh active one in the same flow.
+    await runtime.query('UPDATE foundation.user_permissions SET revoked_at=CURRENT_TIMESTAMP WHERE id=$1', [permissionId]);
+    const regrantedId = randomUUID();
+    await runtime.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope) VALUES($1,$2,'RUNTIME_SYNTHETIC','GLOBAL')", [regrantedId, runtimeStaffId]);
+    const permissions = await runtime.query('SELECT id,revoked_at FROM foundation.user_permissions WHERE staff_id=$1 AND capability=$2 AND scope=$3 ORDER BY revoked_at NULLS FIRST', [runtimeStaffId, 'RUNTIME_SYNTHETIC', 'GLOBAL']);
+    assert(permissions.rowCount === 2 && permissions.rows[0].id === regrantedId && permissions.rows[0].revoked_at === null
+      && permissions.rows[1].id === permissionId && permissions.rows[1].revoked_at !== null, 'Re-grant via revoke plus insert failed');
     const webGrants = [
-      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
-      ['web_auth_throttles', ['key_hash'], ['key_hash']],
-      ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
+      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
+      ['web_auth_throttles', ['key_hash'], ['key_hash'], ['key_hash']],
+      ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
+      ['user_permissions', ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'revoked_at', 'granted_by', 'created_at'], ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'granted_by', 'created_at'], ['valid_until', 'revoked_at']],
     ];
-    for (const [table, readable, writable] of webGrants) {
+    for (const [table, readable, insertable, writable] of webGrants) {
       const columns = await runtime.query("SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'SELECT') AS readable,has_column_privilege(current_user,a.attrelid,a.attnum,'INSERT') AS insertable,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=$1::regclass AND a.attnum>0 AND NOT a.attisdropped", [`foundation.${table}`]);
       assert(columns.rows.length === readable.length && columns.rows.every((column) => column.readable === readable.includes(column.attname)
-        && column.insertable === readable.includes(column.attname) && column.writable === writable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
+        && column.insertable === insertable.includes(column.attname) && column.writable === writable.includes(column.attname)), `Runtime ${table} column grants mismatch`);
       const broad = await runtime.query("SELECT has_table_privilege(current_user,$1,'UPDATE') AS writable,has_table_privilege(current_user,$1,'DELETE') AS deletable", [`foundation.${table}`]);
       assert(!broad.rows[0].writable && !broad.rows[0].deletable, `Runtime ${table} broad grants unexpectedly allowed`);
     }
@@ -313,16 +380,21 @@ try {
       "UPDATE foundation.staff SET role='MANAGER'", "UPDATE foundation.staff SET employment_state='INACTIVE'",
       "UPDATE foundation.staff_web_credentials SET login='forbidden'", 'UPDATE foundation.staff SET id=id',
       'UPDATE foundation.staff_web_credentials SET staff_id=staff_id',
-      ...['staff', 'staff_web_credentials', 'staff_bootstrap_marker'].flatMap((table) => [
+      ...['staff_web_credentials', 'staff_bootstrap_marker'].flatMap((table) => [
         `INSERT INTO foundation.${table} DEFAULT VALUES`, `DELETE FROM foundation.${table}`,
       ]),
+      'DELETE FROM foundation.staff',
       'SELECT * FROM foundation.staff_bootstrap_marker', 'UPDATE foundation.staff_bootstrap_marker SET id=id',
       ...['web_sessions', 'web_auth_throttles', 'web_auth_attempts'].map((table) => `DELETE FROM foundation.${table}`),
       'UPDATE foundation.web_sessions SET staff_id=staff_id', 'UPDATE foundation.web_sessions SET absolute_expires_at=absolute_expires_at',
       'UPDATE foundation.web_auth_attempts SET key_hash=key_hash', 'UPDATE foundation.web_auth_attempts SET reserved_at=reserved_at',
+      'DELETE FROM foundation.user_permissions',
+      'UPDATE foundation.user_permissions SET id=id', 'UPDATE foundation.user_permissions SET staff_id=staff_id',
+      'UPDATE foundation.user_permissions SET capability=capability', 'UPDATE foundation.user_permissions SET scope=scope',
+      `INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,revoked_at) VALUES(gen_random_uuid(),'${runtimeStaffId}','RUNTIME_REVOKED','GLOBAL',CURRENT_TIMESTAMP)`,
     ];
     for (const sql of privilegeDenials) { await denied(runtime, sql); }
-    console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials and ${privilegeDenials.length} privilege denials: PASS`);
+    console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials, ${uniqueViolations} unique violations and ${privilegeDenials.length} privilege denials: PASS`);
   } finally { await runtime.end(); }
   console.log('P01-01.9A migration integration proofs: PASS. Test databases retained; no dev data reset.');
 } catch (error) {
