@@ -8,13 +8,20 @@ import { WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE, WebAuthController } from './aut
 import { WebAuthResources } from './auth/web-auth.resources.js';
 import { AUTHORIZATION_SERVICE, AuthorizationResources } from './authz/authorization.resources.js';
 import { StaffWebAuthGuard } from './authz/authorization.guard.js';
+import { StaffTelegramAuthGuard } from './authz/telegram-auth.guard.js';
+import { TELEGRAM_AUTH_SERVICE, TelegramAuthController } from './auth/telegram-auth.controller.js';
+import { TelegramAuthResources } from './auth/telegram-auth.resources.js';
+import type { TelegramAuthConfig } from './auth/telegram-auth.config.js';
 import { StaffController, StaffService } from './staff/staff.controller.js';
 
 @Module({})
 export class AppModule {
-  static register(database?: DatabaseConfig, webAuth?: WebAuthConfig): DynamicModule {
-    if (webAuth && !database) { throw new Error('Web authentication requires a database'); }
-    const controllers = webAuth ? [HealthController, WebAuthController, StaffController] : [HealthController];
+  static register(database?: DatabaseConfig, webAuth?: WebAuthConfig, telegramAuth?: TelegramAuthConfig): DynamicModule {
+    if ((webAuth || telegramAuth) && !database) { throw new Error('Web authentication requires a database'); }
+    if (telegramAuth && !webAuth) { throw new Error('Telegram authentication requires web authentication configuration'); }
+    const controllers = webAuth
+      ? [HealthController, WebAuthController, StaffController, ...(telegramAuth ? [TelegramAuthController] : [])]
+      : [HealthController];
     const providers = [
       HealthService, { provide: RuntimeDatabase, useFactory: () => new RuntimeDatabase(database, Boolean(webAuth)) },
       ...(webAuth && database ? [
@@ -28,6 +35,13 @@ export class AppModule {
         { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin: webAuth.origin, csrfSecret: webAuth.csrfSecret } },
         { provide: AuthorizationResources, useFactory: () => new AuthorizationResources(database) },
         { provide: AUTHORIZATION_SERVICE, useFactory: (resources: AuthorizationResources) => resources.service, inject: [AuthorizationResources] },
+        ...(telegramAuth ? [
+          // Same fail-fast provider registration as StaffWebAuthGuard: no master
+          // routes are mounted yet, but the guard's wiring is verified at startup.
+          StaffTelegramAuthGuard,
+          { provide: TelegramAuthResources, useFactory: () => new TelegramAuthResources(database, telegramAuth, webAuth.throttleSecret) },
+          { provide: TELEGRAM_AUTH_SERVICE, useFactory: (resources: TelegramAuthResources) => resources.service, inject: [TelegramAuthResources] },
+        ] : []),
       ] : []),
     ];
     return { module: AppModule, controllers, providers };

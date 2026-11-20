@@ -12,4 +12,17 @@ export interface StaffWebPrincipal {
   readonly authVersion: number;
 }
 
-export type Principal = StaffWebPrincipal;
+/** P02-05 principal from a verified STAFF_TELEGRAM web_sessions row (Mini App bearer
+ * token in memory). telegramUserId is the decimal string of the BIGINT Telegram id,
+ * never a JavaScript number. role is metadata only; rights come from capability
+ * grants, never from the login channel.
+ */
+export interface StaffTelegramPrincipal {
+  readonly kind: 'staff-telegram';
+  readonly staffId: string;
+  readonly role: 'TECHNICIAN';
+  readonly authVersion: number;
+  readonly telegramUserId: string;
+}
+
+export type Principal = StaffWebPrincipal | StaffTelegramPrincipal;

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { HttpException, InternalServerErrorException } from '@nestjs/common';
+import type { Principal } from './principal.js';
 import type { StaffWebPrincipal } from './principal.js';
 import type { Capability, Scope } from './capability.js';
 import { isCapability } from './capability.js';
@@ -17,7 +18,7 @@ export interface StaffWriteContext {
 
 /** DI-facing API of AuthorizationService, mirroring the WebAuthServiceApi pattern. */
 export interface AuthorizationServiceApi {
-  authorize(principal: StaffWebPrincipal, capability: Capability, scope: Scope): Promise<void>;
+  authorize(principal: Principal, capability: Capability, scope: Scope): Promise<void>;
   read<T>(fn: (client: PoolClient) => Promise<T>): Promise<T>;
   authorizeForWrite<T>(token: string, capability: Capability, scope: Scope, write: (context: StaffWriteContext) => Promise<T>): Promise<T>;
 }
@@ -72,7 +73,7 @@ export class AuthorizationService implements AuthorizationServiceApi {
   /** Throws FORBIDDEN when the principal lacks the capability in scope. Default deny.
    * Read path: no locks, plain READ COMMITTED; the guard has just re-verified the session.
    */
-  async authorize(principal: StaffWebPrincipal, capability: Capability, scope: Scope): Promise<void> {
+  async authorize(principal: Principal, capability: Capability, scope: Scope): Promise<void> {
     await this.transaction(async (client) => {
       if (!await this.permitted(client, principal.staffId, capability, scope)) { throw new AuthorizationError('FORBIDDEN'); }
     });

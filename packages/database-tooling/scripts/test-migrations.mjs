@@ -26,14 +26,16 @@ async function uniqueViolation(client, sql, values = []) {
   catch (error) { assert(error.code === '23505', `Expected unique_violation, got ${error.code}`); uniqueViolations += 1; return; }
   throw new Error('Duplicate row accepted');
 }
-const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth', '20261120000600_authorization'];
+const migrations = ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth', '20261120000600_authorization', '20261120000700_staff_telegram_auth'];
 const expectedChecks = [
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check',
   'staff_web_credentials_login_check', 'staff_web_credentials_password_hash_check', 'staff_bootstrap_marker_singleton_check',
   'user_permissions_capability_check', 'user_permissions_scope_check', 'user_permissions_validity_check', 'user_permissions_revoked_at_check',
+  'staff_telegram_links_telegram_user_id_check', 'staff_telegram_links_username_check', 'staff_telegram_links_revoked_at_check',
   'web_sessions_token_hash_check', 'web_sessions_auth_version_check', 'web_sessions_expiry_check', 'web_sessions_revoked_at_check',
+  'web_sessions_channel_check', 'web_sessions_initdata_digest_check', 'web_sessions_channel_pair_check', 'web_sessions_initdata_exchanged_at_check',
   'web_auth_throttles_key_hash_check', 'web_auth_attempts_expiry_check', 'web_auth_attempts_completion_check',
 ];
 const client = await admin();
@@ -177,24 +179,44 @@ try {
     await fifthReader.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES($1,'TECHNICIAN','ACTIVE',2)", [fifthStaffId]);
     await fifthReader.query("INSERT INTO foundation.staff_web_credentials(staff_id,login,password_hash) VALUES($1,'fifth-synthetic-login','fifth-synthetic-hash')", [fifthStaffId]);
     await fifthReader.query("INSERT INTO foundation.web_sessions(id,staff_id,token_hash,auth_version,idle_expires_at,absolute_expires_at) VALUES($1,$2,$3,2,CURRENT_TIMESTAMP+INTERVAL '1 hour',CURRENT_TIMESTAMP+INTERVAL '30 days')", [randomUUID(), fifthStaffId, '1'.repeat(64)]);
-    const existingTables = ['staff', 'staff_web_credentials', 'web_sessions'];
-    const existingBefore = [];
-    for (const table of existingTables) { existingBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
+    // The fifth-to-latest upgrade now applies migrations 006 and 007 together; both add
+    // columns to web_sessions, so compare a stable projection instead of SELECT *.
+    const existingTablesStableEarly = ['staff', 'staff_web_credentials'];
+    const earlyWebSession = await fifthReader.query('SELECT id, staff_id, token_hash, auth_version, idle_expires_at, absolute_expires_at, revoked_at FROM foundation.web_sessions ORDER BY 1');
+    const earlyBefore = [];
+    for (const table of existingTablesStableEarly) { earlyBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
     command(['migrate', 'deploy'], upgradeFifth);
-    for (const [index, table] of existingTables.entries()) {
+    const earlyWebSessionAfter = await fifthReader.query('SELECT id, staff_id, token_hash, auth_version, idle_expires_at, absolute_expires_at, revoked_at FROM foundation.web_sessions ORDER BY 1');
+    assert(JSON.stringify(earlyWebSessionAfter.rows) === JSON.stringify(earlyWebSession.rows), 'Fifth-to-latest upgrade changed web_sessions data');
+    for (const [index, table] of existingTablesStableEarly.entries()) {
       const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
-      assert(JSON.stringify(after) === JSON.stringify(existingBefore[index]), `Fifth-to-latest upgrade changed ${table} data`);
+      assert(JSON.stringify(after) === JSON.stringify(earlyBefore[index]), `Fifth-to-latest upgrade changed ${table} data`);
     }
     await fifthReader.query("INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,valid_until,granted_by) VALUES($1,$2,'FIFTH_SYNTHETIC','GLOBAL',CURRENT_TIMESTAMP+INTERVAL '7 days',$2)", [randomUUID(), fifthStaffId]);
-    const fifthTables = [...existingTables, 'user_permissions'];
+    // After the first deploy the database is at migration 007 (fifthHistory contained
+    // only migrations 001-005, so the single deploy above already applied 006+007).
+    // Replay and drift checks run against the full history; no further data mutations here.
+    const fullHistoryRows = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(fullHistoryRows.rowCount === migrations.length
+      && JSON.stringify(fullHistoryRows.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
+      && fullHistoryRows.rows.every((entry) => entry.finished_at !== null), 'Sixth history mismatch');
+    command(['migrate', 'deploy'], upgradeFifth);
+    const fullHistoryReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(JSON.stringify(fullHistoryReplay.rows) === JSON.stringify(fullHistoryRows.rows), 'Sixth-to-latest replay changed history');
+    const replayWebSession = await fifthReader.query('SELECT id, staff_id, token_hash, auth_version, idle_expires_at, absolute_expires_at, revoked_at FROM foundation.web_sessions ORDER BY 1');
+    assert(JSON.stringify(replayWebSession.rows) === JSON.stringify(earlyWebSessionAfter.rows), 'Sixth-to-latest replay changed web_sessions data');
+    const fifthTables = ['staff', 'staff_web_credentials', 'user_permissions'];
     const fifthBefore = [];
     for (const table of fifthTables) { fifthBefore.push((await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows); }
-    const fifthHistoryRows = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
-    assert(fifthHistoryRows.rowCount === migrations.length && JSON.stringify(fifthHistoryRows.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
-      && fifthHistoryRows.rows.every((entry) => entry.finished_at !== null), 'Fifth-to-latest history mismatch');
     command(['migrate', 'deploy'], upgradeFifth);
-    const fifthReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
-    assert(JSON.stringify(fifthReplay.rows) === JSON.stringify(fifthHistoryRows.rows), 'Fifth-to-latest replay changed history');
+    const eighthReplay = await fifthReader.query('SELECT migration_name,checksum,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+    assert(JSON.stringify(eighthReplay.rows) === JSON.stringify(fullHistoryRows.rows), 'Fifth-to-latest replay changed history');
+    const fifthWebSessionAfterReplay = await fifthReader.query('SELECT id, staff_id, token_hash, auth_version, idle_expires_at, absolute_expires_at, revoked_at FROM foundation.web_sessions ORDER BY 1');
+    assert(JSON.stringify(fifthWebSessionAfterReplay.rows) === JSON.stringify(replayWebSession.rows), 'Fifth-to-latest replay changed web_sessions data');
+    for (const [index, table] of fifthTables.entries()) {
+      const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
+      assert(JSON.stringify(after) === JSON.stringify(fifthBefore[index]), `Fifth-to-latest replay changed ${table} data`);
+    }
     for (const [index, table] of fifthTables.entries()) {
       const after = (await fifthReader.query(`SELECT * FROM foundation.${table} ORDER BY 1`)).rows;
       assert(JSON.stringify(after) === JSON.stringify(fifthBefore[index]), `Fifth-to-latest replay changed ${table} data`);
@@ -202,7 +224,7 @@ try {
     command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeFifth, 0, shadow);
     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeFifth);
   } finally { await fifthReader.end(); }
-  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/fifth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
+  console.log(`Fresh/first-to-latest/second-to-latest/third-to-latest/fourth-to-latest/fifth-to-latest/sixth-to-latest/data preservation/replay (${migrations.length} migrations): PASS`);
   command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], fresh, 0, shadow);
   command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
   const runtimeStaffId = randomUUID();
@@ -282,7 +304,7 @@ try {
     assert(permissions.rowCount === 2 && permissions.rows[0].id === regrantedId && permissions.rows[0].revoked_at === null
       && permissions.rows[1].id === permissionId && permissions.rows[1].revoked_at !== null, 'Re-grant via revoke plus insert failed');
     const webGrants = [
-      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
+      ['web_sessions', ['id', 'staff_id', 'token_hash', 'auth_version', 'channel', 'initdata_digest', 'initdata_exchanged_at', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['id', 'staff_id', 'token_hash', 'auth_version', 'channel', 'initdata_digest', 'initdata_exchanged_at', 'created_at', 'idle_expires_at', 'absolute_expires_at', 'revoked_at'], ['token_hash', 'auth_version', 'idle_expires_at', 'revoked_at']],
       ['web_auth_throttles', ['key_hash'], ['key_hash'], ['key_hash']],
       ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
       ['user_permissions', ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'revoked_at', 'granted_by', 'created_at'], ['id', 'staff_id', 'capability', 'scope', 'valid_from', 'valid_until', 'granted_by', 'created_at'], ['valid_until', 'revoked_at']],
