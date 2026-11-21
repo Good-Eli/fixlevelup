@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { proveRbacCutover, proveRbacInvariants, proveEighthUpgrade, proveRejectedUpgrade, syntheticVerifier } from './test-rbac-migration.mjs';
 import { cityChecks, proveCityUpgrade } from './test-city-migration.mjs';
 import { geoAccessChecks, proveGeoAccessUpgrade, proveGeoAccessGrants } from './test-geo-access-migration.mjs';
+import { settingsChecks, proveSettingsUpgrade, proveSettingsGrants, proveSettingsRuntimeDenials } from './test-settings-migration.mjs';
 import { areaChecks, proveAreaUpgrade } from './test-area-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -34,10 +35,11 @@ const migrations = [
   'technical_audit_outbox', 'technical_outbox_attempts', 'technical_outbox_leases', 'staff_identity',
   'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac',
 ].map((name, index) => `20261120${String(index + 1).padStart(4, '0')}00_${name}`)
-  .concat('20261121000100_city_foundation', '20261121000200_service_areas', '20261121000300_geography_access');
+  .concat('20261121000100_city_foundation', '20261121000200_service_areas', '20261121000300_geography_access',
+    '20261121000400_settings_legal_references');
 const expectedChecks = [
   ...cityChecks,
-  ...areaChecks, ...geoAccessChecks,
+  ...areaChecks, ...geoAccessChecks, ...settingsChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -60,6 +62,10 @@ const upgradeThird = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}
 const upgradeFourth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const upgradeFifth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const upgradeEighth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+// A database capped at exactly 012: the 012 runtime ACL proof must not run on the
+// final fresh database once 013 exists, because 013 deliberately extends the
+// business_settings_versions read/write surface.
+const upgradeTwelfth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const shadow = `fixlevelup_p017a_shadow_${suffix}`;
 const historyRoot = resolve(root, `node_modules/.cache/p017a-${suffix}`);
 const firstHistory = resolve(historyRoot, 'first/migrations');
@@ -70,11 +76,14 @@ const eighthHistory = resolve(historyRoot, 'eighth/migrations');
 const ninthHistory = resolve(historyRoot, 'ninth/migrations');
 const tenthHistory = resolve(historyRoot, 'tenth/migrations');
 const eleventhHistory = resolve(historyRoot, 'eleventh/migrations');
+const twelfthHistory = resolve(historyRoot, 'twelfth/migrations');
+const thirteenthHistory = resolve(historyRoot, 'thirteenth/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
-  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, shadow]) { await prepareDatabase(client, database, true); }
-  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${shadow}`);
-  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)], [tenthHistory, migrations.slice(0,10)], [eleventhHistory, migrations.slice(0,11)]]) {
+  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, upgradeTwelfth, shadow]) { await prepareDatabase(client, database, true); }
+  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${upgradeTwelfth}, ${shadow}`);
+  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)], [tenthHistory, migrations.slice(0,10)], [eleventhHistory, migrations.slice(0,11)],
+    [twelfthHistory, migrations.slice(0,12)], [thirteenthHistory, migrations.slice(0,13)]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -91,8 +100,22 @@ try {
     // 011 likewise deploys and replays through its own capped history, so a later
     // migration 012 cannot silently enter the P03-02 proof.
     await proveAreaUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, eleventhHistory));
-    await proveGeoAccessUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth));
+    await proveGeoAccessUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, twelfthHistory));
+    // 013 must also deploy and replay through its own capped history, so the P03-03 proof
+    // is anchored at exactly 012 and can never silently absorb a later migration.
+    await proveSettingsUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, thirteenthHistory),
+      (expected) => {
+        // Drift must be detectable both from the migration history and from the Prisma schema.
+        command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow);
+        command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth, expected);
+      });
   } finally { await eighthReader.end(); }
+  // The 012 ACL proof runs on a database capped at exactly 012, not on the final fresh
+  // database: 013 deliberately widens the business_settings_versions read/write surface.
+  command(['migrate', 'deploy'], upgradeTwelfth, 0, undefined, twelfthHistory);
+  const twelfthRuntime = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, upgradeTwelfth);
+  await twelfthRuntime.connect();
+  try { await proveGeoAccessGrants(twelfthRuntime); } finally { await twelfthRuntime.end(); }
   command(['migrate', 'deploy'], fresh);
   command(['migrate', 'deploy'], upgrade, 0, undefined, firstHistory);
   const upgraded = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, upgrade);
@@ -305,7 +328,9 @@ try {
   const runtime = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, fresh);
   await runtime.connect();
   try {
-    await proveGeoAccessGrants(runtime);
+    // 012's exact ACL was proven on the database capped at exactly 012 (upgradeTwelfth).
+    // Here the final fresh database must carry the full 013 ACL delta plus every previous grant.
+    await proveSettingsGrants(runtime);
     const role = await runtime.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolinherit FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator')");
     assert(role.rowCount === 2 && role.rows.every((row) => Object.values(row).every((value) => value === false)), 'Unsafe technical role flags');
     const memberships = await runtime.query("SELECT 1 FROM pg_auth_members WHERE member IN (SELECT oid FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator'))");
@@ -473,6 +498,9 @@ try {
       `INSERT INTO foundation.user_permissions(id,staff_id,capability,scope,revoked_at) VALUES(gen_random_uuid(),'${runtimeStaffId}','RUNTIME_REVOKED','GLOBAL',CURRENT_TIMESTAMP)`,
     ];
     for (const sql of privilegeDenials) { await denied(runtime, sql); }
+    // 013-specific runtime denials: history tables stay SELECT/INSERT only, no DELETE/
+    // TRUNCATE/UPDATE of an immutable row, no PUBLIC and no callable guard/trigger function.
+    await proveSettingsRuntimeDenials(runtime);
     console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials, ${uniqueViolations} unique violations and ${privilegeDenials.length} privilege denials: PASS`);
   } finally { await runtime.end(); }
   console.log('P01-01.9A migration integration proofs: PASS. Test databases retained; no dev data reset.');

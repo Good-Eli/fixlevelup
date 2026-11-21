@@ -56,6 +56,9 @@ model Staff {
   approvedZoneAdmissions  TechnicianServiceArea[]   @relation("TechnicianZoneApprover")
   revokedZoneAdmissions   TechnicianServiceArea[]   @relation("TechnicianZoneRevoker")
   geographyReceipts       GeographyCommandReceipt[] @relation("GeographyReceiptActor")
+  reviewedReferenceEntryVersions  ReferenceEntryVersion[] @relation("ReferenceEntryVersionReviewer")
+  reviewedContentBlockRevisions   ContentBlockRevision[]  @relation("ContentBlockRevisionReviewer")
+  reviewedLegalDocumentVersions   LegalDocumentVersion[]  @relation("LegalDocumentVersionReviewer")
 
   @@map("staff")
   @@schema("foundation")
@@ -271,6 +274,10 @@ model ServiceCity {
   serviceAreas     ServiceArea[]
   adminAssignments StaffAdminCityAssignment[]
   cityMemberships  TechnicianCityMembership[]
+  referenceEntries ReferenceEntry[]
+  referenceEntryVersions ReferenceEntryVersion[] @relation("ReferenceEntryVersionCity")
+  contentBlocks    ContentBlock[] @relation("ContentBlockCity")
+  requestSessions  RequestSession[] @relation("RequestSessionCity")
 
   @@map("service_cities")
   @@schema("foundation")
@@ -295,6 +302,8 @@ model ServiceCityVersion {
   city           ServiceCity @relation("ServiceCityVersions", fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   reviewer       Staff    @relation("CityVersionReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
   currentFor     ServiceCity[] @relation("ServiceCityCurrentVersion")
+  referenceEntryVersions ReferenceEntryVersion[] @relation("ReferenceEntryVersionCityVersion")
+  requestSessions RequestSession[] @relation("RequestSessionCityVersion")
 
   @@unique([cityId, version], map: "service_city_versions_city_version_key")
   @@unique([cityId, id], map: "service_city_versions_city_id_key")
@@ -308,13 +317,26 @@ model ServiceCityVersion {
 // enables SINGLE_CITY and treats MULTI_CITY as unsupported configuration. No DRAFT
 // state and no seeded row: the current revision is max(version). Immutability
 // triggers live in migration SQL.
+//
+// P03-03 adds company-wide provenance as NULLable text: NULL means "unknown", never an
+// approved legal/security/upload/retention value. Non-blank and bounded-length rules
+// (business_settings_versions_*_check) live only in migration SQL. A policy ref is
+// reviewed provenance, not the policy implementation itself. Existing revisions are
+// preserved as-is and therefore keep meaning "unknown" for these columns.
 model BusinessSettingsVersion {
-  id            String   @id @db.Uuid
-  version       Int
-  launchMode    String   @map("launch_mode") @db.VarChar(16)
-  primaryCityId String   @map("primary_city_id") @db.Uuid
-  reviewedBy    String   @map("reviewed_by") @db.Uuid
-  publishedAt   DateTime @default(now()) @map("published_at") @db.Timestamptz(6)
+  id                       String   @id @db.Uuid
+  version                  Int
+  launchMode               String   @map("launch_mode") @db.VarChar(16)
+  primaryCityId            String   @map("primary_city_id") @db.Uuid
+  reviewedBy               String   @map("reviewed_by") @db.Uuid
+  publishedAt              DateTime @default(now()) @map("published_at") @db.Timestamptz(6)
+  operatorName             String?  @map("operator_name")
+  operatorRegistrationId   String?  @map("operator_registration_id")
+  operatorAddress          String?  @map("operator_address")
+  legalReviewRef           String?  @map("legal_review_ref")
+  securityPolicyRef        String?  @map("security_policy_ref")
+  retentionPolicyRef       String?  @map("retention_policy_ref")
+  uploadPolicyRef          String?  @map("upload_policy_ref")
   primaryCity   ServiceCity @relation(fields: [primaryCityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   reviewer      Staff    @relation("BusinessSettingsReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
 
@@ -531,5 +553,207 @@ model GeographyCommandReceipt {
 
   @@id([actorId, operation, key])
   @@map("geography_command_receipts")
+  @@schema("foundation")
+}
+
+// P03-03 typed reference data (013). Stable identity, immutable reviewed versions and a
+// current pointer. CALLBACK_INTERVAL is strictly CITY scoped; PAYMENT_METHOD,
+// CANCEL_REASON, DECLINE_REASON and REQUEST_SOURCE are strictly COMPANY scoped. The
+// scope/city pairing CHECK, the partial unique code indexes (company: type+code, city:
+// city+type+code), the stable-identity/row_version guard and the append-only triggers
+// live only in migration SQL. Archived rows stay as history and are never deleted.
+model ReferenceEntry {
+  id               String                  @id @db.Uuid
+  type             String                  @db.VarChar(32)
+  scope            String                  @db.VarChar(16)
+  cityId           String?                 @map("city_id") @db.Uuid
+  code             String                  @db.VarChar(64)
+  rowVersion       Int                     @default(1) @map("row_version")
+  currentVersionId String?                 @map("current_version_id") @db.Uuid
+  archivedAt       DateTime?               @map("archived_at") @db.Timestamptz(6)
+  city             ServiceCity?            @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentVersion   ReferenceEntryVersion?  @relation("ReferenceEntryCurrentVersion", fields: [id, type, currentVersionId], references: [entryId, type, id], onDelete: Restrict, onUpdate: Restrict)
+  versions         ReferenceEntryVersion[] @relation("ReferenceEntryVersions")
+
+  @@unique([type, id], map: "reference_entries_type_id_key")
+  @@map("reference_entries")
+  @@schema("foundation")
+}
+
+// Immutable reviewed revision of one reference entry. city_id, city_version_id and the
+// callback minute window exist only for CALLBACK_INTERVAL (0 <= start < end <= 1440);
+// every other type keeps all four NULL. city_version_id is creation provenance only: the
+// timezone used by a consumer comes from an explicitly passed trusted intake/visit city
+// version of the same city. No DRAFT state: every row is a published revision.
+model ReferenceEntryVersion {
+  id             String         @id @db.Uuid
+  entryId        String         @map("entry_id") @db.Uuid
+  type           String         @db.VarChar(32)
+  cityId         String?        @map("city_id") @db.Uuid
+  version        Int
+  label          String
+  validFrom      DateTime       @map("valid_from") @db.Timestamptz(6)
+  validUntil     DateTime?      @map("valid_until") @db.Timestamptz(6)
+  sourceRef      String         @map("source_ref")
+  reviewedBy     String         @map("reviewed_by") @db.Uuid
+  publishedAt    DateTime       @default(now()) @map("published_at") @db.Timestamptz(6)
+  cityVersionId  String?        @map("city_version_id") @db.Uuid
+  startMinute    Int?           @map("start_minute")
+  endMinute      Int?           @map("end_minute")
+  entry          ReferenceEntry @relation("ReferenceEntryVersions", fields: [type, entryId], references: [type, id], onDelete: Restrict, onUpdate: Restrict)
+  city           ServiceCity?   @relation("ReferenceEntryVersionCity", fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  cityVersion    ServiceCityVersion? @relation("ReferenceEntryVersionCityVersion", fields: [cityId, cityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
+  reviewer       Staff          @relation("ReferenceEntryVersionReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentFor     ReferenceEntry[] @relation("ReferenceEntryCurrentVersion")
+
+  @@unique([entryId, version], map: "reference_entry_versions_entry_version_key")
+  @@unique([entryId, type, id], map: "reference_entry_versions_entry_type_id_key")
+  @@map("reference_entry_versions")
+  @@schema("foundation")
+}
+
+// P03-03 content block (013): stable identity with explicit COMPANY/CITY scope, a
+// current revision pointer and row_version owned by the database. A block never copies
+// city contacts, hours or timezone. allow_company_fallback is meaningful only for a
+// COMPANY block (it is the explicit permission to be used when a city has no block of
+// the same code). The scope/city CHECK, the partial unique code indexes, the
+// stable-identity/row_version guard and the append-only triggers live in migration SQL.
+model ContentBlock {
+  id                  String                 @id @db.Uuid
+  code                String                 @db.VarChar(64)
+  kind                String                 @db.VarChar(16)
+  scope               String                 @db.VarChar(16)
+  cityId              String?                @map("city_id") @db.Uuid
+  allowCompanyFallback Boolean               @default(false) @map("allow_company_fallback")
+  rowVersion          Int                    @default(1) @map("row_version")
+  currentRevisionId   String?                @map("current_revision_id") @db.Uuid
+  archivedAt          DateTime?              @map("archived_at") @db.Timestamptz(6)
+  city                ServiceCity?           @relation("ContentBlockCity", fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentRevision     ContentBlockRevision?  @relation("ContentBlockCurrentRevision", fields: [id, currentRevisionId], references: [blockId, id], onDelete: Restrict, onUpdate: Restrict)
+  revisions           ContentBlockRevision[] @relation("ContentBlockRevisions")
+
+  @@map("content_blocks")
+  @@schema("foundation")
+}
+
+// Immutable reviewed revision of one content block: title/body/source are the reviewed
+// snapshot, so a published correction is always a new revision row.
+model ContentBlockRevision {
+  id          String       @id @db.Uuid
+  blockId     String       @map("block_id") @db.Uuid
+  version     Int
+  title       String
+  body        String
+  sourceRef   String       @map("source_ref")
+  reviewedBy  String       @map("reviewed_by") @db.Uuid
+  publishedAt DateTime     @default(now()) @map("published_at") @db.Timestamptz(6)
+  block       ContentBlock @relation("ContentBlockRevisions", fields: [blockId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  reviewer    Staff        @relation("ContentBlockRevisionReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentFor  ContentBlock[] @relation("ContentBlockCurrentRevision")
+
+  @@unique([blockId, version], map: "content_block_revisions_block_version_key")
+  @@unique([blockId, id], map: "content_block_revisions_block_id_key")
+  @@map("content_block_revisions")
+  @@schema("foundation")
+}
+
+// P03-03 legal document identity (013): one stable document per (purpose, kind). purpose
+// is one of REQUEST_PROCESSING / ADDRESS_COVERAGE / MARKETING and kind separates the
+// privacy POLICY, the CONSENT_FORM a GIVEN consent must reference, and an OPT_IN_NOTICE.
+// row_version is bumped by the database guard; the current pointer is a CAS UPDATE.
+model LegalDocument {
+  id               String                 @id @db.Uuid
+  purpose          String                 @db.VarChar(32)
+  kind             String                 @db.VarChar(24)
+  rowVersion       Int                    @default(1) @map("row_version")
+  currentVersionId String?                @map("current_version_id") @db.Uuid
+  currentVersion   LegalDocumentVersion?  @relation("LegalDocumentCurrentVersion", fields: [id, currentVersionId], references: [documentId, id], onDelete: Restrict, onUpdate: Restrict)
+  versions         LegalDocumentVersion[] @relation("LegalDocumentVersions")
+
+  @@unique([purpose, kind], map: "legal_documents_purpose_kind_key")
+  @@unique([id, purpose, kind], map: "legal_documents_id_purpose_kind_key")
+  @@map("legal_documents")
+  @@schema("foundation")
+}
+
+// Immutable reviewed legal text. checksum is the SHA-256 of the exact UTF-8 body and is
+// verified by the database CHECK with the built-in pg sha256()/convert_to()/encode()
+// (no pgcrypto). purpose/kind are proven equal to the parent document by the composite
+// FK, and are immutable. A GIVEN consent may only reference a current CONSENT_FORM
+// version; a policy or notice document never accepts a consent event.
+model LegalDocumentVersion {
+  id           String            @id @db.Uuid
+  documentId   String            @map("document_id") @db.Uuid
+  purpose      String            @db.VarChar(32)
+  kind         String            @db.VarChar(24)
+  version      Int
+  title        String
+  body         String
+  checksum     String            @db.VarChar(64)
+  legalBasis   String            @map("legal_basis")
+  sourceRef    String            @map("source_ref")
+  reviewedBy   String            @map("reviewed_by") @db.Uuid
+  publishedAt  DateTime          @default(now()) @map("published_at") @db.Timestamptz(6)
+  document     LegalDocument     @relation("LegalDocumentVersions", fields: [documentId, purpose, kind], references: [id, purpose, kind], onDelete: Restrict, onUpdate: Restrict)
+  reviewer     Staff             @relation("LegalDocumentVersionReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentFor   LegalDocument[]   @relation("LegalDocumentCurrentVersion")
+  consents     ConsentRecord[]   @relation("ConsentDocumentVersion")
+
+  @@unique([documentId, version], map: "legal_document_versions_document_version_key")
+  @@unique([documentId, id], map: "legal_document_versions_document_id_key")
+  @@unique([documentId, id, purpose], map: "legal_document_versions_document_id_purpose_key")
+  @@map("legal_document_versions")
+  @@schema("foundation")
+}
+
+// Minimal pre-submit anchor for consent evidence: a server-generated secret hash and the
+// trusted intake city context only. Deliberately no name, phone, address, request or
+// customer column. created_at is forced from the database clock by the guard trigger and
+// expires_at is supplied by the trusted policy (no default TTL); both are immutable, and
+// only one revoke (revoked_at NULL -> database clock) is allowed. This is not public
+// authentication F; external session issuance is P05.
+model RequestSession {
+  id                  String    @id @db.Uuid
+  secretHash          String    @unique(map: "request_sessions_secret_hash_key") @map("secret_hash") @db.VarChar(64)
+  intakeCityId        String    @map("intake_city_id") @db.Uuid
+  intakeCityVersionId String    @map("intake_city_version_id") @db.Uuid
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt           DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt           DateTime? @map("revoked_at") @db.Timestamptz(6)
+  intakeCity          ServiceCity @relation("RequestSessionCity", fields: [intakeCityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  intakeCityVersion   ServiceCityVersion @relation("RequestSessionCityVersion", fields: [intakeCityId, intakeCityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
+  consents            ConsentRecord[]
+
+  @@map("request_sessions")
+  @@schema("foundation")
+}
+
+// Append-only consent evidence (013): one row per GIVEN/REVOKED event, never updated or
+// deleted. GIVEN needs a live unexpired anchor and the current CONSENT_FORM version (a
+// stale text is refused, not accepted silently); REVOKED must name the exact GIVEN event
+// of the same session/purpose/document/version and one revoke per GIVEN is enforced by
+// the unique supersedes index. occurred_at is forced from the database clock by the
+// guard and the runtime has no INSERT privilege on it. evidence_ref is a non-PII
+// reference; unique(session_id, evidence_ref) makes a replay detectable.
+model ConsentRecord {
+  id                String              @id @db.Uuid
+  sessionId         String              @map("session_id") @db.Uuid
+  documentId        String              @map("document_id") @db.Uuid
+  documentVersionId String              @map("document_version_id") @db.Uuid
+  purpose           String              @db.VarChar(32)
+  action            String              @db.VarChar(16)
+  legalBasis        String              @map("legal_basis")
+  source            String              @default("FORM") @db.VarChar(32)
+  evidenceRef       String              @map("evidence_ref") @db.Uuid
+  occurredAt        DateTime            @default(now()) @map("occurred_at") @db.Timestamptz(6)
+  supersedesId      String?             @map("supersedes_id") @db.Uuid
+  session           RequestSession      @relation(fields: [sessionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  documentVersion   LegalDocumentVersion @relation("ConsentDocumentVersion", fields: [documentId, documentVersionId, purpose], references: [documentId, id, purpose], onDelete: Restrict, onUpdate: Restrict)
+  supersedes        ConsentRecord?      @relation("ConsentSupersedes", fields: [supersedesId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  supersededBy      ConsentRecord?      @relation("ConsentSupersedes")
+
+  @@unique([sessionId, evidenceRef], map: "consent_records_session_evidence_key")
+  @@unique([supersedesId], map: "consent_records_supersedes_id_key")
+  @@map("consent_records")
   @@schema("foundation")
 }

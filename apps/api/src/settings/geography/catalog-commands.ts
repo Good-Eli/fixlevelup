@@ -78,6 +78,8 @@
  * null list is accepted only for a verified SYSTEM ADMIN.
  */
 import { randomUUID } from 'node:crypto';
+import { acquireCompanySettingsLock } from '../configuration/company-lock.js';
+import { ConfigurationError } from '../configuration/configuration-errors.js';
 import {
   BadRequestException, ConflictException, ForbiddenException, HttpException, InternalServerErrorException, NotFoundException,
 } from '@nestjs/common';
@@ -344,6 +346,19 @@ async function activeCities(ctx: GeoContext): Promise<readonly CityRow[]> {
   return result.rows;
 }
 
+/** Keep the existing geography transport contract when the internal lock port refuses. */
+async function lockCompanySettings(ctx: GeoContext): Promise<void> {
+  try {
+    await acquireCompanySettingsLock(ctx.client);
+  } catch (error) {
+    if (error instanceof ConfigurationError) {
+      if (error.code === 'CONFLICT') { throw new ConflictException(); }
+      throw new InternalServerErrorException();
+    }
+    throw error;
+  }
+}
+
 async function latestSettings(ctx: GeoContext): Promise<SettingsRow | null> {
   const result = await ctx.client.query<SettingsRow>(
     'SELECT version,launch_mode,primary_city_id FROM foundation.business_settings_versions ORDER BY version DESC LIMIT 1');
@@ -351,15 +366,23 @@ async function latestSettings(ctx: GeoContext): Promise<SettingsRow | null> {
 }
 
 /**
- * Appends one immutable published company revision naming `primaryCityId`.
- * Versions are append-only (010 immutability triggers), the next number is
- * `max(version)+1`, and the runner's global lock serializes GLOBAL operations, so
- * two activations cannot claim the same revision number.
+ * Geography changes only the primary pointer; company policy provenance must
+ * survive in the new immutable revision. The company-settings lock is shared
+ * with P03-03's internal publisher (which has no HTTP authority of its own).
+ * Read the latest row after waiting, so a concurrent publish is carried forward.
  */
 async function appendPrimaryRevision(ctx: GeoContext, primaryCityId: string): Promise<void> {
   const result = await ctx.client.query(
-    `INSERT INTO foundation.business_settings_versions (id,version,launch_mode,primary_city_id,reviewed_by)
-     SELECT $1, COALESCE(max(version),0)+1, 'SINGLE_CITY', $2, $3 FROM foundation.business_settings_versions`,
+    `INSERT INTO foundation.business_settings_versions
+       (id,version,launch_mode,primary_city_id,reviewed_by,operator_name,operator_registration_id,
+        operator_address,legal_review_ref,security_policy_ref,retention_policy_ref,upload_policy_ref)
+     SELECT $1, COALESCE(latest.version,0)+1, 'SINGLE_CITY', $2, $3,
+       latest.operator_name,latest.operator_registration_id,latest.operator_address,latest.legal_review_ref,
+       latest.security_policy_ref,latest.retention_policy_ref,latest.upload_policy_ref
+     FROM (SELECT 1) AS singleton LEFT JOIN LATERAL
+       (SELECT version,operator_name,operator_registration_id,operator_address,legal_review_ref,
+         security_policy_ref,retention_policy_ref,upload_policy_ref
+        FROM foundation.business_settings_versions ORDER BY version DESC LIMIT 1) AS latest ON true`,
     [randomUUID(), primaryCityId, ctx.staffId]);
   if (result.rowCount !== 1) {
     throw new ConflictException();
@@ -369,7 +392,11 @@ async function appendPrimaryRevision(ctx: GeoContext, primaryCityId: string): Pr
 /** The resolver needs the latest revision to be SINGLE_CITY with this primary. */
 async function ensurePrimary(ctx: GeoContext, cityId: string): Promise<void> {
   const latest = await latestSettings(ctx);
-  if (latest !== null && latest.launch_mode === 'SINGLE_CITY' && latest.primary_city_id === cityId) {
+  // MULTI_CITY remains reserved vocabulary, never an implicit mode conversion.
+  if (latest !== null && latest.launch_mode !== 'SINGLE_CITY') {
+    throw new ConflictException();
+  }
+  if (latest !== null && latest.primary_city_id === cityId) {
     return;
   }
   await appendPrimaryRevision(ctx, cityId);
@@ -830,6 +857,7 @@ export const catalogCommands = {
     run: async (ctx, target, body, expected) => {
       const cityId = targetCity(target);
       const input = cityActivateInput(body);
+      await lockCompanySettings(ctx);
       const city = await lockCity(ctx, cityId, expected);
       // An ACTIVE city must point at the reviewed snapshot it serves (010 CHECK).
       if (city.current_version_id === null) {
@@ -878,6 +906,7 @@ export const catalogCommands = {
     run: async (ctx, target, body, expected) => {
       const cityId = targetCity(target);
       const input = cityDeactivateInput(body);
+      await lockCompanySettings(ctx);
       const city = await lockCity(ctx, cityId, expected);
       const latest = await latestSettings(ctx);
       const isPrimary = latest !== null && latest.launch_mode === 'SINGLE_CITY' && latest.primary_city_id === cityId;
@@ -902,6 +931,7 @@ export const catalogCommands = {
     run: async (ctx, target, body, expected) => {
       const cityId = targetCity(target);
       emptyBody(body);
+      await lockCompanySettings(ctx);
       const city = await lockCity(ctx, cityId, expected);
       // The primary must be the ACTIVE city the resolver serves; promoting a DRAFT
       // or INACTIVE city would produce a configuration the resolver refuses.

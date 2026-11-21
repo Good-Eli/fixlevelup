@@ -44,6 +44,263 @@ const expectedColumns = {
 };
 const nullableOutboxColumns = new Set(['lease_owner', 'lease_expires_at', 'last_error_code']);
 const expectedOutboxTypeModifiers: Readonly<Record<string, number>> = { lease_expires_at: 6, next_attempt_at: 6, last_error_code: 36 };
+
+// P03-03 (013) mechanical readiness: exact physical columns, not legal readiness. A
+// missing column, a widened nullability or a changed type/typmod must fail closed.
+// `type`/`modifier` are the pg_type name and atttypmod; `notNull` is attnotnull.
+type SettingsColumn = readonly [type: string, modifier: number, notNull: boolean];
+const settingsColumns: Readonly<Record<string, Readonly<Record<string, SettingsColumn>>>> = {
+  business_settings_versions: {
+    id: ['uuid', -1, true], version: ['int4', -1, true], launch_mode: ['varchar', 20, true],
+    primary_city_id: ['uuid', -1, true], reviewed_by: ['uuid', -1, true], published_at: ['timestamptz', 6, true],
+    operator_name: ['text', -1, false], operator_registration_id: ['text', -1, false],
+    operator_address: ['text', -1, false], legal_review_ref: ['text', -1, false],
+    security_policy_ref: ['text', -1, false], retention_policy_ref: ['text', -1, false],
+    upload_policy_ref: ['text', -1, false],
+  },
+  reference_entries: {
+    id: ['uuid', -1, true], type: ['varchar', 36, true], scope: ['varchar', 20, true],
+    city_id: ['uuid', -1, false], code: ['varchar', 68, true], row_version: ['int4', -1, true],
+    current_version_id: ['uuid', -1, false], archived_at: ['timestamptz', 6, false],
+  },
+  reference_entry_versions: {
+    id: ['uuid', -1, true], entry_id: ['uuid', -1, true], type: ['varchar', 36, true],
+    city_id: ['uuid', -1, false], version: ['int4', -1, true], label: ['text', -1, true],
+    valid_from: ['timestamptz', 6, true], valid_until: ['timestamptz', 6, false],
+    source_ref: ['text', -1, true], reviewed_by: ['uuid', -1, true], published_at: ['timestamptz', 6, true],
+    city_version_id: ['uuid', -1, false], start_minute: ['int4', -1, false], end_minute: ['int4', -1, false],
+  },
+  content_blocks: {
+    id: ['uuid', -1, true], code: ['varchar', 68, true], kind: ['varchar', 20, true],
+    scope: ['varchar', 20, true], city_id: ['uuid', -1, false], allow_company_fallback: ['bool', -1, true],
+    row_version: ['int4', -1, true], current_revision_id: ['uuid', -1, false], archived_at: ['timestamptz', 6, false],
+  },
+  content_block_revisions: {
+    id: ['uuid', -1, true], block_id: ['uuid', -1, true], version: ['int4', -1, true],
+    title: ['text', -1, true], body: ['text', -1, true], source_ref: ['text', -1, true],
+    reviewed_by: ['uuid', -1, true], published_at: ['timestamptz', 6, true],
+  },
+  legal_documents: {
+    id: ['uuid', -1, true], purpose: ['varchar', 36, true], kind: ['varchar', 28, true],
+    row_version: ['int4', -1, true], current_version_id: ['uuid', -1, false],
+  },
+  legal_document_versions: {
+    id: ['uuid', -1, true], document_id: ['uuid', -1, true], purpose: ['varchar', 36, true],
+    kind: ['varchar', 28, true], version: ['int4', -1, true], title: ['text', -1, true],
+    body: ['text', -1, true], checksum: ['varchar', 68, true], legal_basis: ['text', -1, true],
+    source_ref: ['text', -1, true], reviewed_by: ['uuid', -1, true], published_at: ['timestamptz', 6, true],
+  },
+  request_sessions: {
+    id: ['uuid', -1, true], secret_hash: ['varchar', 68, true], intake_city_id: ['uuid', -1, true],
+    intake_city_version_id: ['uuid', -1, true], created_at: ['timestamptz', 6, true],
+    expires_at: ['timestamptz', 6, true], revoked_at: ['timestamptz', 6, false],
+  },
+  consent_records: {
+    id: ['uuid', -1, true], session_id: ['uuid', -1, true], document_id: ['uuid', -1, true],
+    document_version_id: ['uuid', -1, true], purpose: ['varchar', 36, true], action: ['varchar', 20, true],
+    legal_basis: ['text', -1, true], source: ['varchar', 36, true], evidence_ref: ['uuid', -1, true],
+    occurred_at: ['timestamptz', 6, true], supersedes_id: ['uuid', -1, false],
+  },
+};
+
+// Index definitions are compared after normalizing away quotes, parentheses, whitespace
+// and the redundant varchar->text casts, so a changed column order or predicate fails.
+const normalizeIndex = (definition: string): string => definition
+  .replace(/\s+/g, '').replace(/"/g, '').replace(/[()]/g, '').replace(/::text/g, '');
+const settingsIndexes: readonly (readonly [table: string, name: string, definition: string])[] = [
+  ['reference_entries', 'reference_entries_company_code_key',
+    "CREATE UNIQUE INDEX reference_entries_company_code_key ON foundation.reference_entries USING btree (type, code) WHERE scope = 'COMPANY'"],
+  ['reference_entries', 'reference_entries_city_code_key',
+    "CREATE UNIQUE INDEX reference_entries_city_code_key ON foundation.reference_entries USING btree (city_id, type, code) WHERE scope = 'CITY'"],
+  ['reference_entries', 'reference_entries_type_id_key',
+    'CREATE UNIQUE INDEX reference_entries_type_id_key ON foundation.reference_entries USING btree (type, id)'],
+  ['reference_entry_versions', 'reference_entry_versions_entry_version_key',
+    'CREATE UNIQUE INDEX reference_entry_versions_entry_version_key ON foundation.reference_entry_versions USING btree (entry_id, version)'],
+  ['reference_entry_versions', 'reference_entry_versions_entry_type_id_key',
+    'CREATE UNIQUE INDEX reference_entry_versions_entry_type_id_key ON foundation.reference_entry_versions USING btree (entry_id, type, id)'],
+  ['content_blocks', 'content_blocks_company_code_key',
+    "CREATE UNIQUE INDEX content_blocks_company_code_key ON foundation.content_blocks USING btree (code) WHERE scope = 'COMPANY'"],
+  ['content_blocks', 'content_blocks_city_code_key',
+    "CREATE UNIQUE INDEX content_blocks_city_code_key ON foundation.content_blocks USING btree (city_id, code) WHERE scope = 'CITY'"],
+  ['content_block_revisions', 'content_block_revisions_block_version_key',
+    'CREATE UNIQUE INDEX content_block_revisions_block_version_key ON foundation.content_block_revisions USING btree (block_id, version)'],
+  ['content_block_revisions', 'content_block_revisions_block_id_key',
+    'CREATE UNIQUE INDEX content_block_revisions_block_id_key ON foundation.content_block_revisions USING btree (block_id, id)'],
+  ['legal_documents', 'legal_documents_purpose_kind_key',
+    'CREATE UNIQUE INDEX legal_documents_purpose_kind_key ON foundation.legal_documents USING btree (purpose, kind)'],
+  ['legal_documents', 'legal_documents_id_purpose_kind_key',
+    'CREATE UNIQUE INDEX legal_documents_id_purpose_kind_key ON foundation.legal_documents USING btree (id, purpose, kind)'],
+  ['legal_document_versions', 'legal_document_versions_document_version_key',
+    'CREATE UNIQUE INDEX legal_document_versions_document_version_key ON foundation.legal_document_versions USING btree (document_id, version)'],
+  ['legal_document_versions', 'legal_document_versions_document_id_key',
+    'CREATE UNIQUE INDEX legal_document_versions_document_id_key ON foundation.legal_document_versions USING btree (document_id, id)'],
+  ['legal_document_versions', 'legal_document_versions_document_id_purpose_key',
+    'CREATE UNIQUE INDEX legal_document_versions_document_id_purpose_key ON foundation.legal_document_versions USING btree (document_id, id, purpose)'],
+  ['request_sessions', 'request_sessions_secret_hash_key',
+    'CREATE UNIQUE INDEX request_sessions_secret_hash_key ON foundation.request_sessions USING btree (secret_hash)'],
+  ['consent_records', 'consent_records_session_evidence_key',
+    'CREATE UNIQUE INDEX consent_records_session_evidence_key ON foundation.consent_records USING btree (session_id, evidence_ref)'],
+  ['consent_records', 'consent_records_supersedes_id_key',
+    'CREATE UNIQUE INDEX consent_records_supersedes_id_key ON foundation.consent_records USING btree (supersedes_id)'],
+];
+// The eight 013 tables: the runtime must never hold table-level privilege, DELETE or
+// TRUNCATE. Only the 013 revision/event tables are strictly append-only for the runtime.
+const settingsTables = ['reference_entries', 'reference_entry_versions', 'content_blocks',
+  'content_block_revisions', 'legal_documents', 'legal_document_versions', 'request_sessions', 'consent_records'];
+
+// Named CHECK constraints of 013 with fragments that must appear in the definition, so a
+// renamed-but-weakened guard (e.g. CHECK (true)) fails readiness even under the same name.
+const settingsChecks: readonly (readonly [table: string, name: string, needles: readonly string[]])[] = [
+  ['business_settings_versions', 'business_settings_versions_operator_name_check', ['operator_name IS NULL', 'length']],
+  ['business_settings_versions', 'business_settings_versions_operator_registration_id_check', ['operator_registration_id IS NULL']],
+  ['business_settings_versions', 'business_settings_versions_operator_address_check', ['operator_address IS NULL']],
+  ['business_settings_versions', 'business_settings_versions_legal_review_ref_check', ['legal_review_ref IS NULL']],
+  ['business_settings_versions', 'business_settings_versions_security_policy_ref_check', ['security_policy_ref IS NULL']],
+  ['business_settings_versions', 'business_settings_versions_retention_policy_ref_check', ['retention_policy_ref IS NULL']],
+  ['business_settings_versions', 'business_settings_versions_upload_policy_ref_check', ['upload_policy_ref IS NULL']],
+  ['reference_entries', 'reference_entries_type_check', ['CALLBACK_INTERVAL', 'PAYMENT_METHOD', 'REQUEST_SOURCE']],
+  ['reference_entries', 'reference_entries_scope_check', ['COMPANY', 'CITY']],
+  ['reference_entries', 'reference_entries_scope_city_check', ['CALLBACK_INTERVAL', 'city_id IS NOT NULL']],
+  // pg_get_constraintdef renders varchar columns with an explicit ::text cast, so needles
+  // avoid the `column ~` form and match the parts that survive the cast.
+  ['reference_entries', 'reference_entries_code_check', ['~', 'A-Za-z', '{0,63}']],
+  ['reference_entries', 'reference_entries_row_version_check', ['row_version >= 1']],
+  ['reference_entry_versions', 'reference_entry_versions_version_check', ['version >= 1']],
+  ['reference_entry_versions', 'reference_entry_versions_type_check', ['CALLBACK_INTERVAL', 'REQUEST_SOURCE']],
+  ['reference_entry_versions', 'reference_entry_versions_type_fields_check', ['CALLBACK_INTERVAL', 'start_minute IS NOT NULL']],
+  ['reference_entry_versions', 'reference_entry_versions_interval_check', ['start_minute >= 0', 'start_minute < end_minute', 'end_minute <= 1440']],
+  ['reference_entry_versions', 'reference_entry_versions_label_check', ['label ~']],
+  ['reference_entry_versions', 'reference_entry_versions_source_check', ['source_ref ~']],
+  ['reference_entry_versions', 'reference_entry_versions_window_check', ['valid_until IS NULL', 'valid_until > valid_from']],
+  ['content_blocks', 'content_blocks_kind_check', ['FAQ', 'FACT', 'SEO']],
+  ['content_blocks', 'content_blocks_scope_check', ['COMPANY', 'CITY']],
+  ['content_blocks', 'content_blocks_scope_city_check', ['COMPANY', 'CITY', 'city_id IS NOT NULL']],
+  ['content_blocks', 'content_blocks_code_check', ['~', 'A-Za-z', '{0,63}']],
+  ['content_blocks', 'content_blocks_row_version_check', ['row_version >= 1']],
+  ['content_blocks', 'content_blocks_fallback_scope_check', ["'COMPANY'", 'allow_company_fallback']],
+  ['content_block_revisions', 'content_block_revisions_version_check', ['version >= 1']],
+  ['content_block_revisions', 'content_block_revisions_text_check', ['title ~', 'body ~', 'source_ref ~']],
+  ['legal_documents', 'legal_documents_purpose_check', ['REQUEST_PROCESSING', 'ADDRESS_COVERAGE', 'MARKETING']],
+  ['legal_documents', 'legal_documents_kind_check', ['POLICY', 'CONSENT_FORM', 'OPT_IN_NOTICE']],
+  ['legal_documents', 'legal_documents_row_version_check', ['row_version >= 1']],
+  ['legal_document_versions', 'legal_document_versions_purpose_check', ['REQUEST_PROCESSING', 'MARKETING']],
+  ['legal_document_versions', 'legal_document_versions_kind_check', ['POLICY', 'CONSENT_FORM', 'OPT_IN_NOTICE']],
+  ['legal_document_versions', 'legal_document_versions_version_check', ['version >= 1']],
+  // The checksum must really be the SHA-256 of the UTF-8 body, not a format-only pattern.
+  ['legal_document_versions', 'legal_document_versions_checksum_check', ['sha256', 'convert_to', 'encode']],
+  ['legal_document_versions', 'legal_document_versions_text_check', ['title ~', 'body ~', 'legal_basis ~', 'source_ref ~']],
+  ['request_sessions', 'request_sessions_secret_hash_check', ['~', '0-9a-f', '{64}']],
+  ['request_sessions', 'request_sessions_expiry_check', ['expires_at > created_at']],
+  ['consent_records', 'consent_records_purpose_check', ['REQUEST_PROCESSING', 'ADDRESS_COVERAGE', 'MARKETING']],
+  ['consent_records', 'consent_records_action_check', ['GIVEN', 'REVOKED']],
+  ['consent_records', 'consent_records_source_check', ['FORM']],
+  ['consent_records', 'consent_records_given_supersedes_check', ['GIVEN', 'REVOKED', 'supersedes_id']],
+  ['consent_records', 'consent_records_legal_basis_check', ['legal_basis ~']],
+];
+// The composite FKs that make a pointer/target meaningful: dropping one would let a row
+// name a foreign version and still look ready, so the exact definition is pinned here.
+const settingsForeignKeys: readonly (readonly [table: string, name: string, needles: readonly string[]])[] = [
+  ['reference_entries', 'reference_entries_city_id_fkey', ['FOREIGN KEY (city_id)', 'service_cities(id)']],
+  ['reference_entries', 'reference_entries_id_type_current_version_id_fkey',
+    ['FOREIGN KEY (id, type, current_version_id)', 'reference_entry_versions(entry_id, type, id)']],
+  ['reference_entry_versions', 'reference_entry_versions_type_entry_id_fkey',
+    ['FOREIGN KEY (type, entry_id)', 'reference_entries(type, id)']],
+  ['reference_entry_versions', 'reference_entry_versions_city_id_fkey', ['FOREIGN KEY (city_id)', 'service_cities(id)']],
+  ['reference_entry_versions', 'reference_entry_versions_city_id_city_version_id_fkey',
+    ['FOREIGN KEY (city_id, city_version_id)', 'service_city_versions(city_id, id)']],
+  ['reference_entry_versions', 'reference_entry_versions_reviewed_by_fkey', ['FOREIGN KEY (reviewed_by)', 'staff(id)']],
+  ['content_blocks', 'content_blocks_city_id_fkey', ['FOREIGN KEY (city_id)', 'service_cities(id)']],
+  ['content_blocks', 'content_blocks_id_current_revision_id_fkey',
+    ['FOREIGN KEY (id, current_revision_id)', 'content_block_revisions(block_id, id)']],
+  ['content_block_revisions', 'content_block_revisions_block_id_fkey', ['FOREIGN KEY (block_id)', 'content_blocks(id)']],
+  ['content_block_revisions', 'content_block_revisions_reviewed_by_fkey', ['FOREIGN KEY (reviewed_by)', 'staff(id)']],
+  ['legal_documents', 'legal_documents_id_current_version_id_fkey',
+    ['FOREIGN KEY (id, current_version_id)', 'legal_document_versions(document_id, id)']],
+  ['legal_document_versions', 'legal_document_versions_document_id_purpose_kind_fkey',
+    ['FOREIGN KEY (document_id, purpose, kind)', 'legal_documents(id, purpose, kind)']],
+  ['legal_document_versions', 'legal_document_versions_reviewed_by_fkey', ['FOREIGN KEY (reviewed_by)', 'staff(id)']],
+  ['request_sessions', 'request_sessions_intake_city_id_fkey', ['FOREIGN KEY (intake_city_id)', 'service_cities(id)']],
+  ['request_sessions', 'request_sessions_intake_city_id_intake_city_version_id_fkey',
+    ['FOREIGN KEY (intake_city_id, intake_city_version_id)', 'service_city_versions(city_id, id)']],
+  ['consent_records', 'consent_records_session_id_fkey', ['FOREIGN KEY (session_id)', 'request_sessions(id)']],
+  ['consent_records', 'consent_records_document_id_document_version_id_purpose_fkey',
+    ['FOREIGN KEY (document_id, document_version_id, purpose)', 'legal_document_versions(document_id, id, purpose)']],
+  ['consent_records', 'consent_records_supersedes_id_fkey', ['FOREIGN KEY (supersedes_id)', 'consent_records(id)']],
+];
+// Every 013 trigger with its function; all functions must stay SECURITY INVOKER,
+// search_path-pinned, migrator-owned and NOT executable by the runtime or PUBLIC.
+const settingsTriggers: readonly (readonly [table: string, trigger: string, fn: string])[] = [
+  ['reference_entries', 'reference_entries_guard', 'reference_entries_guard'],
+  ['reference_entries', 'reference_entries_reject_truncate', 'settings_history_reject_truncate'],
+  ['reference_entry_versions', 'reference_entry_versions_pointer_guard', 'reference_entry_versions_pointer_guard'],
+  ['reference_entry_versions', 'reference_entry_versions_immutable', 'reference_entry_versions_immutable'],
+  ['reference_entry_versions', 'reference_entry_versions_reject_truncate', 'settings_history_reject_truncate'],
+  ['content_blocks', 'content_blocks_guard', 'content_blocks_guard'],
+  ['content_blocks', 'content_blocks_reject_truncate', 'settings_history_reject_truncate'],
+  ['content_block_revisions', 'content_block_revisions_pointer_guard', 'content_block_revisions_pointer_guard'],
+  ['content_block_revisions', 'content_block_revisions_immutable', 'content_block_revisions_immutable'],
+  ['content_block_revisions', 'content_block_revisions_reject_truncate', 'settings_history_reject_truncate'],
+  ['legal_documents', 'legal_documents_guard', 'legal_documents_guard'],
+  ['legal_documents', 'legal_documents_reject_truncate', 'settings_history_reject_truncate'],
+  ['legal_document_versions', 'legal_document_versions_pointer_guard', 'legal_document_versions_pointer_guard'],
+  ['legal_document_versions', 'legal_document_versions_immutable', 'legal_document_versions_immutable'],
+  ['legal_document_versions', 'legal_document_versions_reject_truncate', 'settings_history_reject_truncate'],
+  ['request_sessions', 'request_sessions_guard', 'request_sessions_guard'],
+  ['request_sessions', 'request_sessions_reject_truncate', 'settings_history_reject_truncate'],
+  ['consent_records', 'consent_records_guard', 'consent_records_guard'],
+  ['consent_records', 'consent_records_reject_truncate', 'settings_history_reject_truncate'],
+];
+// Exact runtime column privileges of 013 (plus the 010-012 columns on
+// business_settings_versions). Anything more, anything less or any table-level
+// privilege must fail closed.
+const settingsGrants: Readonly<Record<string, { select: readonly string[]; insert: readonly string[]; update: readonly string[] }>> = {
+  business_settings_versions: {
+    select: ['id', 'version', 'launch_mode', 'primary_city_id', 'reviewed_by', 'published_at',
+      'operator_name', 'operator_registration_id', 'operator_address', 'legal_review_ref',
+      'security_policy_ref', 'retention_policy_ref', 'upload_policy_ref'],
+    insert: ['id', 'version', 'launch_mode', 'primary_city_id', 'reviewed_by', 'operator_name',
+      'operator_registration_id', 'operator_address', 'legal_review_ref', 'security_policy_ref',
+      'retention_policy_ref', 'upload_policy_ref'],
+    update: [] },
+  reference_entries: {
+    select: ['id', 'type', 'scope', 'city_id', 'code', 'row_version', 'current_version_id', 'archived_at'],
+    insert: ['id', 'type', 'scope', 'city_id', 'code'], update: ['current_version_id', 'archived_at'] },
+  reference_entry_versions: {
+    select: ['id', 'entry_id', 'type', 'city_id', 'version', 'label', 'valid_from', 'valid_until', 'source_ref',
+      'reviewed_by', 'published_at', 'city_version_id', 'start_minute', 'end_minute'],
+    insert: ['id', 'entry_id', 'type', 'city_id', 'version', 'label', 'valid_from', 'valid_until', 'source_ref',
+      'reviewed_by', 'city_version_id', 'start_minute', 'end_minute'],
+    update: [] },
+  content_blocks: {
+    select: ['id', 'code', 'kind', 'scope', 'city_id', 'allow_company_fallback', 'row_version',
+      'current_revision_id', 'archived_at'],
+    insert: ['id', 'code', 'kind', 'scope', 'city_id', 'allow_company_fallback'],
+    update: ['current_revision_id', 'archived_at'] },
+  content_block_revisions: {
+    select: ['id', 'block_id', 'version', 'title', 'body', 'source_ref', 'reviewed_by', 'published_at'],
+    insert: ['id', 'block_id', 'version', 'title', 'body', 'source_ref', 'reviewed_by'], update: [] },
+  legal_documents: {
+    select: ['id', 'purpose', 'kind', 'row_version', 'current_version_id'],
+    insert: ['id', 'purpose', 'kind'], update: ['current_version_id'] },
+  legal_document_versions: {
+    select: ['id', 'document_id', 'purpose', 'kind', 'version', 'title', 'body', 'checksum', 'legal_basis',
+      'source_ref', 'reviewed_by', 'published_at'],
+    insert: ['id', 'document_id', 'purpose', 'kind', 'version', 'title', 'body', 'checksum', 'legal_basis',
+      'source_ref', 'reviewed_by'],
+    update: [] },
+  request_sessions: {
+    select: ['id', 'secret_hash', 'intake_city_id', 'intake_city_version_id', 'created_at', 'expires_at', 'revoked_at'],
+    insert: ['id', 'secret_hash', 'intake_city_id', 'intake_city_version_id', 'expires_at'],
+    update: ['revoked_at'] },
+  consent_records: {
+    select: ['id', 'session_id', 'document_id', 'document_version_id', 'purpose', 'action', 'legal_basis',
+      'source', 'evidence_ref', 'occurred_at', 'supersedes_id'],
+    insert: ['id', 'session_id', 'document_id', 'document_version_id', 'purpose', 'action', 'legal_basis',
+      'source', 'evidence_ref', 'supersedes_id'],
+    update: [] },
+};
+
+
 const expectedConstraints = [
   ['audit_logs', 'audit_logs_pkey', 'p', 'PRIMARY KEY (id)'],
   ['audit_logs', 'audit_logs_operation_check', 'c', 'CHECK ((length((operation)::text) > 0))'],
@@ -142,7 +399,135 @@ export class RuntimeDatabase implements OnModuleDestroy {
           && entry.definition === 'CREATE INDEX outbox_events_queue_idx ON foundation.outbox_events USING btree (status, created_at)')
         && row.indexes.some((entry) => entry.table === 'outbox_events' && entry.name === 'outbox_events_due_idx' && entry.valid && !entry.unique
           && entry.definition === 'CREATE INDEX outbox_events_due_idx ON foundation.outbox_events USING btree (status, next_attempt_at, created_at, id)');
-      return foundationReady && (!this.authEnabled || await this.authReady());
+      return foundationReady && (!this.authEnabled || (await this.authReady() && await this.settingsReady()));
+  }
+
+  // P03-03 (013) readiness: physical schema, named guards and exact column grants of the
+  // settings/reference/content/legal slice. Mechanical only - it never claims legal
+  // readiness, reviewed values, Q02/Q13 answers or a permitted production deployment.
+  private async settingsReady(): Promise<boolean> {
+    if (!this.client) { return false; }
+    const tables = [...settingsTables, 'business_settings_versions'];
+    const rows = await this.client.$queryRaw<{
+      columns: { table: string; column: string; type: string; not_null: boolean; type_modifier: number }[];
+      checks: { table: string; name: string; kind: string; validated: boolean; definition: string }[];
+      indexes: { table: string; name: string; valid: boolean; definition: string }[];
+      triggers: { table: string; name: string; enabled: boolean; fn: string; owner: string; secdef: boolean;
+        config: string[] | null; runtime_execute: boolean; public_execute: boolean }[];
+      grants: { table: string; column: string; readable: boolean; insertable: boolean; updatable: boolean;
+        referencable: boolean; grantable: boolean; insert_grantable: boolean; update_grantable: boolean }[];
+      broad: { table: string; elevated: boolean; deletable: boolean }[];
+      public_acl: { table: string; column: string | null; privilege: string }[];
+    }[]>`
+      SELECT
+        COALESCE((SELECT json_agg(json_build_object('table',c.relname,'column',a.attname,'type',t.typname,
+            'not_null',a.attnotnull,'type_modifier',a.atttypmod))
+          FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+          JOIN pg_type t ON t.oid=a.atttypid
+          WHERE n.nspname='foundation' AND c.relname=ANY(${tables}) AND c.relkind='r'
+            AND a.attnum>0 AND NOT a.attisdropped),'[]'::json) AS columns,
+        COALESCE((SELECT json_agg(json_build_object('table',c.relname,'name',k.conname,'kind',k.contype,
+            'validated',k.convalidated,'definition',pg_get_constraintdef(k.oid)))
+          FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname='foundation' AND c.relname=ANY(${tables})),'[]'::json) AS checks,
+        COALESCE((SELECT json_agg(json_build_object('table',t.relname,'name',i.relname,'valid',x.indisvalid,
+            'definition',pg_get_indexdef(x.indexrelid)))
+          FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class t ON t.oid=x.indrelid
+          JOIN pg_namespace n ON n.oid=t.relnamespace
+          WHERE n.nspname='foundation' AND t.relname=ANY(${tables})),'[]'::json) AS indexes,
+        COALESCE((SELECT json_agg(json_build_object('table',c.relname,'name',g.tgname,
+            'enabled',g.tgenabled IN ('O','A'),'fn',p.proname,'owner',pg_get_userbyid(p.proowner),
+            'secdef',p.prosecdef,'config',p.proconfig,
+            'runtime_execute',has_function_privilege(current_user,p.oid,'EXECUTE'),
+            'public_execute',EXISTS (SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl
+              WHERE acl.grantee=0 AND acl.privilege_type='EXECUTE')))
+          FROM pg_trigger g JOIN pg_class c ON c.oid=g.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+          JOIN pg_proc p ON p.oid=g.tgfoid
+          WHERE n.nspname='foundation' AND c.relname=ANY(${tables}) AND NOT g.tgisinternal),'[]'::json) AS triggers,
+        COALESCE((SELECT json_agg(json_build_object('table',c.relname,'column',a.attname,
+            'readable',has_column_privilege(current_user,c.oid,a.attnum,'SELECT'),
+            'insertable',has_column_privilege(current_user,c.oid,a.attnum,'INSERT'),
+            'updatable',has_column_privilege(current_user,c.oid,a.attnum,'UPDATE'),
+            'referencable',has_column_privilege(current_user,c.oid,a.attnum,'REFERENCES'),
+            'grantable',has_column_privilege(current_user,c.oid,a.attnum,'SELECT WITH GRANT OPTION'),
+            'insert_grantable',has_column_privilege(current_user,c.oid,a.attnum,'INSERT WITH GRANT OPTION'),
+            'update_grantable',has_column_privilege(current_user,c.oid,a.attnum,'UPDATE WITH GRANT OPTION')))
+          FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname='foundation' AND c.relname=ANY(${tables}) AND a.attnum>0 AND NOT a.attisdropped),'[]'::json) AS grants,
+        COALESCE((SELECT json_agg(json_build_object('table',c.relname,
+            'elevated',has_table_privilege(current_user,c.oid,'SELECT,INSERT,UPDATE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN'),
+            'deletable',has_table_privilege(current_user,c.oid,'DELETE')))
+          FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname='foundation' AND c.relname=ANY(${tables})),'[]'::json) AS broad,
+        -- PUBLIC is checked against the stored ACL, not against the effective privileges
+        -- of the runtime: a duplicate PUBLIC grant would otherwise stay invisible. Both
+        -- table-level and column-level PUBLIC entries of every privilege type count,
+        -- including a PUBLIC table-level SELECT.
+        COALESCE((SELECT json_agg(json_build_object('table',public_rows.table,'column',public_rows.column,
+            'privilege',public_rows.privilege))
+          FROM (
+            SELECT c.relname AS table, NULL::text AS column, x.privilege_type AS privilege
+              FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+              CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x
+              WHERE n.nspname='foundation' AND c.relname=ANY(${tables}) AND x.grantee=0
+            UNION ALL
+            SELECT c.relname, a.attname, y.privilege_type
+              FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+              JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+              CROSS JOIN LATERAL aclexplode(a.attacl) y
+              WHERE n.nspname='foundation' AND c.relname=ANY(${tables}) AND y.grantee=0
+          ) public_rows),'[]'::json) AS public_acl
+    `;
+    const row = rows[0];
+    if (!row || this.closing) { return false; }
+    // 1. Exact physical columns, nullability and type modifiers.
+    for (const [table, columns] of Object.entries(settingsColumns)) {
+      for (const [column, [type, modifier, notNull]] of Object.entries(columns)) {
+        if (!row.columns.some((entry) => entry.table === table && entry.column === column && entry.type === type
+          && entry.type_modifier === modifier && entry.not_null === notNull)) { return false; }
+      }
+    }
+    // 2. Every named guard exists, is validated, and its definition still enforces the rule.
+    for (const [table, name, needles] of settingsChecks) {
+      const found = row.checks.find((entry) => entry.table === table && entry.name === name);
+      if (!found || found.kind !== 'c' || !found.validated
+        || !needles.every((needle) => found.definition.includes(needle))) { return false; }
+    }
+    // 3. The composite FKs that make a pointer/target meaningful must exist and be validated;
+    //    a dropped FK would otherwise leave a row naming a foreign version "ready".
+    for (const [table, name, needles] of settingsForeignKeys) {
+      const found = row.checks.find((entry) => entry.table === table && entry.name === name);
+      if (!found || found.kind !== 'f' || !found.validated
+        || !needles.every((needle) => found.definition.includes(needle))) { return false; }
+    }
+    // 4. Unique/partial-unique indexes and their exact definitions.
+    for (const [table, name, definition] of settingsIndexes) {
+      const found = row.indexes.find((entry) => entry.table === table && entry.name === name);
+      if (!found || !found.valid || normalizeIndex(found.definition) !== normalizeIndex(definition)) { return false; }
+    }
+    // 5. Every guard trigger is enabled and its function is non-delegating and unreachable.
+    for (const [table, trigger, fn] of settingsTriggers) {
+      const found = row.triggers.find((entry) => entry.table === table && entry.name === trigger);
+      if (!found || !found.enabled || found.fn !== fn || found.owner !== 'fixlevelup_migrator'
+        || found.secdef || !found.config?.includes('search_path=pg_catalog')
+        || found.runtime_execute || found.public_execute) { return false; }
+    }
+    // 6. Exact column grants: nothing extra, nothing missing, no table-level privilege,
+    //    no REFERENCES/grant option and no DELETE/TRUNCATE on any of these tables.
+    for (const [table, spec] of Object.entries(settingsGrants)) {
+      const granted = row.grants.filter((entry) => entry.table === table);
+      const pick = (flag: 'readable' | 'insertable' | 'updatable') =>
+        granted.filter((entry) => entry[flag]).map((entry) => entry.column).sort();
+      if (JSON.stringify(pick('readable')) !== JSON.stringify([...spec.select].sort())) { return false; }
+      if (JSON.stringify(pick('insertable')) !== JSON.stringify([...spec.insert].sort())) { return false; }
+      if (JSON.stringify(pick('updatable')) !== JSON.stringify([...spec.update].sort())) { return false; }
+      if (granted.some((entry) => entry.referencable || entry.grantable
+        || entry.insert_grantable || entry.update_grantable)) { return false; }
+    }
+    // 7. No PUBLIC privilege of any kind on these tables (checked against the stored ACL,
+    //    so a duplicate PUBLIC grant cannot hide behind an existing runtime grant).
+    if (row.public_acl.length > 0) { return false; }
+    return row.broad.every((entry) => !entry.elevated && !entry.deletable);
   }
 
   private async authReady(): Promise<boolean> {

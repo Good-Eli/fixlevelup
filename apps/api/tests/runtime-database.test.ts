@@ -13,6 +13,7 @@ import { loadConfig, ConfigurationError } from '../src/runtime/config.js';
 import { loadDatabaseConfig, RuntimeDatabase } from '../src/infrastructure/database/runtime-database.js';
 import type { DatabaseConfig } from '../src/infrastructure/database/runtime-database.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
+import { authFixtureMigrations, migrateAuthFixture } from './auth-db-fixture.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 const source = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
@@ -20,8 +21,29 @@ const password = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(source)?.[
 if (!password) { throw new Error('Local runtime credentials required for DB integration tests'); }
 const database: DatabaseConfig = { host: '127.0.0.1', port: 55432, database: 'fixlevelup_dev', user: 'fixlevelup_runtime', password };
 const config = loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' });
+// The 013 readiness proof needs a disposable full-migration database, so it follows the
+// same opt-in as every other isolated integration suite.
+const isolatedDbTests = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1';
 
 describe('API runtime database readiness', () => {
+  it('mocked settings readiness fails closed on missing schema or grants', async () => {
+    const db = new RuntimeDatabase(undefined, true);
+    const internal = db as unknown as { client: { $queryRaw: (parts: TemplateStringsArray) => Promise<unknown[]> }; settingsReady: () => Promise<boolean> };
+    let row: unknown = undefined;
+    let sql = '';
+    internal.client = { $queryRaw: (parts) => { sql = parts.join(''); return Promise.resolve(row ? [row] : []); } };
+    expect(await internal.settingsReady()).toBe(false);
+    // A payload without any 013 catalog rows must stay not-ready, never throw.
+    row = { columns: [], checks: [], indexes: [], triggers: [], grants: [], broad: [] };
+    expect(await internal.settingsReady()).toBe(false);
+    // Table names are bound parameters, not SQL text, so assert on stable fragments.
+    expect(sql).toContain('public_acl');
+    expect(sql).toContain('has_column_privilege');
+    expect(sql).toContain('public_execute');
+    expect(sql).not.toContain(password);
+    row = undefined;
+  });
+
   it('mocked auth readiness fails closed on missing schema or privileges', async () => {
     const db = new RuntimeDatabase(undefined, true);
     const internal = db as unknown as { client: { $queryRaw: (parts: TemplateStringsArray) => Promise<{ ready: boolean }[]> }; authReady: () => Promise<boolean> };
@@ -174,6 +196,80 @@ describe('API runtime database readiness', () => {
         await request(server).get('/health/ready').expect(200);
       }
       await fixture.query('DROP INDEX foundation.outbox_events_queue_idx; CREATE INDEX outbox_events_queue_idx ON foundation.outbox_events(created_at,status)');
+      await request(server).get('/health/ready').expect(503);
+      await request(server).get('/health/live').expect(200);
+    } finally { await app.close(); await fixture.end(); }
+  });
+
+  it.runIf(isolatedDbTests)('rejects weakened 013 settings/legal guards and grants on an isolated full-migration DB', async () => {
+    const apiRequire = createRequire(pathToFileURL(resolve(root, 'apps/api/package.json')));
+    const pgModule = await import(pathToFileURL(apiRequire.resolve('pg')).href) as typeof import('pg');
+    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'))?.[1];
+    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(source)?.[1];
+    if (!adminPassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    // The fixture isolation guard requires the opt-in flag and an allowlisted name.
+    const name = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
+    const admin = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+    await admin.connect();
+    try {
+      await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
+    } finally { await admin.end(); }
+    const fixture = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+    await fixture.connect();
+    try { await migrateAuthFixture(fixture, name); } finally { /* keep the client open for the mutations below */ }
+    // The fixture chain must really end with 013; otherwise the mutations below would
+    // target a schema that does not exist yet.
+    expect(authFixtureMigrations.at(-1)).toBe('20261121000400_settings_legal_references');
+    // The runtime must not read migration history, but auth readiness expects the table.
+    await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
+    const webAuth = { origin: 'https://127.0.0.1:3100', csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
+    const app = await createApi(config, new SafeLogger('api'), { ...database, database: name }, webAuth);
+    const server = app.getHttpServer() as Server;
+    try {
+      await request(server).get('/health/ready').expect(200);
+      // A weakened named CHECK must be detected even under the same constraint name.
+      await fixture.query('ALTER TABLE foundation.consent_records DROP CONSTRAINT consent_records_action_check; ALTER TABLE foundation.consent_records ADD CONSTRAINT consent_records_action_check CHECK (true)');
+      await request(server).get('/health/ready').expect(503);
+      await fixture.query("ALTER TABLE foundation.consent_records DROP CONSTRAINT consent_records_action_check; ALTER TABLE foundation.consent_records ADD CONSTRAINT consent_records_action_check CHECK (action IN ('GIVEN','REVOKED'))");
+      await request(server).get('/health/ready').expect(200);
+      // The checksum guard must really be the SHA-256 of the body, not a format pattern.
+      await fixture.query("ALTER TABLE foundation.legal_document_versions DROP CONSTRAINT legal_document_versions_checksum_check; ALTER TABLE foundation.legal_document_versions ADD CONSTRAINT legal_document_versions_checksum_check CHECK (checksum ~ '^[0-9a-f]{64}$')");
+      await request(server).get('/health/ready').expect(503);
+      await fixture.query("ALTER TABLE foundation.legal_document_versions DROP CONSTRAINT legal_document_versions_checksum_check; ALTER TABLE foundation.legal_document_versions ADD CONSTRAINT legal_document_versions_checksum_check CHECK (checksum = encode(sha256(convert_to(body,'UTF8')),'hex'))");
+      await request(server).get('/health/ready').expect(200);
+      // A disabled immutability trigger silently removes the append-only guarantee.
+      await fixture.query('ALTER TABLE foundation.legal_document_versions DISABLE TRIGGER legal_document_versions_immutable');
+      await request(server).get('/health/ready').expect(503);
+      await fixture.query('ALTER TABLE foundation.legal_document_versions ENABLE TRIGGER legal_document_versions_immutable');
+      await request(server).get('/health/ready').expect(200);
+      // A missing column grant, an extra table-level grant and a widened history grant fail.
+      for (const [breakGrant, restoreGrant] of [
+        ['REVOKE SELECT(session_id) ON foundation.consent_records FROM fixlevelup_runtime',
+          'GRANT SELECT(session_id) ON foundation.consent_records TO fixlevelup_runtime'],
+        ['GRANT UPDATE ON foundation.legal_document_versions TO fixlevelup_runtime',
+          'REVOKE UPDATE ON foundation.legal_document_versions FROM fixlevelup_runtime'],
+        ['GRANT DELETE ON foundation.consent_records TO fixlevelup_runtime',
+          'REVOKE DELETE ON foundation.consent_records FROM fixlevelup_runtime'],
+        ['GRANT INSERT(published_at) ON foundation.content_block_revisions TO fixlevelup_runtime',
+          'REVOKE INSERT(published_at) ON foundation.content_block_revisions FROM fixlevelup_runtime'],
+        ['GRANT EXECUTE ON FUNCTION foundation.consent_records_guard() TO fixlevelup_runtime',
+          'REVOKE EXECUTE ON FUNCTION foundation.consent_records_guard() FROM fixlevelup_runtime'],
+        ['GRANT SELECT(operator_name) ON foundation.business_settings_versions TO PUBLIC',
+          'REVOKE SELECT(operator_name) ON foundation.business_settings_versions FROM PUBLIC'],
+      ] as const) {
+        await fixture.query(breakGrant);
+        await request(server).get('/health/ready').expect(503);
+        await fixture.query(restoreGrant);
+        await request(server).get('/health/ready').expect(200);
+      }
+      // A dropped pointer/unique index and a changed predicate both fail closed.
+      await fixture.query('DROP INDEX foundation.consent_records_supersedes_id_key');
+      await request(server).get('/health/ready').expect(503);
+      await fixture.query('CREATE UNIQUE INDEX consent_records_supersedes_id_key ON foundation.consent_records(supersedes_id)');
+      await request(server).get('/health/ready').expect(200);
+      await fixture.query('DROP INDEX foundation.reference_entries_company_code_key; CREATE UNIQUE INDEX reference_entries_company_code_key ON foundation.reference_entries(type, code)');
       await request(server).get('/health/ready').expect(503);
       await request(server).get('/health/live').expect(200);
     } finally { await app.close(); await fixture.end(); }

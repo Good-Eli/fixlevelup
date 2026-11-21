@@ -14,7 +14,7 @@ const expectedSteps = [
     'technical_audit_outbox', 'technical_outbox_attempts', 'technical_outbox_leases',
     'staff_identity', 'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac',
   ]),
-  ...migrationDay('20261121', ['city_foundation', 'service_areas', 'geography_access']),
+  ...migrationDay('20261121', ['city_foundation', 'service_areas', 'geography_access', 'settings_legal_references']),
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })
@@ -27,8 +27,9 @@ function discoverMigrations(): readonly string[] {
 export const authFixtureMigrations = discoverMigrations();
 
 export async function migrateAuthFixture(db: Client, database: string): Promise<void> {
+  // Isolation guard: only an allowlisted disposable database may be migrated by a fixture.
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1'
-    || !/^fixlevelup_(bootstrap|recovery|web_auth|auth_e2e)_test_[a-f0-9]{24}$/.test(database)
+    || !/^fixlevelup_(bootstrap|recovery|web_auth|auth_e2e|legal|configuration)_test_[a-f0-9]{24}$/.test(database)
     || (await db.query<{ db: string }>('SELECT current_database() AS db')).rows[0]?.db !== database) {
     throw new Error('Refusing non-isolated auth fixture');
   }
