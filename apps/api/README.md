@@ -185,6 +185,14 @@ anchor доверенной серверной сессии. Порты покр
   тестовые документы содержат только синтетический текст. Файлы и intake
   остаются за P03-04/P05.
 
+## P03-04A: принятый no-byte срез резервирования файлов
+
+Срез **принят владельцем 21.11.2026** в synthetic внутреннем scope: только резервирование `RESERVED→CANCELLED`, без передачи байтов. `src/files/reservations/` предоставляет только внутренние `reserveFileUpload`, `readFileUploadIntent`, `cancelFileUploadIntent`, `beginFileReservationTransaction`. Caller открывает READ COMMITTED до data access. Mandatory reviewed policy без defaults, raw F token, exact current GIVEN, DB clock после session→document→intent locks, pending quota и owner/key idempotency; cancel one-way CAS без нового согласия. Успех резервирует capacity, а не загружает файл. Нет S3 IO/SDK/HTTP/scanner/EXIF/READY/access/stream/delete и новых зависимостей. Staff-owner вариант явно отказывает до DB access.
+
+Финальные проверки среза A: 679/679 Vitest в 50 файлах (40 unit + 17 PostgreSQL), 14 миграций/138 CHECK, SQL014 SHA-256 `2ec24c33…bb4377`, typecheck/source-lint/build PASS; повторный read-only вердикт Astra — PASS. Принятый срез коммитится отдельным локальным коммитом (создаёт root), SHA не заявлен.
+
+[План P03-04](../../docs/P03-04-PLAN.md) проверен Astra до реализации; это только первый срез A, весь P03-04 не завершён и принятый прогресс остаётся 60%. Реализация P03-04B остановлена и запрещена до нового решения: её артефакты не входят в A-коммит, а старт возможен только через отдельное предложение с проверкой Astra. Q02/Q12/Q13/Q16 открыты, реальные ПД не разрешены, dev DB не мигрируется.
+
 ## Поведение
 
 - GET /health/live: 200 {status:ok}, процесс API жив, без зависимости от каналов.

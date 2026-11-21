@@ -149,3 +149,9 @@ migration proofs, quality gate и runtime isolation.
   без `DELETE`/`TRUNCATE`/DDL, без `PUBLIC`-доступа и без `SECURITY DEFINER`
   делегирования. Отсутствие seed и автоматических грантов проверяется отдельно.
 - Фактические результаты: **13 миграций и 121 CHECK**, fresh/`012`→`013`/replay/drift — PASS; SHA-256 итогового SQL `013` — `54fda83b0eff7055a0b1dbac46d9df64910666eb984bd5df316a30c9d81cfbf9`. Полный Vitest — 622/622 в 48 файлах (39 configuration + 36 legal). Миграция не развёрнута в рабочей БД.
+
+## P03-04A — migration014, принятый no-byte reservation
+
+`20261121000500_file_upload_reservations` добавляет только `file_upload_intents` и уникальный consent-basis index; 013 данные/ACL не переписываются. Только RESERVED/CANCELLED, actual owner FKs, immutable policy/basis, RC/live/current-consent/post-lock expiry/quota guards и narrow runtime columns. Нет files/S3/IO/READY. [План](../../docs/P03-04-PLAN.md) проверен Astra; срез A принят владельцем 21.11.2026, весь P03-04 не завершён (прогресс 60%).
+
+Независимый `test-file-reservations-migration.mjs` проверяет 013→014/fresh/replay/drift, exact inventories/ACL и негативные guards. Старый013 proof ограничен своей capped history, final014 proof сравнивает актуальную Prisma schema и миграции. Migration gate выполняется только на случайных изолированных БД, не `db:deploy` рабочей dev БД. Итог: migration proof PASS — **14 миграций/138 CHECK**, fresh/013→014/replay/drift/ACL; финальный полный PostgreSQL Vitest — **679/679 в 50 файлах** (40 unit + 17 PG); SQL014 SHA-256 `2ec24c3365b4681859cd11d4fc7dd031fc487d410ff695692f4a2ec650bb4377`. Предыдущий gate 670/670 сохранён как исторический. Schema во время адресных исправлений не менялась. Принятый срез A коммитится отдельным локальным коммитом (создаёт root), SHA не заявлен; весь P03-04 не завершён.

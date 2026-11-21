@@ -59,6 +59,7 @@ model Staff {
   reviewedReferenceEntryVersions  ReferenceEntryVersion[] @relation("ReferenceEntryVersionReviewer")
   reviewedContentBlockRevisions   ContentBlockRevision[]  @relation("ContentBlockRevisionReviewer")
   reviewedLegalDocumentVersions   LegalDocumentVersion[]  @relation("LegalDocumentVersionReviewer")
+  fileUploadIntents               FileUploadIntent[]      @relation("FileUploadIntentStaff")
 
   @@map("staff")
   @@schema("foundation")
@@ -723,6 +724,7 @@ model RequestSession {
   intakeCity          ServiceCity @relation("RequestSessionCity", fields: [intakeCityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   intakeCityVersion   ServiceCityVersion @relation("RequestSessionCityVersion", fields: [intakeCityId, intakeCityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
   consents            ConsentRecord[]
+  fileUploadIntents   FileUploadIntent[] @relation("FileUploadIntentSession")
 
   @@map("request_sessions")
   @@schema("foundation")
@@ -751,9 +753,61 @@ model ConsentRecord {
   documentVersion   LegalDocumentVersion @relation("ConsentDocumentVersion", fields: [documentId, documentVersionId, purpose], references: [documentId, id, purpose], onDelete: Restrict, onUpdate: Restrict)
   supersedes        ConsentRecord?      @relation("ConsentSupersedes", fields: [supersedesId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   supersededBy      ConsentRecord?      @relation("ConsentSupersedes")
+  fileUploadIntents FileUploadIntent[]  @relation("FileUploadIntentConsent")
 
   @@unique([sessionId, evidenceRef], map: "consent_records_session_evidence_key")
   @@unique([supersedesId], map: "consent_records_supersedes_id_key")
+  @@unique([id, sessionId, documentVersionId, purpose], map: "consent_records_intent_basis_key")
   @@map("consent_records")
+  @@schema("foundation")
+}
+
+// P03-04 slice A reservation intent (014): an immutable snapshot of one owner, the
+// exact consent basis it was granted under, the reviewed policy snapshot and the
+// declared MIME/bytes, plus the single RESERVED -> CANCELLED transition. There is no
+// object key, no file row and no READY state: this table reserves future capacity and
+// nothing else. Exactly one owner is set (request session XOR staff; the staff variant
+// has no runtime INSERT privilege until the P03-05 workflow with real authorization).
+// created_at, state, cancelled_at and row_version are database-owned: the INSERT guard
+// forces RESERVED/NULL/1 and the UPDATE guard stamps the cancel and OLD+1 row_version.
+// The DB-owned row_version guard, the owner-XOR/consent-basis/state/size/allowlist
+// CHECKs, the closed-MIME and expiry-vs-anchor rules, the quota check under
+// session -> document locks and the delete/truncate refusal live only in migration SQL.
+model FileUploadIntent {
+  id                       String         @id @db.Uuid
+  ownerRequestSessionId    String?        @map("owner_request_session_id") @db.Uuid
+  ownerStaffId             String?        @map("owner_staff_id") @db.Uuid
+  consentRecordId          String?        @map("consent_record_id") @db.Uuid
+  consentDocumentVersionId String?        @map("consent_document_version_id") @db.Uuid
+  consentPurpose           String?        @map("consent_purpose") @db.VarChar(32)
+  policyVersionId          String         @map("policy_version_id") @db.Uuid
+  policySourceRef          String         @map("policy_source_ref")
+  policySha256             String         @map("policy_sha256") @db.VarChar(64)
+  allowedMimeTypes         Json           @map("allowed_mime_types") @db.JsonB
+  maxFileBytes             BigInt         @map("max_file_bytes")
+  maxOwnerBytes            BigInt         @map("max_owner_bytes")
+  maxOwnerFiles            Int            @map("max_owner_files")
+  policyExpiresAt          DateTime       @map("policy_expires_at") @db.Timestamptz(6)
+  declaredMime             String         @map("declared_mime") @db.VarChar(100)
+  declaredBytes            BigInt         @map("declared_bytes")
+  expiresAt                DateTime       @map("expires_at") @db.Timestamptz(6)
+  createdAt                DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  idempotencyKey           String         @map("idempotency_key") @db.Uuid
+  bodySha256               String         @map("body_sha256") @db.VarChar(64)
+  state                    String         @map("state") @db.VarChar(16)
+  cancelledAt              DateTime?      @map("cancelled_at") @db.Timestamptz(6)
+  rowVersion               Int            @default(1) @map("row_version")
+  ownerRequestSession      RequestSession? @relation("FileUploadIntentSession", fields: [ownerRequestSessionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  ownerStaff               Staff?          @relation("FileUploadIntentStaff", fields: [ownerStaffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  // Composite basis FK: the evidence row must belong to this session, this document
+  // version and this purpose. GIVEN/unrevoked/current is proven by the INSERT guard.
+  // The explicit map keeps the reviewed 014 constraint name instead of Prisma's
+  // truncated default, so `migrate diff` converges on the real catalog.
+  consentRecord            ConsentRecord?  @relation("FileUploadIntentConsent", fields: [consentRecordId, ownerRequestSessionId, consentDocumentVersionId, consentPurpose], references: [id, sessionId, documentVersionId, purpose], onDelete: Restrict, onUpdate: Restrict, map: "file_upload_intents_consent_basis_fkey")
+
+  // The two owner+idempotency unique indexes and the pending-quota index are PARTIAL
+  // indexes (WHERE owner_... IS NOT NULL), which Prisma cannot express; they exist only
+  // in migration SQL, exactly like the other partial unique indexes in this schema.
+  @@map("file_upload_intents")
   @@schema("foundation")
 }

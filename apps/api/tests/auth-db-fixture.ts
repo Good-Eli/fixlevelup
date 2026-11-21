@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { Client } from 'pg';
 import { hashPassword } from '../src/staff/password.js';
@@ -9,12 +9,18 @@ const migrationRoot = resolve(import.meta.dirname, '../../../prisma/migrations')
 function migrationDay(day: string, steps: readonly string[]): string[] {
   return steps.map((step, index) => `${day}${String(index + 1).padStart(4, '0')}00_${step}`);
 }
+// 014 (P03-04A file upload reservations) joins the chain as soon as its migration directory
+// exists. The expected list stays explicit; the existence check only keeps the fixture
+// runnable while the schema slice is not yet on disk, and never silently accepts a renamed
+// or reordered migration.
+const fileReservationsMigration = '20261121000500_file_upload_reservations';
 const expectedSteps = [
   ...migrationDay('20261120', [
     'technical_audit_outbox', 'technical_outbox_attempts', 'technical_outbox_leases',
     'staff_identity', 'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac',
   ]),
-  ...migrationDay('20261121', ['city_foundation', 'service_areas', 'geography_access', 'settings_legal_references']),
+  ...migrationDay('20261121', ['city_foundation', 'service_areas', 'geography_access', 'settings_legal_references',
+    ...(existsSync(resolve(migrationRoot, fileReservationsMigration)) ? ['file_upload_reservations'] : [])]),
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })

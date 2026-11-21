@@ -219,9 +219,9 @@ describe('API runtime database readiness', () => {
     const fixture = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
     await fixture.connect();
     try { await migrateAuthFixture(fixture, name); } finally { /* keep the client open for the mutations below */ }
-    // The fixture chain must really end with 013; otherwise the mutations below would
-    // target a schema that does not exist yet.
-    expect(authFixtureMigrations.at(-1)).toBe('20261121000400_settings_legal_references');
+    // The full fixture must include 013; later additive migrations must not make
+    // this regression stop checking the still-required settings/legal guards.
+    expect(authFixtureMigrations).toContain('20261121000400_settings_legal_references');
     // The runtime must not read migration history, but auth readiness expects the table.
     await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
     const webAuth = { origin: 'https://127.0.0.1:3100', csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };

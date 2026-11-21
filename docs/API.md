@@ -104,6 +104,8 @@ Company settings — legal identity/security/retention/channel policies/primary 
 
 ## 4. Файлы
 
+**P03-04A:** принят владельцем 21.11.2026 только внутренний no-byte reservation slice ([план](P03-04-PLAN.md)): `reserveFileUpload/readFileUploadIntent/cancelFileUploadIntent` на caller READ COMMITTED transaction, только RESERVED→CANCELLED. Ни один маршрут таблицы ниже ещё не реализован; reservation DTO не является fileId/объектом/права́ми upload или download. Нужны raw F proof, mandatory reviewed policy и точный текущий GIVEN; staff-вариант запрещён до отдельной авторизации. Срез A не завершает P03-04, не открывает приём реальных вложений и не даёт READY/выдачи; весь P03-04 не завершён, прогресс P03 остаётся 60%. Принятый срез коммитится отдельным локальным коммитом (создаёт root), SHA не заявлен.
+
 | Метод / путь | Доступ | Назначение |
 |---|---|---|
 | GET `/public/upload-policy` | P | Разрешённые типы/размеры/количество, без закрытых настроек |
