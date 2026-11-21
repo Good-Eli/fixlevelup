@@ -2,11 +2,13 @@
 
 FixLevelUp — платформа для организации заявок на ремонт бытовой техники: клиентский приём заявок, рабочее место менеджера, инструменты мастеров и коммуникация через подключаемые каналы. Проект рассчитан на одну компанию с возможностью последовательно запускать новые города; это не multi-tenant SaaS.
 
-> **Текущее состояние:** foundation P01 и контур доступа сотрудников P02: web-сессии, Telegram Mini App exchange и [управление доступом](docs/RBAC.md) в CRM (`/crm/access`). Каталог услуг, заявки, расписание, сметы и клиентские messenger adapters — не часть этой реализации. Production deployment и живые приёмки не выполнены.
+> **Текущее состояние:** foundation P01 и контур сотрудников P02. Реализованы web-сессии менеджера и администратора, серверная авторизация с ролями и правами, Telegram Mini App exchange для мастера и [управление доступом](docs/RBAC.md) в CRM (`/crm/access`). Каталог услуг, заявки, расписание, сметы и клиентские messenger adapters — не часть этой реализации. Production deployment, живые приёмки и реальный Telegram-вход не выполнены.
+
+Контур P02 — это доступ сотрудников, а не готовый продукт. Он не открывает следующий этап: для P03 и последующих модулей нужно отдельное решение владельца.
 
 ## Технологический стек
 
-Версии ниже сверены с root/workspace manifests и `pnpm-lock.yaml` на commit `b42e0efa23d7c67b17271cf3a4f489660a95ebe5` (20.11.2026).
+Версии ниже сверены с root/workspace manifests и `pnpm-lock.yaml` на commit `8f0b204333395dcee1a1808b703a4dfbdce9efa9` (21.11.2026). Манифесты и lockfile не менялись с `b42e0ef`, поэтому граф зависимостей прежний.
 
 | Область | Технологии |
 |---|---|
@@ -25,14 +27,14 @@ FixLevelUp — платформа для организации заявок н�
 
 ```text
 apps/
-  api/          технические NestJS API и worker entrypoints
-  web/          минимальный Next.js build/smoke target
-  miniapp/      минимальный React/Vite target будущего staff Mini App
+  api/          NestJS API и worker; auth, RBAC и staff-операции
+  web/          Next.js: техническая страница и закрытый раздел CRM /crm/access
+  miniapp/      React/Vite target будущего staff Mini App (UI пока не подключён)
 packages/
   tooling/             общие TypeScript/tooling настройки
-  database-tooling/    Prisma CLI, миграции и DB proofs
+  database-tooling/    Prisma CLI, девять миграций и DB proofs
   storage-tooling/     S3-compatible dev tooling и backup/restore drill
-  browser-tooling/     Playwright browser proof
+  browser-tooling/     Playwright browser proof и RBAC-сценарий CRM
 infra/
   dev-postgres/        изолированная локальная PostgreSQL
   dev-s3/              локальный Garage S3-compatible
@@ -40,12 +42,12 @@ infra/
   linux-proof/         Linux runtime/reproducibility proof
   linux-integration/   Linux PostgreSQL/Garage integration proof
   browser-proof/       browser smoke proof
-  ci/                  CI helper scripts и dependency/license gate
-docs/                  архитектура, БД, API, решения, Preflight и Roadmap
-info/                  исходные материалы проекта
+  ci/                  CI helper scripts и dependency/license/secret gates
+docs/                  архитектура, БД, API, решения, RBAC, Preflight, Roadmap, подэтапы
+info/                  исходные материалы проекта и отчёты
 ```
 
-Подробные контракты находятся в `docs/ARCHITECTURE.md`, `docs/DATABASE.md`, `docs/API.md` и `docs/DECISIONS.md`.
+Подробные контракты находятся в `docs/ARCHITECTURE.md`, `docs/DATABASE.md`, `docs/API.md`, `docs/DECISIONS.md` и `docs/RBAC.md`.
 
 ## Требования
 
@@ -101,17 +103,19 @@ Compose-файл: `infra/dev-s3/compose.yaml`. Секреты создаются
 
 ## Приложения
 
-- **API / worker:** [`apps/api/README.md`](apps/api/README.md). Технические health/readiness entrypoints и outbox infrastructure. Production business handlers отсутствуют. Entrypoints не загружают `.env` автоматически; нужные переменные передаются окружением явно.
-- **Web:** [руководство Web](apps/web/README.md). Техническая страница и закрытый раздел CRM `/crm/access`. Для UI и `/api/v1` нужен один HTTPS origin; браузер не подключается к БД.
-- **Mini App:** [`apps/miniapp/README.md`](apps/miniapp/README.md). Технический React/Vite target будущего staff Telegram Mini App; Telegram SDK, initData validation и бизнес-интерфейс пока не подключены.
+- **API / worker:** [`apps/api/README.md`](apps/api/README.md). Health/readiness, технический outbox, web-аутентификация, серверная авторизация, staff- и roles-операции. Бизнес-маршрутов заявок, каталога и расписания нет; реестр обработчиков outbox по-прежнему пуст. Auth-маршруты существуют только при `WEB_AUTH_ENABLED=1` с полной валидной конфигурацией, иначе `/auth/*` отсутствуют. Entrypoints не загружают `.env` автоматически; нужные переменные передаются окружением явно. Первый администратор создаётся консольной командой `staff:bootstrap`, пароль восстанавливается через `staff:recover`.
+- **Web:** [руководство Web](apps/web/README.md). Техническая страница и закрытый раздел CRM `/crm/access` — «Сотрудники и доступ». Серверный HTML раздела только оболочка: данные приходят после проверки CRM-сессии. Для UI и `/api/v1` нужен один HTTPS origin; браузер не подключается к БД, а Next не заменяет серверную авторизацию Nest.
+- **Mini App:** [`apps/miniapp/README.md`](apps/miniapp/README.md). Технический React/Vite target. Серверная проверка `initData` и обмен на сессию мастера реализованы в API (P02-05), но сам интерфейс Mini App их пока не вызывает: Telegram SDK и рабочий экран мастера не подключены.
 
 ## CI и evidence
 
 Workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Он запускает Linux proof, Linux PostgreSQL/Garage integration, browser proof и dependency/license/lockfile/secret gates.
 
-На commit `b42e0efa23d7c67b17271cf3a4f489660a95ebe5` GitHub Actions run [44675339571](https://github.com/Good-Eli/fixlevelup/actions/runs/44675339571) завершился успешно: четыре из четырёх jobs — success. Это воспроизводимое evidence конкретного технического commit, а не production certification или приёмка бизнес-функций.
+На commit `8f0b204333395dcee1a1808b703a4dfbdce9efa9` GitHub Actions run [44815347477](https://github.com/Good-Eli/fixlevelup/actions/runs/44815347477) завершился успешно. Это воспроизводимое evidence конкретного технического commit, а не production certification или приёмка бизнес-функций.
 
-Политика и ограничения dependency/license gate: [`infra/ci/DEPENDENCIES.md`](infra/ci/DEPENDENCIES.md). В частности, technical license inventory не является legal approval; отдельный review текущих исключений находится в [`docs/THIRD_PARTY_LICENSE_REVIEW.md`](docs/THIRD_PARTY_LICENSE_REVIEW.md) (добавлен в подэтапе P01-12B.1).
+Промежуточные прогоны 12–14 завершились failure: информационные patch-файлы в `info/` срабатывали в secret scan. В проверенном прогоне [44804420059](https://github.com/Good-Eli/fixlevelup/actions/runs/44804420059) единственная упавшая задача — «Scan repository and all available Git history for secrets»; Linux, integration и browser jobs прошли. Патчи удалены, для единственного false positive добавлено исключение, привязанное к commit/path/line/rule и к SHA-256 blob-а, поэтому изменённый или перемещённый контент остаётся находкой.
+
+Политика и ограничения dependency/license gate: [`infra/ci/DEPENDENCIES.md`](infra/ci/DEPENDENCIES.md). В частности, technical license inventory не является legal approval; отдельный review текущих исключений находится в [`docs/THIRD_PARTY_LICENSE_REVIEW.md`](docs/THIRD_PARTY_LICENSE_REVIEW.md) (добавлен в подэтапе P01-12B.1). F06 остаётся PARTIAL до фактического deployment SBOM, notices и legal distribution review.
 
 ## Документация и план
 
@@ -119,7 +123,9 @@ Workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Он запу�
 - [Database model](docs/DATABASE.md)
 - [API contracts](docs/API.md)
 - [Decisions](docs/DECISIONS.md)
+- [RBAC сотрудников](docs/RBAC.md)
 - [Roadmap](docs/ROADMAP.md)
+- [Подэтапы проектов](docs/SUBTASKS.md)
 - [P01 Preflight](docs/PREFLIGHT_P01.md)
 - [Changelog](CHANGELOG.md)
 - [Third-party license review](docs/THIRD_PARTY_LICENSE_REVIEW.md)
