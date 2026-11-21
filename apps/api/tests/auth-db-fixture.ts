@@ -5,13 +5,16 @@ import type { Client } from 'pg';
 import { hashPassword } from '../src/staff/password.js';
 
 const migrationRoot = resolve(import.meta.dirname, '../../../prisma/migrations');
-const expectedSteps = ['technical_audit_outbox', 'technical_outbox_attempts', 'technical_outbox_leases',
-  'staff_identity', 'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac'];
+const expectedSteps = [
+  '20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts',
+  '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth',
+  '20261120000600_authorization', '20261120000700_staff_telegram_auth', '20261120000800_staff_deactivation_grant',
+  '20261120000900_rbac', '20261121000100_city_foundation',
+];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })
     .filter(entry => entry.isDirectory() && /^\d{14}_/.test(entry.name)).map(entry => entry.name).sort();
-  if (dirs.length !== expectedSteps.length || !expectedSteps.every((step, i) =>
-    dirs[i] === `20261120${String(i + 1).padStart(4, '0')}00_${step}`)) {
+  if (dirs.length !== expectedSteps.length || !expectedSteps.every((step, i) => dirs[i] === step)) {
     throw new Error('Unexpected auth fixture migration chain');
   }
   return Object.freeze(dirs);

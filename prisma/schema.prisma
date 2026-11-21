@@ -11,7 +11,7 @@ datasource db {
   schemas  = ["foundation"]
 }
 
-// Technical infrastructure and minimal staff identity. No customers, requests or geography models.
+// Technical infrastructure, staff access and city settings. No customers or requests yet.
 model AuditLog {
   id            String   @id @db.Uuid
   operation     String   @db.VarChar(64)
@@ -42,6 +42,8 @@ model Staff {
   grantedPermissions   UserPermission[]        @relation("UserPermissionGrantedBy")
   staffTelegramLinks   StaffTelegramLink[]
   linkedTelegramLinks  StaffTelegramLink[]     @relation("StaffTelegramLinkLinkedBy")
+  reviewedCityVersions ServiceCityVersion[]    @relation("CityVersionReviewer")
+  reviewedSettings     BusinessSettingsVersion[] @relation("BusinessSettingsReviewer")
 
   @@map("staff")
   @@schema("foundation")
@@ -233,5 +235,72 @@ model OutboxEvent {
   @@index([status, createdAt], map: "outbox_events_queue_idx")
   @@index([status, nextAttemptAt, createdAt, id], map: "outbox_events_due_idx")
   @@map("outbox_events")
+  @@schema("foundation")
+}
+
+// P03-01 city foundation. Stable city identity (not a tenant); row_version is
+// bumped by the city_guard_update trigger in migration SQL, never by the caller.
+// The composite (id, current_version_id) FK to service_city_versions(city_id, id)
+// forbids a foreign city's history; ACTIVE-requires-pointer, the lifecycle/code
+// CHECKs, the timezone trigger and the immutability triggers live only in
+// migration SQL. No "at most one ACTIVE city" rule exists here on purpose.
+model ServiceCity {
+  id               String                   @id @db.Uuid
+  code             String                   @unique(map: "service_cities_code_key") @db.VarChar(32)
+  lifecycle        String                   @default("DRAFT") @db.VarChar(16)
+  rowVersion       Int                      @default(1) @map("row_version")
+  currentVersionId String?                  @map("current_version_id") @db.Uuid
+  currentVersion   ServiceCityVersion?      @relation("ServiceCityCurrentVersion", fields: [id, currentVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
+  versions         ServiceCityVersion[]     @relation("ServiceCityVersions")
+  settingsVersions BusinessSettingsVersion[]
+
+  @@map("service_cities")
+  @@schema("foundation")
+}
+
+// Immutable reviewed snapshot of one city's local settings: display name, IANA
+// timezone, public contact and office hours. Every row is published; UPDATE,
+// DELETE and TRUNCATE are refused by migration SQL triggers, so a correction is a
+// new (city_id, version) row. office_hours is exactly seven ISO weekday arrays
+// Mon..Sun of [startMinute, endMinute] pairs; [] is an explicitly closed day.
+model ServiceCityVersion {
+  id             String   @id @db.Uuid
+  cityId         String   @map("city_id") @db.Uuid
+  version        Int
+  displayName    String   @map("display_name")
+  addressDisplay String?  @map("address_display")
+  timezone       String
+  publicContact  String   @map("public_contact")
+  officeHours    Json     @map("office_hours") @db.JsonB
+  reviewedBy     String   @map("reviewed_by") @db.Uuid
+  publishedAt    DateTime @default(now()) @map("published_at") @db.Timestamptz(6)
+  city           ServiceCity @relation("ServiceCityVersions", fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  reviewer       Staff    @relation("CityVersionReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentFor     ServiceCity[] @relation("ServiceCityCurrentVersion")
+
+  @@unique([cityId, version], map: "service_city_versions_city_version_key")
+  @@unique([cityId, id], map: "service_city_versions_city_id_key")
+  @@map("service_city_versions")
+  @@schema("foundation")
+}
+
+// Published company settings revision. Deliberately has no city timezone/contact/
+// office-hours columns: those live only in service_city_versions, so there is no
+// second editable copy. MULTI_CITY is reserved vocabulary only - the resolver
+// enables SINGLE_CITY and treats MULTI_CITY as unsupported configuration. No DRAFT
+// state and no seeded row: the current revision is max(version). Immutability
+// triggers live in migration SQL.
+model BusinessSettingsVersion {
+  id            String   @id @db.Uuid
+  version       Int
+  launchMode    String   @map("launch_mode") @db.VarChar(16)
+  primaryCityId String   @map("primary_city_id") @db.Uuid
+  reviewedBy    String   @map("reviewed_by") @db.Uuid
+  publishedAt   DateTime @default(now()) @map("published_at") @db.Timestamptz(6)
+  primaryCity   ServiceCity @relation(fields: [primaryCityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  reviewer      Staff    @relation("BusinessSettingsReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([version], map: "business_settings_versions_version_key")
+  @@map("business_settings_versions")
   @@schema("foundation")
 }

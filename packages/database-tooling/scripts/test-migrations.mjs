@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { proveRbacCutover, proveRbacInvariants, proveEighthUpgrade, proveRejectedUpgrade, syntheticVerifier } from './test-rbac-migration.mjs';
+import { cityChecks, proveCityUpgrade, proveCityReadGrants } from './test-city-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { admin, credentials, connection, prepareDatabase, runPrisma, root } from './migration-local.mjs';
@@ -30,8 +31,9 @@ async function uniqueViolation(client, sql, values = []) {
 const migrations = [
   'technical_audit_outbox', 'technical_outbox_attempts', 'technical_outbox_leases', 'staff_identity',
   'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac',
-].map((name, index) => `20261120${String(index + 1).padStart(4, '0')}00_${name}`);
+].map((name, index) => `20261120${String(index + 1).padStart(4, '0')}00_${name}`).concat('20261121000100_city_foundation');
 const expectedChecks = [
+  ...cityChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -61,11 +63,12 @@ const secondHistory = resolve(historyRoot, 'second/migrations');
 const thirdHistory = resolve(historyRoot, 'third/migrations');
 const fourthHistory = resolve(historyRoot, 'fourth/migrations');
 const eighthHistory = resolve(historyRoot, 'eighth/migrations');
+const ninthHistory = resolve(historyRoot, 'ninth/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
   for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, shadow]) { await prepareDatabase(client, database, true); }
   console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${shadow}`);
-  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)]]) {
+  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -75,7 +78,8 @@ try {
   await eighthReader.connect();
   try {
     await proveRejectedUpgrade(eighthReader);
-    await proveEighthUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth));
+    await proveEighthUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, ninthHistory));
+    await proveCityUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth));
   } finally { await eighthReader.end(); }
   command(['migrate', 'deploy'], fresh);
   command(['migrate', 'deploy'], upgrade, 0, undefined, firstHistory);
@@ -289,6 +293,7 @@ try {
   const runtime = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, fresh);
   await runtime.connect();
   try {
+    await proveCityReadGrants(runtime);
     const role = await runtime.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolinherit FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator')");
     assert(role.rowCount === 2 && role.rows.every((row) => Object.values(row).every((value) => value === false)), 'Unsafe technical role flags');
     const memberships = await runtime.query("SELECT 1 FROM pg_auth_members WHERE member IN (SELECT oid FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator'))");
