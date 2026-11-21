@@ -4,6 +4,7 @@ import { cityChecks, proveCityUpgrade } from './test-city-migration.mjs';
 import { geoAccessChecks, proveGeoAccessUpgrade, proveGeoAccessGrants } from './test-geo-access-migration.mjs';
 import { settingsChecks, proveSettingsUpgrade, proveSettingsGrants, proveSettingsRuntimeDenials } from './test-settings-migration.mjs';
 import { fileReservationChecks, proveFileReservationsGrants, proveFileReservationsUpgrade, seedFileReservationFixtures } from './test-file-reservations-migration.mjs';
+import { fileUploadChecks, proveFileUploadGrants, proveFileUploadUpgrade } from './test-file-upload-migration.mjs';
 import { areaChecks, proveAreaUpgrade } from './test-area-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -37,10 +38,11 @@ const migrations = [
   'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac',
 ].map((name, index) => `20261120${String(index + 1).padStart(4, '0')}00_${name}`)
   .concat('20261121000100_city_foundation', '20261121000200_service_areas', '20261121000300_geography_access',
-    '20261121000400_settings_legal_references', '20261121000500_file_upload_reservations');
+    '20261121000400_settings_legal_references', '20261121000500_file_upload_reservations',
+    '20261122000100_file_upload_attempts');
 const expectedChecks = [
   ...cityChecks,
-  ...areaChecks, ...geoAccessChecks, ...settingsChecks, ...fileReservationChecks,
+  ...areaChecks, ...geoAccessChecks, ...settingsChecks, ...fileReservationChecks, ...fileUploadChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -82,12 +84,14 @@ const thirteenthHistory = resolve(historyRoot, 'thirteenth/migrations');
 // A database capped at exactly 014: the 014 proof must compare its own capped chain, and
 // the live Prisma schema is compared by the final fresh/upgrade proofs below.
 const fourteenthHistory = resolve(historyRoot, 'fourteenth/migrations');
+const fifteenthHistory = resolve(historyRoot, 'fifteenth/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
   for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, upgradeTwelfth, shadow]) { await prepareDatabase(client, database, true); }
   console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${upgradeTwelfth}, ${shadow}`);
   for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)], [tenthHistory, migrations.slice(0,10)], [eleventhHistory, migrations.slice(0,11)],
-    [twelfthHistory, migrations.slice(0,12)], [thirteenthHistory, migrations.slice(0,13)], [fourteenthHistory, migrations.slice(0,14)]]) {
+    [twelfthHistory, migrations.slice(0,12)], [thirteenthHistory, migrations.slice(0,13)], [fourteenthHistory, migrations.slice(0,14)],
+    [fifteenthHistory, migrations.slice(0,15)]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -109,8 +113,7 @@ try {
     // is anchored at exactly 012 and can never silently absorb a later migration.
     // 013 is proven on a database capped at exactly 013: its drift check must compare the
     // capped 013 migration directory, never the live repo migrations/schema, because a
-    // later migration 014 would otherwise look like 013 drift. The live Prisma schema and
-    // the full migration chain are proven by the 014 proof below.
+    // later migration would otherwise look like 013 drift.
     await proveSettingsUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, thirteenthHistory),
       (expected) => {
         command(['migrate', 'diff', '--from-migrations', thirteenthHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow);
@@ -121,6 +124,9 @@ try {
       (expected) => {
         command(['migrate', 'diff', '--from-migrations', fourteenthHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow);
       });
+    await proveFileUploadUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, fifteenthHistory),
+      (expected) => command(['migrate', 'diff', '--from-migrations', fifteenthHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow),
+      () => command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth));
   } finally { await eighthReader.end(); }
   // The 012 ACL proof runs on a database capped at exactly 012, not on the final fresh
   // database: 013 deliberately widens the business_settings_versions read/write surface.
@@ -350,6 +356,7 @@ try {
     // 014's exact ACL on the same final fresh database, plus the proof that 013's ACL
     // (including consent_records) is unchanged by the additive consent-basis index.
     await proveFileReservationsGrants(runtime, reservationFixtures);
+    await proveFileUploadGrants(runtime, reservationFixtures);
     const role = await runtime.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolinherit FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator')");
     assert(role.rowCount === 2 && role.rows.every((row) => Object.values(row).every((value) => value === false)), 'Unsafe technical role flags');
     const memberships = await runtime.query("SELECT 1 FROM pg_auth_members WHERE member IN (SELECT oid FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator'))");

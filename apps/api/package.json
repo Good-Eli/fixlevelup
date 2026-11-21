@@ -12,6 +12,7 @@
     "staff:recover": "node dist/bootstrap/staff-recover.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1172.0",
     "@nestjs/common": "12.5.1",
     "@nestjs/core": "12.5.1",
     "@nestjs/platform-express": "12.5.1",

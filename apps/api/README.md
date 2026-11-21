@@ -189,9 +189,17 @@ anchor доверенной серверной сессии. Порты покр
 
 Срез **принят владельцем 21.11.2026** в synthetic внутреннем scope: только резервирование `RESERVED→CANCELLED`, без передачи байтов. `src/files/reservations/` предоставляет только внутренние `reserveFileUpload`, `readFileUploadIntent`, `cancelFileUploadIntent`, `beginFileReservationTransaction`. Caller открывает READ COMMITTED до data access. Mandatory reviewed policy без defaults, raw F token, exact current GIVEN, DB clock после session→document→intent locks, pending quota и owner/key idempotency; cancel one-way CAS без нового согласия. Успех резервирует capacity, а не загружает файл. Нет S3 IO/SDK/HTTP/scanner/EXIF/READY/access/stream/delete и новых зависимостей. Staff-owner вариант явно отказывает до DB access.
 
-Финальные проверки среза A: 679/679 Vitest в 50 файлах (40 unit + 17 PostgreSQL), 14 миграций/138 CHECK, SQL014 SHA-256 `2ec24c33…bb4377`, typecheck/source-lint/build PASS; повторный read-only вердикт Astra — PASS. Принятый срез коммитится отдельным локальным коммитом (создаёт root), SHA не заявлен.
+Финальные проверки среза A: 679/679 Vitest в 50 файлах (40 unit + 17 PostgreSQL), 14 миграций/138 CHECK, SQL014 SHA-256 `2ec24c33…bb4377`, typecheck/source-lint/build PASS; повторный read-only вердикт Astra — PASS. Принятый срез A зафиксирован отдельным локальным коммитом `7d92122`, без B.
 
-[План P03-04](../../docs/P03-04-PLAN.md) проверен Astra до реализации; это только первый срез A, весь P03-04 не завершён и принятый прогресс остаётся 60%. Реализация P03-04B остановлена и запрещена до нового решения: её артефакты не входят в A-коммит, а старт возможен только через отдельное предложение с проверкой Astra. Q02/Q12/Q13/Q16 открыты, реальные ПД не разрешены, dev DB не мигрируется.
+[План P03-04](../../docs/P03-04-PLAN.md) проверен Astra до реализации; A зафиксирован отдельно в `7d92122`, весь P03-04 не завершён, прогресс остаётся 60%. После отдельного разрешения B1+B2 реализован внутренний путь резервирования в приватный карантин; обязательный Astra PASS по B1 получен до B2, отдельный финальный Astra PASS по B2 — после исправлений.
+
+## P03-04B1+B2: private quarantine, принят владельцем
+
+[Контракт B2](../../docs/P03-04B2-CONTRACT.md): `src/files/upload-coordinator/index.ts` предоставляет `uploadReservedFile(pool, storage, operationalPolicy, command)` с обязательными trusted synthetic bounds, raw F proof и cooperative body factory. Registration COMMIT предшествует factory/первому next, dispatch COMMIT — единственному PUT; locks не держатся на IO. Storage проверяет полный GET HTTP200 без Content-Range и actual bytes/SHA-256. После IO повторно проверяются exact original GIVEN, owner, policy, сроки и поколение/lease; единственный binding означает только QUARANTINED. Replay после ожидания binding читает свежий DB clock.
+
+Operator-only direct `src/files/upload-coordinator/reconcile.ts` делает bounded GET exact registered key/target, фиксирует fenced observations и держит физическую charge UNKNOWN/поздних PUT. 404 не доказывает отсутствие, recovery не пишет старый key, не публикует и не удаляет. Opaque probe issuer не экспортируется из feature barrels. Additive015: attempts и immutable quarantine objects, точные FK/column ACL; migration014 и A не меняются.
+
+Итог: 767/767 тестов, 56 файлов, real PG+S3 включены без skipped; B1 52/B2 36 адресных. Migration proof15/149CHECK, workspace tsc/source-lint/build, dependency525/audit0 и secret/diff PASS. Astra B2 PASS закрывает 3 MUST FIX: full GET, replay clock после SELECT, rollback/audit-outbox fault matrix. Владелец принял B1+B2 22.11.2026, разрешил отдельный коммит и push, поручил завершить остальные части P03-04. HTTP/DI, READY, scanner/EXIF, выдача/DELETE/restore и реальные ПД отсутствуют, production disabled; Q02/Q12/Q13/Q16 открыты. Рабочая dev DB не мигрировалась.
 
 ## Поведение
 

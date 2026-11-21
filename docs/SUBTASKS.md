@@ -25,8 +25,12 @@
 Принят только P03-04A — первый no-byte срез резервирования файлов (RESERVED→CANCELLED);
 план проверен Astra, повторный вердикт Astra — PASS. Весь P03-04 не завершён
 (принят внутренний срез A, а не 4 из 5 подэтапов), прогресс остаётся 60%;
-Реализация P03-04B остановлена и запрещена до нового решения; её артефакты вне
-A-коммита, а старт возможен только через отдельное предложение.
+A зафиксирован локально в `7d92122` (27 файлов, без push). После отдельного предложения
+владелец разрешил B1+B2: промежуточный ASTRA PASS B1 выполнен до начала B2,
+после реализации и доработки B2 получен отдельный ASTRA PASS. Итог 767/767 в 56 файлах,
+15 миграций/149 CHECK; владелец принял B1+B2 22.11.2026 и поручил продолжить P03-04,
+создать коммит и отправить в GitHub. Приёмка B фиксируется отдельным коммитом.
+Общий P03-04 по-прежнему не завершён и не принят.
 
 ### Прогресс по этапам
 
@@ -34,7 +38,7 @@ A-коммита, а старт возможен только через отд�
 P00 ██████████ 100%   архитектура и решения
 P01 ██████████ 100%   foundation (F06 → PARTIAL до production)
 P02 ██████████ 100%   сотрудники, Auth, capabilities (6 из 6)
-P03 ██████░░░░  60%   настройки, география, файлы (3 из 5 приняты; принят только P03-04A, весь P03-04 не завершён)
+P03 ██████░░░░  60%   настройки, география, файлы (3 из 5 приняты; приняты A и B1+B2, весь P03-04 не завершён)
 P04 ░░░░░░░░░░   0%   каталог, цены, CRM
 P05 ░░░░░░░░░░   0%   клиенты и заявки
 P06 ░░░░░░░░░░   0%   расписание и смены
@@ -399,6 +403,14 @@ Astra проверила фактическую реализацию по отд
 По прямому поручению владельца после приёмки P03-03 начат P03-04; перед реализацией план проверил `GPT-6.2 Astra`, reasoning high. [План и замечания Astra](P03-04-PLAN.md) фиксируют безопасный порядок: **A — intent/reservation без байтов**, B — private upload/quarantine, C — обработка/stream, D — delete/restore, затем общая приёмка. Срез A не закрывает P03-04 и не повышает принятый прогресс выше 60%.
 
 В A нет policy по умолчанию, byte IO/S3/SDK/scanner/EXIF/READY/download/delete, новых зависимостей или HTTP. Реализованы существующий F-owner, живое exact consent basis, policy snapshot, idempotency и конкурентные квоты. Адресные тесты — 40/40 unit + 17/17 PostgreSQL (предыдущий срез 34/34 + 14/14 сохранён как исторический); полный PostgreSQL Vitest — **679/679 в 50 файлах** (предыдущий 670/670 — исторический). Workspace typecheck и production builds API/Web/Mini App — PASS. Полный migration proof — **14 миграций, 138 CHECK**, fresh/013→014/replay/drift, exact ACL и отрицательные guards — PASS. [Контракт первого среза](P03-04-CONTRACT.md) отделяет эту готовность от отсутствующих upload/processing/access/delete/restore. Финальные source-lint, secret scan рабочих файлов/истории (0 неожиданных находок) и diff/whitespace — PASS. SQL014 SHA-256 `2ec24c3365b4681859cd11d4fc7dd031fc487d410ff695692f4a2ec650bb4377`. Принятый срез A коммитится отдельным локальным коммитом (создаёт root), SHA не заявлен; весь P03-04 по-прежнему не завершён. Staff/reference parents не выдумываются; будущие request/file связи появятся вместе с реальными parent tables. Q02/Q12/Q13/Q16 и зависимости/движки/численные production политики не согласуются автоматически. Весь подэтап не принят; рабочая dev БД не мигрируется.
+
+### P03-04B1+B2 — принято владельцем, ASTRA PASS
+
+После [отдельного предложения ASTRA](P03-04B-PROPOSAL.md) владелец явно разрешил B1+B2 с дополнительным gate: **B2 не начинается до ASTRA PASS по B1**, после B2 требуется отдельное ASTRA review. B1 — только private S3 adapter и synthetic transport/Garage проверки; единственная прямая runtime-зависимость — `@aws-sdk/client-s3@3.1172.0` (ignore-scripts/frozen/dependency audit). В границах B1 не было подключённого business upload, HTTP или schema B2. После ASTRA PASS реализован внутренний B2 durable attempt registry/register-before-byte/post-IO authorization и QUARANTINED finalize; HTTP/READY/scanner/EXIF/выдача и реальные ПД по-прежнему отсутствуют; Q02/Q12/Q13/Q16 не закрываются. A уже принят и закоммичен отдельно `7d92122`.
+
+Первое промежуточное B1 review Astra нашло 4 MUST FIX: target binding, cap service response до SDK serde, public validator с credentials и caller exceptions. Они адресно исправлены, регрессии B1 — 50/50 (unit26+transport17+realGarage7), повторный полный gate с PG+S3 — **729/729 в 53 файлах**, workspace tsc/lint/build PASS, schema/A hashes без изменений, secrets/diff PASS. [Контракт B1](P03-04B-STORAGE.md) отделяет предыдущий 722/722 gate от исправленного. Повторный Astra verdict закрыл первые три MUST FIX, но оставил один путь MUST4: чтение `iterator.return` getter до защищённого try в optional cleanup. Исправление минимальное (получение метода один раз и вызов с исходным receiver внутри try); добавляются EOF+abort регрессии. 729/729 — evidence предыдущего среза; остаточная cleanup правка прошла B1 52/52 и полный PostgreSQL+S3 gate **731/731 в 53 файлах**, без skipped/ENOSPC, все tsc/lint/build/security/diff PASS. После адресного повторного read-only ревью получен **ASTRA PASS для B1**. По ранее данному владельцем разрешению теперь начинается B2 с отдельным финальным ASTRA review; коммит B1 без приёмки владельца не создаётся.
+
+B2 реализован по [контракту](P03-04B2-CONTRACT.md) отдельными GPT-6.2 Sol исполнителями: additive015 (`file_upload_attempts`, `file_quarantine_objects`), видимый `upload-coordinator/`, internal GET-only probes. Передача source начинается после registration COMMIT, PUT — после dispatch COMMIT; post-IO reauthorization exact original GIVEN и fencing перед единственным QUARANTINED binding. Независимые адресные тесты — **28/28** (20 PG/controlled transport, 7 unit/probes, 1 real PG+Garage); migration proof — **15 миграций/149 CHECK**, populated014→015/fresh/replay/drift/ACL PASS; dependency525/audit0, secrets/diff PASS. Интеграционное Sol review закрыло suppressed abort, next-getter cleanup и post-audit clock/fence gaps с регрессиями. Полный frozen gate завершён: **759/759 тестов в 56 файлах**, оба PG/S3 opt-in включены, no skipped; generate/workspace tsc/source-lint/all builds exit0, non-doc294file hashes identical. Первый обязательный ASTRA B2 verdict — **не готов к приёмке**: main GET проверял hash/bytes без отказа partial/range response, replay clock проверялся до потенциально ожидающего binding read, отсутствовали обязательные rollback/outbox-failure регрессии dispatch/finalize. Адресная доработка source+tests выполнена без изменений schema/dependencies/policy. Финальный B2-набор **36/36** (28 PG/wire +7 unit/probes +1 real PG/Garage); полный frozen gate **767/767 в56файлах**, оба opt-in без skipped, все tsc/lint/build/security/diff PASS, non-doc294file hashes identical. Повторный read-only вердикт **ASTRA PASS для B2**, все три MUST FIX закрыты. Владелец принял B1+B2 22.11.2026 в согласованном synthetic scope и разрешил отдельный коммит/push; поручил продолжить C/D/E, без объявления их уже реализованными. 759/759 остаётся историческим evidence до этих исправлений. HTTP/READY/scanner/выдача/real PII не добавлялись.
 
 ### Состав подэтапов и как проверяем
 

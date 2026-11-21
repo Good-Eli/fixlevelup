@@ -804,10 +804,70 @@ model FileUploadIntent {
   // The explicit map keeps the reviewed 014 constraint name instead of Prisma's
   // truncated default, so `migrate diff` converges on the real catalog.
   consentRecord            ConsentRecord?  @relation("FileUploadIntentConsent", fields: [consentRecordId, ownerRequestSessionId, consentDocumentVersionId, consentPurpose], references: [id, sessionId, documentVersionId, purpose], onDelete: Restrict, onUpdate: Restrict, map: "file_upload_intents_consent_basis_fkey")
+  uploadAttempts           FileUploadAttempt[]
 
   // The two owner+idempotency unique indexes and the pending-quota index are PARTIAL
   // indexes (WHERE owner_... IS NOT NULL), which Prisma cannot express; they exist only
   // in migration SQL, exactly like the other partial unique indexes in this schema.
+  @@unique([id, ownerRequestSessionId, declaredBytes], map: "file_upload_intents_attempt_basis_key")
   @@map("file_upload_intents")
+  @@schema("foundation")
+}
+
+// A privately registered transfer attempt. Migration 015 owns the partial indexes,
+// phase/probe CHECKs and transition guards, DB stamps, and runtime column ACLs.
+model FileUploadAttempt {
+  id                    String    @id @db.Uuid
+  intentId              String    @map("intent_id") @db.Uuid
+  ownerRequestSessionId String    @map("owner_request_session_id") @db.Uuid
+  idempotencyKey        String    @map("idempotency_key") @db.Uuid
+  generation            Int
+  uploadLeaseId         String    @map("upload_lease_id") @db.Uuid
+  uploadLeaseExpiresAt  DateTime  @map("upload_lease_expires_at") @db.Timestamptz(6)
+  objectKey             String    @unique(map: "file_upload_attempts_object_key_key") @map("object_key") @db.VarChar(84)
+  storageEndpoint       String    @map("storage_endpoint") @db.VarChar(32)
+  storageBucket         String    @map("storage_bucket") @db.VarChar(63)
+  storageRegion         String    @map("storage_region") @db.VarChar(63)
+  chargedBytes          BigInt    @map("charged_bytes")
+  state                 String    @default("REGISTERED") @db.VarChar(16)
+  createdAt             DateTime  @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  dispatchedAt          DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  verifiedBytes         BigInt?   @map("verified_bytes")
+  verifiedSha256        String?   @map("verified_sha256") @db.VarChar(64)
+  probeGeneration       Int       @default(0) @map("probe_generation")
+  probeHeldSlots        Int       @default(0) @map("probe_held_slots")
+  probeLeaseId          String?   @map("probe_lease_id") @db.Uuid
+  probeLeaseExpiresAt   DateTime? @map("probe_lease_expires_at") @db.Timestamptz(6)
+  observedAt            DateTime? @map("observed_at") @db.Timestamptz(6)
+  observation           String?   @db.VarChar(24)
+  observedBytes         BigInt?   @map("observed_bytes")
+  observedSha256        String?   @map("observed_sha256") @db.VarChar(64)
+
+  intent FileUploadIntent @relation(fields: [intentId, ownerRequestSessionId, chargedBytes], references: [id, ownerRequestSessionId, declaredBytes], onDelete: Restrict, onUpdate: Restrict, map: "file_upload_attempts_intent_basis_fkey")
+  // PostgreSQL's unique attempt_id permits at most one binding, but Prisma cannot
+  // infer singleton cardinality from just one column of the composite FK.
+  quarantineObjects FileQuarantineObject[]
+
+  @@unique([ownerRequestSessionId, idempotencyKey], map: "file_upload_attempts_owner_idempotency_key")
+  @@unique([intentId, generation], map: "file_upload_attempts_intent_generation_key")
+  @@unique([intentId, id, verifiedBytes, verifiedSha256], map: "file_upload_attempts_verified_tuple_key")
+  @@index([ownerRequestSessionId, state], map: "file_upload_attempts_owner_budget_idx")
+  @@map("file_upload_attempts")
+  @@schema("foundation")
+}
+
+// Existence is QUARANTINED only. The FK requires the verified tuple for the same
+// intent and attempt; target/key are not duplicated and nothing here serves bytes.
+model FileQuarantineObject {
+  id          String   @id @db.Uuid
+  intentId    String   @unique(map: "file_quarantine_objects_intent_id_key") @map("intent_id") @db.Uuid
+  attemptId   String   @unique(map: "file_quarantine_objects_attempt_id_key") @map("attempt_id") @db.Uuid
+  actualBytes BigInt   @map("actual_bytes")
+  sha256      String   @db.VarChar(64)
+  createdAt   DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+
+  attempt FileUploadAttempt @relation(fields: [intentId, attemptId, actualBytes, sha256], references: [intentId, id, verifiedBytes, verifiedSha256], onDelete: Restrict, onUpdate: Restrict, map: "file_quarantine_objects_verified_attempt_fkey")
+
+  @@map("file_quarantine_objects")
   @@schema("foundation")
 }
