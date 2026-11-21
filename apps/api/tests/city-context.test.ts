@@ -164,11 +164,11 @@ integration('single city context against isolated PostgreSQL', () => {
     await expect(read()).resolves.toEqual({ cityId: west.id, cityVersionId: tokyoVersion, timezone: 'Asia/Tokyo' });
   }, 30000);
 
-  it('needs only the narrow read grants and cannot write city configuration', async () => {
-    // These privilege checks work even if this test runs alone on an empty city schema.
-    await expect(runtime.query("INSERT INTO foundation.service_cities (id, code) VALUES (gen_random_uuid(), 'runtime-write')"))
+  it('cannot rewrite reviewed city versions, even with the catalog commands enabled', async () => {
+    // The exact read-only grants of 010 are independently proved before the 012 activation step.
+    await expect(runtime.query("UPDATE foundation.service_city_versions SET timezone='UTC'"))
       .rejects.toMatchObject({ code: '42501' });
-    await expect(runtime.query("UPDATE foundation.service_cities SET lifecycle = 'INACTIVE'"))
+    await expect(runtime.query('DELETE FROM foundation.business_settings_versions'))
       .rejects.toMatchObject({ code: '42501' });
   }, 30000);
 });

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, errorMessage, ApiError, type Access, type Role } from '../app/crm/access/api';
-import { canEditGrant, canTarget, load } from '../app/crm/access/workspace';
+import { allowedScopes, canEditGrant, canTarget, load } from '../app/crm/access/workspace';
 
 const actor = '22222222-2222-4222-8222-222222222222';
 const target = '33333333-3333-4333-8333-333333333333';
@@ -45,6 +45,14 @@ describe('effective grants govern reads and actions independently', () => {
   it('rejects response for another actor without querying protected lists', async () => {
     const fn = stub(); fn.mockResolvedValueOnce(res({...principal,staffId:target,permissions:['roles.read','staff.read']}));
     await expect(load(client(token),actor)).rejects.toThrow('Session changed'); expect(fn).toHaveBeenCalledTimes(1);
+  });
+  it('offers only the geography scopes that the target role can actually hold', () => {
+    const publish = {code:'geography.publish',module:'geography',description:'publish',protected:false,scope:'CITY' as const,scopes:['CITY','GLOBAL'] as ('CITY'|'GLOBAL')[]};
+    const manager = {...role,code:'MANAGER',type:'SYSTEM' as const};
+    expect(allowedScopes(manager,publish)).toEqual([]);
+    expect(allowedScopes(manager,{...publish,code:'geography.manage'})).toEqual(['CITY']);
+    expect(allowedScopes({...manager,code:'TECHNICIAN'},{...publish,code:'geography.read'})).toEqual([]);
+    expect(allowedScopes({...manager,code:'ADMIN'},publish)).toEqual(['CITY','GLOBAL']);
   });
   it('keeps self grants separate, stops custom roles masquerading as ADMIN and locks protected/self escalation', () => {
     const manager: Access = {...principal, role:{id:actor,code:'MANAGER',type:'SYSTEM'}, permissions:['staff.update']};

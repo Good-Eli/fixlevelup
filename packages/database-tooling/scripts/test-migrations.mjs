@@ -1,6 +1,8 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { proveRbacCutover, proveRbacInvariants, proveEighthUpgrade, proveRejectedUpgrade, syntheticVerifier } from './test-rbac-migration.mjs';
-import { cityChecks, proveCityUpgrade, proveCityReadGrants } from './test-city-migration.mjs';
+import { cityChecks, proveCityUpgrade } from './test-city-migration.mjs';
+import { geoAccessChecks, proveGeoAccessUpgrade, proveGeoAccessGrants } from './test-geo-access-migration.mjs';
+import { areaChecks, proveAreaUpgrade } from './test-area-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { admin, credentials, connection, prepareDatabase, runPrisma, root } from './migration-local.mjs';
@@ -31,9 +33,11 @@ async function uniqueViolation(client, sql, values = []) {
 const migrations = [
   'technical_audit_outbox', 'technical_outbox_attempts', 'technical_outbox_leases', 'staff_identity',
   'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac',
-].map((name, index) => `20261120${String(index + 1).padStart(4, '0')}00_${name}`).concat('20261121000100_city_foundation');
+].map((name, index) => `20261120${String(index + 1).padStart(4, '0')}00_${name}`)
+  .concat('20261121000100_city_foundation', '20261121000200_service_areas', '20261121000300_geography_access');
 const expectedChecks = [
   ...cityChecks,
+  ...areaChecks, ...geoAccessChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -64,11 +68,13 @@ const thirdHistory = resolve(historyRoot, 'third/migrations');
 const fourthHistory = resolve(historyRoot, 'fourth/migrations');
 const eighthHistory = resolve(historyRoot, 'eighth/migrations');
 const ninthHistory = resolve(historyRoot, 'ninth/migrations');
+const tenthHistory = resolve(historyRoot, 'tenth/migrations');
+const eleventhHistory = resolve(historyRoot, 'eleventh/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
   for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, shadow]) { await prepareDatabase(client, database, true); }
   console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${shadow}`);
-  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)]]) {
+  for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)], [tenthHistory, migrations.slice(0,10)], [eleventhHistory, migrations.slice(0,11)]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -79,7 +85,13 @@ try {
   try {
     await proveRejectedUpgrade(eighthReader);
     await proveEighthUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, ninthHistory));
-    await proveCityUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth));
+    // The city proof must run on exactly 010 (including its replay) before 011 exists,
+    // so its same-city FK, immutable history and replay evidence stay untouched by P03-02.
+    await proveCityUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, tenthHistory));
+    // 011 likewise deploys and replays through its own capped history, so a later
+    // migration 012 cannot silently enter the P03-02 proof.
+    await proveAreaUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth, 0, undefined, eleventhHistory));
+    await proveGeoAccessUpgrade(eighthReader, () => command(['migrate','deploy'], upgradeEighth));
   } finally { await eighthReader.end(); }
   command(['migrate', 'deploy'], fresh);
   command(['migrate', 'deploy'], upgrade, 0, undefined, firstHistory);
@@ -284,7 +296,7 @@ try {
     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh, 2);
     await migration.query('ALTER TABLE foundation.audit_logs DROP COLUMN p017a_drift_probe');
     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
-    await proveRbacCutover(migration);
+    await proveRbacCutover(migration, ['geography.read','geography.manage','geography.publish','staff.geography.read','staff.geography.manage']);
     await proveRbacInvariants(migration);
     await checkViolation(migration, "UPDATE foundation.permissions SET protected=false WHERE code='roles.create'");
     await checkViolation(migration, "UPDATE foundation.staff_web_credentials SET login='bad login'");
@@ -293,7 +305,7 @@ try {
   const runtime = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, fresh);
   await runtime.connect();
   try {
-    await proveCityReadGrants(runtime);
+    await proveGeoAccessGrants(runtime);
     const role = await runtime.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolinherit FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator')");
     assert(role.rowCount === 2 && role.rows.every((row) => Object.values(row).every((value) => value === false)), 'Unsafe technical role flags');
     const memberships = await runtime.query("SELECT 1 FROM pg_auth_members WHERE member IN (SELECT oid FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator'))");
@@ -347,7 +359,7 @@ try {
       ['web_auth_attempts', ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['id', 'key_hash', 'reserved_at', 'expires_at', 'failed_at', 'completed_at'], ['expires_at', 'failed_at', 'completed_at']],
       ['permissions', ['code','module','description','protected','active'], [], []],
       ['roles', ['id','code','name','description','role_type','status','version','created_by','updated_by','created_at','updated_at'], ['id','code','name','description','created_by','updated_by'], ['name','description','status','version','updated_by','updated_at']],
-      ['role_permissions', ['role_id','permission_code','scope_type','enabled'], ['role_id','permission_code','scope_type','enabled'], ['enabled']],
+      ['role_permissions', ['role_id','permission_code','scope_type','enabled'], ['role_id','permission_code','scope_type','enabled'], ['enabled','scope_type']],
       ['staff_role_assignments', ['id','staff_id','role_id','assigned_by','assigned_at','revoked_by','revoked_at'], ['id','staff_id','role_id','assigned_by'], ['revoked_at','revoked_by']],
     ];
     for (const [table, readable, insertable, writable] of webGrants) {
@@ -442,7 +454,7 @@ try {
       "UPDATE foundation.outbox_events SET event_id='00000000-0000-0000-0000-000000000000'", 'CREATE TABLE public.forbidden(id integer)',
       'SELECT * FROM foundation.user_permissions', 'UPDATE foundation.user_permissions SET revoked_at=now()',
       'UPDATE foundation.permissions SET protected=false', 'UPDATE foundation.roles SET role_type=role_type',
-      'UPDATE foundation.role_permissions SET scope_type=scope_type', 'UPDATE foundation.staff_role_assignments SET role_id=role_id',
+      'UPDATE foundation.role_permissions SET role_id=role_id', 'UPDATE foundation.staff_role_assignments SET role_id=role_id',
       ...['roles','permissions','role_permissions','staff_role_assignments'].flatMap((table) => [`DELETE FROM foundation.${table}`, `TRUNCATE foundation.${table}`]),
       // Lifecycle/profile grants remain column-only; identity id/login are never editable.
       'UPDATE foundation.staff_web_credentials SET login=\'forbidden\'', 'UPDATE foundation.staff SET id=id',

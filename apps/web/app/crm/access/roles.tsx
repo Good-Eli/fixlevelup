@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import type { Person, Role } from './api';
-import { canEditGrant, fields, has, protects, roleLabel, type Snapshot, type Write } from './workspace';
+import type { Grant, Person, Role } from './api';
+import { allowedScopes, canEditGrant, fields, has, protects, roleLabel, type Snapshot, type Write } from './workspace';
 
 type Props = { data: Snapshot; selected: Role | null; members: Person[] | null; open: (id: string) => void; openMembers: (id: string) => void; write: Write };
 function RoleFields({ role }: { role?: Role }) {
@@ -9,10 +9,10 @@ function RoleFields({ role }: { role?: Role }) {
 }
 function RoleCard({ data, role, members, openMembers, write }: Omit<Props,'selected'|'open'> & {role:Role}) {
   const a = data.access; const active = role.status === 'ACTIVE';
-  const [chosen, choose] = useState(() => new Set(role.permissions.map(p => p.code)));
-  const original = new Set(role.permissions.map(p => p.code));
-  const dirty = chosen.size !== original.size || [...chosen].some(k => !original.has(k));
-  const known = [...original].every(k => data.catalog.some(p => k === p.code));
+  const [chosen, choose] = useState(() => new Map<string, Grant['scope']>(role.permissions.map(p => [p.code, p.scope])));
+  const original = new Map(role.permissions.map(p => [p.code, p.scope]));
+  const dirty = chosen.size !== original.size || [...chosen].some(([k, v]) => original.get(k) !== v);
+  const known = [...original.keys()].every(k => data.catalog.some(p => k === p.code));
   const modules = [...new Set(data.catalog.map(p => p.module))];
   const impact = role.assignedCount === null ? 'Количество назначенных сотрудников скрыто правами доступа' : `Назначено сотрудников: ${String(role.assignedCount)}; активных: ${String(role.activeAssignedCount)} (в видимой области на момент загрузки)`;
   return <article className="panel"><h3>{role.name}</h3><p>{role.description || 'Без описания'}</p><dl>
@@ -22,15 +22,22 @@ function RoleCard({ data, role, members, openMembers, write }: Omit<Props,'selec
       e.preventDefault(); const name = fields(e.currentTarget,'name'); const description = fields(e.currentTarget,'description');
       write(c => c.editRole(role,name,description), 'Описание роли обновлено.');
     }}><RoleFields role={role}/><button>Сохранить сведения</button></form>}
-    <h4>Возможности по модулям</h4><p>SELF — только свой профиль; GLOBAL — без ограничения по городу. CITY недоступна.
-    Действия независимы: выбор не добавляет другие права. Новое право можно выдать только при наличии его у вас. Для операций с сотрудниками у неадминистраторов цель — только системная роль «Мастер».</p>
+    <h4>Возможности по модулям</h4><p>SELF — только свой профиль; CITY — только назначенные сотруднику города; GLOBAL — без географической границы. Географические права выдаются отдельно: у неадминистративной роли допустим только CITY, а публикация и GLOBAL — только у системной роли «Администратор». Действия независимы: выбор не добавляет другие права. Новое право можно выдать только при наличии его у вас. Для операций с сотрудниками у неадминистраторов цель — только системная роль «Мастер».</p>
     {role.id === a.role.id && role.type === 'SYSTEM' && <p className="notice">Снятое у собственной роли ADMIN обычное право нельзя восстановить самовыдачей через этот редактор.</p>}
-    {modules.map(module => <fieldset key={module}><legend>{module}</legend>{data.catalog.filter(p => p.module === module).map(p => <label className="permission" key={p.code}>
-      <input type="checkbox" checked={chosen.has(p.code)} disabled={!known || !canEditGrant(a,role,p.code,p.protected)} onChange={e => {
-        const selected = e.currentTarget.checked; choose(prev => { const next = new Set(prev); if (selected) { next.add(p.code); } else { next.delete(p.code); } return next; });
-      }}/><span>{p.description}<small>{p.code} · {p.scope}{p.protected ? ' · защищённая возможность' : ''}</small></span></label>)}</fieldset>)}
+    {modules.map(module => <fieldset key={module}><legend>{module}</legend>{data.catalog.filter(p => p.module === module).map(p => {
+      const scopes = allowedScopes(role, p);
+      const current = chosen.get(p.code);
+      return <label className="permission" key={p.code}>
+        <input type="checkbox" checked={current !== undefined} disabled={!known || !canEditGrant(a,role,p,p.protected)} onChange={e => {
+          const selected = e.currentTarget.checked; choose(prev => { const next = new Map(prev); if (selected) { next.set(p.code, scopes[0] ?? p.scope); } else { next.delete(p.code); } return next; });
+        }}/><span>{p.description}<small>{p.code} · {current ?? (scopes.length > 1 ? scopes.join('/') : p.scope)}{p.protected ? ' · защищённая возможность' : ''}</small></span>
+        {current !== undefined && scopes.length > 1 && <select value={current} disabled={!canEditGrant(a,role,p,p.protected)} onChange={e => {
+          const value = e.currentTarget.value as Grant['scope']; choose(prev => { const next = new Map(prev); next.set(p.code, value); return next; });
+        }}>{scopes.map(s => <option key={s} value={s}>{s}</option>)}</select>}
+      </label>;
+    })}</fieldset>)}
     {active && protects(a,'roles.permissions.manage') && <button disabled={!dirty || !known} onClick={() => {
-      const grants = data.catalog.filter(p => chosen.has(p.code)).map(p => ({ code:p.code, scope:p.scope }));
+      const grants = data.catalog.filter(p => chosen.has(p.code)).map(p => ({ code:p.code, scope: chosen.get(p.code) ?? p.scope }));
       if (window.confirm(`Изменить права роли «${role.name}»? ${impact}. Новые права применятся немедленно.`)) { write(c => c.permissions(role,grants), 'Возможности роли обновлены.'); }
     }}>Сохранить возможности</button>}
     {has(a,'staff.read') && <section><h4>Назначенные сотрудники</h4><button onClick={() => { openMembers(role.id); }}>Показать сотрудников роли</button>

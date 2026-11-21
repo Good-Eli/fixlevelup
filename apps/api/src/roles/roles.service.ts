@@ -4,11 +4,11 @@ import type { PoolClient } from 'pg';
 import { AUTHORIZATION_SERVICE } from '../authz/authorization.resources.js';
 import { isSystemAdmin } from '../authz/authorization.service.js';
 import type { AuthorizationServiceApi, SessionProof, StaffWriteContext } from '../authz/authorization.service.js';
-import { GLOBAL_SCOPE, isCapability, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES } from '../authz/capability.js';
-import type { Capability } from '../authz/capability.js';
+import { GLOBAL_SCOPE, isCapability, isPermissionCode, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES } from '../authz/capability.js';
+import type { Capability, GrantScope } from '../authz/capability.js';
 import { staffReadFilter } from '../staff/staff-policy.js';
 import type { StaffDto } from '../staff/staff.service.js';
-import { catalogEntry, checkReplacement } from './role-policy.js';
+import { catalogEntry, checkReplacement, grantableScopes } from './role-policy.js';
 import type { MetadataPatch, PermissionDto, RoleGrant } from './role-policy.js';
 
 interface RoleRecord {
@@ -51,8 +51,18 @@ async function projected(ctx: StaffWriteContext, id: string | null): Promise<Rol
   return result.rows.map(({ grants, ...role }) => {
     const permissions: RoleGrant[] = [];
     for (const g of grants) {
-      if (g.active && isCapability(g.code) && PERMISSION_CONTRACT[g.code] === g.scope && PROTECTED_CAPABILITIES.includes(g.code) === g.protected
-        && (!g.protected || isSystemAdmin(role))) { permissions.push({ code: g.code, scope: PERMISSION_CONTRACT[g.code] }); }
+      if (!g.active) { continue; }
+      if (isCapability(g.code)) {
+        if (PERMISSION_CONTRACT[g.code] === g.scope && PROTECTED_CAPABILITIES.includes(g.code) === g.protected
+          && (!g.protected || isSystemAdmin(role))) { permissions.push({ code: g.code, scope: PERMISSION_CONTRACT[g.code] }); }
+        continue;
+      }
+      // Geography rows are projected only at a scope the target role may legally hold:
+      // a non-administrator role never shows GLOBAL or publish, even from a drifted DB.
+      if (!isPermissionCode(g.code)) { continue; }
+      const scope = g.scope as GrantScope;
+      if (!grantableScopes(g.code, role).includes(scope)) { continue; }
+      permissions.push({ code: g.code, scope });
     }
     return { ...role, permissions };
   });
@@ -153,13 +163,14 @@ export class RolesService {
       const current: RoleGrant[] = [];
       for (const g of before.rows) {
         // Do not echo or silently re-enable unsupported/disabled grants from a drifted DB.
-        const p = available.find((item) => item.code === g.code && item.scope === g.scope);
-        if (!p || (p.protected && !isSystemAdmin(target))) { throw new ConflictException(); }
-        current.push({ code: p.code, scope: p.scope });
+        const p = available.find((item) => item.code === g.code && item.scopes.includes(g.scope as GrantScope));
+        if (!p || !grantableScopes(p.code, target).includes(g.scope as GrantScope)) { throw new ConflictException(); }
+        current.push({ code: p.code, scope: g.scope as GrantScope });
       }
       checkReplacement(ctx, target, available, current, desired);
-      const removed = current.filter((g) => !desired.some((n) => n.code === g.code));
-      const added = desired.filter((g) => !current.some((o) => o.code === g.code));
+      // Compare code+scope: a geography grant may change CITY<->GLOBAL, which is a real change.
+      const removed = current.filter((g) => !desired.some((n) => n.code === g.code && n.scope === g.scope));
+      const added = desired.filter((g) => !current.some((o) => o.code === g.code && o.scope === g.scope));
       // Matching sets receive the same version/audit treatment as changed sets.
       if (removed.length) {
         await ctx.client.query('UPDATE foundation.role_permissions SET enabled=false WHERE role_id=$1 AND enabled AND permission_code=ANY($2::text[])', [id, removed.map((g) => g.code)]);
@@ -167,12 +178,13 @@ export class RolesService {
       if (added.length) {
         await ctx.client.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type,enabled)
           SELECT $1,g.code,g.scope,true FROM unnest($2::text[],$3::text[]) AS g(code,scope)
-          ON CONFLICT(role_id,permission_code) DO UPDATE SET enabled=EXCLUDED.enabled`,
+          ON CONFLICT(role_id,permission_code) DO UPDATE SET enabled=EXCLUDED.enabled,scope_type=EXCLUDED.scope_type`,
         [id, added.map((g) => g.code), added.map((g) => g.scope)]);
       }
       await ctx.client.query('UPDATE foundation.roles SET version=version+1,updated_at=clock_timestamp(),updated_by=$2 WHERE id=$1', [id, ctx.staffId]);
       await audit(ctx, 'ROLE_PERMISSIONS_CHANGED', id, { version, removed }, { version: version + 1, added });
-      const permissions: readonly Capability[] = id === ctx.role.id ? desired.map((g) => g.code) : ctx.permissions;
+      // Geography grants are not staff capabilities: ctx.permissions stays the staff set.
+      const permissions: readonly Capability[] = id === ctx.role.id ? desired.map((g) => g.code).filter(isCapability) : ctx.permissions;
       return result({ ...ctx, permissions }, id, version + 1);
     });
   }

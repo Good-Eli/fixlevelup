@@ -1,1 +1,2 @@
 5ff927854947a07605677ffe74a0fc5bac607640:info/Полный diff P02-06.patch:generic-api-key:203
+3677960f4ba6cc355ea4338e18cad782932e60b3:apps/api/tests/auth-db-fixture.ts:generic-api-key:11

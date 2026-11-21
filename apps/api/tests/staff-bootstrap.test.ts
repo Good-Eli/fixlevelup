@@ -114,7 +114,7 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
       const failure = await bootstrapFirstAdmin(required(pools[0]), { login, password: syntheticPassword }).catch((error: unknown) => error);
       expect(failure).toMatchObject({ code: 'FAILED', message: 'Staff bootstrap failed' });
       expect(JSON.stringify(failure)).not.toContain(syntheticPassword);
-      for (const table of ['staff', 'staff_role_assignments', 'staff_web_credentials', 'staff_bootstrap_marker', 'audit_logs']) {
+      for (const table of ['staff', 'staff_role_assignments', 'staff_web_credentials', 'staff_bootstrap_marker', 'geography_bootstrap_permissions', 'audit_logs']) {
         const result = await required(fixtures[0]).query<{ count: number }>(`SELECT count(*)::int AS count FROM foundation.${table}`);
         expect(result.rows[0]?.count).toBe(0);
       }
@@ -144,7 +144,7 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
        WHERE a.staff_id=$1 AND a.revoked_at IS NULL AND r.role_type='SYSTEM' AND r.status='ACTIVE'`, [winner.value.staffId]);
     expect(assignments.rows).toHaveLength(1);
     expect(assignments.rows[0]?.code).toBe('ADMIN');
-    const audit = await required(fixtures[0]).query('SELECT operation, correlation_id, details FROM foundation.audit_logs');
+    const audit = await required(fixtures[0]).query("SELECT operation, correlation_id, details FROM foundation.audit_logs WHERE operation='STAFF_BOOTSTRAP'");
     expect(audit.rows).toEqual([{ operation: 'STAFF_BOOTSTRAP', correlation_id: winner.value.correlationId, details: { staffId: winner.value.staffId, roleId: required(assignments.rows[0]).role_id } }]);
     const spare = await spareAdmin(required(fixtures[0]), winner.value.staffId);
     await required(fixtures[0]).query("UPDATE foundation.staff SET employment_state = 'INACTIVE' WHERE id = $1", [winner.value.staffId]);
@@ -152,7 +152,9 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
       .rejects.toMatchObject({ code: 'ALREADY_INITIALIZED' });
     expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff')).rows[0]?.count).toBe(2);
     expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.staff_web_credentials')).rows[0]?.count).toBe(2);
-    expect((await required(fixtures[0]).query<{ count: number }>('SELECT count(*)::int AS count FROM foundation.audit_logs')).rows[0]?.count).toBe(1);
+    expect((await required(fixtures[0]).query<{ operation:string }>('SELECT operation FROM foundation.audit_logs ORDER BY operation')).rows.map(row => row.operation))
+      .toEqual(['GEOGRAPHY_BOOTSTRAP_PERMISSIONS','STAFF_BOOTSTRAP']);
+    expect((await required(fixtures[0]).query('SELECT assignment_id FROM foundation.geography_bootstrap_permissions WHERE revoked_at IS NULL')).rowCount).toBe(5);
     expect((await required(fixtures[0]).query('SELECT id, staff_id FROM foundation.staff_bootstrap_marker')).rows)
       .toEqual([{ id: 1, staff_id: winner.value.staffId }]);
     // The durable marker still blocks replacement after the former admin loses the role.

@@ -14,13 +14,14 @@ const ordinary = ['staff.read', 'staff.create', 'staff.update', 'staff.deactivat
 const protectedCodes = ['roles.create', 'roles.update', 'roles.archive', 'roles.permissions.manage', 'staff.role.assign'];
 
 // Deliberately separate from the seed SQL: a missing, extra or mis-scoped seed fails.
-export async function proveRbacCutover(client) {
+export async function proveRbacCutover(client, extraCatalogOnly = []) {
   const catalog = await client.query('SELECT code,protected,active FROM foundation.permissions ORDER BY code');
-  assert.deepEqual(catalog.rows.map((p) => p.code), [...self,...ordinary,...protectedCodes,'roles.read'].sort());
+  const original = [...self,...ordinary,...protectedCodes,'roles.read'];
+  assert.deepEqual(catalog.rows.map((p) => p.code), [...original,...extraCatalogOnly].sort());
   assert(catalog.rows.every((p) => p.active && p.protected === protectedCodes.includes(p.code)));
   const grants = await client.query(`SELECT r.code,rp.permission_code,rp.scope_type,rp.enabled FROM foundation.roles r
     JOIN foundation.role_permissions rp ON rp.role_id=r.id WHERE r.role_type='SYSTEM' ORDER BY rp.permission_code`);
-  for (const [role, codes] of [['TECHNICIAN',self], ['MANAGER',[...self,...ordinary]], ['ADMIN',catalog.rows.map((p) => p.code)]]) {
+  for (const [role, codes] of [['TECHNICIAN',self], ['MANAGER',[...self,...ordinary]], ['ADMIN',original]]) {
     const rows = grants.rows.filter((row) => row.code === role);
     assert.deepEqual(rows.map((row) => row.permission_code), [...codes].sort());
     assert(rows.every((row) => row.enabled && row.scope_type === (self.includes(row.permission_code) ? 'SELF' : 'GLOBAL')));

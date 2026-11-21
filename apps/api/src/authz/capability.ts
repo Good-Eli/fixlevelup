@@ -24,3 +24,41 @@ export function scopeMatches(capability: Capability, scope: Scope, staffId: stri
     && (scope.kind === 'GLOBAL' || (!!staffId && scope.ownerId === staffId));
 }
 export const CAPABILITY_METADATA = Symbol('fixlevelup:require-capability');
+
+/** Grant scopes a stored role permission may carry. CITY is only meaningful for the
+ * geography contract below; staff operations keep exactly one supported scope. */
+export type GrantScope = 'GLOBAL' | 'SELF' | 'CITY';
+
+/** Geography operation codes are a separate contract from the staff dictionary above:
+ * one code can be granted either for the caller's assigned cities (CITY) or without a
+ * geographic border (GLOBAL). The scope is not fixed per code because only a SYSTEM
+ * ADMIN may ever hold GLOBAL, while every other role may only hold CITY. The five codes
+ * are deliberately never `protected`: protection makes a grant mandatory on ADMIN and
+ * would silently give geography to every administrator instead of an explicit grant.
+ * `geography.publish` is additionally restricted to SYSTEM ADMIN by the authorization
+ * service and the role editor, whatever its stored scope. A catalog row or a string in
+ * a request never becomes authority: the enabled role grant, the live role type and the
+ * caller's current assignment are checked on every request.
+ */
+export const GEO_SCOPE_CONTRACT = {
+  'geography.read': ['CITY', 'GLOBAL'],
+  'geography.manage': ['CITY', 'GLOBAL'],
+  'geography.publish': ['CITY', 'GLOBAL'],
+  'staff.geography.read': ['CITY', 'GLOBAL'],
+  'staff.geography.manage': ['CITY', 'GLOBAL'],
+} as const satisfies Record<string, readonly GrantScope[]>;
+export type GeoCapability = keyof typeof GEO_SCOPE_CONTRACT;
+export const GEO_CAPABILITIES = Object.freeze(Object.keys(GEO_SCOPE_CONTRACT) as GeoCapability[]);
+/** One explicitly granted geography operation and the geographic border it carries. */
+export interface GeoGrant { readonly code: GeoCapability; readonly scope: 'GLOBAL' | 'CITY' }
+export type PermissionCode = Capability | GeoCapability;
+export const PERMISSION_CODES: readonly PermissionCode[] = Object.freeze([...STAFF_CAPABILITIES, ...GEO_CAPABILITIES]);
+export function isGeoCapability(value: unknown): value is GeoCapability {
+  return typeof value === 'string' && Object.hasOwn(GEO_SCOPE_CONTRACT, value);
+}
+export function isPermissionCode(value: unknown): value is PermissionCode {
+  return isCapability(value) || isGeoCapability(value);
+}
+export function isGrantScope(value: unknown): value is GrantScope {
+  return value === 'GLOBAL' || value === 'SELF' || value === 'CITY';
+}

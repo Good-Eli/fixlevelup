@@ -73,6 +73,9 @@ export async function bootstrapFirstAdmin(pool: Pick<Pool, 'connect'>, input: Bo
     if (assignment.rowCount !== 1 || !roleId) { throw new BootstrapError('FAILED'); }
     await client.query('INSERT INTO foundation.audit_logs (id, operation, correlation_id, details) VALUES ($1, $2, $3, $4::jsonb)',
       [randomUUID(), 'STAFF_BOOTSTRAP', correlationId, JSON.stringify({ staffId, roleId })]);
+    // Migration 012 and fresh provisioning use the same original-assignment/marker check.
+    // A missing migration or failed issue rolls back the entire bootstrap; no permissive fallback.
+    await client.query('SELECT foundation.issue_first_geo_permissions()');
     await client.query('COMMIT');
     transaction = false;
     return { staffId, correlationId };

@@ -214,7 +214,7 @@ export class RuntimeDatabase implements OnModuleDestroy {
         ('roles','id','INSERT'), ('roles','code','INSERT'), ('roles','name','INSERT'), ('roles','description','INSERT'), ('roles','created_by','INSERT'), ('roles','updated_by','INSERT'),
         ('roles','name','UPDATE'), ('roles','description','UPDATE'), ('roles','status','UPDATE'), ('roles','version','UPDATE'), ('roles','updated_at','UPDATE'), ('roles','updated_by','UPDATE'),
         ('role_permissions','role_id','INSERT'), ('role_permissions','permission_code','INSERT'), ('role_permissions','enabled','INSERT'), ('role_permissions','scope_type','INSERT'),
-        ('role_permissions','enabled','UPDATE'),
+        ('role_permissions','enabled','UPDATE'), ('role_permissions','scope_type','UPDATE'),
         ('staff_role_assignments','id','INSERT'), ('staff_role_assignments','staff_id','INSERT'), ('staff_role_assignments','role_id','INSERT'), ('staff_role_assignments','assigned_by','INSERT'),
         ('staff_role_assignments','revoked_at','UPDATE'), ('staff_role_assignments','revoked_by','UPDATE')
         UNION ALL SELECT table_name, column_name, 'SELECT' FROM expected_columns
@@ -275,6 +275,12 @@ export class RuntimeDatabase implements OnModuleDestroy {
           ('roles','rbac_role_write','rbac_lock_write'),('roles','rbac_guard_role','rbac_guard_role'),
           ('permissions','rbac_catalog_write','rbac_lock_write'),('permissions','rbac_guard_catalog','rbac_guard_catalog'),
           ('role_permissions','rbac_grant_write','rbac_lock_write'),('role_permissions','rbac_guard_grant','rbac_guard_grant'),
+          ('role_permissions','geography_guard_role_grant','geography_guard_role_grant'),
+          ('geography_bootstrap_permissions','geography_bootstrap_guard','geography_bootstrap_guard'),
+          ('staff_admin_city_assignments','geography_admin_assignment_guard','geography_admin_assignment_guard'),
+          ('staff_admin_city_assignments','geography_admin_assignment_write','rbac_lock_write'),
+          ('technician_city_memberships','geography_membership_write','rbac_lock_write'),
+          ('technician_service_areas','geography_zone_write','rbac_lock_write'),
           ('staff_role_assignments','rbac_assignment_write','rbac_lock_write'),('staff_role_assignments','rbac_guard_assignment','rbac_guard_assignment'),
           ('staff_role_assignments','rbac_assignment_current','rbac_check_staff'),('staff_web_credentials','rbac_credential_removal','rbac_lock_write'),
           ('staff_web_credentials','rbac_credential_current','rbac_check_staff')) required(tab,trig,fn)

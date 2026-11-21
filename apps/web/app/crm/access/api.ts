@@ -28,10 +28,14 @@ function id(value: unknown): string {
   const result = text(value); if (!new RegExp(`^${uuidPattern}$`).test(result)) { throw new Error('Invalid resource ID'); } return result;
 }
 function roleType(v: unknown) { return oneOf(v, 'SYSTEM', 'CUSTOM'); }
-function scope(v: unknown) { return oneOf(v, 'SELF', 'GLOBAL'); }
+function scope(v: unknown) { return oneOf(v, 'SELF', 'GLOBAL', 'CITY'); }
 function grant(value: unknown) { const r = object(value); return { code: text(r['code']), scope: scope(r['scope']) }; }
 function permission(value: unknown) {
-  const r = object(value); return { ...grant(r), description: text(r['description']), module: text(r['module']), protected: bool(r['protected']) };
+  const r = object(value);
+  // `scopes` is the authoritative list for a target role; legacy `scope` stays supported.
+  const scopes = r['scopes'] === undefined ? [scope(r['scope'])] : array(scope, r['scopes']);
+  if (!scopes.length) { throw new Error('Invalid scope list'); }
+  return { ...grant(r), description: text(r['description']), module: text(r['module']), protected: bool(r['protected']), scopes };
 }
 function role(value: unknown) {
   const r = object(value); return { id: id(r['id']), code: text(r['code']), name: text(r['name']), description: nullable(text, r['description']),
@@ -46,8 +50,14 @@ function identity(value: unknown) {
   const r = object(value); const csrf = text(r['csrfToken']);
   if (!/^[A-Za-z0-9_-]{43}$/.test(csrf)) { throw new Error('Invalid CSRF response'); } return { staffId: id(r['staffId']), csrf };
 }
-function access(value: unknown) {
-  const r = object(value); const role = object(r['role']); return { staffId: id(r['staffId']), role: { id: id(role['id']), code: text(role['code']), type: roleType(role['type']) }, permissions: array(text, r['permissions']) };
+export interface GeoGrantView { code: string; scope: 'GLOBAL' | 'CITY' }
+function access(value: unknown): { staffId: string; role: { id: string; code: string; type: 'SYSTEM' | 'CUSTOM' }; permissions: string[]; geoPermissions?: GeoGrantView[] } {
+  const r = object(value); const role = object(r['role']);
+  // Individual geography grants (code + GLOBAL/CITY) as resolved by the server session.
+  // Optional so an older/absent field can never be read as an implicit grant.
+  const geo = r['geoPermissions'] === undefined ? undefined
+    : array(v => { const g = object(v); return { code: text(g['code']), scope: oneOf(g['scope'], 'GLOBAL', 'CITY') }; }, r['geoPermissions']);
+  return { staffId: id(r['staffId']), role: { id: id(role['id']), code: text(role['code']), type: roleType(role['type']) }, permissions: array(text, r['permissions']), ...(geo === undefined ? {} : { geoPermissions: geo }) };
 }
 function list<T>(read: Decoder<T>) { return (v: unknown) => array(read, object(v)['items']); }
 function receipt(value: unknown) {

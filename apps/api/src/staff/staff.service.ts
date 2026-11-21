@@ -4,7 +4,7 @@ import type { PoolClient } from 'pg';
 import { AUTHORIZATION_SERVICE } from '../authz/authorization.resources.js';
 import { AuthorizationError, isSystemAdmin } from '../authz/authorization.service.js';
 import type { AuthorizationServiceApi, EffectiveRole, SessionProof, StaffWriteContext } from '../authz/authorization.service.js';
-import { GLOBAL_SCOPE, PROTECTED_CAPABILITIES } from '../authz/capability.js';
+import { GLOBAL_SCOPE, isCapability, isGeoCapability, PROTECTED_CAPABILITIES } from '../authz/capability.js';
 import { checkTarget, nextChannelMarker, staffReadFilter, staffTargetFilter } from './staff-policy.js';
 import type { ChannelMarker, StaffTarget } from './staff-policy.js';
 
@@ -49,13 +49,30 @@ function requireAssignmentAuthority(ctx: StaffWriteContext): void {
   if (!isSystemAdmin(ctx.role) || !ctx.permissions.includes('staff.role.assign')) { throw new ForbiddenException(); }
 }
 /** Even an administrator may only delegate general grants they presently hold. SELF
- * grants bind to the new subject's own resources and do not expand delegated authority. */
+ * grants bind to the new subject's own resources and do not expand delegated authority.
+ * A geography grant is delegable only when the actor holds that same code at GLOBAL, the
+ * scope is CITY or the target role is the SYSTEM ADMIN role itself, and publish is never
+ * delegated to a non-administrative role. */
 async function requireDelegable(ctx: StaffWriteContext, roleId: string): Promise<void> {
-  const stronger = await ctx.client.query(`SELECT 1 FROM foundation.role_permissions rp
-    JOIN foundation.permissions p ON p.code=rp.permission_code AND p.active
-    WHERE rp.role_id=$1 AND rp.enabled AND NOT (p.code IN ('staff.self.read','staff.self.update','staff.self.deactivate') AND rp.scope_type='SELF' AND NOT p.protected)
-      AND NOT (p.code=ANY($2::text[])) LIMIT 1`, [roleId, ctx.permissions]);
-  if (stronger.rowCount !== 0) { throw new ForbiddenException(); }
+  const rows = (await ctx.client.query<{ code: string; scope: string; role_type: string; role_code: string }>(
+    `SELECT p.code, rp.scope_type AS scope, r.role_type, r.code AS role_code
+     FROM foundation.role_permissions rp
+     JOIN foundation.permissions p ON p.code=rp.permission_code AND p.active
+     JOIN foundation.roles r ON r.id=rp.role_id
+     WHERE rp.role_id=$1 AND rp.enabled
+       AND NOT (p.code IN ('staff.self.read','staff.self.update','staff.self.deactivate')
+         AND rp.scope_type='SELF' AND NOT p.protected)`, [roleId])).rows;
+  const globalGeo = new Set((ctx.geoPermissions ?? []).filter((g) => g.scope === 'GLOBAL').map((g) => g.code));
+  for (const row of rows) {
+    if (isCapability(row.code)) {
+      if (!ctx.permissions.includes(row.code)) { throw new ForbiddenException(); }
+      continue;
+    }
+    if (!isGeoCapability(row.code) || !globalGeo.has(row.code)) { throw new ForbiddenException(); }
+    const targetAdmin = row.role_type === 'SYSTEM' && row.role_code === 'ADMIN';
+    if (row.scope !== 'CITY' && !targetAdmin) { throw new ForbiddenException(); }
+    if (row.code === 'geography.publish' && !targetAdmin) { throw new ForbiddenException(); }
+  }
 }
 async function otherUsableAdmin(client: PoolClient, target: StaffRow): Promise<void> {
   if (target.role_type !== 'SYSTEM' || target.role !== 'ADMIN') { return; }

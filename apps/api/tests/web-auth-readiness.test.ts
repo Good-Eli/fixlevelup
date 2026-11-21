@@ -67,6 +67,7 @@ integration('web auth readiness against isolated PostgreSQL', () => {
       ['GRANT MAINTAIN ON foundation.roles TO fixlevelup_runtime', 'REVOKE MAINTAIN ON foundation.roles FROM fixlevelup_runtime'],
       ['GRANT SELECT(code) ON foundation.permissions TO fixlevelup_runtime WITH GRANT OPTION', 'REVOKE GRANT OPTION FOR SELECT(code) ON foundation.permissions FROM fixlevelup_runtime'],
       ['ALTER TABLE foundation.staff DISABLE TRIGGER rbac_staff_current', 'ALTER TABLE foundation.staff ENABLE TRIGGER rbac_staff_current'],
+      ['ALTER TABLE foundation.role_permissions DISABLE TRIGGER geography_guard_role_grant', 'ALTER TABLE foundation.role_permissions ENABLE TRIGGER geography_guard_role_grant'],
       ['REVOKE EXECUTE ON FUNCTION foundation.cleanup_web_sessions() FROM fixlevelup_runtime', 'GRANT EXECUTE ON FUNCTION foundation.cleanup_web_sessions() TO fixlevelup_runtime'],
     ] as const) {
       await fixture.query(breakGrant);

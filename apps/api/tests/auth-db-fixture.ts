@@ -5,11 +5,16 @@ import type { Client } from 'pg';
 import { hashPassword } from '../src/staff/password.js';
 
 const migrationRoot = resolve(import.meta.dirname, '../../../prisma/migrations');
+// The numerical sequence restarts for each migration day. Keep the expected names independent of discovery.
+function migrationDay(day: string, steps: readonly string[]): string[] {
+  return steps.map((step, index) => `${day}${String(index + 1).padStart(4, '0')}00_${step}`);
+}
 const expectedSteps = [
-  '20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts',
-  '20261120000300_technical_outbox_leases', '20261120000400_staff_identity', '20261120000500_web_auth',
-  '20261120000600_authorization', '20261120000700_staff_telegram_auth', '20261120000800_staff_deactivation_grant',
-  '20261120000900_rbac', '20261121000100_city_foundation',
+  ...migrationDay('20261120', [
+    'technical_audit_outbox', 'technical_outbox_attempts', 'technical_outbox_leases',
+    'staff_identity', 'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac',
+  ]),
+  ...migrationDay('20261121', ['city_foundation', 'service_areas', 'geography_access']),
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })

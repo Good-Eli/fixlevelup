@@ -44,6 +44,18 @@ model Staff {
   linkedTelegramLinks  StaffTelegramLink[]     @relation("StaffTelegramLinkLinkedBy")
   reviewedCityVersions ServiceCityVersion[]    @relation("CityVersionReviewer")
   reviewedSettings     BusinessSettingsVersion[] @relation("BusinessSettingsReviewer")
+  createdAreaVersions   ServiceAreaVersion[]    @relation("ServiceAreaVersionCreator")
+  publishedAreaVersions ServiceAreaVersion[]    @relation("ServiceAreaVersionPublisher")
+  cityAssignments       StaffAdminCityAssignment[]  @relation("AdminCityAssignmentSubject")
+  grantedCityAssignments StaffAdminCityAssignment[] @relation("AdminCityAssignmentGrantor")
+  revokedCityAssignments StaffAdminCityAssignment[] @relation("AdminCityAssignmentRevoker")
+  cityMemberships        TechnicianCityMembership[] @relation("TechnicianCityMembershipSubject")
+  approvedCityMemberships TechnicianCityMembership[] @relation("TechnicianCityMembershipApprover")
+  revokedCityMemberships  TechnicianCityMembership[] @relation("TechnicianCityMembershipRevoker")
+  zoneAdmissions          TechnicianServiceArea[]   @relation("TechnicianZoneSubject")
+  approvedZoneAdmissions  TechnicianServiceArea[]   @relation("TechnicianZoneApprover")
+  revokedZoneAdmissions   TechnicianServiceArea[]   @relation("TechnicianZoneRevoker")
+  geographyReceipts       GeographyCommandReceipt[] @relation("GeographyReceiptActor")
 
   @@map("staff")
   @@schema("foundation")
@@ -75,6 +87,7 @@ model Permission {
   protected   Boolean          @default(false)
   active      Boolean          @default(true)
   grants      RolePermission[]
+  bootstrapGrants GeographyBootstrapPermission[]
 
   @@map("permissions")
   @@schema("foundation")
@@ -127,6 +140,7 @@ model StaffRoleAssignment {
   role       Role      @relation(fields: [roleId], references: [id], onUpdate: Restrict, onDelete: Restrict)
   assigner   Staff?    @relation("RoleAssignedBy", fields: [assignedBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
   revoker    Staff?    @relation("RoleRevokedBy", fields: [revokedBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
+  bootstrapGrants GeographyBootstrapPermission[]
 
   @@index([roleId, staffId], map: "staff_role_assignments_role_staff_idx")
   @@map("staff_role_assignments")
@@ -253,6 +267,10 @@ model ServiceCity {
   currentVersion   ServiceCityVersion?      @relation("ServiceCityCurrentVersion", fields: [id, currentVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
   versions         ServiceCityVersion[]     @relation("ServiceCityVersions")
   settingsVersions BusinessSettingsVersion[]
+  districts        AdministrativeDistrict[]
+  serviceAreas     ServiceArea[]
+  adminAssignments StaffAdminCityAssignment[]
+  cityMemberships  TechnicianCityMembership[]
 
   @@map("service_cities")
   @@schema("foundation")
@@ -302,5 +320,216 @@ model BusinessSettingsVersion {
 
   @@unique([version], map: "business_settings_versions_version_key")
   @@map("business_settings_versions")
+  @@schema("foundation")
+}
+
+// P03-02 geography: real administrative district of one city. Optional reference
+// data (a city may have none) that is archived, never deleted, because request
+// snapshots keep the district label they were reviewed with. row_version is owned
+// by the administrative_districts_guard_update trigger in migration SQL, and
+// id/city/code are stable there. No seed, no runtime privilege.
+model AdministrativeDistrict {
+  id        String    @id @db.Uuid
+  cityId    String    @map("city_id") @db.Uuid
+  code      String    @db.VarChar(32)
+  name      String
+  archivedAt DateTime? @map("archived_at") @db.Timestamptz(6)
+  rowVersion Int      @default(1) @map("row_version")
+  city      ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  coverage  ServiceAreaDistrictCoverage[]
+
+  @@unique([cityId, code], map: "administrative_districts_city_code_key")
+  @@unique([cityId, id], map: "administrative_districts_city_id_key")
+  @@map("administrative_districts")
+  @@schema("foundation")
+}
+
+// Stable service area identity inside one city: a company trip zone, not a
+// district and not a tenant. current_version_id may only name a published revision
+// of the same city and area; the composite (id, city_id, current_version_id) FK and
+// the published-pointer trigger live in migration SQL, which also owns row_version.
+model ServiceArea {
+  id               String    @id @db.Uuid
+  cityId           String    @map("city_id") @db.Uuid
+  code             String    @db.VarChar(32)
+  currentVersionId String?   @map("current_version_id") @db.Uuid
+  archivedAt       DateTime? @map("archived_at") @db.Timestamptz(6)
+  rowVersion       Int       @default(1) @map("row_version")
+  city             ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentVersion   ServiceAreaVersion? @relation("ServiceAreaCurrentVersion", fields: [id, cityId, currentVersionId], references: [areaId, cityId, id], onDelete: Restrict, onUpdate: Restrict)
+  versions         ServiceAreaVersion[] @relation("ServiceAreaVersions")
+  zoneAdmissions   TechnicianServiceArea[]
+
+  @@unique([cityId, code], map: "service_areas_city_code_key")
+  @@unique([cityId, id], map: "service_areas_city_id_key")
+  @@map("service_areas")
+  @@schema("foundation")
+}
+
+// Revision of one service area. Created as a draft (published_at/published_by
+// NULL); a draft is editable and its district coverage is editable, then one UPDATE
+// publishes it without changing the reviewed content. Published revisions and their
+// coverage are append-only (UPDATE/DELETE/TRUNCATE refused in migration SQL), so
+// changing the zone is a new revision and old history keeps explaining itself.
+model ServiceAreaVersion {
+  id                  String    @id @db.Uuid
+  cityId              String    @map("city_id") @db.Uuid
+  areaId              String    @map("area_id") @db.Uuid
+  version             Int
+  name                String
+  coverageDescription String?   @map("coverage_description")
+  addressCriteria     String?   @map("address_criteria")
+  createdBy           String    @map("created_by") @db.Uuid
+  publishedAt         DateTime? @map("published_at") @db.Timestamptz(6)
+  publishedBy         String?   @map("published_by") @db.Uuid
+  rowVersion          Int       @default(1) @map("row_version")
+  area                ServiceArea @relation("ServiceAreaVersions", fields: [cityId, areaId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
+  creator             Staff     @relation("ServiceAreaVersionCreator", fields: [createdBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  publisher           Staff?    @relation("ServiceAreaVersionPublisher", fields: [publishedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentFor          ServiceArea[] @relation("ServiceAreaCurrentVersion")
+  coverage            ServiceAreaDistrictCoverage[]
+
+  @@unique([cityId, areaId, version], map: "service_area_versions_city_area_version_key")
+  @@unique([cityId, id], map: "service_area_versions_city_id_key")
+  @@unique([areaId, cityId, id], map: "service_area_versions_area_city_id_key")
+  @@map("service_area_versions")
+  @@schema("foundation")
+}
+
+// Manual M:N coverage of one area revision by real districts of the same city. Both
+// composite FKs are city-scoped, so a foreign district or a foreign revision cannot
+// be mapped. FULL/PARTIAL is an advisory candidate only: neither value qualifies a
+// concrete address, and no address is stored or derived here. Editable only while
+// the parent revision is a draft; the child-change trigger locks the parent row and
+// bumps its draft row_version, which serializes coverage edits against publication.
+model ServiceAreaDistrictCoverage {
+  cityId        String  @map("city_id") @db.Uuid
+  areaVersionId String  @map("area_version_id") @db.Uuid
+  districtId    String  @map("district_id") @db.Uuid
+  relation      String  @db.VarChar(16)
+  description   String?
+  areaVersion   ServiceAreaVersion @relation(fields: [cityId, areaVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
+  district      AdministrativeDistrict @relation(fields: [cityId, districtId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([areaVersionId, districtId])
+  @@index([cityId, districtId], map: "service_area_district_coverage_district_idx")
+  @@map("service_area_district_coverage")
+  @@schema("foundation")
+}
+
+// P03-02 geography access (012). One row per permission code issued to one bootstrap
+// assignment. This is NOT a role grant: the authorization layer resolves it only for
+// the caller's current assignment, so a reassignment, a revocation or a replay cannot
+// resurrect it. The founder binding is re-proved by geography_bootstrap_guard on every
+// INSERT, INSERT is owner-only (runtime cannot insert), and revoked_at is the only
+// mutable column and only null -> value; DELETE is refused. SQL-only guards.
+model GeographyBootstrapPermission {
+  assignmentId   String    @map("assignment_id") @db.Uuid
+  permissionCode String    @map("permission_code") @db.VarChar(64)
+  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
+  assignment     StaffRoleAssignment @relation(fields: [assignmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  permission     Permission @relation(fields: [permissionCode], references: [code], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([assignmentId, permissionCode])
+  @@map("geography_bootstrap_permissions")
+  @@schema("foundation")
+}
+
+// Administrative city assignment: a territory boundary for an operation, never a role
+// grant and never technician work eligibility. One live row per staff+city pair (partial
+// unique index is SQL-only); history stays as revoked rows and DELETE is refused by
+// geography_admin_assignment_guard. granted_at is database-stamped; the guard requires
+// an active web staff member with a current role and an active actor other than the
+// subject. Revocation is the only UPDATE.
+model StaffAdminCityAssignment {
+  id        String    @id @db.Uuid
+  staffId   String    @map("staff_id") @db.Uuid
+  cityId    String    @map("city_id") @db.Uuid
+  grantedBy String    @map("granted_by") @db.Uuid
+  grantedAt DateTime  @default(dbgenerated("statement_timestamp()")) @map("granted_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+  revokedBy String?   @map("revoked_by") @db.Uuid
+  staff     Staff     @relation("AdminCityAssignmentSubject", fields: [staffId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  city      ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  grantor   Staff     @relation("AdminCityAssignmentGrantor", fields: [grantedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  revoker   Staff?    @relation("AdminCityAssignmentRevoker", fields: [revokedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@map("staff_admin_city_assignments")
+  @@schema("foundation")
+}
+
+// Dated technician work eligibility in one city. At most one live row per
+// technician+city pair (partial unique index is SQL-only and is also the overlap
+// guard). The period is immutable: a different period is a new row, revocation is an
+// UPDATE of revoked_at/revoked_by only. The composite (technician_id, city_id, id)
+// unique index is the same-city target for zone admissions.
+model TechnicianCityMembership {
+  id           String    @id @db.Uuid
+  technicianId String    @map("technician_id") @db.Uuid
+  cityId       String    @map("city_id") @db.Uuid
+  validFrom    DateTime  @map("valid_from") @db.Timestamptz(6)
+  validTo      DateTime? @map("valid_to") @db.Timestamptz(6)
+  approvedBy   String    @map("approved_by") @db.Uuid
+  revokedAt    DateTime? @map("revoked_at") @db.Timestamptz(6)
+  revokedBy    String?   @map("revoked_by") @db.Uuid
+  technician   Staff     @relation("TechnicianCityMembershipSubject", fields: [technicianId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  city         ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  approver     Staff     @relation("TechnicianCityMembershipApprover", fields: [approvedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  revoker      Staff?    @relation("TechnicianCityMembershipRevoker", fields: [revokedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  zoneAdmissions TechnicianServiceArea[]
+
+  @@unique([technicianId, cityId, id], map: "technician_city_memberships_identity_key")
+  @@index([technicianId, cityId], map: "technician_city_memberships_technician_city_idx")
+  @@map("technician_city_memberships")
+  @@schema("foundation")
+}
+
+// Dated technician eligibility for one area of the same city. Both parent links are
+// composite and city-scoped, so a foreign area or a foreign city admission cannot be
+// used. geography_zone_guard additionally requires the whole admission period to sit
+// inside its city membership period and refuses a revoked membership; the deferred
+// geography_membership_zone_consistency trigger refuses a committed state where an
+// active zone admission outlives its revoked city membership. Period is immutable,
+// revocation is the only UPDATE, DELETE is refused.
+model TechnicianServiceArea {
+  id            String    @id @db.Uuid
+  technicianId  String    @map("technician_id") @db.Uuid
+  cityId        String    @map("city_id") @db.Uuid
+  serviceAreaId String    @map("service_area_id") @db.Uuid
+  membershipId  String    @map("membership_id") @db.Uuid
+  validFrom     DateTime  @map("valid_from") @db.Timestamptz(6)
+  validTo       DateTime? @map("valid_to") @db.Timestamptz(6)
+  approvedBy    String    @map("approved_by") @db.Uuid
+  revokedAt     DateTime? @map("revoked_at") @db.Timestamptz(6)
+  revokedBy     String?   @map("revoked_by") @db.Uuid
+  technician    Staff     @relation("TechnicianZoneSubject", fields: [technicianId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  serviceArea   ServiceArea @relation(fields: [cityId, serviceAreaId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict, map: "technician_service_areas_city_id_service_area_id_fkey")
+  // PostgreSQL truncates identifiers to 63 bytes, so the 012 name
+  // technician_service_areas_technician_id_city_id_membership_id_fkey is stored as the
+  // 63-byte form below; Prisma must map that exact catalog name or drift never converges.
+  membership    TechnicianCityMembership @relation(fields: [technicianId, cityId, membershipId], references: [technicianId, cityId, id], onDelete: Restrict, onUpdate: Restrict, map: "technician_service_areas_technician_id_city_id_membership_id_fk")
+  approver      Staff     @relation("TechnicianZoneApprover", fields: [approvedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  revoker       Staff?    @relation("TechnicianZoneRevoker", fields: [revokedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([technicianId, serviceAreaId], map: "technician_service_areas_technician_area_idx")
+  @@map("technician_service_areas")
+  @@schema("foundation")
+}
+
+// Idempotency evidence for a geography command: actor, operation name, Idempotency-Key,
+// SHA-256 of the canonical request and the created entity id/version. Deliberately no
+// request body, no free text and no personal data. Append-only: UPDATE/DELETE/TRUNCATE
+// are refused by geography_receipts_immutable in migration SQL.
+model GeographyCommandReceipt {
+  actorId       String   @map("actor_id") @db.Uuid
+  operation     String   @db.VarChar(64)
+  key           String   @db.Uuid
+  bodyHash      String   @map("body_hash") @db.Char(64)
+  entityId      String   @map("entity_id") @db.Uuid
+  entityVersion Int      @map("entity_version")
+  actor         Staff    @relation("GeographyReceiptActor", fields: [actorId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([actorId, operation, key])
+  @@map("geography_command_receipts")
   @@schema("foundation")
 }

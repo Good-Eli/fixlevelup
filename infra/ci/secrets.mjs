@@ -7,10 +7,13 @@ import { pathToFileURL } from 'node:url';
 
 // Gitleaks' default rules are pinned by the checksummed 8.30.1 binary. Never use
 // a repository baseline, custom allowlist or ambient GITLEAKS_* override.
-// Exactly one owner-approved false positive is declared in .gitleaksignore: the
-// historical patch line is a migration-name list, not a credential. Approval is
-// bound to this immutable commit/path/line/rule and to the SHA-256 of the blob,
-// so any edited, relocated or duplicated content stays an unexpected finding.
+// Two owner-approved false positives are declared in .gitleaksignore: both lines
+// are migration-name lists, not credentials. Each approval is bound to one
+// immutable commit/path/line/rule and to the SHA-256 of that exact blob, so any
+// edited, relocated, duplicated or differently-committed content stays an
+// unexpected finding. The first applies to the tracked tree and history; the
+// second is history only, so a working-tree copy is never concealed even when
+// its bytes happen to have the approved hash.
 export const APPROVED_EXCEPTION = Object.freeze({
   fingerprint: '5ff927854947a07605677ffe74a0fc5bac607640:info/Полный diff P02-06.patch:generic-api-key:203',
   commit: '5ff927854947a07605677ffe74a0fc5bac607640',
@@ -18,7 +21,19 @@ export const APPROVED_EXCEPTION = Object.freeze({
   line: 203,
   rule: 'generic-api-key',
   blobSha256: '3b92bf6129eab412e5d786555986a8afe7e03954795a1c79422792d6f350ae26',
+  scopes: Object.freeze(['repository', 'history']),
 });
+export const HISTORY_EXCEPTION = Object.freeze({
+  fingerprint: '3677960f4ba6cc355ea4338e18cad782932e60b3:apps/api/tests/auth-db-fixture.ts:generic-api-key:11',
+  commit: '3677960f4ba6cc355ea4338e18cad782932e60b3',
+  path: 'apps/api/tests/auth-db-fixture.ts',
+  line: 11,
+  rule: 'generic-api-key',
+  blobSha256: 'e590d0786b6ad455cdc2a3475a05ecfe9361769ca24facd096b6774cb5d123fa',
+  scopes: Object.freeze(['history']),
+});
+export const APPROVED_EXCEPTIONS = Object.freeze([APPROVED_EXCEPTION, HISTORY_EXCEPTION]);
+const DECLARATION = APPROVED_EXCEPTIONS.map(exception => exception.fingerprint).join('\n');
 const RULE = /^[a-z0-9-]{1,100}$/;
 const IGNORE_NAME = '.gitleaksignore';
 // Repository-location variables could redirect Git away from the inspected tree.
@@ -45,26 +60,48 @@ function relativeTo(root, file) {
   const path = relative(resolve(root), resolve(file));
   return path && !path.startsWith('..') ? path.split(sep).join('/') : null;
 }
+function validException(exception) {
+  return exception !== null && typeof exception === 'object'
+    && typeof exception.fingerprint === 'string' && typeof exception.commit === 'string'
+    && typeof exception.path === 'string' && typeof exception.rule === 'string'
+    && Number.isInteger(exception.line) && typeof exception.blobSha256 === 'string'
+    && Array.isArray(exception.scopes) && exception.scopes.length > 0
+    && exception.scopes.every(scope => scope === 'repository' || scope === 'history')
+    && exception.fingerprint === `${exception.commit}:${exception.path}:${exception.rule}:${exception.line}`;
+}
 // A finding is approved only with actual content evidence (blob SHA-256 checked
 // by the caller), the exact scope-specific fingerprint and at most one approval
-// per scope; anything else stays an unexpected finding for the gate.
-export function classifyScan(findings, { scope, root = null, exception = APPROVED_EXCEPTION, contentMatches } = {}) {
+// per exception per scan; anything else stays an unexpected finding for the gate.
+// `contentMatches` is either one boolean for a single-scope check or a map from
+// exception fingerprint to the verified blob evidence for that exception.
+export function classifyScan(findings, { scope, root = null, exceptions = APPROVED_EXCEPTIONS, contentMatches } = {}) {
   if (!Array.isArray(findings)) { throw new Error('Invalid scanner report'); }
   if (scope !== 'repository' && scope !== 'history') { throw new Error('Invalid scanner scope'); }
-  if (typeof contentMatches !== 'boolean') { throw new Error('Missing scanner content evidence'); }
-  if (!exception || typeof exception.path !== 'string' || typeof exception.rule !== 'string' || !Number.isInteger(exception.line)) { throw new Error('Invalid scanner exception'); }
+  if (!Array.isArray(exceptions) || exceptions.length === 0 || !exceptions.every(validException)) { throw new Error('Invalid scanner exception'); }
+  const scoped = exceptions.filter(exception => exception.scopes.includes(scope));
+  const perException = contentMatches !== null && typeof contentMatches === 'object' && !Array.isArray(contentMatches);
+  if (perException) {
+    for (const value of Object.values(contentMatches)) { if (typeof value !== 'boolean') { throw new Error('Missing scanner content evidence'); } }
+  } else if (typeof contentMatches !== 'boolean' || scoped.length !== 1) {
+    // A bare boolean cannot name which exception it evidences: only a single
+    // scope-applicable exception may rely on it, otherwise evidence must be
+    // supplied per exception fingerprint so no copy is approved by association.
+    throw new Error('Missing scanner content evidence');
+  }
   if (scope === 'repository' && typeof root !== 'string') { throw new Error('Invalid scanner root'); }
   const unexpected = [];
-  let approved = 0;
+  const approved = new Set();
   for (const finding of findings) {
     assertFinding(finding, scope);
     const path = scope === 'repository' ? relativeTo(root, finding.File) : finding.File;
-    const matches = contentMatches && approved === 0 && path === exception.path && finding.StartLine === exception.line
-      && finding.RuleID === exception.rule && (scope !== 'history' || finding.Commit === exception.commit);
-    if (matches) { approved++; } else { unexpected.push(finding); }
+    const exception = scoped.find(item => item.path === path
+      && item.line === finding.StartLine && item.rule === finding.RuleID
+      && (scope !== 'history' || item.commit === finding.Commit));
+    const evidenced = exception !== undefined && (perException ? contentMatches[exception.fingerprint] === true : contentMatches);
+    if (exception !== undefined && evidenced && !approved.has(exception.fingerprint)) { approved.add(exception.fingerprint); } else { unexpected.push(finding); }
   }
   const summary = summarizeFindings(unexpected);
-  return { findings: summary.findings, rules: summary.rules, approved, raw: findings.length };
+  return { findings: summary.findings, rules: summary.rules, approved: approved.size, raw: findings.length };
 }
 // Only the single validated root declaration may exist. A nested declaration
 // (any case) could hide findings in the directory scan, so it is rejected.
@@ -76,11 +113,11 @@ export function validateSourcePath(file) {
   if (name.toLowerCase() === IGNORE_NAME && file !== IGNORE_NAME) { throw new Error('Unexpected nested secret scanner ignore'); }
   return file;
 }
-export function validateIgnoreDeclaration(text, expected = APPROVED_EXCEPTION.fingerprint) {
+export function validateIgnoreDeclaration(text, expected = DECLARATION) {
   if (typeof text !== 'string' || typeof expected !== 'string') { throw new Error('Secret scanner ignore declaration rejected'); }
   const lines = text.split('\n').map(line => line.endsWith('\r') ? line.slice(0, -1) : line).filter(line => line.trim() !== '');
-  if (lines.length !== 1 || lines[0] !== expected) { throw new Error('Secret scanner ignore declaration rejected'); }
-  return lines[0];
+  if (lines.join('\n') !== expected) { throw new Error('Secret scanner ignore declaration rejected'); }
+  return expected;
 }
 export function scanRepository(binary, output) {
   // Resolve a caller-supplied path before any temporary working directory is used.
@@ -138,8 +175,16 @@ export function scanRepository(binary, output) {
   if (execute('git', ['-C', history, 'cat-file', '-e', `${head}^{commit}`]).status !== 0) { throw new Error('Secret scanner Git isolation failed'); }
   const treeCopy = join(snapshot, APPROVED_EXCEPTION.path);
   const treeMatches = existsSync(treeCopy) && lstatSync(treeCopy).isFile() && sha256(readFileSync(treeCopy)) === APPROVED_EXCEPTION.blobSha256;
-  const historyBlob = execute('git', ['-C', history, 'cat-file', 'blob', `${APPROVED_EXCEPTION.commit}:${APPROVED_EXCEPTION.path}`]);
-  const historyMatches = historyBlob.status === 0 && sha256(historyBlob.stdout) === APPROVED_EXCEPTION.blobSha256;
+  const historyEvidence = (exception) => {
+    const blob = execute('git', ['-C', history, 'cat-file', 'blob', `${exception.commit}:${exception.path}`]);
+    return blob.status === 0 && sha256(blob.stdout) === exception.blobSha256;
+  };
+  // Evidence is per scan scope: a verified history blob never approves the
+  // working tree, and the history-only exception never approves the tree at all.
+  const evidence = {
+    repository: treeMatches ? { [APPROVED_EXCEPTION.fingerprint]: true } : {},
+    history: Object.fromEntries(APPROVED_EXCEPTIONS.filter(exception => historyEvidence(exception)).map(exception => [exception.fingerprint, true])),
+  };
   const scans = [];
   for (const [kind, args] of [['repository', ['dir', snapshot]], ['history', ['git', history, `--log-opts=--all --full-history ${head}`]]]) {
     // Every scanner run uses a sterile working directory; raw output stays in memory.
@@ -147,11 +192,11 @@ export function scanRepository(binary, output) {
     if (![0, 2].includes(result.status)) { throw new Error('Secret scanner failed safely; raw output suppressed'); }
     const findings = JSON.parse(result.stdout);
     if ((result.status === 2) !== (Array.isArray(findings) && findings.length > 0)) { throw new Error('Secret scanner result mismatch'); }
-    scans.push({ scope: kind, ...classifyScan(findings, { scope: kind, root: snapshot, contentMatches: kind === 'repository' ? treeMatches : historyMatches }) });
+    scans.push({ scope: kind, ...classifyScan(findings, { scope: kind, root: snapshot, contentMatches: evidence[kind] }) });
   }
   const result = { tool: 'gitleaks', version: '8.30.1', redacted: true, sourceFiles: files,
     history: 'all available refs, full history; shallow clones rejected', commits: Number(git(['-C', history, 'rev-list', '--count', '--all', head])),
-    exception: { declared: 1, approved: scans.reduce((sum, scan) => sum + scan.approved, 0) },
+    exception: { declared: APPROVED_EXCEPTIONS.length, approved: scans.reduce((sum, scan) => sum + scan.approved, 0) },
     scans, status: scans.every(scan => scan.findings === 0) ? 'passed' : 'failed' };
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, JSON.stringify(result, null, 2) + '\n');

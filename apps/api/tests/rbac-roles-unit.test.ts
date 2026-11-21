@@ -2,24 +2,35 @@ import 'reflect-metadata';
 import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
 import type { PoolClient } from 'pg';
 import { describe, expect, it, vi } from 'vitest';
-import { PERMISSION_CONTRACT, PROTECTED_CAPABILITIES, STAFF_CAPABILITIES } from '../src/authz/capability.js';
-import type { Capability } from '../src/authz/capability.js';
-import type { AuthorizationServiceApi, EffectiveRole, StaffWriteContext } from '../src/authz/authorization.service.js';
-import { catalogEntry, checkReplacement, createMetadata, emptyBody, metadataPatch, replacement } from '../src/roles/role-policy.js';
-import type { RoleGrant } from '../src/roles/role-policy.js';
+import { GEO_CAPABILITIES, GEO_SCOPE_CONTRACT, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES, STAFF_CAPABILITIES } from '../src/authz/capability.js';
+import type { Capability, GeoGrant, PermissionCode } from '../src/authz/capability.js';
+import type { AccessView, AuthorizationServiceApi, EffectiveRole, StaffWriteContext } from '../src/authz/authorization.service.js';
+import { catalogEntry, checkReplacement, createMetadata, emptyBody, grantableScopes, metadataPatch, replacement } from '../src/roles/role-policy.js';
+import type { PermissionDto, RoleGrant } from '../src/roles/role-policy.js';
 import { RolesService } from '../src/roles/index.js';
 
 const admin = { id: '00000000-0000-4000-8000-000000000003', type: 'SYSTEM', code: 'ADMIN' } as const;
 const custom = { id: '00000000-0000-4000-8000-000000000004', type: 'CUSTOM', code: 'CUSTOM_EXAMPLE' } as const;
 const staffId = '00000000-0000-4000-8000-000000000005';
-const grant = (code: Capability): RoleGrant => ({ code, scope: PERMISSION_CONTRACT[code] });
-const perms = STAFF_CAPABILITIES.map((code) => ({ ...grant(code), description: 'test', module: 'staff', protected: PROTECTED_CAPABILITIES.includes(code) }));
+const grant = (code: PermissionCode): RoleGrant => ({
+  code, scope: code.startsWith('staff.self.') ? 'SELF' : 'GLOBAL',
+});
+const geoGrant = (code: PermissionCode, scope: 'CITY' | 'GLOBAL' = 'CITY'): RoleGrant => ({ code, scope });
+const perms: PermissionDto[] = [
+  ...STAFF_CAPABILITIES.map((code) => ({ ...grant(code), description: 'test', module: 'staff',
+    protected: PROTECTED_CAPABILITIES.includes(code), scopes: [PERMISSION_CONTRACT[code]] as const })),
+  ...GEO_CAPABILITIES.map((code) => ({ code, scope: 'CITY' as const, description: 'test', module: 'geography',
+    protected: false, scopes: GEO_SCOPE_CONTRACT[code] })),
+];
+const allGeoGlobal: GeoGrant[] = GEO_CAPABILITIES.map((code) => ({ code, scope: 'GLOBAL' as const }));
 const session = { kind: 'staff-web' as const, token: 'synthetic-test-token' };
-const view = (permissions: readonly Capability[] = STAFF_CAPABILITIES, role: EffectiveRole = admin) => ({ role, staffId, permissions });
+const view = (permissions: readonly Capability[] = STAFF_CAPABILITIES, role: EffectiveRole = admin, geoPermissions: readonly GeoGrant[] = []) =>
+  ({ role, staffId, permissions, geoPermissions }) as AccessView;
 
 /** Mock only the transaction boundary/driver. Fail on unexpected SQL; assert projections
  * cannot issue a second unguarded read, and all write/audit SQL uses that one callback. */
-function fixture(permissions: readonly Capability[], responses: { contains: string; rows?: unknown[] }[], role: EffectiveRole = admin) {
+function fixture(permissions: readonly Capability[], responses: { contains: string; rows?: unknown[] }[],
+  role: EffectiveRole = admin, geoPermissions: readonly GeoGrant[] = []) {
   const statements: { sql: string; params?: unknown[] }[] = [];
   const query = (sql: string, params?: unknown[]) => {
     const response = responses[statements.length];
@@ -28,7 +39,7 @@ function fixture(permissions: readonly Capability[], responses: { contains: stri
     const rows = response.rows ?? [];
     return Promise.resolve({ rowCount: rows.length, rows });
   };
-  const ctx: StaffWriteContext = { ...view(permissions, role), principal: { kind: 'staff-web', role: 'ADMIN', authVersion: 1, staffId }, client: { query } as unknown as PoolClient };
+  const ctx: StaffWriteContext = { ...view(permissions, role, geoPermissions), principal: { kind: 'staff-web', role: 'ADMIN', authVersion: 1, staffId }, client: { query } as unknown as PoolClient };
   const execute = <T>(_proof: unknown, capability: Capability, _scope: unknown, callback: (ctx: StaffWriteContext) => Promise<T>) => {
     if (!permissions.includes(capability)) { return Promise.reject(new ForbiddenException()); }
     return callback(ctx);
@@ -56,25 +67,57 @@ describe('role-management input allowlists', () => {
     expect(() => { emptyBody({ updatedBy: staffId }); }).toThrow(BadRequestException);
     expect(() => { emptyBody({}); }).not.toThrow();
   });
-  it('enforces exact code/scope pairs, uniqueness, no CITY or direct grants', () => {
+  it('enforces exact code/scope pairs, uniqueness, and no invented scope or direct grants', () => {
     expect(replacement({ permissions: [] })).toEqual([]);
     expect(replacement({ permissions: [grant('roles.read'), grant('staff.self.update')] })).toEqual([grant('roles.read'), grant('staff.self.update')]);
+    expect(replacement({ permissions: [geoGrant('geography.read', 'CITY'), geoGrant('geography.publish', 'GLOBAL')] }))
+      .toEqual([geoGrant('geography.read', 'CITY'), geoGrant('geography.publish', 'GLOBAL')]);
     for (const value of [{ scope: 'CITY', code: 'staff.read' }, { scope: 'SELF', code: 'staff.read' }, { scope: 'GLOBAL', code: 'staff.self.read' },
-      { scope: 'GLOBAL', code: 'staff.manage' }, { ...grant('staff.read'), staffId }, { code: '__proto__', scope: 'GLOBAL' }, null]) {
+      { scope: 'GLOBAL', code: 'staff.manage' }, { scope: 'SELF', code: 'geography.read' }, { scope: 'CITY', code: 'geography.self.read' },
+      { scope: 'CITY', code: 'geography.admin.assign' }, { scope: 'CITY', code: 'geography.bootstrap.revoke' },
+      { ...grant('staff.read'), staffId }, { code: '__proto__', scope: 'GLOBAL' }, null]) {
       expect(() => replacement({ permissions: [value] })).toThrow(BadRequestException);
     }
     expect(() => replacement({ permissions: [grant('roles.read'), grant('roles.read')] })).toThrow(BadRequestException);
+    expect(() => replacement({ permissions: [geoGrant('geography.read', 'CITY'), geoGrant('geography.read', 'GLOBAL')] })).toThrow(BadRequestException);
     expect(() => replacement({ permissions: [], role: 'ADMIN' })).toThrow(BadRequestException);
     expect(() => replacement({ permissions: 'staff.read' })).toThrow(BadRequestException);
   });
 });
 
 describe('role permission policy', () => {
-  it('excludes unknown and mismarked catalog rows', () => {
+  it('excludes unknown and mismarked catalog rows, and never protects geography', () => {
     const p = { module: 'roles', description: 'test', protected: false };
-    expect(catalogEntry({ ...p, code: 'roles.read' })).toMatchObject({ code: 'roles.read', scope: 'GLOBAL' });
+    expect(catalogEntry({ ...p, code: 'roles.read' })).toMatchObject({ code: 'roles.read', scope: 'GLOBAL', scopes: ['GLOBAL'] });
     expect(catalogEntry({ ...p, code: 'roles.archive' })).toBeNull();
     expect(catalogEntry({ ...p, code: 'unknown.capability' })).toBeNull();
+    expect(catalogEntry({ ...p, code: 'geography.read', module: 'geography' }))
+      .toMatchObject({ code: 'geography.read', scope: 'CITY', scopes: ['CITY', 'GLOBAL'], protected: false });
+    // A protected geography row would become mandatory on every ADMIN: reject it.
+    expect(catalogEntry({ ...p, code: 'geography.read', protected: true })).toBeNull();
+  });
+  it('restricts geography scopes per target role and never grants publish or GLOBAL to a non-admin role', () => {
+    expect(grantableScopes('geography.read', admin)).toEqual(['CITY', 'GLOBAL']);
+    expect(grantableScopes('geography.read', custom)).toEqual(['CITY']);
+    expect(grantableScopes('geography.publish', custom)).toEqual([]);
+    expect(grantableScopes('geography.publish', admin)).toEqual(['CITY', 'GLOBAL']);
+    expect(grantableScopes('geography.read', { type: 'SYSTEM', code: 'TECHNICIAN' })).toEqual([]);
+    expect(grantableScopes('roles.read', custom)).toEqual(['GLOBAL']);
+    const actor = view(STAFF_CAPABILITIES, admin, allGeoGlobal);
+    // A manager/custom role can never store GLOBAL or publish geography through this editor.
+    for (const desired of [[geoGrant('geography.read', 'GLOBAL')], [geoGrant('geography.publish', 'CITY')], [geoGrant('geography.publish', 'GLOBAL')]]) {
+      expect(() => { checkReplacement(actor, custom, perms, [], desired); }).toThrow(BadRequestException);
+    }
+    expect(() => { checkReplacement(actor, { ...admin, code: 'MANAGER' }, perms, [], [geoGrant('geography.publish', 'CITY')]); }).toThrow(BadRequestException);
+    expect(() => { checkReplacement(actor, custom, perms, [], [geoGrant('geography.read', 'CITY'), geoGrant('geography.manage', 'CITY')]); }).not.toThrow();
+  });
+  it('lets an administrator delegate geography only at a scope it holds itself', () => {
+    const withoutGeo = view(STAFF_CAPABILITIES);
+    expect(() => { checkReplacement(withoutGeo, custom, perms, [], [geoGrant('geography.read', 'CITY')]); }).toThrow(ForbiddenException);
+    const cityOnly = view(STAFF_CAPABILITIES, admin, [{ code: 'geography.read', scope: 'CITY' }]);
+    expect(() => { checkReplacement(cityOnly, custom, perms, [], [geoGrant('geography.read', 'CITY')]); }).toThrow(ForbiddenException);
+    // Retaining an existing grant is not delegation, even without the actor's own grant.
+    expect(() => { checkReplacement(withoutGeo, custom, perms, [geoGrant('geography.read', 'CITY')], [geoGrant('geography.read', 'CITY')]); }).not.toThrow();
   });
   it('requires all protected grants on ADMIN and rejects all protected grants on any other role', () => {
     const protectedGrants = PROTECTED_CAPABILITIES.map(grant);
@@ -157,5 +200,44 @@ describe('role management commands', () => {
     await expect(fx.service.replacePermissions(session, admin.id, 2, mandatory)).resolves.toEqual({ id: admin.id, version: 3 });
     expect(fx.statements[3]?.params).toEqual([admin.id, ['roles.read']]);
     expect(fx.statements).toHaveLength(6);
+  });
+  it('writes and projects geography grants without adding them to the staff capability set', async () => {
+    const geo = [geoGrant('geography.read', 'CITY'), geoGrant('geography.manage', 'CITY')];
+    const fx = fixture(['roles.permissions.manage'], [
+      { contains: 'FOR UPDATE', rows: [customRow] }, { contains: 'FROM foundation.permissions', rows: perms },
+      { contains: 'AND enabled ORDER BY' }, { contains: 'DO UPDATE SET enabled=EXCLUDED.enabled' },
+      { contains: 'SET version=version+1' }, { contains: 'INSERT INTO foundation.audit_logs' },
+    ], admin, allGeoGlobal);
+    await expect(fx.service.replacePermissions(session, custom.id, 2, geo)).resolves.toEqual({ id: custom.id, version: 3 });
+    // scope_type is written explicitly: CITY grants are real rows, not a client string.
+    expect(fx.statements[3]?.params).toEqual([custom.id, ['geography.read', 'geography.manage'], ['CITY', 'CITY']]);
+    // A non-administrator role can never receive GLOBAL geography, only CITY.
+    const rejected = fixture(['roles.permissions.manage'], [
+      { contains: 'FOR UPDATE', rows: [customRow] }, { contains: 'FROM foundation.permissions', rows: perms },
+      { contains: 'AND enabled ORDER BY' },
+    ], admin, allGeoGlobal);
+    await expect(rejected.service.replacePermissions(session, custom.id, 2, [geoGrant('geography.read', 'GLOBAL')]))
+      .rejects.toBeInstanceOf(BadRequestException);
+    // A scope change CITY->GLOBAL on the ADMIN role is a real change, not a no-op.
+    const adminRow = { ...admin, name: 'role name', description: '', status: 'ACTIVE', version: 2 };
+    const mandatory = PROTECTED_CAPABILITIES.map(grant);
+    const moved = fixture([...PROTECTED_CAPABILITIES, 'roles.permissions.manage'], [
+      { contains: 'FOR UPDATE', rows: [adminRow] }, { contains: 'FROM foundation.permissions', rows: perms },
+      { contains: 'AND enabled ORDER BY', rows: [...mandatory, { code: 'geography.read', scope: 'CITY' }] },
+      { contains: 'SET enabled=false' }, { contains: 'DO UPDATE SET enabled=EXCLUDED.enabled' },
+      { contains: 'SET version=version+1' }, { contains: 'INSERT INTO foundation.audit_logs' },
+    ], admin, allGeoGlobal);
+    await expect(moved.service.replacePermissions(session, admin.id, 2, [...mandatory, geoGrant('geography.read', 'GLOBAL')]))
+      .resolves.toEqual({ id: admin.id, version: 3 });
+    expect(moved.statements[3]?.params).toEqual([admin.id, ['geography.read']]);
+    expect(moved.statements[4]?.params).toEqual([admin.id, ['geography.read'], ['GLOBAL']]);
+  });
+  it('rejects a drifted unsupported geography scope in the stored set instead of silently rewriting it', async () => {
+    const fx = fixture(['roles.permissions.manage'], [
+      { contains: 'FOR UPDATE', rows: [customRow] }, { contains: 'FROM foundation.permissions', rows: perms },
+      { contains: 'AND enabled ORDER BY', rows: [{ code: 'geography.read', scope: 'GLOBAL' }] },
+    ]);
+    await expect(fx.service.replacePermissions(session, custom.id, 2, [geoGrant('geography.read', 'CITY')]))
+      .rejects.toBeInstanceOf(ConflictException);
   });
 });

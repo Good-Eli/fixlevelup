@@ -451,7 +451,7 @@ Sitemap/robots/canonical/OG/LocalBusiness — routes и SSR frontend, данны
 
 ### 12.1. Административная география и scope (P03, не P01)
 
-Geography — подмодуль existing Settings одного монолита. P02 задаёт typed GLOBAL/CITY policy contract; concrete CITY FK/grants появляются после service_cities на P03. Новые capability names ниже — проект для общей baseline, не уже выданные права. Каждый route проверяет capability+GLOBAL/CITY scope, same-city refs, I/V и audit; staff raw cityId не расширяет область доступа. V1 работает с одним primary city, без пустых mock rows/фиктивных контактов. Активация второго города и UI/фильтры утверждаются позднее.
+Geography — подмодуль Settings одного монолита. P03-02 реализует серверную проверку GLOBAL/CITY; точная [матрица прав и контракт команд](P03-02-ACCESS.md) уточняют проектную таблицу ниже. Код в каталоге разрешений не означает выдачу права сотруднику. Каждый route проверяет capability+GLOBAL/CITY scope, same-city refs, I/V и audit; staff raw cityId не расширяет область доступа. V1 работает с одним primary city, без пустых mock rows/фиктивных контактов. Активация второго города и UI/фильтры утверждаются позднее.
 
 | Метод / путь | Доступ / версия | Контракт |
 |---|---|---|

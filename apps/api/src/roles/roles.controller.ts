@@ -76,7 +76,9 @@ abstract class PermissionReads {
   @Get() @RequireCapability('roles.read') @Header('Cache-Control', 'no-store')
   async list(@Req() req: RbacRequest) {
     readOrigin(req, this.config);
-    return envelope({ ...page(await this.service.permissions(proof(req)).catch(authFailure)), unsupportedScopes: ['CITY'] });
+    // Each catalog item carries every scope its code may legally hold (`scopes`) and the
+    // first one in the legacy `scope` field. Geography CITY is a real, supported scope now.
+    return envelope(page(await this.service.permissions(proof(req)).catch(authFailure)));
   }
 }
 
