@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { isP03Capability } from '@fixlevelup/p03-contracts';
-import type { Grant, Person, Role } from './api';
-import { allowedScopes, canEditGrant, fields, has, hasP03, p03ReplacementAllowed, protects, roleLabel, type Snapshot, type Write } from './workspace';
+import { isP04Capability, type Grant, type Person, type Role } from './api';
+import { allowedScopes, canEditGrant, fields, has, hasP03, holdsGlobalP04, p03ReplacementAllowed, p04GrantChanges,
+  p04ReplacementAllowed, protects, roleLabel, type Snapshot, type Write } from './workspace';
 
 type Props = { data: Snapshot; selected: Role | null; members: Person[] | null; open: (id: string) => void; openMembers: (id: string) => void; write: Write };
 function RoleFields({ role }: { role?: Role }) {
@@ -19,6 +20,10 @@ function RoleCard({ data, role, members, openMembers, write }: Omit<Props,'selec
   const changedP03 = grants.filter(g => isP03Capability(g.code) && original.get(g.code) !== g.scope);
   const scopeDetails = changedP03.map(g => `${g.code} · ${g.scope}`).join(', ');
   const roleWide = `${scopeDetails}. Права получат все нынешние и будущие сотрудники этой роли, а не выбранный сотрудник. CITY действует в назначенных каждому городах; GLOBAL — без географической границы. Отзыв личного права основателя не снимет эти права роли.`;
+  const changedP04 = p04GrantChanges(role.permissions, grants);
+  const changes = changedP04.map(({ code, from, to }) => `${code}: ${from ?? 'нет'} → ${to ?? 'нет'}`).join(', ');
+  const p04RoleWide = `${changes}. Изменения действуют для всех нынешних и будущих сотрудников этой роли, а не для одного сотрудника. CITY ограничен назначенными городами; GLOBAL действует без географической границы.`;
+  const saveAllowed = dirty && known && p03ReplacementAllowed(a, role, grants) && p04ReplacementAllowed(a, role, grants);
   const impact = role.assignedCount === null ? 'Количество назначенных сотрудников скрыто правами доступа' : `Назначено сотрудников: ${String(role.assignedCount)}; активных: ${String(role.activeAssignedCount)} (в видимой области на момент загрузки)`;
   return <article className="panel"><h3>{role.name}</h3><p>{role.description || 'Без описания'}</p><dl>
     <dt>Код</dt><dd>{role.code}</dd><dt>Тип и статус</dt><dd>{role.type === 'SYSTEM' ? 'Системная' : 'Пользовательская'} · {active ? 'активна' : 'архивирована'}</dd>
@@ -32,18 +37,24 @@ function RoleCard({ data, role, members, openMembers, write }: Omit<Props,'selec
     {modules.map(module => <fieldset key={module}><legend>{module}</legend>{data.catalog.filter(p => p.module === module).map(p => {
       const scopes = allowedScopes(role, p);
       const current = chosen.get(p.code);
+      const p04 = isP04Capability(p.code);
+      const exactGlobal = isP04Capability(p.code) ? holdsGlobalP04(a, p.code) : true;
       return <label className="permission" key={p.code}>
         <input type="checkbox" checked={current !== undefined} disabled={!known || !canEditGrant(a,role,p,p.protected)} onChange={e => {
-          const selected = e.currentTarget.checked; choose(prev => { const next = new Map(prev); if (selected) { next.set(p.code, scopes[0] ?? p.scope); } else { next.delete(p.code); } return next; });
+          const selected = e.currentTarget.checked;
+          const nextScope = p04 && !exactGlobal ? original.get(p.code) : scopes[0] ?? p.scope;
+          choose(prev => { const next = new Map(prev); if (selected && nextScope !== undefined) { next.set(p.code, nextScope); } else { next.delete(p.code); } return next; });
         }}/><span>{p.description}<small>{p.code} · {current ?? (scopes.length > 1 ? scopes.join('/') : p.scope)}{p.protected ? ' · защищённая возможность' : ''}</small></span>
-        {current !== undefined && scopes.length > 1 && <select aria-label={`Область ${p.code}`} value={current} disabled={!canEditGrant(a,role,p,p.protected) || (isP03Capability(p.code) && !hasP03(a, p.code, 'GLOBAL'))} onChange={e => {
+        {current !== undefined && scopes.length > 1 && <select aria-label={`Область ${p.code}`} value={current} disabled={!canEditGrant(a,role,p,p.protected) || !exactGlobal || (isP03Capability(p.code) && !hasP03(a, p.code, 'GLOBAL'))} onChange={e => {
           const value = e.currentTarget.value as Grant['scope']; choose(prev => { const next = new Map(prev); next.set(p.code, value); return next; });
         }}>{scopes.map(s => <option key={s} value={s}>{s}</option>)}</select>}
       </label>;
     })}</fieldset>)}
     {changedP03.length > 0 && <p className="notice">{roleWide}</p>}
-    {active && protects(a,'roles.permissions.manage') && <button disabled={!dirty || !known || !p03ReplacementAllowed(a, role, grants)} onClick={() => {
-      const effect = changedP03.length ? ` ${roleWide}` : '';
+    {changedP04.length > 0 && <p className="notice">{p04RoleWide}</p>}
+    {active && protects(a,'roles.permissions.manage') && <button disabled={!saveAllowed} onClick={() => {
+      if (!saveAllowed) { return; }
+      const effect = `${changedP03.length ? ` ${roleWide}` : ''}${changedP04.length ? ` ${p04RoleWide}` : ''}`;
       if (window.confirm(`Изменить права роли «${role.name}»? ${impact}. Новые права применятся немедленно.${effect}`)) { write(c => c.permissions(role,grants), 'Возможности роли обновлены.'); }
     }}>Сохранить возможности</button>}
     {has(a,'staff.read') && <section><h4>Назначенные сотрудники</h4><button onClick={() => { openMembers(role.id); }}>Показать сотрудников роли</button>
@@ -56,6 +67,10 @@ function RoleCard({ data, role, members, openMembers, write }: Omit<Props,'selec
 }
 export function Roles({ data, selected, members, open, openMembers, write }: Props) {
   const a = data.access; return <section><h2>Роли и возможности</h2>
+    {a.p04Permissions && a.p04Permissions.length > 0 && <section className="panel"><h3>Ваши права каталога, цен и внешних отзывов</h3>
+      <ul>{a.p04Permissions.map(({ code, scope }) => <li key={code}>{code} · {scope}</li>)}</ul>
+      <p>Выдавать право можно только системному администратору с правом управления возможностями и собственным GLOBAL для того же кода.</p>
+    </section>}
     {protects(a,'roles.create') && <form className="panel" onSubmit={e => { e.preventDefault(); const name = fields(e.currentTarget,'name');
       const description = fields(e.currentTarget,'description'); write(c => c.createRole(name,description), 'Пользовательская роль создана без разрешений.', true);
     }}><h3>Новая пользовательская роль</h3><RoleFields/><button>Создать роль</button></form>}

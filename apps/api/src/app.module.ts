@@ -18,6 +18,8 @@ import { StaffService } from './staff/staff.service.js';
 import { GeoRunner } from './settings/geography/geo-runner.js';
 import { ManagementRunner } from './settings/management/management-runner.js';
 import { ManagementController } from './settings/management/management.controller.js';
+import { CatalogManagementController } from './catalog-management/controller.js';
+import { CatalogManagementRunner } from './catalog-management/runner.js';
 import { GeographyController, TechnicianTerritoryController } from './settings/geography/geography.controller.js';
 import { PermissionsController, RolesController, RolesService, TelegramPermissionsController, TelegramRolesController } from './roles/index.js';
 
@@ -28,12 +30,13 @@ export class AppModule {
     if (telegramAuth && !webAuth) { throw new Error('Telegram authentication requires web authentication configuration'); }
     const controllers = webAuth
       ? [HealthController, WebAuthController, AccessController, StaffController, RolesController,
-          PermissionsController, GeographyController, ManagementController, ...(telegramAuth ? [TelegramAuthController, TelegramStaffController, TelegramRolesController, TelegramPermissionsController, TechnicianTerritoryController] : [])]
+          PermissionsController, GeographyController, ManagementController, CatalogManagementController,
+          ...(telegramAuth ? [TelegramAuthController, TelegramStaffController, TelegramRolesController, TelegramPermissionsController, TechnicianTerritoryController] : [])]
       : [HealthController];
     const providers = [
       HealthService, { provide: RuntimeDatabase, useFactory: () => new RuntimeDatabase(database, Boolean(webAuth)) },
       ...(webAuth && database ? [
-        StaffService, RolesService, GeoRunner, ManagementRunner,
+        StaffService, RolesService, GeoRunner, ManagementRunner, CatalogManagementRunner,
         // Explicit DI registration makes missing security dependencies a startup failure.
         StaffWebAuthGuard,
         { provide: WebAuthResources, useFactory: () => new WebAuthResources(database, webAuth) },

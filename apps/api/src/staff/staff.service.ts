@@ -5,9 +5,11 @@ import { AUTHORIZATION_SERVICE } from '../authz/authorization.resources.js';
 import { AuthorizationError, isSystemAdmin } from '../authz/authorization.service.js';
 import type { AuthorizationServiceApi, EffectiveRole, SessionProof, StaffWriteContext } from '../authz/authorization.service.js';
 import {
-  GLOBAL_SCOPE, isCapability, isGeoCapability, isP03Capability, P03_CAPABILITIES, P03_CAPABILITY_METADATA, PROTECTED_CAPABILITIES,
+  GLOBAL_SCOPE, isCapability, isGeoCapability, isP03Capability, isP04Capability, P03_CAPABILITIES, P03_CAPABILITY_METADATA,
+  P04_CAPABILITIES, p04Module, PROTECTED_CAPABILITIES,
 } from '../authz/capability.js';
 import { holdsGlobalP03, p03GrantableScopes } from '../authz/p03-grants.js';
+import { holdsGlobalP04, p04GrantableScopes } from '../authz/p04-grants.js';
 import { checkTarget, nextChannelMarker, staffReadFilter, staffTargetFilter } from './staff-policy.js';
 import type { ChannelMarker, StaffTarget } from './staff-policy.js';
 
@@ -67,7 +69,7 @@ async function requireDelegable(ctx: StaffWriteContext, roleId: string): Promise
      WHERE rp.role_id=$1 AND rp.enabled
        AND (rp.permission_code=ANY($2::text[]) OR (p.active
          AND NOT (p.code IN ('staff.self.read','staff.self.update','staff.self.deactivate')
-           AND rp.scope_type='SELF' AND NOT p.protected)))`, [roleId, P03_CAPABILITIES])).rows;
+           AND rp.scope_type='SELF' AND NOT p.protected)))`, [roleId, [...P03_CAPABILITIES, ...P04_CAPABILITIES]])).rows;
   const globalGeo = new Set((ctx.geoPermissions ?? []).filter((g) => g.scope === 'GLOBAL').map((g) => g.code));
   for (const row of rows) {
     if (isP03Capability(row.code)) {
@@ -75,6 +77,13 @@ async function requireDelegable(ctx: StaffWriteContext, roleId: string): Promise
         || (row.scope !== 'CITY' && row.scope !== 'GLOBAL')
         || !p03GrantableScopes(row.code, { type: row.role_type, code: row.role_code }).includes(row.scope)
         || !holdsGlobalP03(ctx, row.code)) { throw new ForbiddenException(); }
+      continue;
+    }
+    if (isP04Capability(row.code)) {
+      if (row.active !== true || row.protected !== false || row.module !== p04Module(row.code)
+        || (row.scope !== 'CITY' && row.scope !== 'GLOBAL')
+        || !p04GrantableScopes(row.code, { type: row.role_type, code: row.role_code }).includes(row.scope)
+        || !holdsGlobalP04(ctx, row.code)) { throw new ForbiddenException(); }
       continue;
     }
     if (isCapability(row.code)) {

@@ -2,6 +2,8 @@ import { BadRequestException, HttpException } from '@nestjs/common';
 import type { ServerResponse } from 'node:http';
 import { TextDecoder } from 'node:util';
 import { P03_BODY_DEADLINE_MS, p03BodyLimit } from '@fixlevelup/p03-contracts';
+import { matchP04Route, P04_ROUTES } from '@fixlevelup/p03-contracts/p04';
+import { parseStrictPricingJson } from '../../pricing/codec/index.js';
 import { header } from '../../auth/http.js';
 import type { StaffRequest } from '../../auth/http.js';
 
@@ -41,7 +43,10 @@ export function boundedJson(req: StaffRequest, res: ServerResponse, next: (error
     return;
   }
 
-  const limit = p03BodyLimit(req.method ?? '', (req.url ?? '').split('?', 1)[0] ?? '');
+  const method = req.method ?? '';
+  const path = (req.url ?? '').split('?', 1)[0] ?? '';
+  const p04 = method === 'POST' ? matchP04Route(method, path) : null;
+  const limit = p04 ? P04_ROUTES[p04.operation].bodyLimit : p03BodyLimit(method, path);
   const chunks: Buffer[] = [];
   let bytes = 0;
   let done = false;
@@ -68,7 +73,8 @@ export function boundedJson(req: StaffRequest, res: ServerResponse, next: (error
   }
   function onEnd(): void {
     try {
-      const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, bytes)));
+      const buffer = Buffer.concat(chunks, bytes);
+      const value: unknown = p04 ? parseStrictPricingJson(buffer) : JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer));
       if (value === null || typeof value !== 'object') { throw new BadRequestException(); }
       req.body = value;
     } catch {

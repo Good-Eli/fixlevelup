@@ -69,6 +69,9 @@ model Staff {
   reviewedPriceRuleVersions        PriceRuleVersion[]         @relation("PriceRuleReviewer")
   reviewedPricingPolicyVersions   PricingPolicyVersion[]    @relation("PricingPolicyReviewer")
   reviewedPublicPriceEstimates    PublicPriceEstimate[]     @relation("PublicPriceEstimateReviewer")
+  p04Receipts                     P04CommandReceipt[]      @relation("P04ReceiptActor")
+  revokedP04BootstrapGrants       P04BootstrapPermission[] @relation("P04BootstrapRevoker")
+  reviewedExternalReviewRevisions ExternalReviewRevision[] @relation("ExternalReviewReviewer")
 
   @@map("staff")
   @@schema("foundation")
@@ -102,6 +105,7 @@ model Permission {
   grants      RolePermission[]
   bootstrapGrants GeographyBootstrapPermission[]
   p03BootstrapGrants P03BootstrapPermission[]
+  p04BootstrapGrants P04BootstrapPermission[]
 
   @@map("permissions")
   @@schema("foundation")
@@ -156,6 +160,7 @@ model StaffRoleAssignment {
   revoker    Staff?    @relation("RoleRevokedBy", fields: [revokedBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
   bootstrapGrants GeographyBootstrapPermission[]
   p03BootstrapGrants P03BootstrapPermission[]
+  p04BootstrapGrants P04BootstrapPermission[]
 
   @@index([roleId, staffId], map: "staff_role_assignments_role_staff_idx")
   @@map("staff_role_assignments")
@@ -294,6 +299,7 @@ model ServiceCity {
   priceRuleSeries PriceRuleSeries[]
   pricingPolicySeries PricingPolicySeries?
   publicPriceEstimateSeries PublicPriceEstimateSeries[]
+  p04Receipts P04CommandReceipt[] @relation("P04ReceiptCity")
 
   @@map("service_cities")
   @@schema("foundation")
@@ -1493,5 +1499,106 @@ model PublicPriceEstimatePeriod {
   requiredBy           PublicPriceEstimate? @relation("PublicPriceEstimateRequiredPeriod")
 
   @@map("public_price_estimate_periods")
+  @@schema("foundation")
+}
+
+// P04-03 (021) synthetic fixture-only personal source. The SQL guard binds this
+// to the original bootstrap assignment and permits a single owner revocation.
+model P04BootstrapPermission {
+  assignmentId   String              @map("assignment_id") @db.Uuid
+  permissionCode String              @map("permission_code") @db.VarChar(64)
+  rowVersion     Int                 @default(1) @map("row_version")
+  revokedAt      DateTime?           @map("revoked_at") @db.Timestamptz(6)
+  revokedBy      String?             @map("revoked_by") @db.Uuid
+  assignment     StaffRoleAssignment @relation(fields: [assignmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  permission     Permission          @relation(fields: [permissionCode], references: [code], onDelete: Restrict, onUpdate: Restrict)
+  revoker        Staff?              @relation("P04BootstrapRevoker", fields: [revokedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([assignmentId, permissionCode])
+  @@map("p04_bootstrap_permissions")
+  @@schema("foundation")
+}
+
+// Immutable command evidence; subject/entity/revision targets are polymorphic.
+// SQL checks the closed operation set and exact shape, and runtime resolves the
+// polymorphic IDs with operation-specific authority rather than generic joins.
+model P04CommandReceipt {
+  actorId         String       @map("actor_id") @db.Uuid
+  operation       String       @db.VarChar(64)
+  key             String       @db.Uuid
+  requestSha256   String       @map("request_sha256") @db.VarChar(64)
+  cityId          String?      @map("city_id") @db.Uuid
+  subjectId       String       @map("subject_id") @db.Uuid
+  targetVersionId String?      @map("target_version_id") @db.Uuid
+  entityId        String       @map("entity_id") @db.Uuid
+  entityVersion   Int          @map("entity_version")
+  revisionId      String?      @map("revision_id") @db.Uuid
+  revisionVersion Int?         @map("revision_version")
+  createdAt       DateTime     @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  actor           Staff        @relation("P04ReceiptActor", fields: [actorId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  city            ServiceCity? @relation("P04ReceiptCity", fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([actorId, operation, key])
+  @@map("p04_command_receipts")
+  @@schema("foundation")
+}
+
+enum ExternalReviewKind {
+  PROFILE
+  REVIEW
+
+  @@map("external_review_kind")
+  @@schema("foundation")
+}
+
+// Stable manual Avito identity. The same-owner pointer and fixed PROFILE parent
+// are typed FKs; archiving never deletes the identity or its published history.
+model ExternalReview {
+  id               String                  @id @db.Uuid
+  code             String                  @db.VarChar(64)
+  kind             ExternalReviewKind
+  profileId        String?                 @map("profile_id") @db.Uuid
+  profileKind      ExternalReviewKind      @default(PROFILE) @map("profile_kind")
+  currentVersionId String?                 @map("current_version_id") @db.Uuid
+  rowVersion       Int                     @default(1) @map("row_version")
+  archivedAt       DateTime?               @map("archived_at") @db.Timestamptz(6)
+  profile          ExternalReview?         @relation("ExternalReviewProfile", fields: [profileId, profileKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "external_reviews_profile_fkey")
+  reviewEntries    ExternalReview[]        @relation("ExternalReviewProfile")
+  currentVersion   ExternalReviewRevision? @relation("ExternalReviewCurrentVersion", fields: [id, kind, currentVersionId], references: [entryId, kind, id], onDelete: Restrict, onUpdate: Restrict, map: "external_reviews_current_version_fkey")
+  versions         ExternalReviewRevision[] @relation("ExternalReviewVersions")
+
+  @@unique([kind, code], map: "external_reviews_kind_code_key")
+  @@unique([id, kind], map: "external_reviews_id_kind_key")
+  @@map("external_reviews")
+  @@schema("foundation")
+}
+
+// Immutable publication. For a REVIEW, the composite self-FK records the exact
+// revision of its PROFILE parent; SQL pins the owner and current/live basis.
+model ExternalReviewRevision {
+  id                String                   @id @db.Uuid
+  entryId           String                   @map("entry_id") @db.Uuid
+  kind              ExternalReviewKind
+  version           Int
+  title             String
+  sourceUrl         String                   @map("source_url")
+  sourceDate        DateTime?                @map("source_date") @db.Date
+  excerpt           String?
+  rating            Int?
+  permissionRef     String                   @map("permission_ref")
+  profileRevisionId String?                  @map("profile_revision_id") @db.Uuid
+  reviewedBy        String                   @map("reviewed_by") @db.Uuid
+  publishedAt       DateTime                 @default(dbgenerated("clock_timestamp()")) @map("published_at") @db.Timestamptz(6)
+  profileId         String?                  @map("profile_id") @db.Uuid
+  profileKind       ExternalReviewKind       @default(PROFILE) @map("profile_kind")
+  entry             ExternalReview           @relation("ExternalReviewVersions", fields: [entryId, kind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "external_review_revisions_entry_fkey")
+  currentFor        ExternalReview[]         @relation("ExternalReviewCurrentVersion")
+  profileRevision   ExternalReviewRevision?  @relation("ExternalReviewRevisionProfile", fields: [profileId, profileKind, profileRevisionId], references: [entryId, kind, id], onDelete: Restrict, onUpdate: Restrict, map: "external_review_revisions_profile_fkey")
+  sourcedReviews    ExternalReviewRevision[] @relation("ExternalReviewRevisionProfile")
+  reviewer          Staff                    @relation("ExternalReviewReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "external_review_revisions_reviewer_fkey")
+
+  @@unique([entryId, version], map: "external_review_revisions_entry_version_key")
+  @@unique([entryId, kind, id], map: "external_review_revisions_entry_kind_id_key")
+  @@map("external_review_revisions")
   @@schema("foundation")
 }

@@ -6,6 +6,9 @@ import {
 } from './capability.js';
 import type { P03Capability, P03Grant, P03Scope } from './capability.js';
 import type { Principal } from './principal.js';
+import { isP04Capability, P04_CAPABILITIES } from './capability.js';
+import { requireP04CityExpansion } from './p04-grants.js';
+import type { P04Capability } from './p04-grants.js';
 
 type RoleIdentity = Pick<EffectiveRole, 'type' | 'code'>;
 const EMPTY: readonly P03Grant[] = Object.freeze([]);
@@ -67,9 +70,9 @@ export async function activeAdminCityIds(client: PoolClient, staffId: string): P
 
 /** Caller holds the policy write lock and target staff lock, and calls this only for a new
  * administrative city, not replays or revocations. There is no personal CITY source. */
-export async function requireP03CityExpansion(ctx: StaffWriteContext, targetStaffId: string): Promise<void> {
-  const result = await ctx.client.query<{ code: string; role_type: EffectiveRole['type']; role_code: string }>(
-    `SELECT p.code,r.role_type,r.code AS role_code
+export async function requireDomainCityExpansion(ctx: StaffWriteContext, targetStaffId: string): Promise<void> {
+  const result = await ctx.client.query<{ code: string; role_type: EffectiveRole['type']; role_code: string; channel_role: string }>(
+    `SELECT p.code,r.role_type,r.code AS role_code,s.role AS channel_role
      FROM foundation.staff s
      JOIN foundation.staff_role_assignments a ON a.staff_id=s.id AND a.revoked_at IS NULL
      JOIN foundation.roles r ON r.id=a.role_id AND r.status='ACTIVE'
@@ -78,13 +81,17 @@ export async function requireP03CityExpansion(ctx: StaffWriteContext, targetStaf
        AND p.module=split_part(p.code,'.',1)
      WHERE s.id=$1 AND s.employment_state='ACTIVE' AND s.role IN ('ADMIN','MANAGER')
        AND (r.role_type='CUSTOM' OR (r.role_type='SYSTEM' AND r.code=s.role))
-       AND p.code=ANY($2::text[])
+       AND (p.code=ANY($3::text[]) OR (p.code=ANY($2::text[])
        AND NOT (r.role_type='SYSTEM' AND r.code='ADMIN' AND EXISTS (
          SELECT 1 FROM foundation.p03_bootstrap_permissions b
          WHERE b.assignment_id=a.id AND b.permission_code=p.code AND b.revoked_at IS NULL
-       ))`, [targetStaffId, P03_CAPABILITIES]);
-  for (const { code, role_type, role_code } of result.rows) {
-    if (isP03Capability(code) && p03GrantableScopes(code, { type: role_type, code: role_code }).includes('CITY')
+       ))))`, [targetStaffId, P03_CAPABILITIES, P04_CAPABILITIES]);
+  const p04: { code: P04Capability; role: RoleIdentity }[] = [];
+  for (const { code, role_type, role_code, channel_role } of result.rows) {
+    const role = { type: role_type, code: role_code };
+    if (isP03Capability(code) && p03GrantableScopes(code, role).includes('CITY')
       && !holdsGlobalP03(ctx, code)) { throw new ForbiddenException(); }
+    if (isP04Capability(code) && (role_type !== 'CUSTOM' || channel_role === 'MANAGER')) { p04.push({ code, role }); }
   }
+  if (p04.length) { await requireP04CityExpansion(ctx, targetStaffId, p04); }
 }

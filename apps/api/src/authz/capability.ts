@@ -57,13 +57,31 @@ export type GeoCapability = keyof typeof GEO_SCOPE_CONTRACT;
 export const GEO_CAPABILITIES = Object.freeze(Object.keys(GEO_SCOPE_CONTRACT) as GeoCapability[]);
 /** One explicitly granted geography operation and the geographic border it carries. */
 export interface GeoGrant { readonly code: GeoCapability; readonly scope: 'GLOBAL' | 'CITY' }
-export type PermissionCode = Capability | GeoCapability | P03Capability;
-export const PERMISSION_CODES: readonly PermissionCode[] = Object.freeze([...STAFF_CAPABILITIES, ...GEO_CAPABILITIES, ...P03_CAPABILITIES]);
+export const P04_SCOPE_CONTRACT = {
+  'catalog.read': ['GLOBAL'], 'catalog.manage': ['GLOBAL'],
+  'pricing.rules.read': ['GLOBAL'], 'pricing.rules.manage': ['GLOBAL'],
+  'pricing.read': ['CITY', 'GLOBAL'], 'pricing.manage': ['CITY', 'GLOBAL'],
+  'content.externalreviews.read': ['GLOBAL'], 'content.externalreviews.manage': ['GLOBAL'],
+  'content.externalreviews.publish': ['GLOBAL'],
+} as const satisfies Record<string, readonly GrantScope[]>;
+export type P04Capability = keyof typeof P04_SCOPE_CONTRACT;
+export type P04Scope = 'CITY' | 'GLOBAL';
+export interface P04Grant { readonly code: P04Capability; readonly scope: P04Scope }
+export const P04_CAPABILITIES = Object.freeze(Object.keys(P04_SCOPE_CONTRACT) as P04Capability[]);
+export function isP04Capability(value: unknown): value is P04Capability {
+  return typeof value === 'string' && Object.hasOwn(P04_SCOPE_CONTRACT, value);
+}
+export function p04Module(code: P04Capability): string { return code.slice(0, code.indexOf('.')); }
+
+export type PermissionCode = Capability | GeoCapability | P03Capability | P04Capability;
+export const PERMISSION_CODES: readonly PermissionCode[] = Object.freeze([
+  ...STAFF_CAPABILITIES, ...GEO_CAPABILITIES, ...P03_CAPABILITIES, ...P04_CAPABILITIES,
+]);
 export function isGeoCapability(value: unknown): value is GeoCapability {
   return typeof value === 'string' && Object.hasOwn(GEO_SCOPE_CONTRACT, value);
 }
 export function isPermissionCode(value: unknown): value is PermissionCode {
-  return isCapability(value) || isGeoCapability(value) || isP03Capability(value);
+  return isCapability(value) || isGeoCapability(value) || isP03Capability(value) || isP04Capability(value);
 }
 export function isGrantScope(value: unknown): value is GrantScope {
   return value === 'GLOBAL' || value === 'SELF' || value === 'CITY';

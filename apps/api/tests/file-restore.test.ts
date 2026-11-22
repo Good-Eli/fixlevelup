@@ -106,7 +106,8 @@ live('P03-04D copy-only isolated restore', () => {
     const schemaVersion = authFixtureMigrations.at(-1) ?? '';
     expect(authFixtureMigrations[17]).toBe('20261122000400_settings_management');
     expect(authFixtureMigrations[18]).toBe('20261122000500_catalog_fixed_prices');
-    expect(schemaVersion).toBe('20261122000600_pricing_rules_ranges');
+    expect(authFixtureMigrations[19]).toBe('20261122000600_pricing_rules_ranges');
+    expect(schemaVersion).toBe('20261122000700_catalog_management');
     const sourceDb = await startFileReservationsDatabase();
     const [ops, writer, nextWriter, signer, floorOps, floorRuntime] = [ledgerPool('file_ledger_operator'), ledgerPool('file_ledger_writer'),
       ledgerPool('file_ledger_writer_next'), ledgerPool('file_ledger_signer'), ledgerPool('file_floor_operator'), ledgerPool('file_floor_verifier')] as const;

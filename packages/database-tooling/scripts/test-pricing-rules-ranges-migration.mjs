@@ -352,9 +352,9 @@ async function proveSql(db, reviewer, { cityA, cityB, cityAV, cityBV, category }
   return negative;
 }
 
-export async function provePricingFresh(owner, db, reviewer, fixtures) {
-  const database = await isolated(owner, 'fixlevelup_migrator', 'fresh');
-  assert.equal(await isolated(db, 'fixlevelup_runtime', 'fresh'), database);
+export async function provePricingFresh(owner, db, reviewer, fixtures, kind = 'fresh') {
+  const database = await isolated(owner, 'fixlevelup_migrator', kind);
+  assert.equal(await isolated(db, 'fixlevelup_runtime', kind), database);
   await noSeed(owner);
   await proveAcl(owner, db);
   await proveFence(owner, db);

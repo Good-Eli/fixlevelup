@@ -4,6 +4,7 @@ import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../../generated/prisma/client.js';
 import { ConfigurationError } from '../../runtime/config.js';
+import { P04_CAPABILITIES } from '../../authz/capability.js';
 
 export interface DatabaseConfig {
   readonly host: '127.0.0.1';
@@ -320,6 +321,7 @@ export class RuntimeDatabase implements OnModuleDestroy {
   private readonly client: PrismaClient | undefined;
   private pending: Promise<boolean> | undefined;
   private pendingManagement: Promise<boolean> | undefined;
+  private pendingCatalog: Promise<boolean> | undefined;
   private closing = false;
 
   constructor(private readonly config?: DatabaseConfig, private readonly authEnabled = false) {
@@ -618,7 +620,107 @@ export class RuntimeDatabase implements OnModuleDestroy {
           OR EXISTS(SELECT FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl WHERE acl.grantee<>p.proowner))
         AS compatible
     `;
-    return !this.closing && rows[0]?.compatible === true && rows[0].metadata === '0495cf5140136b04298a8428bb99eb80b064c62b05863a247810b58c4019553a';
+    return !this.closing && rows[0]?.compatible === true && [
+      '0495cf5140136b04298a8428bb99eb80b064c62b05863a247810b58c4019553a', // 018–020
+      'c41a3d75fc824c5a967c242f45c3a05d02e28c3c27b9a20325b95a011e535183', // 021: exact extended role_permissions_scope_check
+    ].includes(rows[0].metadata);
+  }
+
+  /** P04 has its own mechanical gate; legacy readiness never depends on this probe. */
+  catalogManagementReady(): Promise<boolean> {
+    if (!this.authEnabled || this.closing || !this.pool || !this.config) { return Promise.resolve(false); }
+    this.pendingCatalog ??= this.probeCatalogManagement().catch(() => false)
+      .finally(() => { this.pendingCatalog = undefined; });
+    return this.pendingCatalog;
+  }
+
+  private async probeCatalogManagement(): Promise<boolean> {
+    if (!this.pool || !this.config) { return false; }
+    // Exact PostgreSQL 18 metadata for 019–021 and the upstream policy state they
+    // trust. In particular, the RBAC writer fence must cover role, grant, assignment,
+    // and geography changes. Fingerprint the trigger definitions/activation and their
+    // functions' bodies and ACLs, not just the existence of the shared lock function.
+    // No business, session, or grant rows enter the fingerprint.
+    const { rows } = await this.pool.query<{ metadata: string; compatible: boolean }>(`
+      WITH tables AS (
+        SELECT * FROM pg_class WHERE relnamespace='foundation'::regnamespace AND relname IN (
+          'catalog_directory_entries','catalog_directory_versions','catalog_items','catalog_item_versions',
+          'catalog_fault_service_mappings','catalog_price_series','catalog_price_versions','catalog_price_periods',
+          'price_rules','price_rule_series','price_rule_versions','price_rule_scopes','price_rule_periods',
+          'pricing_policy_series','pricing_policy_versions','price_rule_priorities','price_rule_compatibilities',
+          'pricing_policy_periods','public_price_estimate_series','public_price_estimates','public_price_estimate_periods',
+          'external_reviews','external_review_revisions','p04_bootstrap_permissions','p04_command_receipts',
+          'role_permissions','permissions','roles','staff','staff_role_assignments','staff_admin_city_assignments',
+          'staff_web_credentials','staff_bootstrap_marker','web_sessions')
+      ), columns AS (
+        SELECT t.relname,a.*,p.typname,pg_get_expr(d.adbin,d.adrelid) AS default_expr
+        FROM tables t JOIN pg_attribute a ON a.attrelid=t.oid JOIN pg_type p ON p.oid=a.atttypid
+        LEFT JOIN pg_attrdef d ON d.adrelid=t.oid AND d.adnum=a.attnum
+        WHERE a.attnum>0 AND NOT a.attisdropped
+      ), triggers AS (
+        SELECT g.* FROM pg_trigger g WHERE NOT g.tgisinternal AND g.tgrelid IN (SELECT oid FROM tables)
+      ), functions AS (
+        SELECT p.* FROM pg_proc p WHERE p.oid IN (SELECT tgfoid FROM triggers)
+          OR (p.pronamespace='foundation'::regnamespace AND p.proname IN (
+            'issue_p04_synthetic_permissions','p03_original_bootstrap_assignment','pricing_policy_units_valid'))
+      ), metadata(category,name,shape) AS (
+        SELECT 'table',t.relname,jsonb_build_array(pg_get_userbyid(t.relowner),t.relkind,t.relrowsecurity,t.relforcerowsecurity)
+        FROM tables t
+        UNION ALL
+        SELECT 'column',a.relname||'.'||a.attname,jsonb_build_array(a.attnum,a.typname,a.atttypmod,a.attnotnull,
+          a.attidentity,a.attgenerated,a.default_expr,CASE WHEN a.attcollation=0 THEN NULL ELSE a.attcollation::regcollation::text END)
+        FROM columns a
+        UNION ALL
+        SELECT 'constraint',k.conname,jsonb_build_array(k.conrelid::regclass::text,k.contype,k.convalidated,k.condeferrable,
+          k.condeferred,pg_get_constraintdef(k.oid))
+        FROM pg_constraint k WHERE k.conrelid IN (SELECT oid FROM tables)
+        UNION ALL
+        SELECT 'index',c.relname,jsonb_build_array(i.indisvalid,i.indisready,i.indisunique,i.indislive,pg_get_indexdef(c.oid))
+        FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid IN (SELECT oid FROM tables)
+        UNION ALL
+        SELECT 'trigger',g.tgname,jsonb_build_array(g.tgrelid::regclass::text,g.tgenabled,pg_get_triggerdef(g.oid))
+        FROM triggers g
+        UNION ALL
+        SELECT 'function',p.proname,jsonb_build_array(pg_get_userbyid(p.proowner),p.proretset,p.prorettype::regtype::text,
+          l.lanname,pg_get_function_identity_arguments(p.oid),p.pronargs,p.pronargdefaults,p.prokind,p.prosecdef,p.proconfig,
+          p.provolatile,p.proisstrict,p.proleakproof,p.proparallel,encode(sha256(convert_to(replace(p.prosrc,chr(13),''),'UTF8')),'hex'))
+        FROM functions p JOIN pg_language l ON l.oid=p.prolang
+        UNION ALL
+        SELECT 'enum',t.typname,jsonb_build_array(pg_get_userbyid(t.typowner),
+          (SELECT jsonb_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid=t.oid))
+        FROM pg_type t WHERE t.typnamespace='foundation'::regnamespace AND t.typname='external_review_kind' AND t.typtype='e'
+        UNION ALL
+        SELECT 'catalog',code,jsonb_build_array(module,description,active,protected)
+        FROM foundation.permissions WHERE code=ANY($1::text[])
+      ), acl(category,name,entries) AS (
+        SELECT 'table_acl',t.relname,COALESCE(t.relacl,acldefault('r',t.relowner)) FROM tables t
+        UNION ALL
+        SELECT 'column_acl',a.relname||'.'||a.attname,a.attacl FROM columns a
+        UNION ALL
+        SELECT 'function_acl',p.proname,COALESCE(p.proacl,acldefault('f',p.proowner)) FROM functions p
+        UNION ALL
+        SELECT 'enum_acl',t.typname,COALESCE(t.typacl,acldefault('T',t.typowner))
+          FROM pg_type t WHERE t.typnamespace='foundation'::regnamespace AND t.typname='external_review_kind'
+      ), checked AS (
+        SELECT * FROM metadata
+        UNION ALL
+        SELECT a.category,a.name,jsonb_build_array(pg_get_userbyid(x.grantor),
+          CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable)
+        FROM acl a CROSS JOIN LATERAL aclexplode(a.entries) x
+      )
+      SELECT encode(sha256(convert_to((SELECT jsonb_agg(jsonb_build_array(category,name,shape)
+          ORDER BY category COLLATE "C",name COLLATE "C",shape::text COLLATE "C")::text FROM checked),'UTF8')),'hex') AS metadata,
+        current_database()=$2 AND current_user='fixlevelup_runtime'
+        AND NOT EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user))
+        AND has_schema_privilege(current_user,'foundation','USAGE')
+        AND NOT has_schema_privilege(current_user,'foundation','CREATE')
+        AND NOT has_schema_privilege(current_user,'public','CREATE')
+        AND NOT has_database_privilege(current_user,current_database(),'CREATE,TEMP')
+        AND NOT (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit
+          FROM pg_roles WHERE rolname=current_user)
+        AND NOT has_function_privilege(current_user,'foundation.issue_p04_synthetic_permissions()','EXECUTE') AS compatible
+    `, [P04_CAPABILITIES, this.config.database]);
+    return !this.closing && rows[0]?.compatible === true && rows[0].metadata === '00a7323a31b502c1bb375aa3ca84cdc570da9bbffd4b87da5e4e0c463964725c';
   }
 
   private async authReady(): Promise<boolean> {

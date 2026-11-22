@@ -4,7 +4,7 @@ import type { PoolClient } from 'pg';
 import { AUTHORIZATION_SERVICE } from '../authz/authorization.resources.js';
 import { isSystemAdmin } from '../authz/authorization.service.js';
 import type { AuthorizationServiceApi, SessionProof, StaffWriteContext } from '../authz/authorization.service.js';
-import { GLOBAL_SCOPE, isCapability, isP03Capability, isPermissionCode, P03_CAPABILITY_METADATA, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES } from '../authz/capability.js';
+import { GLOBAL_SCOPE, isCapability, isP03Capability, isP04Capability, isPermissionCode, P03_CAPABILITY_METADATA, p04Module, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES } from '../authz/capability.js';
 import type { Capability, GrantScope } from '../authz/capability.js';
 import { staffReadFilter } from '../staff/staff-policy.js';
 import type { StaffDto } from '../staff/staff.service.js';
@@ -61,6 +61,7 @@ async function projected(ctx: StaffWriteContext, id: string | null): Promise<Rol
       // protected-domain drift must not become a delegable (or visible) grant.
       if (!isPermissionCode(g.code)) { continue; }
       if (isP03Capability(g.code) && (g.protected !== false || g.module !== P03_CAPABILITY_METADATA[g.code].module)) { continue; }
+      if (isP04Capability(g.code) && (g.protected !== false || g.module !== p04Module(g.code))) { continue; }
       const scope = g.scope as GrantScope;
       if (!grantableScopes(g.code, role).includes(scope)) { continue; }
       permissions.push({ code: g.code, scope });

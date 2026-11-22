@@ -6,7 +6,7 @@ import {
 import type { PoolClient } from 'pg';
 import type { P03Page, P03TechnicianPickerItem } from '@fixlevelup/p03-contracts';
 import { isSystemAdmin } from '../../authz/authorization.service.js';
-import { requireP03CityExpansion } from '../../authz/p03-grants.js';
+import { requireDomainCityExpansion } from '../../authz/p03-grants.js';
 import { uuid } from '../../authz/rbac-http.js';
 import type { GeoCapability, GeoGrant } from '../../authz/capability.js';
 import type { GeoCommand, GeoContext, GeoReceipt, GeoTarget } from './geo-contract.js';
@@ -432,9 +432,9 @@ const adminAssign: GeoCommand = {
       'SELECT id FROM foundation.staff_admin_city_assignments WHERE staff_id=$1 AND city_id=$2 AND revoked_at IS NULL FOR UPDATE',
       [staffId, cityId]);
     if (active.rowCount !== 0) { throw new ConflictException(); }
-    // A new city widens every effective CITY P03 grant of the target. This runs
+    // A new city widens every effective CITY P03/P04 grant of the target. This runs
     // under the RBAC write and target staff locks, only on the actual INSERT path.
-    await requireP03CityExpansion(ctx, staffId);
+    await requireDomainCityExpansion(ctx, staffId);
     const id = randomUUID();
     // `granted_at` is database-stamped and deliberately not insertable by the runtime:
     // the caller cannot backdate a grant.

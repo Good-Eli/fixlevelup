@@ -38,7 +38,11 @@ export function check(result: Result, status: number): Result { expect(result.st
 export const grant = (code: string) => ({ code, scope: code.startsWith('staff.self.') ? 'SELF' : 'GLOBAL' });
 
 export class RbacFixture {
-  readonly database = `fixlevelup_rbac_test_${randomBytes(12).toString('hex')}`;
+  readonly database: string;
+  constructor(private readonly options: { readonly p04?: true } = {}) {
+    const prefix = options.p04 === true ? 'fixlevelup_configuration_test' : 'fixlevelup_rbac_test';
+    this.database = `${prefix}_${randomBytes(12).toString('hex')}`;
+  }
   readonly botToken = `7000000002:${random()}`;
   private pool?: Pool;
   private app?: Awaited<ReturnType<typeof createApi>>;
@@ -54,7 +58,8 @@ export class RbacFixture {
   private logs = vi.spyOn(ConsoleLogger.prototype, 'log').mockImplementation(() => undefined);
   get db(): Pool { if (!this.pool) { throw new Error('Missing isolated fixture'); } return this.pool; }
   async start(): Promise<void> {
-    if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1' || !/^fixlevelup_rbac_test_[a-f0-9]{24}$/.test(this.database)) { throw new Error('Refusing non-isolated DB'); }
+    const name = this.options.p04 === true ? /^fixlevelup_configuration_test_[a-f0-9]{24}$/ : /^fixlevelup_rbac_test_[a-f0-9]{24}$/;
+    if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1' || !name.test(this.database)) { throw new Error('Refusing non-isolated DB'); }
     const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
     const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
     const postgresPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
@@ -83,6 +88,18 @@ export class RbacFixture {
       { origin, csrfSecret: random(), throttleSecret: random() }, { botToken: this.botToken });
     this.server = this.app.getHttpServer() as Server;
     this.admin = await this.login(staffId, login, password); this.initialized = true;
+  }
+  /** No automatic issue at setup, login, startup or recovery. Only a fresh opted-in fixture can call this. */
+  async issueP04Synthetic(): Promise<void> {
+    if (!this.initialized || this.options.p04 !== true || process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1'
+      || !/^fixlevelup_configuration_test_[a-f0-9]{24}$/.test(this.database)) { throw new Error('Refusing P04 synthetic issuance'); }
+    const client = await this.db.connect();
+    try {
+      const { rows } = await client.query<{ ok: boolean }>(`SELECT current_database()=$1 AND current_user='fixlevelup_migrator'
+        AND pg_get_userbyid(datdba)=current_user AS ok FROM pg_database WHERE datname=current_database()`, [this.database]);
+      if (rows[0]?.ok !== true) { throw new Error('P04 fixture migrator identity mismatch'); }
+      await client.query('SELECT foundation.issue_p04_synthetic_permissions()');
+    } finally { client.release(); }
   }
   async close(): Promise<void> {
     try { await this.app?.close(); } finally { try { await this.pool?.end(); } finally { this.logs.mockRestore(); } }

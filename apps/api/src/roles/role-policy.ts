@@ -1,12 +1,13 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import {
-  GEO_SCOPE_CONTRACT, isCapability, isGeoCapability, isP03Capability, isPermissionCode, P03_CAPABILITY_METADATA,
-  PERMISSION_CONTRACT, PERMISSION_CODES, PROTECTED_CAPABILITIES,
+  GEO_SCOPE_CONTRACT, isCapability, isGeoCapability, isP03Capability, isP04Capability, isPermissionCode, P03_CAPABILITY_METADATA,
+  P04_SCOPE_CONTRACT, p04Module, PERMISSION_CONTRACT, PERMISSION_CODES, PROTECTED_CAPABILITIES,
 } from '../authz/capability.js';
 import type { GeoCapability, GrantScope, PermissionCode } from '../authz/capability.js';
 import { isSystemAdmin } from '../authz/authorization.service.js';
 import type { AccessView, EffectiveRole } from '../authz/authorization.service.js';
 import { holdsGlobalP03, p03GrantableScopes } from '../authz/p03-grants.js';
+import { holdsGlobalP04, p04GrantableScopes } from '../authz/p04-grants.js';
 
 export interface RoleGrant { code: PermissionCode; scope: GrantScope }
 export interface PermissionDto extends RoleGrant {
@@ -52,6 +53,7 @@ export function emptyBody(body: unknown): void { fields(body, []); }
 export function grantableScopes(code: PermissionCode, target: Pick<EffectiveRole, 'type' | 'code'>): readonly GrantScope[] {
   if (isCapability(code)) { return [PERMISSION_CONTRACT[code]]; }
   if (isP03Capability(code)) { return p03GrantableScopes(code, target); }
+  if (isP04Capability(code)) { return p04GrantableScopes(code, target); }
   if (target.type === 'SYSTEM' && target.code === 'TECHNICIAN') { return []; }
   const admin = isSystemAdmin({ id: '', type: target.type, code: target.code });
   if (code === 'geography.publish' && !admin) { return []; }
@@ -91,6 +93,11 @@ export function catalogEntry(row: { code: string; description: string; module: s
     if (row.protected || row.module !== meta.module || scope === undefined) { return null; }
     return { ...row, code: row.code, scope, scopes: meta.scopes };
   }
+  if (isP04Capability(row.code)) {
+    if (row.protected || row.module !== p04Module(row.code)) { return null; }
+    const scopes = P04_SCOPE_CONTRACT[row.code];
+    return { ...row, code: row.code, scope: scopes[0], scopes };
+  }
   if (!isGeoCapability(row.code) || row.protected) { return null; }
   const scopes = GEO_SCOPE_CONTRACT[row.code];
   return { code: row.code, module: row.module, description: row.description, protected: false, scope: 'CITY', scopes };
@@ -120,6 +127,12 @@ export function checkReplacement(actor: AccessView, target: EffectiveRole, catal
     }
     // Domain grants are delegable only when the actor independently owns that exact
     // code at GLOBAL (or retains the exact visible grant on another role).
+    if (isP04Capability(grant.code)) {
+      if (!actor.permissions.includes('roles.permissions.manage') || (!holdsGlobalP04(actor, grant.code) && !mayRetain)) {
+        throw new ForbiddenException();
+      }
+      continue;
+    }
     const holdsGlobal = isP03Capability(grant.code) ? holdsGlobalP03(actor, grant.code) : holdsGlobalGeo(actor, grant.code);
     if (!holdsGlobal && !mayRetain) { throw new ForbiddenException(); }
   }

@@ -23,6 +23,7 @@
     "browser:test": "corepack pnpm --filter @fixlevelup/browser-tooling run test",
     "p03:contracts": "corepack pnpm --filter @fixlevelup/p03-contracts run build",
     "p03:verify-contracts": "corepack pnpm run p03:contracts && node packages/p03-contracts/verify.mjs",
+    "p04:verify-contracts": "node packages/p03-contracts/generate-p04.mjs && node packages/p03-contracts/p04-verify.mjs",
     "lint": "corepack pnpm run db:generate && corepack pnpm run p03:contracts && eslint . --max-warnings 0",
     "typecheck": "corepack pnpm run db:generate && corepack pnpm run p03:contracts && corepack pnpm --filter @fixlevelup/database-tooling run typecheck && corepack pnpm --filter @fixlevelup/storage-tooling run typecheck && corepack pnpm --filter @fixlevelup/browser-tooling run typecheck && tsc --noEmit && corepack pnpm --filter @fixlevelup/api run typecheck && corepack pnpm --filter @fixlevelup/web run typecheck && corepack pnpm --filter @fixlevelup/miniapp run typecheck",
     "build": "corepack pnpm run db:generate && corepack pnpm run p03:contracts && corepack pnpm --filter @fixlevelup/api run build && corepack pnpm --filter @fixlevelup/web run build && corepack pnpm --filter @fixlevelup/miniapp run build",

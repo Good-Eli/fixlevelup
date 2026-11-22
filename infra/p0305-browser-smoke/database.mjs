@@ -9,7 +9,7 @@ import { hashPassword } from '../../apps/api/dist/staff/password.js';
 const requireApi = createRequire(new URL('../../apps/api/package.json', import.meta.url));
 const { Pool } = requireApi('pg');
 const migrationRoot = new URL('../../prisma/migrations/', import.meta.url);
-const head = '20261122000600_pricing_rules_ranges';
+const head = '20261122000700_catalog_management';
 export const database = 'fixlevelup_dev'; // Required by compiled production API, inside a new network namespace only.
 export const token = () => randomBytes(32).toString('hex');
 
@@ -54,8 +54,9 @@ export async function provision() {
   const manager = { id: randomUUID(), login: `p0305-manager-${randomUUID()}`, password: token() };
   try {
     const steps = (await readdir(migrationRoot)).filter(name => /^\d{14}_/.test(name)).sort();
-    if (steps.length !== 20 || steps[17] !== '20261122000400_settings_management'
-      || steps[18] !== '20261122000500_catalog_fixed_prices' || steps.at(-1) !== head) {
+    if (steps.length !== 21 || steps[17] !== '20261122000400_settings_management'
+      || steps[18] !== '20261122000500_catalog_fixed_prices' || steps[19] !== '20261122000600_pricing_rules_ranges'
+      || steps.at(-1) !== head) {
       throw new Error('Unexpected migration chain for P03 regression smoke');
     }
     const databaseTooling = new URL('../../packages/database-tooling/', import.meta.url);

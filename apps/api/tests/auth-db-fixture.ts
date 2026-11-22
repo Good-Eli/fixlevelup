@@ -22,6 +22,7 @@ const expectedSteps = [
   '20261122000400_settings_management',
   '20261122000500_catalog_fixed_prices',
   '20261122000600_pricing_rules_ranges',
+  '20261122000700_catalog_management',
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })

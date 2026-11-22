@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./p04": { "types": "./dist/p04.d.ts", "import": "./dist/p04.js" }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node generate-p04.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }

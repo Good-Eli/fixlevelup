@@ -31,18 +31,69 @@ function id(value: unknown): string {
 }
 function roleType(v: unknown) { return oneOf(v, 'SYSTEM', 'CUSTOM'); }
 function scope(v: unknown) { return oneOf(v, 'SELF', 'GLOBAL', 'CITY'); }
+
+// P04-03 role-editor policy, not an authorization decision or an implicit grant.
+const P04_SCOPES = {
+  'catalog.read': ['GLOBAL'], 'catalog.manage': ['GLOBAL'],
+  'pricing.rules.read': ['GLOBAL'], 'pricing.rules.manage': ['GLOBAL'],
+  'pricing.read': ['CITY', 'GLOBAL'], 'pricing.manage': ['CITY', 'GLOBAL'],
+  'content.externalreviews.read': ['GLOBAL'], 'content.externalreviews.manage': ['GLOBAL'],
+  'content.externalreviews.publish': ['GLOBAL'],
+} as const;
+export type P04Capability = keyof typeof P04_SCOPES;
+export type P04Scope = 'GLOBAL' | 'CITY';
+export interface P04Grant { readonly code: P04Capability; readonly scope: P04Scope }
+export function isP04Capability(value: unknown): value is P04Capability {
+  return typeof value === 'string' && Object.hasOwn(P04_SCOPES, value);
+}
+export function p04Scopes(role: { type: 'SYSTEM' | 'CUSTOM'; code: string }, code: P04Capability): readonly P04Scope[] {
+  const scopes: readonly P04Scope[] = P04_SCOPES[code];
+  if (role.type === 'SYSTEM' && role.code === 'ADMIN') { return scopes; }
+  return role.type === 'CUSTOM' || role.code === 'MANAGER' ? scopes.filter(s => s === 'CITY') : [];
+}
+function checkP04RoleGrants(role: { type: 'SYSTEM' | 'CUSTOM'; code: string }, grants: readonly Grant[]): void {
+  const seen = new Set<P04Capability>();
+  for (const g of grants) {
+    if (!isP04Capability(g.code)) { continue; }
+    if (g.scope === 'SELF' || !p04Scopes(role, g.code).includes(g.scope) || seen.has(g.code)) { throw new Error('Invalid P04 grant'); }
+    seen.add(g.code);
+  }
+}
+function p04Grants(role: { type: 'SYSTEM' | 'CUSTOM'; code: string }, value: unknown): readonly P04Grant[] | undefined {
+  if (value === undefined) { return undefined; }
+  if (!Array.isArray(value) || value.length > Object.keys(P04_SCOPES).length) { throw new Error('Invalid P04 grant list'); }
+  const grants = array<P04Grant>(v => {
+    const g = object(v);
+    const code = g['code'];
+    if (Object.keys(g).length !== 2 || !isP04Capability(code)) { throw new Error('Invalid P04 grant'); }
+    return { code, scope: oneOf(g['scope'], 'GLOBAL', 'CITY') };
+  }, value);
+  checkP04RoleGrants(role, grants);
+  return grants;
+}
 function grant(value: unknown) { const r = object(value); return { code: text(r['code']), scope: scope(r['scope']) }; }
 function permission(value: unknown) {
   const r = object(value);
   // `scopes` is the authoritative list for a target role; legacy `scope` stays supported.
   const scopes = r['scopes'] === undefined ? [scope(r['scope'])] : array(scope, r['scopes']);
   if (!scopes.length) { throw new Error('Invalid scope list'); }
-  return { ...grant(r), description: text(r['description']), module: text(r['module']), protected: bool(r['protected']), scopes };
+  const item = { ...grant(r), description: text(r['description']), module: text(r['module']), protected: bool(r['protected']), scopes };
+  if (isP04Capability(item.code)) {
+    const expected: readonly string[] = P04_SCOPES[item.code];
+    if (item.protected || item.module !== item.code.split('.')[0] || item.scope !== expected[0]
+      || scopes.length !== expected.length || expected.some(s => !scopes.some(actual => actual === s))) {
+      throw new Error('Invalid P04 catalog permission');
+    }
+  }
+  return item;
 }
 function role(value: unknown) {
-  const r = object(value); return { id: id(r['id']), code: text(r['code']), name: text(r['name']), description: nullable(text, r['description']),
+  const r = object(value);
+  const decoded = { id: id(r['id']), code: text(r['code']), name: text(r['name']), description: nullable(text, r['description']),
     type: roleType(r['type']), status: oneOf(r['status'], 'ACTIVE', 'ARCHIVED'), version: count(r['version']), assignedCount: nullable(count, r['assignedCount']),
     activeAssignedCount: nullable(count, r['activeAssignedCount']), updatedAt: text(r['updatedAt']), updatedBy: nullable(id, r['updatedBy']), permissions: array(grant, r['permissions']) };
+  checkP04RoleGrants(decoded, decoded.permissions);
+  return decoded;
 }
 function staff(value: unknown) {
   const r = object(value); return { id: id(r['id']), role: text(r['role']), roleId: id(r['roleId']), roleName: text(r['roleName']),
@@ -56,8 +107,10 @@ function identity(value: unknown) {
 }
 export type Identity = ReturnType<typeof identity>;
 export interface GeoGrantView { code: string; scope: 'GLOBAL' | 'CITY' }
-function access(value: unknown): { staffId: string; role: { id: string; code: string; type: 'SYSTEM' | 'CUSTOM' }; permissions: string[]; geoPermissions?: GeoGrantView[]; p03Permissions?: readonly P03Grant[] } {
-  const r = object(value); const role = object(r['role']);
+function access(value: unknown): { staffId: string; role: { id: string; code: string; type: 'SYSTEM' | 'CUSTOM' }; permissions: string[]; geoPermissions?: GeoGrantView[]; p03Permissions?: readonly P03Grant[]; p04Permissions?: readonly P04Grant[] } {
+  const r = object(value); const rawRole = object(r['role']);
+  const role = { id: id(rawRole['id']), code: text(rawRole['code']), type: roleType(rawRole['type']) };
+  const p04 = p04Grants(role, r['p04Permissions']);
   // Individual geography grants (code + GLOBAL/CITY) as resolved by the server session.
   // Optional so an older/absent field can never be read as an implicit grant.
   const geo = r['geoPermissions'] === undefined ? undefined
@@ -70,10 +123,17 @@ function access(value: unknown): { staffId: string; role: { id: string; code: st
     return { code, scope };
   }, raw);
   if (p03 && new Set(p03.map(g => g.code)).size !== p03.length) { throw new Error('Duplicate P03 grant'); }
-  return { staffId: id(r['staffId']), role: { id: id(role['id']), code: text(role['code']), type: roleType(role['type']) }, permissions: array(text, r['permissions']),
-    ...(geo === undefined ? {} : { geoPermissions: geo }), ...(p03 === undefined ? {} : { p03Permissions: p03 }) };
+  return { staffId: id(r['staffId']), role, permissions: array(text, r['permissions']),
+    ...(geo === undefined ? {} : { geoPermissions: geo }), ...(p03 === undefined ? {} : { p03Permissions: p03 }),
+    ...(p04 === undefined ? {} : { p04Permissions: p04 }) };
 }
 function list<T>(read: Decoder<T>) { return (v: unknown) => array(read, object(v)['items']); }
+function permissionCatalog(value: unknown) {
+  const permissions = list(permission)(value);
+  const p04 = permissions.filter(p => isP04Capability(p.code));
+  if (new Set(p04.map(p => p.code)).size !== p04.length) { throw new Error('Duplicate P04 catalog permission'); }
+  return permissions;
+}
 function receipt(value: unknown) {
   const r = object(value); return { id: id(r['id']), version: count(r['version']) };
 }
@@ -118,7 +178,7 @@ export function api(signal: AbortSignal, csrf?: string) {
     me: () => request('auth/me', identity), login: (login: string, password: string) => request('auth/login', identity, 'POST', { login, password }),
     logout: () => request('auth/logout', v => { if (v !== null) { throw new Error('Unexpected logout response'); } }, 'POST', {}),
     access: () => request('access', access), roles: () => request('roles', list(role)), staff: () => request('staff', list(staff)),
-    catalog: () => request('permissions', list(permission)), role: (target: string) => request(rolePath(target), role),
+    catalog: () => request('permissions', permissionCatalog), role: (target: string) => request(rolePath(target), role),
     person: (target: string) => request(staffPath(target), staff), members: (target: string) => request(`${rolePath(target)}/staff`, list(staff)),
     createRole: (name: string, description: string) => request('roles', receipt, 'POST', { name, description }),
     editRole: (target: Role, name: string, description: string) => request(rolePath(target.id), receipt, 'PATCH', { name, description }, tag('role', target.version)),

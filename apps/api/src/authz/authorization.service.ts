@@ -12,17 +12,20 @@ import {
   PROTECTED_CAPABILITIES, scopeMatches,
 } from './capability.js';
 import { activeAdminCityIds, effectiveP03Grants } from './p03-grants.js';
+import { effectiveP04Grants } from './p04-grants.js';
+import type { P04Capability, P04Grant, P04Target } from './p04-grants.js';
 import { lockAccessPolicy } from './rbac-lock.js';
 import type { GeoAction, GeoContext, GeographyAuthorizationApi } from '../settings/geography/geo-contract.js';
 
 export type { P03Target } from '@fixlevelup/p03-contracts';
+export type { P04Capability, P04Target } from './p04-grants.js';
 
 export type AuthorizationErrorCode = 'UNAUTHORIZED' | 'FORBIDDEN' | 'FAILED';
 export class AuthorizationError extends Error {
   constructor(readonly code: AuthorizationErrorCode) { super('Authorization failed'); this.name = 'AuthorizationError'; }
 }
-/** P03 writes only: the last authorization check passed, but COMMIT was not acknowledged.
- * Callers may reauthorize a receipt read, never retry the mutation. No raw error is kept. */
+/** Receipt-backed P03/P04 writes only: COMMIT was not acknowledged. Never retry the
+ * mutation automatically. No raw error is kept; P03's existing receipt path is unchanged. */
 export class P03CommitUnknown extends Error {
   constructor() { super('P03 commit acknowledgement unknown'); this.name = 'P03CommitUnknown'; }
 }
@@ -40,6 +43,7 @@ export interface AccessView {
   readonly staffId: string; readonly role: EffectiveRole; readonly permissions: readonly Capability[];
   readonly geoPermissions?: readonly GeoGrant[];
   readonly p03Permissions?: readonly P03Grant[];
+  readonly p04Permissions?: readonly P04Grant[];
 }
 export interface StaffWriteContext extends AccessView { readonly client: PoolClient; readonly principal: Principal }
 type Command<T> = (ctx: StaffWriteContext) => Promise<T>;
@@ -69,6 +73,30 @@ export interface P03AuthorizationApi {
     callback: (ctx: P03PolicyContext, cityIds: readonly string[] | null) => Promise<T>): Promise<T>;
 }
 
+export interface P04Context {
+  readonly client: PoolClient;
+  readonly staffId: string;
+  readonly target: P04Target;
+  /** Null means all required grants are GLOBAL; a CITY query must still bind its target. */
+  readonly cityIds: readonly string[] | null;
+  recheck(target?: P04Target): Promise<void>;
+}
+export interface P04AuthorizationApi {
+  withP04<T>(proof: SessionProof, mode: 'read' | 'write', required: readonly P04Capability[], target: P04Target,
+    callback: (ctx: P04Context) => Promise<T>): Promise<T>;
+}
+
+const P04_COMPANY_ACTIONS: readonly (readonly P04Capability[])[] = [
+  ['catalog.read'], ['catalog.read', 'catalog.manage'], ['pricing.rules.read'], ['pricing.rules.read', 'pricing.rules.manage'],
+  ['content.externalreviews.read'], ['content.externalreviews.read', 'content.externalreviews.manage'],
+  ['content.externalreviews.read', 'content.externalreviews.manage', 'content.externalreviews.publish'],
+];
+const P04_FINAL_CLOCK_GUARDS = new Set([
+  'catalog_price_periods_final_clock_guard', 'price_rule_periods_final_clock_guard',
+  'pricing_policy_periods_final_clock_guard', 'public_price_estimate_periods_final_clock_guard',
+]);
+type ReceiptCommitMode = false | 'P03' | 'P04';
+
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const GEO_ACTIONS: readonly GeoAction[] = Object.freeze([
@@ -91,7 +119,7 @@ interface LockedProof {
 }
 interface PolicyRow {
   id: string; code: string; role_type: string; permission_code: string | null;
-  scope_type: string | null; protected: boolean | null;
+  scope_type: string | null; protected: boolean | null; p04_present?: boolean;
 }
 interface GeoGrantRow { code: string; scope: string; source: string }
 export function isSystemAdmin(role: EffectiveRole): boolean { return role.type === 'SYSTEM' && role.code === 'ADMIN'; }
@@ -120,10 +148,10 @@ function effectiveGeoGrant(code: unknown, scope: unknown, role: EffectiveRole, s
 /** No permission cache, plain unchecked read callback or channel-derived grants. A guard preflight
  * is not authority for a later read/write: every protected projection and command takes
  * the policy lock, verifies the specific session and reads the role on its own transaction. */
-export class AuthorizationService implements AuthorizationServiceApi, GeographyAuthorizationApi, P03AuthorizationApi {
+export class AuthorizationService implements AuthorizationServiceApi, GeographyAuthorizationApi, P03AuthorizationApi, P04AuthorizationApi {
   constructor(private readonly pool: Pick<Pool, 'connect'>) {}
 
-  private async transaction<T>(mode: 'read' | 'write', fn: (client: PoolClient) => Promise<T>, recoverP03Receipt = false): Promise<T> {
+  private async transaction<T>(mode: 'read' | 'write', fn: (client: PoolClient) => Promise<T>, receiptCommitMode: ReceiptCommitMode = false): Promise<T> {
     let client: PoolClient | undefined;
     let inTransaction = false;
     let discard = false;
@@ -133,11 +161,16 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
       inTransaction = true;
       await lockAccessPolicy(client, mode);
       const result = await fn(client);
-      if (recoverP03Receipt) {
+      if (receiptCommitMode) {
         try {
           const acknowledgement = await client.query('COMMIT');
           if (acknowledgement.command !== 'COMMIT') { throw new InternalServerErrorException(); }
         } catch (error) {
+          if (receiptCommitMode === 'P04' && definiteCommitRejection(error) && error && typeof error === 'object'
+            && 'code' in error && error.code === '23514' && 'constraint' in error
+            && typeof error.constraint === 'string' && P04_FINAL_CLOCK_GUARDS.has(error.constraint)) {
+            throw new ConflictException();
+          }
           if (error instanceof InternalServerErrorException || definiteCommitRejection(error)) { throw error; }
           // A broken/uncertain connection cannot be reused, even for rollback.
           // Only the caller's receipt-only path may open a new transaction.
@@ -159,9 +192,13 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
     } finally { client?.release(discard); }
   }
 
-  private async policy(client: PoolClient, principal: Principal): Promise<AccessView & { geoPermissions: readonly GeoGrant[] }> {
+  private async policy(client: PoolClient, principal: Principal, includeP04 = false): Promise<AccessView & { geoPermissions: readonly GeoGrant[] }> {
+    // Legacy projections keep their statement sequence: detect 021 via pg_catalog in
+    // the existing lookup, and never reference the new source relation on 018–020.
+    const p04Marker = includeP04 && principal.kind === 'staff-web'
+      ? ", to_regclass('foundation.p04_bootstrap_permissions') IS NOT NULL AS p04_present" : '';
     const result = await client.query<PolicyRow>(
-      `SELECT r.id, r.code, r.role_type, p.code AS permission_code, rp.scope_type, p.protected
+      `SELECT r.id, r.code, r.role_type, p.code AS permission_code, rp.scope_type, p.protected${p04Marker}
        FROM foundation.staff s
        JOIN foundation.staff_role_assignments a ON a.staff_id=s.id AND a.revoked_at IS NULL
        JOIN foundation.roles r ON r.id=a.role_id AND r.status='ACTIVE'
@@ -190,7 +227,10 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
         || (protectedCode && !isSystemAdmin(role))) { continue; }
       permissions.push(code);
     }
-    return { staffId: principal.staffId, role, permissions, geoPermissions: await this.geoGrants(client, principal.staffId, role) };
+    const geoPermissions = await this.geoGrants(client, principal.staffId, role);
+    const p04Permissions = includeP04 && first.p04_present === true ? await effectiveP04Grants(client, principal, role) : [];
+    return { staffId: principal.staffId, role, permissions, geoPermissions,
+      ...(p04Permissions.length ? { p04Permissions } : {}) };
   }
 
   /** Geography grants on the same locked snapshot. Role grants come from the live role;
@@ -284,13 +324,13 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
   }
 
   private async withProof<T>(mode: 'read' | 'write', proof: SessionProof, callback: (client: PoolClient, principal: Principal) => Promise<T>,
-    selfDeactivation = false, recoverP03Receipt = false): Promise<T> {
+    selfDeactivation = false, receiptCommitMode: ReceiptCommitMode = false): Promise<T> {
     return this.transaction(mode, async (client) => {
       const locked = await this.lockedPrincipal(client, proof);
       const result = await callback(client, locked.principal);
       await this.assertProofCurrent(client, locked, selfDeactivation);
       return result;
-    }, recoverP03Receipt);
+    }, receiptCommitMode);
   }
 
   async authorize(principal: Principal, capability: Capability, scope: Scope): Promise<void> {
@@ -298,13 +338,14 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
   }
   async inspectAccess(proof: SessionProof): Promise<AccessView> {
     return this.withProof('read', proof, async (client, principal) => {
-      const view = await this.policy(client, principal);
+      const view = await this.policy(client, principal, true);
       return { ...view, p03Permissions: await effectiveP03Grants(client, principal, view.role) };
     });
   }
   private async execute<T>(mode: 'read' | 'write', proof: SessionProof, capability: Capability, scope: Scope, operation: Command<T>): Promise<T> {
     return this.withProof(mode, proof, async (client, principal) => {
-      const view = await this.policy(client, principal);
+      const view = await this.policy(client, principal, mode === 'write' &&
+        (capability === 'roles.permissions.manage' || capability === 'staff.role.assign' || capability === 'staff.create'));
       requirePermission(view, capability, scope);
       const p03Permissions = await effectiveP03Grants(client, principal, view.role);
       return operation({ ...view, p03Permissions, client, principal });
@@ -361,7 +402,85 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
         throw new NotFoundException();
       }
       return callback({ ...ctx, target, cityIds });
-    }, false, mode === 'write');
+    }, false, mode === 'write' && 'P03');
+  }
+
+  /** P04 uses the same RC policy lock and live session proof as P03. The callback
+   * rechecks actual stored targets after its own fence/receipt waits; all such targets
+   * then remain part of the last proof even on a thrown conflict or other late error. */
+  async withP04<T>(proof: SessionProof, mode: 'read' | 'write', required: readonly P04Capability[], inputTarget: P04Target,
+    callback: (ctx: P04Context) => Promise<T>): Promise<T> {
+    const codes = [...required];
+    const target = this.p04Target(inputTarget);
+    const matches = (expected: readonly P04Capability[]): boolean =>
+      codes.length === expected.length && expected.every((code) => codes.includes(code));
+    const validate = (current: P04Target): void => {
+      if (current.scope === 'COMPANY') {
+        if (P04_COMPANY_ACTIONS.some((action) => (mode === 'read') === (action.length === 1) && matches(action))) { return; }
+      } else if (mode === 'read' ? matches(['pricing.read']) : current.scope === 'CITY' && matches(['pricing.read', 'pricing.manage'])) {
+        return;
+      }
+      throw new BadRequestException();
+    };
+    validate(target);
+    return this.transaction(mode, async (client) => {
+      const locked = await this.lockedPrincipal(client, proof);
+      const { principal } = locked;
+      if (principal.kind !== 'staff-web') { throw new AuthorizationError('FORBIDDEN'); }
+      const authorizeTargets = async (targets: readonly P04Target[]): Promise<readonly string[] | null> => {
+        await this.assertProofCurrent(client, locked, false);
+        const view = await this.policy(client, principal, true);
+        const grants = codes.map((code) => view.p04Permissions?.find((grant) => grant.code === code));
+        if (grants.some((grant) => !grant)) { throw new AuthorizationError('FORBIDDEN'); }
+        const cityIds = grants.some((grant) => grant?.scope === 'CITY') ? await activeAdminCityIds(client, principal.staffId) : null;
+        for (const current of targets) {
+          if (current.scope === 'COMPANY' && cityIds !== null) { throw new AuthorizationError('FORBIDDEN'); }
+          if (current.scope === 'CITY' && ((cityIds !== null && !cityIds.includes(current.cityId)) ||
+            (await client.query('SELECT id FROM foundation.service_cities WHERE id=$1', [current.cityId])).rowCount !== 1)) {
+            throw new NotFoundException();
+          }
+        }
+        // Keep the time-sensitive session predicate the last statement in the proof.
+        await this.assertProofCurrent(client, locked, false);
+        return cityIds;
+      };
+      const cityIds = await authorizeTargets([target]);
+      const checked = new Map([[JSON.stringify(target), target]]);
+      const recheck = async (otherTarget = target): Promise<void> => {
+        const current = this.p04Target(otherTarget);
+        // Receipt targets can change the city, but cannot convert a scoped command
+        // into a company or discovery operation (or vice versa).
+        if (current.scope !== target.scope) { throw new NotFoundException(); }
+        checked.set(JSON.stringify(current), current);
+        await authorizeTargets([...checked.values()]);
+      };
+      await client.query('SAVEPOINT p04_authorized_callback');
+      let result: T;
+      try {
+        result = await callback(Object.freeze({ client, staffId: principal.staffId, target, cityIds, recheck }));
+      } catch (error) {
+        // A raw SQL failure can abort the transaction; restore the pre-callback state
+        // first so we can do the live, locked proof before exposing its status.
+        await client.query('ROLLBACK TO SAVEPOINT p04_authorized_callback');
+        await authorizeTargets([...checked.values()]);
+        throw error;
+      }
+      await authorizeTargets([...checked.values()]);
+      return result;
+    }, mode === 'write' && 'P04');
+  }
+
+  private p04Target(value: unknown): P04Target {
+    if (value && typeof value === 'object' && 'scope' in value) {
+      if (value.scope === 'CITY' && Object.keys(value).length === 2
+        && 'cityId' in value && typeof value.cityId === 'string' && UUID.test(value.cityId)) {
+        return Object.freeze({ scope: 'CITY', cityId: value.cityId.toLowerCase() });
+      }
+      if ((value.scope === 'COMPANY' || value.scope === 'DISCOVERY') && Object.keys(value).length === 1) {
+        return Object.freeze({ scope: value.scope });
+      }
+    }
+    throw new BadRequestException();
   }
 
   private p03Target(value: unknown): P03Target {
@@ -399,7 +518,7 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
     if (cityId !== null && !UUID.test(cityId)) { throw new BadRequestException(); }
     const target = cityId === null ? null : cityId.toLowerCase();
     return this.withProof(mode, proof, async (client, principal) => {
-      const view = await this.policy(client, principal);
+      const view = await this.policy(client, principal, action === 'geography.admin.assign' && mode === 'write');
       const grants = view.geoPermissions;
       if (action === 'geography.self.read') {
         // SELF summary is a verified Telegram master reading only its own row. A CRM
