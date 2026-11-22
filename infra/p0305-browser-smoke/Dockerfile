@@ -17,6 +17,7 @@ COPY packages/ packages/
 COPY prisma/ prisma/
 COPY infra/linux-proof/source-check.mjs infra/linux-proof/source-check.mjs
 COPY infra/p0305-browser-smoke/ infra/p0305-browser-smoke/
+COPY infra/p0404-browser-smoke/ infra/p0404-browser-smoke/
 COPY pnpm-workspace.yaml .
 RUN --network=none node infra/linux-proof/source-check.mjs && cp -a apps packages prisma infra /p0305/
 WORKDIR /p0305

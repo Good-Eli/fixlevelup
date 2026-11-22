@@ -56,9 +56,18 @@ integration('P04-03 staff HTTP on isolated PostgreSQL', () => {
     problem(await f.post(CATEGORIES, bad, { headers: { 'Content-Encoding': 'gzip' } }), 415);
     problem(await f.post(`${CATEGORIES}?includeArchived=false`, bad), 400);
     problem(await f.http('POST', CATEGORIES, req => req.end('{"code":"first", "c\\u006fde":"second"}')), 400);
-    problem(await f.chunked('POST', CATEGORIES, Buffer.from(JSON.stringify({ code: 'a'.repeat(16_384) }))), 413);
+    const json = Buffer.from(JSON.stringify(bad));
+    const atLimit = Buffer.concat([json, Buffer.alloc(16_384 - json.length, 0x20)]);
+    // Cross the cap by exactly one payload byte, without queuing a terminating
+    // chunk against the server's early close (a TCP reset race on Windows).
+    // Require the complete 413 problem before end-of-input, not just a close.
+    const tooLarge = await f.http('POST', CATEGORIES, req => {
+      req.write(atLimit);
+      req.write(' ');
+    }, { headers: { 'Transfer-Encoding': 'chunked' } });
+    problem(tooLarge, 413);
     expect(await f.evidence()).toEqual(before);
-    const entity = receipt(await f.post(CATEGORIES, bad), 201);
+    const entity = receipt(await f.chunked('POST', CATEGORIES, atLimit), 201);
     const path = `${CATEGORIES}/${id(entity)}/versions`;
     const details = { title: '   Reviewed name   ' };
     problem(await f.post(path, details, { key: null }), 400); // I is validated before V

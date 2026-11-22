@@ -107,10 +107,20 @@ function identity(value: unknown) {
 }
 export type Identity = ReturnType<typeof identity>;
 export interface GeoGrantView { code: string; scope: 'GLOBAL' | 'CITY' }
-function access(value: unknown): { staffId: string; role: { id: string; code: string; type: 'SYSTEM' | 'CUSTOM' }; permissions: string[]; geoPermissions?: GeoGrantView[]; p03Permissions?: readonly P03Grant[]; p04Permissions?: readonly P04Grant[] } {
+function access(value: unknown): { staffId: string; role: { id: string; code: string; type: 'SYSTEM' | 'CUSTOM' }; permissions: string[];
+  geoPermissions?: GeoGrantView[]; p03Permissions?: readonly P03Grant[]; p04Permissions?: readonly P04Grant[];
+  p04PricingWriteCityIds?: readonly string[] } {
   const r = object(value); const rawRole = object(r['role']);
   const role = { id: id(rawRole['id']), code: text(rawRole['code']), type: roleType(rawRole['type']) };
   const p04 = p04Grants(role, r['p04Permissions']);
+  const rawCities = r['p04PricingWriteCityIds'];
+  let p04PricingWriteCityIds: string[] | undefined;
+  if (rawCities !== undefined) {
+    const scoped = p04?.some(g => g.code === 'pricing.read') === true && p04.some(g => g.scope === 'CITY');
+    if (!scoped || !Array.isArray(rawCities) || rawCities.length > 128) { throw new Error('Invalid P04 city assignment projection'); }
+    p04PricingWriteCityIds = rawCities.map(v => id(v).toLowerCase());
+    if (new Set(p04PricingWriteCityIds).size !== p04PricingWriteCityIds.length) { throw new Error('Duplicate P04 city ID'); }
+  }
   // Individual geography grants (code + GLOBAL/CITY) as resolved by the server session.
   // Optional so an older/absent field can never be read as an implicit grant.
   const geo = r['geoPermissions'] === undefined ? undefined
@@ -125,7 +135,8 @@ function access(value: unknown): { staffId: string; role: { id: string; code: st
   if (p03 && new Set(p03.map(g => g.code)).size !== p03.length) { throw new Error('Duplicate P03 grant'); }
   return { staffId: id(r['staffId']), role, permissions: array(text, r['permissions']),
     ...(geo === undefined ? {} : { geoPermissions: geo }), ...(p03 === undefined ? {} : { p03Permissions: p03 }),
-    ...(p04 === undefined ? {} : { p04Permissions: p04 }) };
+    ...(p04 === undefined ? {} : { p04Permissions: p04 }),
+    ...(p04PricingWriteCityIds === undefined ? {} : { p04PricingWriteCityIds }) };
 }
 function list<T>(read: Decoder<T>) { return (v: unknown) => array(read, object(v)['items']); }
 function permissionCatalog(value: unknown) {

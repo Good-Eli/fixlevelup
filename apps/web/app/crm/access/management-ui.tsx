@@ -48,7 +48,7 @@ export function Form({ title, children, submit, action, prompt }: {
 export function Text({ name, label, max, value, required = true, area = false, pattern }: {
   name: string; label: string; max: number; value?: string | undefined | null; required?: boolean; area?: boolean; pattern?: string;
 }) {
-  return <label>{label}{area ? <textarea name={name} defaultValue={value ?? ''} maxLength={max} required={required} rows={5}/>
+  return <label>{label}{area ? <textarea aria-label={label} name={name} defaultValue={value ?? ''} maxLength={max} required={required} rows={5}/>
     : <input name={name} defaultValue={value ?? ''} maxLength={max} required={required} {...(pattern ? { pattern } : {})}/>}</label>;
 }
 export function Select({ name, label, values, value }: { name: string; label: string; values: readonly string[]; value?: string }) {

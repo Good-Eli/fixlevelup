@@ -73,7 +73,7 @@ export function isUncertain(e: unknown) {
   return !(e instanceof ApiError) || e.status >= 500;
 }
 
-async function boundedJson(response: Response, limit: number): Promise<unknown> {
+export async function boundedJson(response: Response, limit: number): Promise<unknown> {
   const reported = response.headers.get('content-length');
   const reader = response.body?.getReader();
   if (!reader) { throw new Error('Missing response'); }

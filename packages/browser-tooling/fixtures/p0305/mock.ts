@@ -1,4 +1,4 @@
-import { expect, type Page, type Route, type Request } from '@playwright/test';
+import { expect, type Page, type Route } from '@playwright/test';
 import { P03_CAPABILITIES, P03_CAPABILITY_METADATA } from '../../../p03-contracts/src/policy.js';
 import type { P03Grant } from '../../../p03-contracts/src/policy.js';
 import { allowedAsset, apiPrefix, mockOrigin, signIn } from './browser.js';
@@ -18,13 +18,23 @@ export function wire(route: Route, data: unknown, status = 200, etag?: string) {
 export function rejected(route: Route, status: number) {
   return route.fulfill({ status, json: { type: 'about:blank', title: 'REQUEST_REJECTED', status, code: 'REQUEST_REJECTED', requestId: uuid(99) }, headers: { 'cache-control': 'no-store' } });
 }
-export interface Hit { readonly method: string; readonly path: string; readonly url: URL; readonly tag: string | undefined; readonly key: string | undefined; readonly body: string | null; readonly request: Request }
+export interface Hit {
+  readonly method: string; readonly path: string; readonly url: URL; readonly tag: string | undefined;
+  readonly key: string | undefined; readonly body: string | null;
+  readonly syntheticCsrfMatches: boolean; readonly sameOrigin: boolean; readonly staffRequest: boolean;
+  readonly mediaType: string | undefined;
+}
 export type Handler = (route: Route, hit: Hit) => Promise<void> | undefined;
-export async function arrange(page: Page, options: { manager?: boolean; grants?: P03Grant[]; geo?: typeof geoGrants; standard?: string[] } = {}) {
+type P04Grant = Readonly<{ code: string; scope: 'GLOBAL' | 'CITY' }>;
+export async function arrange(page: Page, options: {
+  manager?: boolean; grants?: P03Grant[]; geo?: typeof geoGrants; standard?: string[];
+  p04?: readonly P04Grant[]; pricingWriteCities?: readonly string[];
+} = {}) {
   let signedIn = false;
   const access = { staffId: options.manager ? id.manager : id.actor, role: { id: options.manager ? id.managerRole : id.adminRole,
     code: options.manager ? 'MANAGER' : 'ADMIN', type: 'SYSTEM' }, permissions: options.standard ?? ['roles.read', 'roles.permissions.manage', 'staff.read'],
-    geoPermissions: options.geo ?? geoGrants, p03Permissions: options.grants ?? adminGrants.slice() };
+    geoPermissions: options.geo ?? geoGrants, p03Permissions: options.grants ?? adminGrants.slice(),
+    p04Permissions: options.p04, p04PricingWriteCityIds: options.pricingWriteCities };
   const identity = { staffId: access.staffId, authVersion: 1, csrfToken: 'x'.repeat(43) };
   const faults = { me: false, access: false };
   const unknown: string[] = [];
@@ -39,7 +49,9 @@ export async function arrange(page: Page, options: { manager?: boolean; grants?:
     }
     const path = url.pathname.slice(apiPrefix.length), headers = request.headers();
     // Login/password payloads and CSRF values aren't retained in request evidence.
-    const hit = { method, path, url, tag: headers['if-match'], key: headers['idempotency-key'], body: /^\/auth\//.test(path) ? null : request.postData(), request };
+    const hit: Hit = { method, path, url, tag: headers['if-match'], key: headers['idempotency-key'],
+      body: /^\/auth\//.test(path) ? null : request.postData(), syntheticCsrfMatches: headers['x-csrf-token'] === identity.csrfToken,
+      sameOrigin: headers['origin'] === mockOrigin, staffRequest: headers['x-auth-request'] === '1', mediaType: headers['content-type'] };
     if (!/^\/auth\//.test(path)) { hits.push(hit); }
     if (path === '/auth/me' && method === 'GET' && headers['x-auth-request'] === '1') {
       if (signedIn && !faults.me) { await wire(route, identity); } else { await rejected(route, faults.me ? 503 : 401); } return;

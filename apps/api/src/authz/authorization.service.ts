@@ -44,6 +44,8 @@ export interface AccessView {
   readonly geoPermissions?: readonly GeoGrant[];
   readonly p03Permissions?: readonly P03Grant[];
   readonly p04Permissions?: readonly P04Grant[];
+  /** Own active P04 CITY assignments for UI affordances; never used as authorization. */
+  readonly p04PricingWriteCityIds?: readonly string[];
 }
 export interface StaffWriteContext extends AccessView { readonly client: PoolClient; readonly principal: Principal }
 type Command<T> = (ctx: StaffWriteContext) => Promise<T>;
@@ -339,7 +341,20 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
   async inspectAccess(proof: SessionProof): Promise<AccessView> {
     return this.withProof('read', proof, async (client, principal) => {
       const view = await this.policy(client, principal, true);
-      return { ...view, p03Permissions: await effectiveP03Grants(client, principal, view.role) };
+      const p03Permissions = await effectiveP03Grants(client, principal, view.role);
+      const pricingRead = view.p04Permissions?.find(grant => grant.code === 'pricing.read');
+      const pricingManage = view.p04Permissions?.find(grant => grant.code === 'pricing.manage');
+      if (pricingRead === undefined || (pricingRead.scope !== 'CITY' && pricingManage?.scope !== 'CITY')) {
+        return { ...view, p03Permissions };
+      }
+      // The UI observes revocation even when the web session epoch and role
+      // stay the same. In mixed scope, cityList proves only read. Expose just
+      // the caller's active assignments, with a fail-closed bound.
+      const { rows } = await client.query<{ city_id: string }>(`SELECT a.city_id
+        FROM foundation.staff_admin_city_assignments a JOIN foundation.service_cities c ON c.id=a.city_id
+        WHERE a.staff_id=$1 AND a.revoked_at IS NULL AND c.lifecycle='ACTIVE' AND c.current_version_id IS NOT NULL
+        ORDER BY a.city_id LIMIT 129`, [principal.staffId]);
+      return { ...view, p03Permissions, p04PricingWriteCityIds: rows.length > 128 ? [] : rows.map(row => row.city_id) };
     });
   }
   private async execute<T>(mode: 'read' | 'write', proof: SessionProof, capability: Capability, scope: Scope, operation: Command<T>): Promise<T> {
