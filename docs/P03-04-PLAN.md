@@ -2,7 +2,7 @@
 
 P03-03 принят владельцем 21.11.2026 и зафиксирован локально как `9116812e6dfa8f4f506b34d66d1382e1efde1096` (48 файлов, без push). Поручение начать следующий подэтап дано отдельно. До реализации по прямому запросу владельца план проверил субагент `plusvibe/gpt-6.2-astra`, reasoning high. Ревью было read-only; это техническая проверка плана, не приёмка кода и не согласование Q02/Q12/Q13/Q16.
 
-**Текущий статус (22.11.2026):** A принят и зафиксирован в `7d92122`. После отдельного [предложения](P03-04B-PROPOSAL.md) реализованы B1+B2 с обязательным промежуточным Astra PASS B1 до начала B2 и отдельным итоговым Astra PASS B2. Владелец принял B1+B2 и прямо поручил коммит/push в GitHub и завершение оставшихся C/D/E. Итог B: 767/767 в 56 файлах с real PG+S3, 15 миграций/149 CHECK и все tsc/lint/build/security/dependency gates PASS. Весь P03-04 пока не завершён: processing/access/delete/restore остаются задачами C/D/E ниже. Q02/Q12/Q13/Q16 production-политики не подменяются этой приёмкой; прогресс P03 остаётся 60% (3 из 5 подэтапов).
+**Текущий статус (22.11.2026):** A принят (`7d92122`), B1+B2 приняты и опубликованы (`e44fae8`), C/D/E технически завершены без коммита (полный Astra A→E — PASS, 22.11.2026); [актуальный статус P03-04 и evidence](P03-04CDE-CONTRACT.md#6-current-status-and-evidence). Владелец разрешил commit/push после полного Astra A→E и поручил остановиться после GitHub; P03-05 не начинать. P03-04 закрыт технически во внутреннем synthetic scope; P03 — 80% (4 из 5), без заявления об отдельной формальной приёмке C/D/E.
 
 ## Итог проверки Astra
 
@@ -19,15 +19,15 @@ P03-03 принят владельцем 21.11.2026 и зафиксирован 
 
 | Срез | Что реализуется | Что блокирует переход / доказательство |
 |---|---|---|
-| **A — intent/reservation, сейчас** | Migration 014, реальные FK владельца, обязательная typed policy, точный consent basis, идемпотентность/квоты, закрытый internal API | Fresh/013→014/replay/drift, чужой/revoked/expired proof, последний слот/байты конкурентно, audit/outbox rollback. Ни byte IO, ни READY, ни выдачи |
+| **A — intent/reservation** | Migration 014, реальные FK владельца, обязательная typed policy, точный consent basis, идемпотентность/квоты, закрытый internal API | Fresh/013→014/replay/drift, чужой/revoked/expired proof, последний слот/байты конкурентно, audit/outbox rollback. Ни byte IO, ни READY, ни выдачи |
 | **B — upload/quarantine** | Реальный private S3 adapter, bounded streaming, immutable зарегистрированные attempt keys, проверка actual bytes/hash, safe finalize | Отдельно согласованные runtime зависимости/конфигурация; crash/orphan/late PUT proof, не HEAD/ETag как checksum |
-| **C — processing/access** | Реальный fail-closed scanner, resource-limited decoding/sanitization, verdict exact served bytes, backend stream reauthorization | Утверждённые форматы/ресурсы/engine/ops; без них QUARANTINED. No fake production scanner. EXIF/size/signature/slow-stream/revoke tests |
-| **D — delete/restore** | File-specific retention/hold/delete checkpoints/ledger и isolated restore/rescrub | Q13 durations/owner/ledger storage/completeness; late PUT/delete/hold race. Полные privacy cases/customer/finance jobs остаются P13P |
+| **C — processing/access** | Реальный fail-closed scanner, resource-limited decoding/sanitization, verdict exact served bytes, backend stream reauthorization | Явный synthetic профиль: JPEG/PNG/WebP без анимации — единственные кандидаты на READY, PDF остаётся в карантине, видео не допускается. Live formats/resources/engine ops требуют отдельной политики. No fake production scanner. EXIF/size/signature/slow-stream/revoke tests |
+| **D — delete/restore** | File-specific retention/hold/delete checkpoints/ledger и isolated restore/rescrub | В synthetic профиле — отдельный ledger и monotonic floor, copy-only restore с текущей authority; Q13 durations/owner/production completeness остаются открытыми; late PUT/delete/hold race. Полные privacy cases/customer/finance jobs остаются P13P |
 | **E — интеграция/приёмка** | Full migration+PG/S3 tests, lint/typecheck/build/security и документация | Только реально пройденные пути; P03-04 не закрывается одним срезом A |
 
 Публичная F-сессия/intake — P05; staff management HTTP/CRM — P03-05. Здесь нет новых UI/capability grants. Не создаются `request_files/diagnostic_files/report_files/message_files` без реальных parent tables (они появятся на своих этапах). Существующие identities — `request_sessions` и `staff`, не несуществующая `users`.
 
-## Срез A: совместный интерфейс реализации
+## Срез A: исторический интерфейс принятого среза (21.11.2026)
 
 ### Ограничения
 
@@ -79,10 +79,10 @@ DB guard является второй линией: F insert отказывае
 - Fresh, populated 013→014, capped replay/history/drift, runtime ACL; все прежние proofs остаются применимы на своей capped версии.
 - Full PostgreSQL Vitest/lint/typecheck/production builds/secrets/diff на неизменном source snapshot; рабочая dev БД не мигрируется.
 
-## Открытые решения для следующих срезов (не закрыты текущим стартом)
+## Открытые live-решения (не закрыты synthetic реализацией)
 
 - **Q02/Q16:** основания/момент сохранения вложений; типы/фото/видео/документы, квоты и resource limits, реальные scanner/базы/ops/обновления; runtime SDK и image-processing зависимости. Не импортировать транзитивный Sharp как неявную прямую dependency.
 - **Q12:** staff/request/assignment окно, политика metadata и chunk-admission revoke; signed URL только при отдельном TTL/разрешении. Staff-owned upload не означает право мастера на заказ.
 - **Q13:** retention/orphan/quarantine horizons, hold и irreversible delete point, актуальный durable ledger вне откатываемого backup и полнота, rescrub/reopen approval, реальные тексты/оператор/РФ-hosting/PII.
 
-До этих решений нельзя назвать upload/READY/выдачу/delete/restore законченной реализацией P03-04. Разрешены synthetic tests механики и fail-closed отсутствие capability; production fake scanner запрещён. Не добавляются placeholders parent records, новые numeric defaults или разрешение реальных ПД.
+Без этих решений не открываются production, реальные ПД и публичные файлы. Реализованный internal F-путь не регистрирует HTTP/DI, signed URL, staff grants или customer intake. После copy-only restore чтение/удаление ограничены скопированными объектами; новые B/C записи требуют исходной epoch 1 (legacy B без runtime row допускается на полной схеме). Не добавляются placeholders parent records, новые business defaults или разрешение реальных ПД.

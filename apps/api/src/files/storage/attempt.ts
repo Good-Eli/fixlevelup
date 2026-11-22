@@ -24,8 +24,11 @@
 import { randomUUID } from 'node:crypto';
 import { privateStorageError } from './errors.js';
 
-/** Public (internal) view of an attempt descriptor. */
+declare const SANITIZED_KIND: unique symbol;
+
+/** Existing raw shape, excluding the new sanitized type without requiring any new field. */
 export interface QuarantineAttempt {
+  readonly [SANITIZED_KIND]?: never;
   readonly attemptId: string;
   readonly objectKey: string;
 }
@@ -40,7 +43,15 @@ export interface StorageTarget {
   readonly region: string;
 }
 
+/** Separate compile-time and process-local namespaces; never accepted by raw PUT/verify. */
+export interface SanitizedAttempt {
+  readonly [SANITIZED_KIND]: true;
+  readonly attemptId: string;
+  readonly objectKey: string;
+}
+
 const IDENTITIES = new WeakSet<object>();
+const SANITIZED_IDENTITIES = new WeakSet<object>();
 const CONSUMED = new WeakSet<object>();
 /** Descriptor identity -> the target its one PUT began against (module-wide). */
 const BOUND = new WeakMap<object, StorageTarget>();
@@ -93,6 +104,23 @@ export function prepareTargetBoundAttempt(target: StorageTarget): QuarantineAtte
   const descriptor = prepareQuarantineAttempt();
   BOUND.set(descriptor, target);
   return descriptor;
+}
+
+/** New C descriptor, independently branded and bound before DB registration. */
+export function prepareTargetBoundSanitizedAttempt(target: StorageTarget): SanitizedAttempt {
+  const attemptId = randomUUID();
+  const descriptor = Object.freeze({ attemptId, objectKey: `sanitized/${attemptId}/${randomUUID()}` }) as SanitizedAttempt;
+  SANITIZED_IDENTITIES.add(descriptor);
+  BOUND.set(descriptor, target);
+  return descriptor;
+}
+
+/** A raw descriptor, clone or Proxy is not a sanitized attempt. */
+export function requireSanitizedAttempt(value: unknown): SanitizedAttempt {
+  if (typeof value !== 'object' || value === null || !SANITIZED_IDENTITIES.has(value)) {
+    throw privateStorageError('ATTEMPT_INVALID');
+  }
+  return value as SanitizedAttempt;
 }
 
 /**

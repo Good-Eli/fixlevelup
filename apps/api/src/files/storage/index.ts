@@ -18,12 +18,14 @@ export {
   createPrivateQuarantineStorage,
 } from './adapter.js';
 export type {
-  InspectRegisteredQuarantineInput, PrivateQuarantineStorage, PutQuarantinedInput, QuarantineReceipt,
-  RegisteredQuarantineAttempt, RegisteredQuarantineObservation, RegisteredQuarantineStorage, VerifyQuarantinedInput,
+  InspectRegisteredQuarantineInput, LifecycleGetInput, LifecycleStorage, PrivateQuarantineStorage,
+  PutQuarantinedInput, QuarantineReceipt, ReadyReadStorage, RegisteredQuarantineAttempt,
+  RegisteredQuarantineObservation, RegisteredQuarantineStorage, RegisteredSanitizedAttempt, VerifyQuarantinedInput,
 } from './adapter.js';
 
 export { prepareQuarantineAttempt } from './attempt.js';
-export type { QuarantineAttempt, StorageTarget } from './attempt.js';
+export type { QuarantineAttempt, SanitizedAttempt, StorageTarget } from './attempt.js';
+export type { RawGetGrant, ReadyGetGrant } from './lifecycle-proof.js';
 
 export {
   PRIVATE_STORAGE_ERROR_CODES, PRIVATE_STORAGE_FAILURE_REASONS, PrivateStorageError,

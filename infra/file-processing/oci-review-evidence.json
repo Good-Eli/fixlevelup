@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "scope": "local-synthetic-only",
+  "independentReview": "pass-for-exact-audited-offline-scanner-and-decoder-entrypoints",
+  "reviewScope": "Astra review of the exact scanner and decoder OCI digests below; no production or FreshClam updater approval",
+  "reviewRecordedAfterTestSnapshot": "e-full-review-final: 876/876; review status metadata only",
+  "productionApproved": false,
+  "auditExemptions": [],
+  "scanner": {
+    "engineVersion": "1.4.7",
+    "indexSha256": "39f936f37a24b0b4658414230bcefa6b52de3a57c42ac88caed0ec6c09317883",
+    "linuxAmd64ManifestSha256": "7c58440c10859ec126d4bba5a5f260cc467395d640c193a5197b1da12073e9f8",
+    "originalLinuxAmd64ManifestSha256": "c2cc3f37cb7c93833441e0c439461649f8ea3c7d16eb94cd7296f123286504c5",
+    "definitions": {
+      "manifestSha256": "bed6a568cf746fb640c82f3c31e4cdab3d910fe373d8405bbe71d749a458469a",
+      "dailyRevision": 28190,
+      "dailyBuildUtc": "2026-11-21T06:27:04Z"
+    },
+    "libcrypto": {
+      "version": "3.5.9 with recorded maintenance patches",
+      "license": "Apache-2.0",
+      "runtimeSha256": "ffe3c003b7685b0d589c94b4ba58df70a1d6d792e3b08a85f17bbd9b97bd429a",
+      "sourceSha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+      "releasePrimaryKey": "B146647E45A7B33947AB226B2A2C87D161692D40",
+      "releaseSigningSubkey": "C46ED3F2CBEFDA1FDAADA44264ED7B1DCCE71CB2",
+      "targetedUpstreamTests": {
+        "recipes": [
+          "60-test_x509_check_cert_pkey.t",
+          "80-test_cmsapi.t"
+        ],
+        "tapTests": 12,
+        "result": "pass"
+      }
+    },
+    "dispositions": [
+      { "id": "CVE-2026-86144", "status": "fixed-version-verified", "fix": "Alpine signed libxml2 2.13.9-r3; zero matches for this ID on full derivative re-scan" },
+      { "id": "CVE-2026-107493", "status": "backport-built-and-tested", "fixCommit": "c8f6d04f8e6d40b1bf83334e4a2ec9daf5943a3d", "testRecipe": "60-test_x509_check_cert_pkey.t" },
+      { "id": "CVE-2026-121482", "status": "backport-built-and-tested", "fixCommit": "468c287cf451a834b370b69ab321b8ffdfac23aa", "testCommit": "1c65edebefa0dd11aa41cb1a31078ecd9c79d472", "testRecipe": "80-test_cmsapi.t" },
+      { "id": "CVE-2026-124709", "status": "fix-source-included-tls-library-not-shipped", "fixCommit": "f3acb0a3328046741479482c51cec815839e1b05", "requiredPath": "QUIC server connection" },
+      { "id": "CVE-2026-35190", "status": "fix-source-included-tls-library-not-shipped", "fixCommit": "9491b0d9cc7950af1f3dc89499bd5433b9cd4f43", "requiredPath": "TLS 1.3 Suite B server" },
+      { "id": "CVE-2026-107494", "status": "tls-library-not-shipped", "requiredPath": "QUIC live connection" },
+      { "id": "CVE-2026-84786", "status": "tls-library-not-shipped", "requiredPath": "mixed DANE/PKIX non-SMTP TLS client" },
+      { "id": "CVE-2026-95690", "status": "tls-library-not-shipped", "requiredPath": "DTLS endpoint" },
+      { "id": "CVE-2025-60876", "status": "affected-component-not-shipped", "requiredComponent": "BusyBox" }
+    ],
+    "limitations": ["Dispositions only cover this fixed stdin scanner, not the separate FreshClam updater.", "Raw archive catalog did not recognize a distro; zero raw matches are not a vulnerability clearance."]
+  },
+  "decoder": {
+    "nodeVersion": "24.22.3",
+    "sharpVersion": "0.35.5",
+    "libvipsVersion": "8.18.7",
+    "indexSha256": "7162306fb4f11234456de8471a3299267f020f7be64f4720c4c9586ca8ee5f68",
+    "linuxAmd64ManifestSha256": "8a0b65bc02e28cab840ea184bc193862ac2806cf02184d6e79df25522d3e23fc",
+    "embeddedOpensslVersion": "3.5.9",
+    "opensslDisposition": "static-implementation-still-present-reviewed-vulnerable-operations-unreachable-from-fixed-image-entrypoint",
+    "limitations": ["No shell, package manager, root permissions, or network. Decoder input is a closed bounded image frame, not TLS/DTLS/QUIC/CMS/PEM.", "Raw scratch scan did not recognize a distro or fully catalog embedded native libraries; zero raw matches are not a vulnerability clearance."]
+  },
+  "auditTool": {
+    "name": "grype",
+    "version": "0.122.1",
+    "databaseVersion": "6.1.10",
+    "databaseBuiltUtc": "2026-11-21T06:20:06Z",
+    "databaseArchiveSha256": "921d1b1b4151a211d39efbb8a7da54caabfc6eb717112766cb5bdee7920809b5"
+  }
+}

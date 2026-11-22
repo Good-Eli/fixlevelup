@@ -260,6 +260,13 @@ class FakeDatabase {
       return rows([{ marker: this.transaction === 'explicit' ? this.marker : null }]);
     }
 
+    // Current-schema A/B legacy fixture: no runtime row or privacy control exists.
+    // Real PostgreSQL freeze/fence behavior is covered by file-privacy-db tests.
+    if (sql === 'SELECT namespace_id,epoch::text,mode FROM foundation.file_runtime_epochs WHERE singleton FOR SHARE'
+      || sql === 'SELECT access_epoch::text,delete_state FROM foundation.file_privacy_controls WHERE intent_id=$1 FOR UPDATE') {
+      return rows([]);
+    }
+
     // --- clocks ------------------------------------------------------------------
     if (sql === 'SELECT clock_timestamp() AS db_now') {
       return rows([{ db_now: this.now }]);

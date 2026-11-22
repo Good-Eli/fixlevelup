@@ -1,0 +1,62 @@
+name: fixlevelup-test-file-ledger
+services:
+  ledger:
+    image: postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402
+    platform: linux/amd64
+    container_name: fixlevelup-test-file-ledger
+    shm_size: 128m
+    command: ["postgres", "-c", "fsync=on", "-c", "synchronous_commit=on", "-c", "full_page_writes=on"]
+    environment:
+      POSTGRES_DB: fixlevelup_file_ledger
+      POSTGRES_USER: file_ledger_admin
+      POSTGRES_PASSWORD: ${FILE_LEDGER_ADMIN_PASSWORD:?Set a synthetic local ledger admin password}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      FILE_LEDGER_WRITER_PASSWORD: ${FILE_LEDGER_WRITER_PASSWORD:?Set a synthetic local ledger writer password}
+      FILE_LEDGER_WRITER_NEXT_PASSWORD: ${FILE_LEDGER_WRITER_NEXT_PASSWORD:?Set a distinct synthetic handoff writer password}
+      FILE_LEDGER_SIGNER_PASSWORD: ${FILE_LEDGER_SIGNER_PASSWORD:?Set a synthetic local ledger signer password}
+      FILE_LEDGER_OPERATOR_PASSWORD: ${FILE_LEDGER_OPERATOR_PASSWORD:?Set a synthetic local ledger operator password}
+    ports: ["127.0.0.1:55433:5432"]
+    volumes:
+      - ledger-data:/var/lib/postgresql
+      - ./ledger.sql:/docker-entrypoint-initdb.d/010-file-ledger.sql:ro
+      - ./writer-roles.sql:/docker-entrypoint-initdb.d/020-writer-roles.sql:ro
+      - ./ledger-writers.sql:/docker-entrypoint-initdb.d/030-ledger-writers.sql:ro
+    networks: [ledger-net]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "file_ledger_admin", "-d", "fixlevelup_file_ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  floor:
+    image: postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402
+    platform: linux/amd64
+    container_name: fixlevelup-test-file-floor
+    shm_size: 128m
+    command: ["postgres", "-c", "fsync=on", "-c", "synchronous_commit=on", "-c", "full_page_writes=on"]
+    environment:
+      POSTGRES_DB: fixlevelup_file_floor
+      POSTGRES_USER: file_floor_admin
+      POSTGRES_PASSWORD: ${FILE_FLOOR_ADMIN_PASSWORD:?Set a synthetic local floor admin password}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      FILE_FLOOR_VERIFIER_PASSWORD: ${FILE_FLOOR_VERIFIER_PASSWORD:?Set a synthetic local floor verifier password}
+      FILE_FLOOR_OPERATOR_PASSWORD: ${FILE_FLOOR_OPERATOR_PASSWORD:?Set a synthetic local floor operator password}
+    ports: ["127.0.0.1:55434:5432"]
+    volumes:
+      - floor-data:/var/lib/postgresql
+      - ./floor.sql:/docker-entrypoint-initdb.d/010-file-floor.sql:ro
+    networks: [floor-net]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "file_floor_admin", "-d", "fixlevelup_file_floor"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  ledger-data:
+    name: fixlevelup-test-file-ledger-data
+  floor-data:
+    name: fixlevelup-test-file-floor-data
+networks:
+  ledger-net:
+    name: fixlevelup-test-file-ledger-net
+  floor-net:
+    name: fixlevelup-test-file-floor-net

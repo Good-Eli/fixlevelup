@@ -74,6 +74,12 @@ export class PrivateStorageError extends Error {
  * untrusted and will not be passed through as an internal failure.
  */
 const INTERNAL = new WeakSet<object>();
+const SETTLED_LIFECYCLE_FAILURES = new WeakSet<object>();
+
+/** Internal wiring only: true means no active lifecycle transport or source pull remains. */
+export function isLifecycleStorageOperationSettled(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && SETTLED_LIFECYCLE_FAILURES.has(error);
+}
 
 /** @internal Creates one trusted failure of this module. */
 export function privateStorageError(
@@ -82,6 +88,19 @@ export function privateStorageError(
 ): PrivateStorageError {
   const error = new PrivateStorageError(code, reason);
   INTERNAL.add(error);
+  return error;
+}
+
+/** Rebuild a safe failure; never mark or return a caller-provided error object. */
+export function lifecycleStorageError(
+  code: PrivateStorageErrorCode,
+  reason: PrivateStorageFailureReason | undefined,
+  settled: boolean,
+): PrivateStorageError {
+  const error = privateStorageError(code, reason);
+  if (settled) {
+    SETTLED_LIFECYCLE_FAILURES.add(error);
+  }
   return error;
 }
 

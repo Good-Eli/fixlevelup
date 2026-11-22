@@ -1,0 +1,15 @@
+# Explicit synthetic-decoder build context. No Git, credentials, caches or app wiring.
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!apps/api/package.json
+!apps/miniapp/package.json
+!apps/web/package.json
+!packages/browser-tooling/package.json
+!packages/database-tooling/package.json
+!packages/storage-tooling/package.json
+!packages/tooling/package.json
+!apps/api/src/files/file-processing/decoder-entry.ts
+!apps/api/src/files/file-processing/protocol.ts
+!apps/api/src/files/file-processing/image-structure.ts

@@ -805,11 +805,14 @@ model FileUploadIntent {
   // truncated default, so `migrate diff` converges on the real catalog.
   consentRecord            ConsentRecord?  @relation("FileUploadIntentConsent", fields: [consentRecordId, ownerRequestSessionId, consentDocumentVersionId, consentPurpose], references: [id, sessionId, documentVersionId, purpose], onDelete: Restrict, onUpdate: Restrict, map: "file_upload_intents_consent_basis_fkey")
   uploadAttempts           FileUploadAttempt[]
+  privacyControl           FilePrivacyControl?
+  sanitizedAttempts        FileSanitizedAttempt[]
 
   // The two owner+idempotency unique indexes and the pending-quota index are PARTIAL
   // indexes (WHERE owner_... IS NOT NULL), which Prisma cannot express; they exist only
   // in migration SQL, exactly like the other partial unique indexes in this schema.
   @@unique([id, ownerRequestSessionId, declaredBytes], map: "file_upload_intents_attempt_basis_key")
+  @@unique([id, ownerRequestSessionId], map: "file_upload_intents_file_owner_key")
   @@map("file_upload_intents")
   @@schema("foundation")
 }
@@ -867,7 +870,144 @@ model FileQuarantineObject {
   createdAt   DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
 
   attempt FileUploadAttempt @relation(fields: [intentId, attemptId, actualBytes, sha256], references: [intentId, id, verifiedBytes, verifiedSha256], onDelete: Restrict, onUpdate: Restrict, map: "file_quarantine_objects_verified_attempt_fkey")
+  sanitizedAttempts FileSanitizedAttempt[]
+  publications      FilePublication[]
 
+  @@unique([intentId, id], map: "file_quarantine_objects_intent_object_key")
+  @@unique([intentId, id, actualBytes, sha256], map: "file_quarantine_objects_raw_tuple_key")
   @@map("file_quarantine_objects")
+  @@schema("foundation")
+}
+
+// Absent by default; only trusted operations can initialize or transition this
+// gate. The lock-only runtime grant and opening stamp are managed in SQL.
+model FileRuntimeEpoch {
+  singleton   Boolean   @id
+  namespaceId String    @map("namespace_id") @db.Uuid
+  epoch       BigInt
+  mode        String    @db.VarChar(16)
+  openedAt    DateTime? @map("opened_at") @db.Timestamptz(6)
+
+  @@map("file_runtime_epochs")
+  @@schema("foundation")
+}
+
+// Lazy coordination row. Occupied does not mean live; only holder settlement
+// and a matched application CAS may release a claim. SQL owns the version bump.
+model FilePrivacyControl {
+  intentId             String    @id @map("intent_id") @db.Uuid
+  rowVersion           BigInt    @default(1) @map("row_version")
+  accessEpoch          BigInt    @default(1) @map("access_epoch")
+  processingGeneration Int      @default(0) @map("processing_generation")
+  processingLeaseId    String?   @map("processing_lease_id") @db.Uuid
+  processingExpiresAt  DateTime? @map("processing_expires_at") @db.Timestamptz(6)
+  readGeneration       Int       @default(0) @map("read_generation")
+  readLeaseId          String?   @map("read_lease_id") @db.Uuid
+  readExpiresAt        DateTime? @map("read_expires_at") @db.Timestamptz(6)
+  holdActive           Boolean   @default(false) @map("hold_active")
+  holdActorId          String?   @map("hold_actor_id") @db.Uuid
+  holdReason           String?   @map("hold_reason") @db.VarChar(24)
+  holdAt               DateTime? @map("hold_at") @db.Timestamptz(6)
+  deleteState          String    @default("OPEN") @map("delete_state") @db.VarChar(24)
+  deleteEventId        String?   @unique(map: "file_privacy_controls_delete_event_id_key") @map("delete_event_id") @db.Uuid
+  deleteAt             DateTime? @map("delete_at") @db.Timestamptz(6)
+  deletePolicyId       String?   @map("delete_policy_id") @db.Uuid
+  deleteWriterEpoch    BigInt?   @map("delete_writer_epoch")
+  ledgerSeq            BigInt?   @map("ledger_seq")
+  ledgerHash           String?   @map("ledger_hash") @db.VarChar(64)
+  deleteGraphSha256    String?   @map("delete_graph_sha256") @db.VarChar(64)
+
+  intent      FileUploadIntent @relation(fields: [intentId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "file_privacy_controls_intent_id_fkey")
+  deleteItems FileDeleteItem[]
+
+  @@unique([intentId, deleteEventId], map: "file_privacy_controls_intent_event_key")
+  @@map("file_privacy_controls")
+  @@schema("foundation")
+}
+
+// Immutable target, charge and expected evidence; 016 SQL owns the transition
+// guards, active-intent partial index, stamps and runtime column ACLs.
+model FileSanitizedAttempt {
+  id                    String    @id @db.Uuid
+  intentId              String    @map("intent_id") @db.Uuid
+  ownerRequestSessionId String    @map("owner_request_session_id") @db.Uuid
+  quarantineId          String    @map("quarantine_id") @db.Uuid
+  generation            Int
+  leaseId               String    @map("lease_id") @db.Uuid
+  leaseExpiresAt        DateTime  @map("lease_expires_at") @db.Timestamptz(6)
+  objectKey             String    @unique(map: "file_sanitized_attempts_object_key_key") @map("object_key") @db.VarChar(83)
+  storageEndpoint       String    @map("storage_endpoint") @db.VarChar(32)
+  storageBucket         String    @map("storage_bucket") @db.VarChar(63)
+  storageRegion         String    @map("storage_region") @db.VarChar(63)
+  mime                  String    @db.VarChar(100)
+  chargedBytes          BigInt    @map("charged_bytes")
+  expectedSha256        String    @map("expected_sha256") @db.VarChar(64)
+  state                 String    @default("REGISTERED") @db.VarChar(16)
+  createdAt             DateTime  @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  dispatchedAt          DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  verifiedBytes         BigInt?   @map("verified_bytes")
+  verifiedSha256        String?   @map("verified_sha256") @db.VarChar(64)
+
+  intent      FileUploadIntent     @relation(fields: [intentId, ownerRequestSessionId], references: [id, ownerRequestSessionId], onDelete: Restrict, onUpdate: Restrict, map: "file_sanitized_attempts_intent_owner_fkey")
+  quarantine  FileQuarantineObject @relation(fields: [intentId, quarantineId], references: [intentId, id], onDelete: Restrict, onUpdate: Restrict, map: "file_sanitized_attempts_quarantine_fkey")
+  publications FilePublication[]
+
+  @@unique([intentId, generation], map: "file_sanitized_attempts_intent_generation_key")
+  @@unique([intentId, quarantineId, id, mime, verifiedBytes, verifiedSha256], map: "file_sanitized_attempts_verified_tuple_key")
+  @@index([ownerRequestSessionId, state], map: "file_sanitized_attempts_owner_budget_idx")
+  @@map("file_sanitized_attempts")
+  @@schema("foundation")
+}
+
+// Immutable evidence of the exact raw and sanitized scan tuples. Availability
+// is a fresh authorization decision, not a mutable attribute of this row.
+model FilePublication {
+  id                     String   @id @db.Uuid
+  intentId               String   @unique(map: "file_publications_intent_id_key") @map("intent_id") @db.Uuid
+  quarantineId           String   @unique(map: "file_publications_quarantine_id_key") @map("quarantine_id") @db.Uuid
+  rawBytes               BigInt   @map("raw_bytes")
+  rawSha256              String   @map("raw_sha256") @db.VarChar(64)
+  sanitizedAttemptId     String   @unique(map: "file_publications_sanitized_attempt_id_key") @map("sanitized_attempt_id") @db.Uuid
+  mime                   String   @db.VarChar(100)
+  servedBytes            BigInt   @map("served_bytes")
+  servedSha256           String   @map("served_sha256") @db.VarChar(64)
+  processingPolicyId     String   @map("processing_policy_id") @db.Uuid
+  processingPolicySha256 String   @map("processing_policy_sha256") @db.VarChar(64)
+  engineVersion          String   @map("engine_version") @db.VarChar(32)
+  engineImageSha256      String   @map("engine_image_sha256") @db.VarChar(64)
+  defsSha256             String   @map("defs_sha256") @db.VarChar(64)
+  defsBuiltAt            DateTime @map("defs_built_at") @db.Timestamptz(6)
+  publishedAt            DateTime @default(dbgenerated("clock_timestamp()")) @map("published_at") @db.Timestamptz(6)
+
+  quarantine       FileQuarantineObject @relation(fields: [intentId, quarantineId, rawBytes, rawSha256], references: [intentId, id, actualBytes, sha256], onDelete: Restrict, onUpdate: Restrict, map: "file_publications_raw_tuple_fkey")
+  sanitizedAttempt FileSanitizedAttempt @relation(fields: [intentId, quarantineId, sanitizedAttemptId, mime, servedBytes, servedSha256], references: [intentId, quarantineId, id, mime, verifiedBytes, verifiedSha256], onDelete: Restrict, onUpdate: Restrict, map: "file_publications_served_tuple_fkey")
+
+  @@map("file_publications")
+  @@schema("foundation")
+}
+
+// P03-04D: snapshot of one registered key in a frozen intent. Physical
+// absence and claim state have separate meaning; SQL owns the guards/stamp.
+model FileDeleteItem {
+  eventId        String    @map("event_id") @db.Uuid
+  attemptKind    String    @map("attempt_kind") @db.VarChar(9)
+  attemptId      String    @map("attempt_id") @db.Uuid
+  intentId       String    @map("intent_id") @db.Uuid
+  targetEndpoint String   @map("target_endpoint") @db.VarChar(32)
+  targetBucket   String    @map("target_bucket") @db.VarChar(63)
+  targetRegion   String    @map("target_region") @db.VarChar(63)
+  objectKey      String    @map("object_key") @db.VarChar(84)
+  writeProof     String    @map("write_proof") @db.VarChar(20)
+  state          String    @default("AUTHORIZED") @db.VarChar(24)
+  claimGeneration Int      @default(0) @map("claim_generation")
+  claimId        String?   @map("claim_id") @db.Uuid
+  claimExpiresAt DateTime? @map("claim_expires_at") @db.Timestamptz(6)
+  verifiedAt     DateTime? @map("verified_at") @db.Timestamptz(6)
+
+  control FilePrivacyControl @relation(fields: [intentId, eventId], references: [intentId, deleteEventId], onDelete: Restrict, onUpdate: Restrict, map: "file_delete_items_control_fkey")
+
+  @@id([eventId, attemptKind, attemptId])
+  @@unique([eventId, targetEndpoint, targetBucket, targetRegion, objectKey], map: "file_delete_items_event_target_key")
+  @@map("file_delete_items")
   @@schema("foundation")
 }

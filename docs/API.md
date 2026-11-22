@@ -104,7 +104,11 @@ Company settings — legal identity/security/retention/channel policies/primary 
 
 ## 4. Файлы
 
-**P03-04A:** принят владельцем 21.11.2026 только внутренний no-byte reservation slice ([план](P03-04-PLAN.md)): `reserveFileUpload/readFileUploadIntent/cancelFileUploadIntent` на caller READ COMMITTED transaction, только RESERVED→CANCELLED. Ни один маршрут таблицы ниже ещё не реализован; reservation DTO не является fileId/объектом/права́ми upload или download. Нужны raw F proof, mandatory reviewed policy и точный текущий GIVEN; staff-вариант запрещён до отдельной авторизации. Срез A не завершает P03-04, не открывает приём реальных вложений и не даёт READY/выдачи; весь P03-04 не завершён, прогресс P03 остаётся 60%. Принятый срез коммитится отдельным локальным коммитом (создаёт root), SHA не заявлен.
+**Внутренний synthetic P03-04:** приняты A (`7d92122`, no-byte `RESERVED→CANCELLED`) и B1+B2 (`e44fae8`, приватный `QUARANTINED`); C/D/E технически завершены (полный Astra A→E — PASS), на момент записи без коммита; см. [актуальный статус P03-04 и evidence](P03-04CDE-CONTRACT.md#6-current-status-and-evidence). Ни один маршрут таблицы ниже не реализован: нет HTTP/DI wiring, signed URL, staff grants или customer intake. Q02/Q12/Q13/Q16 открыты, реальные ПД и production не разрешены.
+
+- A reserve/read/cancel используют доверенный raw F proof, explicit RC, обязательную reviewed policy и точное текущее GIVEN для обычного чтения/резервирования. После D freeze или non-ACTIVE runtime A read/exact replay отказывают `CONFLICT`; cancel остаётся отдельной минимальной квитанцией из пяти полей, а не metadata path.
+- B регистрирует durable attempt и dispatch перед IO, проверяет полный GET и exact reauthorization; квитанция означает только `QUARANTINED`. C выдаёт из processing только `{intentId, completed:true}`, метаданные READY — через отдельную проверку access policy; поток проверяет digest до первого байта и авторизацию на каждую bounded порцию. JPEG/PNG/WebP без анимации могут стать READY; PDF остаётся в карантине, видео и анимация не допускаются.
+- Новые B/C команды и их replay запрещены вне исходной ACTIVE epoch 1 (`NOT_CONFIGURED` для restored ACTIVE epoch 2+); legacy B без runtime row допускается на полной схеме. После copy-only restore остаются только чтение/удаление скопированных объектов под текущей властью; новый no-byte A intent не открывает B/C.
 
 | Метод / путь | Доступ | Назначение |
 |---|---|---|

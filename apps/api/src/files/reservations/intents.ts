@@ -18,10 +18,11 @@
  *
  * ## Mandated order (one order only, no reverse file → session lock)
  *
- * `assertCallerTransaction` (explicit READ COMMITTED) → `request_sessions FOR
- * UPDATE` + raw token proof → `legal_documents FOR UPDATE` through
- * `currentPurposeConsent` → the owner's existing intent row (`FOR UPDATE`) for a
- * read/replay → a fresh database-clock re-check of the anchor, the policy expiry
+ * `assertCallerTransaction` (explicit READ COMMITTED) → runtime singleton `FOR
+ * SHARE` when present → `request_sessions FOR UPDATE` + raw token proof →
+ * `legal_documents FOR UPDATE` through `currentPurposeConsent` → the owner's
+ * existing intent row → privacy control (`FOR UPDATE`) for a read/replay → a
+ * fresh database-clock re-check of the anchor, the policy expiry
  * and the intent expiry after the last wait → exact current GIVEN basis → quota
  * sum/count → INSERT/receipt + audit + outbox.
  *
@@ -95,6 +96,39 @@ interface FileIntentRow {
 interface ConsentBasis {
   readonly evidenceId: string;
   readonly documentVersionId: string;
+}
+
+interface MetadataRuntime {
+  readonly namespace_id: string;
+  readonly epoch: string;
+  readonly mode: string;
+}
+
+/** Runtime first: an exclusive restore/fence transition waits for this transaction. */
+async function lockMetadataRuntime(client: FileReservationSqlClient): Promise<void> {
+  const { rows: [runtime] } = await guardFile(() => client.query<MetadataRuntime>(
+    `SELECT namespace_id,epoch::text,mode FROM foundation.file_runtime_epochs WHERE singleton FOR SHARE`,
+  ));
+  // No row is the historical non-restored A/B-only case on the current schema.
+  // Missing tables are not compatibility: driver errors still fail closed.
+  if (runtime !== undefined && (runtime.mode !== 'ACTIVE'
+    || typeof runtime.namespace_id !== 'string' || runtime.namespace_id.length === 0
+    || typeof runtime.epoch !== 'string' || !/^[1-9]\d*$/.test(runtime.epoch))) {
+    conflict();
+  }
+}
+
+/** Intent lock precedes its control lock, matching C/D's irreversible decision. */
+async function requireOpenMetadata(client: FileReservationSqlClient, intentId: string): Promise<void> {
+  const { rows: [control] } = await guardFile(() => client.query<{ access_epoch: string; delete_state: string }>(
+    `SELECT access_epoch::text,delete_state FROM foundation.file_privacy_controls WHERE intent_id=$1 FOR UPDATE`,
+    [intentId],
+  ));
+  // Lazy absence is an unfrozen intent. Any decision epoch/state denies even a
+  // replay's state/dedupe answer; a hold by itself does not grant or revoke access.
+  if (control !== undefined && (control.access_epoch !== '1' || control.delete_state !== 'OPEN')) {
+    conflict();
+  }
 }
 
 function conflict(): never {
@@ -386,8 +420,9 @@ export async function reserveFileUpload(
   // The guard is the first statement of the call: explicit READ COMMITTED, no
   // inherited stronger snapshot, and a proven multi-statement transaction.
   await legalCall(() => assertCallerTransaction(client));
+  await lockMetadataRuntime(client);
   const anchor = await legalCall(() => requireLiveAnchor(client, parsed.session));
-  // Lock order: anchor, then document. The consent answer is the exact current
+  // Lock order: runtime, anchor, then document. The consent answer is the exact current
   // GIVEN of REQUEST_PROCESSING for this anchor.
   const consent = await legalCall(() => currentPurposeConsent(client, {
     session: parsed.session, purpose: FILE_RESERVATION_PURPOSE,
@@ -397,7 +432,10 @@ export async function reserveFileUpload(
   // Replay lookup under the anchor lock: a concurrent duplicate of this owner
   // waits on the session row and then sees the committed intent.
   const existing = await lockIntentByIdempotency(client, anchor.id, parsed.idempotencyKey);
-  // Last wait is over: re-sample the clock and re-prove the anchor before deciding.
+  if (existing !== null) {
+    await requireOpenMetadata(client, existing.id);
+  }
+  // Last wait (including an existing privacy control) is over: re-prove liveness.
   const now = await dbClock(client);
   await legalCall(() => assertAnchorLiveAfterLock(client, anchor));
   if (parsed.policy.expiresAt.getTime() <= now.getTime()) {
@@ -443,12 +481,14 @@ export async function readFileUploadIntent(
 ): Promise<FileUploadIntentView> {
   const parsed = readFileUploadIntentInput(input);
   await legalCall(() => assertCallerTransaction(client));
+  await lockMetadataRuntime(client);
   const anchor = await legalCall(() => requireLiveAnchor(client, parsed.session));
   const consent = await legalCall(() => currentPurposeConsent(client, {
     session: parsed.session, purpose: FILE_RESERVATION_PURPOSE,
   }));
   const basis = consentBasis(consent);
   const row = await lockOwnedIntent(client, anchor.id, parsed.intentId);
+  await requireOpenMetadata(client, row.id);
   const now = await dbClock(client);
   await legalCall(() => assertAnchorLiveAfterLock(client, anchor));
   if (policyExpiry(row).getTime() <= now.getTime()) {

@@ -191,15 +191,30 @@ anchor доверенной серверной сессии. Порты покр
 
 Финальные проверки среза A: 679/679 Vitest в 50 файлах (40 unit + 17 PostgreSQL), 14 миграций/138 CHECK, SQL014 SHA-256 `2ec24c33…bb4377`, typecheck/source-lint/build PASS; повторный read-only вердикт Astra — PASS. Принятый срез A зафиксирован отдельным локальным коммитом `7d92122`, без B.
 
-[План P03-04](../../docs/P03-04-PLAN.md) проверен Astra до реализации; A зафиксирован отдельно в `7d92122`, весь P03-04 не завершён, прогресс остаётся 60%. После отдельного разрешения B1+B2 реализован внутренний путь резервирования в приватный карантин; обязательный Astra PASS по B1 получен до B2, отдельный финальный Astra PASS по B2 — после исправлений.
+[План P03-04](../../docs/P03-04-PLAN.md) проверен Astra до реализации. На дату приёмки A P03-04 ещё не был завершён, P03 составлял 60%; обязательный отдельный Astra PASS для B1 затем предшествовал B2.
 
 ## P03-04B1+B2: private quarantine, принят владельцем
 
 [Контракт B2](../../docs/P03-04B2-CONTRACT.md): `src/files/upload-coordinator/index.ts` предоставляет `uploadReservedFile(pool, storage, operationalPolicy, command)` с обязательными trusted synthetic bounds, raw F proof и cooperative body factory. Registration COMMIT предшествует factory/первому next, dispatch COMMIT — единственному PUT; locks не держатся на IO. Storage проверяет полный GET HTTP200 без Content-Range и actual bytes/SHA-256. После IO повторно проверяются exact original GIVEN, owner, policy, сроки и поколение/lease; единственный binding означает только QUARANTINED. Replay после ожидания binding читает свежий DB clock.
 
-Operator-only direct `src/files/upload-coordinator/reconcile.ts` делает bounded GET exact registered key/target, фиксирует fenced observations и держит физическую charge UNKNOWN/поздних PUT. 404 не доказывает отсутствие, recovery не пишет старый key, не публикует и не удаляет. Opaque probe issuer не экспортируется из feature barrels. Additive015: attempts и immutable quarantine objects, точные FK/column ACL; migration014 и A не меняются.
+Operator-only direct `src/files/upload-coordinator/reconcile.ts` делает bounded GET exact registered key/target, фиксирует fenced observations и держит физическую charge UNKNOWN/поздних PUT. 404 не доказывает отсутствие, recovery не пишет старый key, не публикует и не удаляет. Opaque probe issuer не экспортируется из feature barrels. В принятом B additive015 добавила attempts и immutable quarantine objects, точные FK/column ACL, не изменяя SQL014 или код A. Позднее C/D/E доработали runtime guards A/B на полной цепочке, без правок SQL014/015.
 
-Итог: 767/767 тестов, 56 файлов, real PG+S3 включены без skipped; B1 52/B2 36 адресных. Migration proof15/149CHECK, workspace tsc/source-lint/build, dependency525/audit0 и secret/diff PASS. Astra B2 PASS закрывает 3 MUST FIX: full GET, replay clock после SELECT, rollback/audit-outbox fault matrix. Владелец принял B1+B2 22.11.2026, разрешил отдельный коммит и push, поручил завершить остальные части P03-04. HTTP/DI, READY, scanner/EXIF, выдача/DELETE/restore и реальные ПД отсутствуют, production disabled; Q02/Q12/Q13/Q16 открыты. Рабочая dev DB не мигрировалась.
+Итог: 767/767 тестов, 56 файлов, real PG+S3 включены без skipped; B1 52/B2 36 адресных. Migration proof15/149CHECK, workspace tsc/source-lint/build, dependency525/audit0 и secret/diff PASS. Astra B2 PASS закрывает 3 MUST FIX: full GET, replay clock после SELECT, rollback/audit-outbox fault matrix. Владелец принял B1+B2 22.11.2026, разрешил отдельный коммит и push, поручил завершить остальные части P03-04. B опубликован в `e44fae8`, [GitHub Actions 44960486563](https://github.com/Good-Eli/fixlevelup/actions/runs/44960486563) — success. В границах принятого B не было HTTP/DI, READY, scanner/EXIF, выдачи/DELETE/restore или реальных ПД; Q02/Q12/Q13/Q16 открыты. Рабочая dev DB не мигрировалась.
+
+## P03-04C/D/E: технически завершено, internal synthetic scope
+
+Поверх принятого `e44fae8` в рабочем дереве лежат модули `src/files/file-processing/`
+(локальный decoder, структура изображения, protocol), `file-lifecycle/`
+(публикация, processing registry/evidence, budget), `file-access/` (метаданные и
+выдача потоком по тикетам), `file-privacy/` (retention, hold, delete claim и
+deletion, broker), `file-restore/` (инвентарь, объекты, записи, rescrub) и
+`file-ledger/` (кодек, verifier, PG-ledger). Плюс аддитивные миграции `016`
+(`file_processing_access`) и `017` (`file_privacy_deletion`) и прямая зависимость
+`sharp@0.35.5`. Контракт — [P03-04CDE](../../docs/P03-04CDE-CONTRACT.md).
+
+Только внутренний F-путь: JPEG/PNG/WebP без анимации могут стать READY после двух реальных сканов и sanitization; PDF остаётся в карантине, видео/анимация не допускаются к READY. Выдача — по закрытому ticket с повторной проверкой на каждый chunk; после D freeze закрыты также A read/exact replay. Новые B/C записи разрешены только в исходной ACTIVE epoch 1; после restore epoch 2+ доступ и DELETE касаются лишь скопированных объектов под текущей властью. Отсутствующая runtime row сохраняет legacy B на полной схеме.
+
+Три межсрезовых MUST закрыты; полный Astra A→E — PASS (22.11.2026), E — 876/876 без пропусков. P03 технически завершён на 80% (4 из 5); P03-05 не начинать. См. [актуальный статус P03-04 и evidence](../../docs/P03-04CDE-CONTRACT.md#6-current-status-and-evidence). C/D/E ещё не закоммичены. Нет HTTP/DI, signed URL, staff grants, customer intake, production или реальных ПД; Q02/Q12/Q13/Q16 открыты. Рабочая dev БД не мигрировалась.
 
 ## Поведение
 
@@ -247,7 +262,7 @@ Dev: @nestjs/testing 12.5.1, supertest 7.3.2, @types/supertest 7.2.1 — DI/HTTP
 @nestjs/config не нужен собственному небольшому technical config validator.
 Prisma client/adapter7.10.1 и pg8.23.1 — существующие runtime deps;
 CLI/Studio/React/Visx исключены из API runtime graph. Swagger/DTO libs,
-Nest CLI, SWC/Jest и provider SDK не добавлены.
+Nest CLI и SWC/Jest не добавлены. Для internal synthetic файлов добавлены точные `@aws-sdk/client-s3@3.1172.0` и `sharp@0.35.5` (последний — в рабочем C/D/E).
 Dependency lifecycle scripts остаются запрещёнными.
 
 ## Проверки и границы доказательств

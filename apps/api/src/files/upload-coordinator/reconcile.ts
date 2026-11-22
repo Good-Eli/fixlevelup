@@ -5,9 +5,11 @@ import { issueRegisteredQuarantineProbe } from '../storage/registered-proof.js';
 import { isUploadError, refuse } from './contract.js';
 import type { Observation, UploadOperationalPolicy, UploadReconcileCommand, UploadReconcileSummary } from './contract.js';
 import { assertNotAborted, deadline, reconcileCommand, signalAborted, uploadOperationalPolicy } from './input.js';
-import { ATTEMPTS, SHA256, audit, hasProbeCapacity, leaseDeadline, lockTechnicalAttempt, retireExpired } from './registry.js';
+import type { RuntimeEpoch } from '../file-lifecycle/contract.js';
+import { ATTEMPTS, SHA256, audit, hasProbeCapacity, leaseDeadline, lockTechnicalAttempt, lockUploadRuntime, retireExpired } from './registry.js';
 import type { AttemptRow } from './registry.js';
 import { CommitUncertain, inUploadTransaction } from './transaction.js';
+import { ownerBudgetSql } from './accounting.js';
 
 export type { UploadReconcileCommand, UploadReconcileSummary } from './contract.js';
 
@@ -29,25 +31,30 @@ function matchesTarget(row: AttemptRow, target: StorageTarget): boolean {
 
 /** Listing is only a hint. Recheck eligibility and all quota/lease predicates under the owner lock. */
 async function candidates(client: PoolClient, target: StorageTarget, policy: UploadOperationalPolicy, limit: number): Promise<Candidate[]> {
-  const { rows } = await client.query<Candidate>(`WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now),
-    capacity AS (SELECT owner_request_session_id FROM ${ATTEMPTS} GROUP BY owner_request_session_id
-      HAVING count(*) FILTER (WHERE state IN ('REGISTERED','IN_FLIGHT','UNKNOWN'))
-      + coalesce(sum(probe_held_slots::numeric),0) < $1)
+  const { rows } = await client.query<Candidate>(`WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now)
     SELECT a.id,a.intent_id FROM ${ATTEMPTS} a CROSS JOIN t
+    LEFT JOIN foundation.file_privacy_controls privacy ON privacy.intent_id=a.intent_id
+    JOIN LATERAL (${ownerBudgetSql('a.owner_request_session_id')}) owner_budget ON true
     WHERE a.storage_endpoint=$2 AND a.storage_bucket=$3 AND a.storage_region=$4
+      -- 016 uses access_epoch=1; every irreversible 017 delete freeze raises it.
+      -- Filter before LIMIT, including retirement rows, so a frozen oldest row
+      -- cannot consume every bounded batch without making progress.
+      AND (privacy.intent_id IS NULL OR privacy.access_epoch=1)
       AND ((a.state IN ('REGISTERED','IN_FLIGHT') AND a.upload_lease_expires_at <= t.now)
        OR (a.state='UNKNOWN' AND (a.probe_lease_expires_at IS NULL OR a.probe_lease_expires_at <= t.now)
          AND a.probe_generation < 2147483647 AND a.probe_held_slots < 2147483647
-         AND a.owner_request_session_id IN (SELECT owner_request_session_id FROM capacity)))
+         -- Match the locked claim check across raw and sanitized attempts, C read
+         -- and unregistered processing claims. Expiry never releases occupied debt.
+         AND owner_budget.slots::numeric < $1::numeric))
     ORDER BY (a.state='UNKNOWN'), a.observed_at NULLS FIRST, a.created_at,a.id LIMIT $5`,
   [policy.maxLiveOperationsPerOwner, target.endpoint, target.bucket, target.region, limit]);
   return rows;
 }
 
 async function claimProbe(client: PoolClient, candidate: Candidate, target: StorageTarget, policy: UploadOperationalPolicy,
-  signal: AbortSignal,
+  signal: AbortSignal, epoch: RuntimeEpoch | null,
 ): Promise<{ retired?: 'FAILED_NOBYTES' | 'UNKNOWN'; claim?: Claim }> {
-  const row = await lockTechnicalAttempt(client, candidate);
+  const row = await lockTechnicalAttempt(client, candidate, { epoch, requireOpen: true });
   if (row === undefined) {
     return {};
   }
@@ -71,8 +78,10 @@ async function claimProbe(client: PoolClient, candidate: Candidate, target: Stor
   return retired === undefined ? { claim: result } : { retired, claim: result };
 }
 
-async function finishProbe(client: PoolClient, claim: Claim, observation: Observation, transportSettled: boolean): Promise<boolean> {
-  const row = await lockTechnicalAttempt(client, claim.attempt);
+async function finishProbe(client: PoolClient, claim: Claim, observation: Observation, transportSettled: boolean,
+  epoch: RuntimeEpoch | null,
+): Promise<boolean> {
+  const row = await lockTechnicalAttempt(client, claim.attempt, { epoch });
   if (!row || row.state !== 'UNKNOWN' || row.object_key !== claim.attempt.object_key
     || !matchesTarget(row, targetOf(claim.attempt))) {
     return false;
@@ -151,14 +160,17 @@ export async function reconcileUploadAttempts(pool: Pool, storage: RegisteredQua
   }
   const result = { retiredWithoutPut: 0, retiredUnknown: 0, present: 0, notObserved: 0, indeterminate: 0, skipped: 0 };
   try {
-    const selected = await inUploadTransaction(pool, (client) => candidates(client, target, policy, limit));
+    const { selected, epoch } = await inUploadTransaction(pool, async (client) => {
+      const runtime = await lockUploadRuntime(client);
+      return { selected: await candidates(client, target, policy, limit), epoch: runtime ?? null };
+    });
     for (const candidate of selected) {
       if (signalAborted(signal)) {
         break;
       }
       let claimed;
       try {
-        claimed = await inUploadTransaction(pool, (client) => claimProbe(client, candidate, target, policy, signal));
+        claimed = await inUploadTransaction(pool, (client) => claimProbe(client, candidate, target, policy, signal, epoch));
       } catch (error) {
         if (error instanceof CommitUncertain) {
           // Never start a GET using an unacknowledged claim.
@@ -187,7 +199,7 @@ export async function reconcileUploadAttempts(pool: Pool, storage: RegisteredQua
       let committed: boolean;
       try {
         committed = await inUploadTransaction(pool,
-          (client) => finishProbe(client, claim, observed.observation, observed.transportSettled));
+          (client) => finishProbe(client, claim, observed.observation, observed.transportSettled, epoch));
       } catch (error) {
         if (error instanceof CommitUncertain || (isUploadError(error) && error.code === 'STALE_ATTEMPT')) {
           result.skipped += 1;

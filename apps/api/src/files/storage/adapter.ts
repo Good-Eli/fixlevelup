@@ -1,13 +1,10 @@
 /**
- * The standalone private quarantine adapter (B1).
+ * Internal private quarantine and lifecycle object storage (B1/B2/C).
  *
- * This module performs exactly two object-storage operations: one bounded PUT of a
- * caller source into the quarantine namespace, and one bounded GET of the *same*
- * descriptor's object for a byte/hash re-check. It is not an upload workflow, not a
- * reservation, not a lifecycle, not a download, not a delete, not a scanner and not
- * a READY transition; it has no HTTP surface, no NestJS provider, no DI token, no
- * database access and no durable attempt registry. The future B2 coordinator owns
- * durable registration, leases/fencing and reconciliation.
+ * One-shot PUT and independent GET verification are namespace-bound. Registered
+ * quarantine probes expose aggregates only; bounded byte reads require a distinct
+ * opaque C grant per namespace. This module does not authorize DB transactions,
+ * publish READY, delete objects, or serve an HTTP response.
  *
  * Guarantees that matter for a later coordinator:
  *
@@ -29,15 +26,17 @@ import { GetObjectCommand, PutObjectCommand, S3ServiceException } from '@aws-sdk
 import type { GetObjectCommandOutput, S3Client } from '@aws-sdk/client-s3';
 import {
   assertAttemptWritable, beginAttemptWrite, markAttemptWritten, prepareQuarantineAttempt, prepareTargetBoundAttempt,
-  requireAttempt, requireWrittenTarget, sameTarget, storageTarget,
+  prepareTargetBoundSanitizedAttempt, requireAttempt, requireSanitizedAttempt, requireWrittenTarget, sameTarget, storageTarget,
 } from './attempt.js';
-import type { QuarantineAttempt, StorageTarget } from './attempt.js';
+import type { QuarantineAttempt, SanitizedAttempt, StorageTarget } from './attempt.js';
 import { BoundedBodyStream } from './body.js';
 import type { BoundedBodyLimits } from './body.js';
 import { createS3Client, validateConfig } from './config.js';
 import type { PrivateQuarantineStorageConfig, ValidatedStorageConfig } from './config.js';
-import { isInternalStorageError, privateStorageError } from './errors.js';
+import { isInternalStorageError, lifecycleStorageError, privateStorageError } from './errors.js';
 import type { PrivateStorageError } from './errors.js';
+import { requireLifecycleGetGrant } from './lifecycle-proof.js';
+import type { RawGetGrant, ReadyGetGrant } from './lifecycle-proof.js';
 import { requireRegisteredQuarantineProbe } from './registered-proof.js';
 import type { RegisteredQuarantineProbeProof } from './registered-proof.js';
 import { bindProbeTransport, ProbeTransport } from './response-limiter.js';
@@ -103,9 +102,31 @@ export interface RegisteredQuarantineStorage extends PrivateQuarantineStorage {
   ): Promise<RegisteredQuarantineObservation>;
 }
 
+export interface RegisteredSanitizedAttempt {
+  readonly attempt: SanitizedAttempt;
+  readonly target: StorageTarget;
+  readonly maxChunkBytes: number;
+}
+
+export interface LifecycleGetInput {
+  readonly maxBytes: number;
+  readonly signal: AbortSignal;
+}
+
+export interface ReadyReadStorage {
+  fetchReadyBytes(proof: ReadyGetGrant, opts: LifecycleGetInput): Promise<Uint8Array>;
+}
+
+export interface LifecycleStorage extends ReadyReadStorage, RegisteredQuarantineStorage {
+  fetchRawBytes(proof: RawGetGrant, opts: LifecycleGetInput): Promise<Uint8Array>;
+  prepareSanitizedAttempt(): RegisteredSanitizedAttempt;
+  putSanitized(attempt: SanitizedAttempt, input: PutQuarantinedInput): Promise<QuarantineReceipt>;
+  verifySanitized(attempt: SanitizedAttempt, input: VerifyQuarantinedInput): Promise<QuarantineReceipt>;
+}
+
 const SHA256_HEX = /^[0-9a-f]{64}$/;
-/** Bound on one drained GET chunk: a single SDK chunk can never exceed this. */
-const MAX_DRAIN_CHUNK_BYTES = 1_048_576;
+/** Technical cap on a single accepted SDK payload chunk, in addition to the full-copy budget. */
+export const LIFECYCLE_READ_MAX_CHUNK_BYTES = 1_048_576;
 /**
  * Technical cleanup bound (not policy): how long `bounded` waits for an aborted SDK
  * request to actually settle, and how long a destroyed response body may take to
@@ -409,6 +430,7 @@ async function drainBounded(
   stream: AsyncIterable<Uint8Array>,
   maxBytes: number,
   signal: AbortSignal,
+  output?: Uint8Array,
 ): Promise<{ actualBytes: number; sha256: string }> {
   const hash = createHash('sha256');
   let total = 0;
@@ -426,11 +448,14 @@ async function drainBounded(
       if (!(chunk instanceof Uint8Array)) {
         throw privateStorageError('READ_FAILED', 'TRANSPORT');
       }
-      total += chunk.byteLength;
-      if (total > maxBytes || chunk.byteLength > MAX_DRAIN_CHUNK_BYTES) {
+      const nextTotal = total + chunk.byteLength;
+      if (nextTotal > maxBytes || chunk.byteLength > LIFECYCLE_READ_MAX_CHUNK_BYTES) {
         throw privateStorageError('VERIFY_MISMATCH');
       }
+      // Internally owned, exactly-sized buffer, never a view of an SDK chunk.
+      output?.set(chunk, total);
       hash.update(chunk);
+      total = nextTotal;
     }
   } finally {
     // Close the response body iterator; the caller separately destroys the socket.
@@ -450,7 +475,9 @@ async function drainBounded(
 }
 
 /** Shared B1/B2 payload read; destroy directly because SDK send has already resolved. */
-async function drainResponseBody(body: unknown, maxBytes: number, signal: AbortSignal): Promise<ObservedObjectBytes> {
+async function drainResponseBody(
+  body: unknown, maxBytes: number, signal: AbortSignal, output?: Uint8Array,
+): Promise<ObservedObjectBytes> {
   if (typeof body !== 'object' || body === null
     || typeof (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] !== 'function') {
     await destroyBody(body, false);
@@ -468,7 +495,7 @@ async function drainResponseBody(body: unknown, maxBytes: number, signal: AbortS
     if (signal.aborted) {
       destroyOnAbort();
     }
-    const drained = await drainBounded(body as AsyncIterable<Uint8Array>, maxBytes, signal);
+    const drained = await drainBounded(body as AsyncIterable<Uint8Array>, maxBytes, signal, output);
     ended = true;
     return drained;
   } finally {
@@ -502,15 +529,17 @@ function boundedSource(
   source: AsyncIterable<Uint8Array>,
   limits: BoundedBodyLimits,
   onFailure: (error: PrivateStorageError) => void,
+  transport?: ProbeTransport,
 ): BoundedBodyStream {
   try {
-    return new BoundedBodyStream(source, limits, onFailure);
+    return new BoundedBodyStream(source, limits, onFailure,
+      transport === undefined ? undefined : (pending) => { transport.track(pending); });
   } catch {
     throw privateStorageError('WRITE_OUTCOME_UNKNOWN', 'SOURCE_FAILED');
   }
 }
 
-class S3QuarantineStorage implements RegisteredQuarantineStorage {
+class S3QuarantineStorage implements LifecycleStorage {
   readonly #config: ValidatedStorageConfig;
   readonly #client: S3Client;
   /**
@@ -544,6 +573,100 @@ class S3QuarantineStorage implements RegisteredQuarantineStorage {
       target: this.#target,
       maxChunkBytes: this.#config.maxChunkBytes,
     });
+  }
+
+  prepareSanitizedAttempt(): RegisteredSanitizedAttempt {
+    this.#assertOpen();
+    return Object.freeze({
+      attempt: prepareTargetBoundSanitizedAttempt(this.#target),
+      target: this.#target,
+      maxChunkBytes: this.#config.maxChunkBytes,
+    });
+  }
+
+  async putSanitized(attempt: SanitizedAttempt, input: PutQuarantinedInput): Promise<QuarantineReceipt> {
+    return await this.#trackedLifecycle(async (transport) => {
+      this.#assertOpen();
+      const descriptor = requireSanitizedAttempt(attempt);
+      const fields = inputSnapshot(input, PUT_INPUT_KEYS);
+      const limits = sizes(fields.get('expectedBytes'), fields.get('maxBytes'));
+      const signal = signalOf(fields);
+      const body = bodyOf(fields);
+      if (signalAborted(signal)) {
+        throw privateStorageError('ABORTED', 'ABORTED');
+      }
+      assertAttemptWritable(descriptor, this.#target);
+      this.#assertCapacity();
+      return await this.#track(this.#put(descriptor, body, limits, signal, transport));
+    });
+  }
+
+  async verifySanitized(attempt: SanitizedAttempt, input: VerifyQuarantinedInput): Promise<QuarantineReceipt> {
+    return await this.#trackedLifecycle(async (transport) => {
+      this.#assertOpen();
+      const descriptor = requireSanitizedAttempt(attempt);
+      const fields = inputSnapshot(input, VERIFY_INPUT_KEYS);
+      const limits = sizes(fields.get('expectedBytes'), fields.get('maxBytes'));
+      const expectedSha = fields.get('sha256');
+      if (typeof expectedSha !== 'string' || expectedSha.length !== 64 || !SHA256_HEX.test(expectedSha)) {
+        invalidInput();
+      }
+      const signal = signalOf(fields);
+      if (signalAborted(signal)) {
+        throw privateStorageError('ABORTED', 'ABORTED');
+      }
+      requireWrittenTarget(descriptor, this.#target);
+      this.#assertCapacity();
+      const actual = await this.#track(this.#getExact(descriptor.objectKey, limits.expectedBytes, expectedSha, signal, transport));
+      return Object.freeze({ attemptId: descriptor.attemptId, objectKey: descriptor.objectKey, ...actual });
+    }, true);
+  }
+
+  fetchRawBytes(proof: RawGetGrant, opts: LifecycleGetInput): Promise<Uint8Array> {
+    return this.#fetchLifecycleBytes(proof, 'RAW', opts);
+  }
+
+  fetchReadyBytes(proof: ReadyGetGrant, opts: LifecycleGetInput): Promise<Uint8Array> {
+    return this.#fetchLifecycleBytes(proof, 'READY', opts);
+  }
+
+  async #fetchLifecycleBytes(
+    proof: RawGetGrant | ReadyGetGrant, kind: 'RAW' | 'READY', opts: LifecycleGetInput,
+  ): Promise<Uint8Array> {
+    return await this.#trackedLifecycle(async (transport) => {
+      this.#assertOpen();
+      const facts = requireLifecycleGetGrant(proof, kind);
+      if (!sameTarget(facts.target, this.#target)) {
+        throw privateStorageError('ATTEMPT_TARGET_MISMATCH');
+      }
+      const fields = inputSnapshot(opts, INSPECT_INPUT_KEYS);
+      const { expectedBytes } = sizes(facts.expectedBytes, fields.get('maxBytes'));
+      const signal = signalOf(fields);
+      if (signalAborted(signal)) {
+        throw privateStorageError('ABORTED', 'ABORTED');
+      }
+      this.#assertCapacity();
+      // An independent ArrayBuffer the exact size of the trusted row: no Buffer
+      // pool, excess capacity, or second full-sized staging copy on this path.
+      const payload = new Uint8Array(expectedBytes);
+      await this.#track(this.#getExact(facts.objectKey, expectedBytes, facts.expectedSha256, signal, transport, payload));
+      return payload;
+    }, true);
+  }
+
+  async #trackedLifecycle<T>(run: (transport: ProbeTransport) => Promise<T>, getOnly = false): Promise<T> {
+    const transport = new ProbeTransport(getOnly);
+    try {
+      return await run(transport);
+    } catch (error: unknown) {
+      if (isInternalStorageError(error)) {
+        if (getOnly && error.code === 'WRITE_OUTCOME_UNKNOWN') {
+          throw lifecycleStorageError('READ_FAILED', error.reason ?? 'TRANSPORT', transport.settled);
+        }
+        throw lifecycleStorageError(error.code, error.reason, transport.settled);
+      }
+      throw lifecycleStorageError(getOnly ? 'READ_FAILED' : 'WRITE_OUTCOME_UNKNOWN', 'TRANSPORT', transport.settled);
+    }
   }
 
   async inspectRegisteredQuarantineObject(
@@ -654,10 +777,11 @@ class S3QuarantineStorage implements RegisteredQuarantineStorage {
   }
 
   async #put(
-    descriptor: QuarantineAttempt,
+    descriptor: QuarantineAttempt | SanitizedAttempt,
     body: AsyncIterable<Uint8Array>,
     limits: { expectedBytes: number; maxBytes: number },
     signal: AbortSignal,
+    transport?: ProbeTransport,
   ): Promise<QuarantineReceipt> {
     // Binding + consumption happen before the first byte leaves the process: the
     // attempt is tied to this immutable target, and a second descriptor use (from any
@@ -667,7 +791,7 @@ class S3QuarantineStorage implements RegisteredQuarantineStorage {
     // flight, and it must also abort that PUT immediately.
     const failure = new FailureSlot();
     try {
-      const outcome = await bounded(async (operationSignal, abort) => {
+      const run = async (operationSignal: AbortSignal, abort: () => void): Promise<ObservedObjectBytes> => {
         const stream = boundedSource(
           body,
           { ...limits, maxChunkBytes: this.#config.maxChunkBytes },
@@ -677,8 +801,14 @@ class S3QuarantineStorage implements RegisteredQuarantineStorage {
             // declared Content-Length until its own timeout: abort it now.
             abort();
           },
+          transport,
         );
+        const stopSource = (): void => { stream.destroy(); };
+        operationSignal.addEventListener('abort', stopSource, { once: true });
         try {
+          if (operationSignal.aborted) {
+            throw privateStorageError('WRITE_OUTCOME_UNKNOWN', 'ABORTED');
+          }
           await this.#client.send(new PutObjectCommand({
             Bucket: this.#target.bucket,
             Key: descriptor.objectKey,
@@ -686,12 +816,16 @@ class S3QuarantineStorage implements RegisteredQuarantineStorage {
             ContentLength: limits.expectedBytes,
           }), { abortSignal: operationSignal });
         } finally {
+          operationSignal.removeEventListener('abort', stopSource);
           stream.destroy();
         }
         // Only a source that fully ended has a byte count and a digest.
         return stream.outcome();
-      }, this.#config.operationTimeoutMs, signal, this.#shutdown.signal,
-      (pending) => { this.#trackInFlight(pending); });
+      };
+      const outcome = transport === undefined
+        ? await bounded(run, this.#config.operationTimeoutMs, signal, this.#shutdown.signal,
+          (pending) => { this.#trackInFlight(pending); })
+        : await this.#boundedLifecycle(run, signal, transport);
       // The success receipt target is the exact target of this successful PUT; a
       // verify through any other endpoint/bucket/region is refused later, before IO.
       markAttemptWritten(descriptor, this.#target);
@@ -704,10 +838,62 @@ class S3QuarantineStorage implements RegisteredQuarantineStorage {
     } catch (error: unknown) {
       const recorded = failure.take();
       if (recorded !== null) {
-        throw recorded;
+        // The bounded source generates only fixed SOURCE_* diagnostics. Rebuild
+        // so the lifecycle wrapper can preserve the reason without passing an object.
+        throw privateStorageError(recorded.code, recorded.reason);
       }
       unknownOutcome(error);
     }
+  }
+
+  async #boundedLifecycle<T>(
+    run: (signal: AbortSignal, abort: () => void) => Promise<T>, signal: AbortSignal, transport: ProbeTransport,
+  ): Promise<T> {
+    const result = await bounded(async (operationSignal, abort) => {
+      bindProbeTransport(operationSignal, transport);
+      try {
+        // Defer caller iterator setup until the adapter has registered #active.
+        // If a source re-enters close()/another operation, its own slot is visible.
+        await Promise.resolve();
+        if (operationSignal.aborted) {
+          throw privateStorageError('WRITE_OUTCOME_UNKNOWN', 'ABORTED');
+        }
+        return await run(operationSignal, abort);
+      } finally {
+        await transport.wait();
+      }
+    }, this.#config.operationTimeoutMs, signal, this.#shutdown.signal, (pending) => {
+      transport.markUncertain();
+      this.#trackInFlight(pending);
+    });
+    if (!transport.settled || !transport.fullResponse) {
+      throw privateStorageError(transport.fullObjectOnly ? 'READ_FAILED' : 'WRITE_OUTCOME_UNKNOWN', 'TRANSPORT');
+    }
+    if (signalAborted(signal) || signalAborted(this.#shutdown.signal)) {
+      throw privateStorageError(transport.fullObjectOnly ? 'READ_FAILED' : 'WRITE_OUTCOME_UNKNOWN', 'ABORTED');
+    }
+    return result;
+  }
+
+  async #getExact(
+    key: string, expectedBytes: number, expectedSha: string, signal: AbortSignal, transport: ProbeTransport, output?: Uint8Array,
+  ): Promise<ObservedObjectBytes> {
+    return await this.#boundedLifecycle(async (operationSignal) => {
+      const response = await this.#client.send(new GetObjectCommand({
+        Bucket: this.#target.bucket,
+        Key: key,
+      }), { abortSignal: operationSignal });
+      if (!validObjectResponse(response, expectedBytes)
+        || (response.ContentLength !== undefined && response.ContentLength !== expectedBytes)) {
+        await destroyBody(response.Body, false);
+        throw privateStorageError('VERIFY_MISMATCH');
+      }
+      const actual = await drainResponseBody(response.Body, expectedBytes, operationSignal, output);
+      if (actual.actualBytes !== expectedBytes || actual.sha256 !== expectedSha) {
+        throw privateStorageError('VERIFY_MISMATCH');
+      }
+      return actual;
+    }, signal, transport);
   }
 
   async #inspect(key: string, maxBytes: number, signal: AbortSignal): Promise<RegisteredQuarantineObservation> {
@@ -815,6 +1001,6 @@ class S3QuarantineStorage implements RegisteredQuarantineStorage {
  * the config and constructs the SDK client; nothing is dialled until the first
  * `putQuarantined`/`verifyQuarantined`.
  */
-export function createPrivateQuarantineStorage(config: PrivateQuarantineStorageConfig): RegisteredQuarantineStorage {
+export function createPrivateQuarantineStorage(config: PrivateQuarantineStorageConfig): LifecycleStorage {
   return new S3QuarantineStorage(validateConfig(config));
 }

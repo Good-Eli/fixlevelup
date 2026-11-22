@@ -49,6 +49,7 @@ const PULL_YIELD_INTERVAL = 16;
 export class BoundedBodyStream extends Readable {
   readonly #limits: BoundedBodyLimits;
   readonly #onFailure: FailureSink;
+  readonly #trackSource: ((operation: Promise<unknown>) => void) | undefined;
   readonly #hash = createHash('sha256');
   #iterator: AsyncIterator<Uint8Array> | null;
   #pulling = false;
@@ -57,10 +58,16 @@ export class BoundedBodyStream extends Readable {
   #iterations = 0;
   #outcome: BoundedBodyOutcome | null = null;
 
-  constructor(source: AsyncIterable<Uint8Array>, limits: BoundedBodyLimits, onFailure: FailureSink) {
+  constructor(
+    source: AsyncIterable<Uint8Array>,
+    limits: BoundedBodyLimits,
+    onFailure: FailureSink,
+    trackSource?: (operation: Promise<unknown>) => void,
+  ) {
     super({ highWaterMark: limits.maxChunkBytes, objectMode: false });
     this.#limits = limits;
     this.#onFailure = onFailure;
+    this.#trackSource = trackSource;
     this.#iterator = source[Symbol.asyncIterator]();
   }
 
@@ -73,7 +80,8 @@ export class BoundedBodyStream extends Readable {
   }
 
   override _read(): void {
-    void this.#pull();
+    const pulling = this.#pull();
+    this.#trackSource?.(pulling);
   }
 
   override _destroy(error: Error | null, callback: (error: Error | null) => void): void {
@@ -184,7 +192,8 @@ export class BoundedBodyStream extends Readable {
       const cleanup = iterator.return;
       if (typeof cleanup === 'function') {
         const returned = cleanup.call(iterator);
-        void Promise.resolve(returned).catch(() => undefined);
+        const cleanupPending = Promise.resolve(returned).catch(() => undefined);
+        this.#trackSource?.(cleanupPending);
       }
     } catch {
       // Optional cleanup cannot suppress EOF, escape _destroy(), or replace an

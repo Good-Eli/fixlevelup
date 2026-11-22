@@ -580,14 +580,13 @@ export async function proveSettingsUpgrade(db, deploy, diff) {
   const session = randomUUID(), revokedSession = randomUUID(), expiringSession = randomUUID();
   const insertSession = (id, cityId, cityVersionId, extra = {}) => db.query(`INSERT INTO foundation.request_sessions
     (id,secret_hash,intake_city_id,intake_city_version_id,expires_at)
-    VALUES($1,$2,$3,$4,$5)`,
-  [id, extra.hash ?? sha256(randomUUID()), cityId, cityVersionId,
-    extra.expiresAt ?? new Date(Date.now() + 3600000)]);
+    VALUES($1,$2,$3,$4,clock_timestamp()+$5::interval)`,
+  [id, extra.hash ?? sha256(randomUUID()), cityId, cityVersionId, extra.lifetime ?? '1 day']);
   await insertSession(session, east.id, eastVersion.id);
   await insertSession(revokedSession, east.id, eastVersion.id);
   // A short-lived live anchor: created_at is database-stamped, so an anchor that is
   // already expired cannot even be inserted; the expired branch needs a real expiry.
-  await insertSession(expiringSession, east.id, eastVersion.id, { expiresAt: new Date(Date.now() + 250) });
+  await insertSession(expiringSession, east.id, eastVersion.id, { lifetime: '250 milliseconds' });
   const stampedSession = (await db.query('SELECT created_at,revoked_at FROM foundation.request_sessions WHERE id=$1', [session])).rows[0];
   assert.ok(Math.abs(Date.now() - stampedSession.created_at.getTime()) < 60000,
     'created_at must be the database clock, not the caller value');
@@ -595,7 +594,7 @@ export async function proveSettingsUpgrade(db, deploy, diff) {
   await denied(insertSession(randomUUID(), east.id, eastVersion.id, { hash: 'not-a-hash' }), '23514', 'secret hash format');
   // An anchor can never be created already expired: expires_at must follow the DB stamp.
   await denied(insertSession(randomUUID(), east.id, eastVersion.id,
-    { expiresAt: new Date(Date.now() - 120000) }), '23514', 'expiry must follow database-stamped creation');
+    { lifetime: '-2 minutes' }), '23514', 'expiry must follow database-stamped creation');
   // A secret hash is one anchor's identity: a second anchor with the same hash is refused.
   const reusedHash = sha256('reused');
   await insertSession(randomUUID(), east.id, eastVersion.id, { hash: reusedHash });
@@ -761,20 +760,23 @@ export async function proveSettingsUpgrade(db, deploy, diff) {
     await db.query('UPDATE foundation.legal_documents SET current_version_id=$2 WHERE id=$1', [raceDoc, raceVersion]);
     const raceSession = randomUUID();
     // Short trusted expiry: the anchor is live at statement start and dead after the wait.
-    await insertSession(raceSession, east.id, eastVersion.id, { expiresAt: new Date(Date.now() + 1500) });
+    await insertSession(raceSession, east.id, eastVersion.id, { lifetime: '1500 milliseconds' });
     const blocker = connection('fixlevelup_migrator', credentials().fixlevelup_migrator, identity.db);
     await blocker.connect();
     try {
       await blocker.query('BEGIN');
       await blocker.query('SELECT 1 FROM foundation.legal_documents WHERE id=$1 FOR UPDATE', [raceDoc]);
-      const blocked = db.query(`INSERT INTO foundation.consent_records
+      const blocked = assert.rejects(db.query(`INSERT INTO foundation.consent_records
         (id,session_id,document_id,document_version_id,purpose,action,legal_basis,source,evidence_ref)
         VALUES($1,$2,$3,$4,'ADDRESS_COVERAGE','GIVEN','SYNTHETIC_LEGAL_BASIS','FORM',$5)`,
-      [randomUUID(), raceSession, raceDoc, raceVersion, randomUUID()]);
+      [randomUUID(), raceSession, raceDoc, raceVersion, randomUUID()]),
+      { code: '23514', message: 'Consent record anchor expired before the event was accepted' });
+      // The INSERT can finish before COMMIT's response; observe rejection now and assert below.
+      void blocked.catch(() => undefined);
       // Let the anchor expire while the insert waits on the document lock, then release it.
       await new Promise((resolve) => { setTimeout(resolve, 1800); });
       await blocker.query('COMMIT');
-      await denied(blocked, '23514', 'anchor expired while the consent insert waited');
+      await blocked;
     } finally { await blocker.query('ROLLBACK').catch(() => undefined); await blocker.end(); }
     assert.equal((await db.query('SELECT count(*)::int AS n FROM foundation.consent_records WHERE session_id=$1',
       [raceSession])).rows[0].n, 0, 'the expired-at-acceptance consent must not be stored');

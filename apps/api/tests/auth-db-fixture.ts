@@ -16,7 +16,9 @@ const expectedSteps = [
   ]),
   ...migrationDay('20261121', ['city_foundation', 'service_areas', 'geography_access', 'settings_legal_references',
     'file_upload_reservations']),
-  ...migrationDay('20261122', ['file_upload_attempts']),
+  '20261122000100_file_upload_attempts',
+  '20261122000200_file_processing_access',
+  '20261122000300_file_privacy_deletion',
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })

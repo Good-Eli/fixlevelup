@@ -85,11 +85,16 @@ interface ClientWithHandler {
   config: { requestHandler: RawHandler };
 }
 
-/** Read-only probes additionally track the handler and raw body, not just SDK send(). */
+/** Track the handler and raw body, not just SDK send(). */
 export class ProbeTransport {
   #pending = new Set<Promise<unknown>>();
   #uncertain = false;
   #fullResponse = false;
+  readonly fullObjectOnly: boolean;
+
+  constructor(fullObjectOnly = false) {
+    this.fullObjectOnly = fullObjectOnly;
+  }
 
   get settled(): boolean {
     return !this.#uncertain && this.#pending.size === 0;
@@ -333,6 +338,13 @@ export function installResponseBodyCap(client: ClientWithHandler, maxResponseBod
       })();
       probe?.track(raw);
       const { response } = await raw;
+      if (probe?.fullObjectOnly === true && request.method === 'GET'
+        && (response.statusCode !== 200 || response.headers['content-range'] !== undefined)) {
+        // Lifecycle reads need only a full object or a fixed failure. Refuse before
+        // the SDK can deserialize/collect a potentially large error payload.
+        destroySource(response.body);
+        throw new ResponseBodyLimitError();
+      }
       if (!isServiceBody(request, response.statusCode)) {
         // Successful GET: the object payload is bounded by the caller's own maxBytes.
         return { response };
