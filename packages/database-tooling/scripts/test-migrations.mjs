@@ -7,6 +7,8 @@ import { fileReservationChecks, proveFileReservationsGrants, proveFileReservatio
 import { fileUploadChecks, proveFileUploadGrants, proveFileUploadUpgrade } from './test-file-upload-migration.mjs';
 import { fileProcessingChecks, proveFileProcessingUpgrade } from './test-file-processing-migration.mjs';
 import { filePrivacyChecks, proveFilePrivacyRuntime, proveFilePrivacyUpgrade } from './test-file-privacy-migration.mjs';
+import { settingsManagementChecks, settingsManagementCodes, proveSettingsManagementUpgrade, proveSettingsManagementCollision,
+  proveSettingsManagementRuntime, prepareSettingsManagementFounder } from './test-settings-management-migration.mjs';
 import { areaChecks, proveAreaUpgrade } from './test-area-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -42,10 +44,11 @@ const migrations = [
   .concat('20261121000100_city_foundation', '20261121000200_service_areas', '20261121000300_geography_access',
     '20261121000400_settings_legal_references', '20261121000500_file_upload_reservations',
     '20261122000100_file_upload_attempts', '20261122000200_file_processing_access',
-    '20261122000300_file_privacy_deletion');
+    '20261122000300_file_privacy_deletion', '20261122000400_settings_management');
 const expectedChecks = [
   ...cityChecks,
   ...areaChecks, ...geoAccessChecks, ...settingsChecks, ...fileReservationChecks, ...fileUploadChecks, ...fileProcessingChecks, ...filePrivacyChecks,
+  ...settingsManagementChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -68,6 +71,8 @@ const upgradeThird = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}
 const upgradeFourth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const upgradeFifth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 const upgradeEighth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+const upgradeSeventeenth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+const collisionSeventeenth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
 // A database capped at exactly 012: the 012 runtime ACL proof must not run on the
 // final fresh database once 013 exists, because 013 deliberately extends the
 // business_settings_versions read/write surface.
@@ -92,8 +97,8 @@ const sixteenthHistory = resolve(historyRoot, 'sixteenth/migrations');
 const seventeenthHistory = resolve(historyRoot, 'seventeenth/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
-  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, upgradeTwelfth, shadow]) { await prepareDatabase(client, database, true); }
-  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${upgradeTwelfth}, ${shadow}`);
+  for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, upgradeTwelfth, upgradeSeventeenth, collisionSeventeenth, shadow]) { await prepareDatabase(client, database, true); }
+  console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${upgradeEighth}, ${upgradeTwelfth}, ${upgradeSeventeenth}, ${collisionSeventeenth}, ${shadow}`);
   for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)], [tenthHistory, migrations.slice(0,10)], [eleventhHistory, migrations.slice(0,11)],
     [twelfthHistory, migrations.slice(0,12)], [thirteenthHistory, migrations.slice(0,13)], [fourteenthHistory, migrations.slice(0,14)],
     [fifteenthHistory, migrations.slice(0,15)], [sixteenthHistory, migrations.slice(0,16)], [seventeenthHistory, migrations.slice(0,17)]]) {
@@ -144,8 +149,24 @@ try {
     await proveFilePrivacyUpgrade(eighthReader,
       () => command(['migrate', 'deploy'], upgradeEighth, 0, undefined, seventeenthHistory),
       (expected) => command(['migrate', 'diff', '--from-migrations', seventeenthHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow),
-      () => command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth));
+      () => {}); // The live Prisma schema now describes 018, never the capped 017 fixture.
+    await proveSettingsManagementUpgrade(eighthReader,
+      () => command(['migrate', 'deploy'], upgradeEighth),
+      (expected) => command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow),
+      (expected) => command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth, expected),
+      migrations, undefined, true);
   } finally { await eighthReader.end(); }
+  for (const database of [collisionSeventeenth, upgradeSeventeenth]) {
+    command(['migrate', 'deploy'], database, 0, undefined, seventeenthHistory);
+    const owner = connection('fixlevelup_migrator', passwords.fixlevelup_migrator, database);
+    await owner.connect();
+    try {
+      if (database === collisionSeventeenth) { await proveSettingsManagementCollision(owner); continue; }
+      const founder = await prepareSettingsManagementFounder(owner);
+      await proveSettingsManagementUpgrade(owner, () => command(['migrate', 'deploy'], database), undefined, undefined, migrations, founder);
+      await proveSettingsManagementRuntime(owner, passwords.fixlevelup_runtime, founder);
+    } finally { await owner.end(); }
+  }
   // The 012 ACL proof runs on a database capped at exactly 012, not on the final fresh
   // database: 013 deliberately widens the business_settings_versions read/write surface.
   command(['migrate', 'deploy'], upgradeTwelfth, 0, undefined, twelfthHistory);
@@ -356,7 +377,8 @@ try {
     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh, 2);
     await migration.query('ALTER TABLE foundation.audit_logs DROP COLUMN p017a_drift_probe');
     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
-    await proveRbacCutover(migration, ['geography.read','geography.manage','geography.publish','staff.geography.read','staff.geography.manage']);
+    await proveRbacCutover(migration, ['geography.read','geography.manage','geography.publish','staff.geography.read','staff.geography.manage',
+      ...settingsManagementCodes]);
     await proveRbacInvariants(migration);
     await checkViolation(migration, "UPDATE foundation.permissions SET protected=false WHERE code='roles.create'");
     await checkViolation(migration, "UPDATE foundation.staff_web_credentials SET login='bad login'");
@@ -548,6 +570,11 @@ try {
     await proveSettingsRuntimeDenials(runtime);
     console.log(`Runtime committed writes/rollback/leases, ${checkDenials} CHECK denials, ${uniqueViolations} unique violations and ${privilegeDenials.length} privilege denials: PASS`);
   } finally { await runtime.end(); }
+  // Preserve the legacy last-admin fixture until all 001–017 runtime assertions finish.
+  const freshManagementOwner = connection('fixlevelup_migrator', passwords.fixlevelup_migrator, fresh);
+  await freshManagementOwner.connect();
+  try { await proveSettingsManagementRuntime(freshManagementOwner, passwords.fixlevelup_runtime); }
+  finally { await freshManagementOwner.end(); }
   console.log('P01-01.9A migration integration proofs: PASS. Test databases retained; no dev data reset.');
 } catch (error) {
   console.error(`Migration proof failed: ${error.message}`);

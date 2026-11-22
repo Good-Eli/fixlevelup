@@ -319,6 +319,7 @@ export class RuntimeDatabase implements OnModuleDestroy {
   private readonly pool: Pool | undefined;
   private readonly client: PrismaClient | undefined;
   private pending: Promise<boolean> | undefined;
+  private pendingManagement: Promise<boolean> | undefined;
   private closing = false;
 
   constructor(private readonly config?: DatabaseConfig, private readonly authEnabled = false) {
@@ -399,7 +400,8 @@ export class RuntimeDatabase implements OnModuleDestroy {
           && entry.definition === 'CREATE INDEX outbox_events_queue_idx ON foundation.outbox_events USING btree (status, created_at)')
         && row.indexes.some((entry) => entry.table === 'outbox_events' && entry.name === 'outbox_events_due_idx' && entry.valid && !entry.unique
           && entry.definition === 'CREATE INDEX outbox_events_due_idx ON foundation.outbox_events USING btree (status, next_attempt_at, created_at, id)');
-      return foundationReady && (!this.authEnabled || (await this.authReady() && await this.settingsReady()));
+      return foundationReady && (!this.authEnabled || (await this.authReady() && await this.settingsReady()
+        && await this.settingsManagementReady()));
   }
 
   // P03-03 (013) readiness: physical schema, named guards and exact column grants of the
@@ -528,6 +530,95 @@ export class RuntimeDatabase implements OnModuleDestroy {
     //    so a duplicate PUBLIC grant cannot hide behind an existing runtime grant).
     if (row.public_acl.length > 0) { return false; }
     return row.broad.every((entry) => !entry.elevated && !entry.deletable);
+  }
+
+  // P03-05 (018), deliberately separate from the 013 and historical auth probes.
+  // Also used by the management HTTP boundary; a failed probe never reaches a command.
+  settingsManagementReady(): Promise<boolean> {
+    if (!this.authEnabled || this.closing || !this.client) { return Promise.resolve(false); }
+    this.pendingManagement ??= this.probeSettingsManagement().catch(() => false)
+      .finally(() => { this.pendingManagement = undefined; });
+    return this.pendingManagement;
+  }
+
+  private async probeSettingsManagement(): Promise<boolean> {
+    if (!this.client) { return false; }
+    // Hash only the fixed physical contract, not business/configuration rows or personal
+    // source state. `prosrc` is deliberately included: presence/name/ACL checks cannot
+    // distinguish the real guards or issuer from same-signature no-op replacements.
+    // PostgreSQL's deparsers below are pinned to the supported PostgreSQL 18 catalog.
+    const rows = await this.client.$queryRaw<{ metadata: string; compatible: boolean }[]>`
+      WITH tables AS (
+        SELECT relname AS name,oid,relowner,relkind,relrowsecurity,relforcerowsecurity,relacl
+        FROM pg_class WHERE relnamespace='foundation'::regnamespace
+          AND relname IN ('p03_bootstrap_permissions','p03_command_receipts')
+      ), columns AS (
+        SELECT t.name,a.attname,t.oid,a.attnum,p.typname,a.atttypmod,a.attnotnull,a.attidentity,a.attgenerated,
+          pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attacl,
+          CASE WHEN a.attcollation=0 THEN NULL ELSE a.attcollation::regcollation::text END AS collation_name
+        FROM tables t JOIN pg_attribute a ON a.attrelid=t.oid JOIN pg_type p ON p.oid=a.atttypid
+        LEFT JOIN pg_attrdef d ON d.adrelid=t.oid AND d.adnum=a.attnum
+        WHERE a.attnum>0 AND NOT a.attisdropped
+      ), functions AS (
+        SELECT p.* FROM pg_proc p WHERE p.pronamespace='foundation'::regnamespace AND p.proname IN
+          ('issue_first_p03_permissions','p03_original_bootstrap_assignment','p03_bootstrap_guard',
+           'p03_guard_role_grant','p03_history_immutable','rbac_lock_write')
+      ), metadata(category,name,shape) AS (
+        SELECT 'table',t.name,jsonb_build_array(pg_get_userbyid(t.relowner),t.relkind,t.relrowsecurity,t.relforcerowsecurity)
+        FROM tables t
+        UNION ALL
+        SELECT 'column',name||'.'||attname,jsonb_build_array(attnum,typname,atttypmod,attnotnull,attidentity,attgenerated,default_expr,collation_name)
+        FROM columns
+        UNION ALL
+        SELECT 'constraint',k.conname,jsonb_build_array(k.conrelid::regclass::text,k.contype,k.convalidated,k.condeferrable,k.condeferred,
+          pg_get_constraintdef(k.oid),CASE WHEN k.conindid=0 THEN NULL ELSE EXISTS(SELECT FROM pg_index i WHERE i.indexrelid=k.conindid AND i.indisvalid AND i.indisready AND i.indisunique) END)
+        FROM pg_constraint k WHERE k.conrelid IN (SELECT oid FROM tables)
+          OR (k.conrelid='foundation.role_permissions'::regclass AND k.conname='role_permissions_scope_check')
+        UNION ALL
+        SELECT 'trigger',t.tgname,jsonb_build_array(t.tgrelid::regclass::text,t.tgtype,t.tgenabled,t.tgdeferrable,t.tginitdeferred,
+          t.tgnargs,t.tgqual::text,n.nspname,p.proname)
+        FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE NOT t.tgisinternal AND (t.tgrelid IN (SELECT oid FROM tables) OR
+          (t.tgrelid='foundation.role_permissions'::regclass AND t.tgname='p03_guard_role_grant'))
+        UNION ALL
+        SELECT 'function',p.proname,jsonb_build_array(pg_get_userbyid(p.proowner),p.proretset,p.prorettype::regtype::text,
+          l.lanname,p.pronargs,p.pronargdefaults,p.proargtypes::text,p.prokind,p.prosecdef,p.proconfig,p.provolatile,p.proisstrict,
+          p.proleakproof,p.proparallel,encode(sha256(convert_to(replace(p.prosrc,chr(13),''),'UTF8')),'hex'))
+        FROM functions p JOIN pg_language l ON l.oid=p.prolang
+      ), catalog AS (
+        SELECT code,module,description,active,protected FROM foundation.permissions WHERE code=ANY(${[
+          'settings.fullread', 'settings.manage', 'settings.readiness.read',
+          'references.callbackinterval.read', 'references.callbackinterval.manage', 'references.paymentmethod.read', 'references.paymentmethod.manage',
+          'references.cancelreason.read', 'references.cancelreason.manage', 'references.declinereason.read', 'references.declinereason.manage',
+          'references.requestsource.read', 'references.requestsource.manage', 'content.read', 'content.manage', 'content.publish', 'legal.read', 'legal.manage',
+        ]}::text[])
+      ), checked AS (
+        SELECT * FROM metadata
+        UNION ALL
+        SELECT 'catalog',code,jsonb_build_array(module,description,active,protected) FROM catalog
+      )
+      SELECT encode(sha256(convert_to((SELECT jsonb_agg(jsonb_build_array(category,name,shape)
+          ORDER BY category COLLATE "C",name COLLATE "C",shape::text COLLATE "C")::text FROM checked),'UTF8')),'hex') AS metadata,
+        current_user='fixlevelup_runtime'
+        AND NOT EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user))
+        AND NOT has_schema_privilege(current_user,'foundation','CREATE')
+        AND NOT has_schema_privilege(current_user,'public','CREATE')
+        AND NOT has_database_privilege(current_user,current_database(),'CREATE,TEMP')
+        AND NOT (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit FROM pg_roles WHERE rolname=current_user)
+        AND NOT EXISTS(SELECT FROM tables t WHERE has_table_privilege(current_user,t.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+          OR EXISTS(SELECT FROM aclexplode(t.relacl) acl WHERE acl.grantee<>t.relowner))
+        AND NOT EXISTS(SELECT FROM columns a WHERE
+          has_column_privilege(current_user,a.oid,a.attnum,'SELECT') <> (a.attname NOT IN ('created_at','revoked_by'))
+          OR has_column_privilege(current_user,a.oid,a.attnum,'INSERT') <> (a.name='p03_command_receipts' AND a.attname<>'created_at')
+          OR has_column_privilege(current_user,a.oid,a.attnum,'UPDATE') <> (a.name='p03_bootstrap_permissions' AND a.attname IN ('revoked_at','revoked_by'))
+          OR has_column_privilege(current_user,a.oid,a.attnum,'REFERENCES,SELECT WITH GRANT OPTION,INSERT WITH GRANT OPTION,UPDATE WITH GRANT OPTION')
+          OR EXISTS(SELECT FROM aclexplode(a.attacl) acl WHERE acl.grantee<>(SELECT oid FROM pg_roles WHERE rolname=current_user)))
+        AND NOT EXISTS(SELECT FROM functions p WHERE has_function_privilege(current_user,p.oid,'EXECUTE')
+          OR NOT has_function_privilege('fixlevelup_migrator',p.oid,'EXECUTE')
+          OR EXISTS(SELECT FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl WHERE acl.grantee<>p.proowner))
+        AS compatible
+    `;
+    return !this.closing && rows[0]?.compatible === true && rows[0].metadata === '0495cf5140136b04298a8428bb99eb80b064c62b05863a247810b58c4019553a';
   }
 
   private async authReady(): Promise<boolean> {
@@ -709,7 +800,7 @@ export class RuntimeDatabase implements OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     this.closing = true;
-    await this.pending;
+    await Promise.all([this.pending, this.pendingManagement]);
     try { await this.client?.$disconnect(); }
     finally { await this.pool?.end(); }
   }

@@ -1,3 +1,5 @@
+import { P03_CAPABILITIES, P03_CAPABILITY_METADATA, isP03Capability, type P03Grant } from '@fixlevelup/p03-contracts';
+
 // Relative URLs only. The reverse proxy, not the client, chooses the Nest host.
 type Json = Record<string, unknown>;
 type Decoder<T> = (value: unknown) => T;
@@ -48,16 +50,28 @@ function staff(value: unknown) {
 }
 function identity(value: unknown) {
   const r = object(value); const csrf = text(r['csrfToken']);
-  if (!/^[A-Za-z0-9_-]{43}$/.test(csrf)) { throw new Error('Invalid CSRF response'); } return { staffId: id(r['staffId']), csrf };
+  if (!/^[A-Za-z0-9_-]{43}$/.test(csrf)) { throw new Error('Invalid CSRF response'); }
+  const authVersion = r['authVersion'] === undefined ? undefined : count(r['authVersion']);
+  return { staffId: id(r['staffId']), csrf, authVersion };
 }
+export type Identity = ReturnType<typeof identity>;
 export interface GeoGrantView { code: string; scope: 'GLOBAL' | 'CITY' }
-function access(value: unknown): { staffId: string; role: { id: string; code: string; type: 'SYSTEM' | 'CUSTOM' }; permissions: string[]; geoPermissions?: GeoGrantView[] } {
+function access(value: unknown): { staffId: string; role: { id: string; code: string; type: 'SYSTEM' | 'CUSTOM' }; permissions: string[]; geoPermissions?: GeoGrantView[]; p03Permissions?: readonly P03Grant[] } {
   const r = object(value); const role = object(r['role']);
   // Individual geography grants (code + GLOBAL/CITY) as resolved by the server session.
   // Optional so an older/absent field can never be read as an implicit grant.
   const geo = r['geoPermissions'] === undefined ? undefined
     : array(v => { const g = object(v); return { code: text(g['code']), scope: oneOf(g['scope'], 'GLOBAL', 'CITY') }; }, r['geoPermissions']);
-  return { staffId: id(r['staffId']), role: { id: id(role['id']), code: text(role['code']), type: roleType(role['type']) }, permissions: array(text, r['permissions']), ...(geo === undefined ? {} : { geoPermissions: geo }) };
+  const raw = r['p03Permissions'];
+  if (raw !== undefined && (!Array.isArray(raw) || raw.length > P03_CAPABILITIES.length)) { throw new Error('Invalid P03 grant list'); }
+  const p03 = raw === undefined ? undefined : array<P03Grant>(v => {
+    const g = object(v); const code = g['code']; const scope = oneOf(g['scope'], 'GLOBAL', 'CITY');
+    if (!isP03Capability(code) || !P03_CAPABILITY_METADATA[code].scopes.includes(scope)) { throw new Error('Invalid P03 grant'); }
+    return { code, scope };
+  }, raw);
+  if (p03 && new Set(p03.map(g => g.code)).size !== p03.length) { throw new Error('Duplicate P03 grant'); }
+  return { staffId: id(r['staffId']), role: { id: id(role['id']), code: text(role['code']), type: roleType(role['type']) }, permissions: array(text, r['permissions']),
+    ...(geo === undefined ? {} : { geoPermissions: geo }), ...(p03 === undefined ? {} : { p03Permissions: p03 }) };
 }
 function list<T>(read: Decoder<T>) { return (v: unknown) => array(read, object(v)['items']); }
 function receipt(value: unknown) {

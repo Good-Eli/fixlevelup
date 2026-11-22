@@ -35,6 +35,8 @@
  * - quota is computed on the database clock: an expired reservation frees its slot;
  * - the clock is re-checked *after* the last lock wait: a read blocked on the
  *   intent row while the reservation expires is refused with `INTENT_EXPIRED`;
+ * - if audit/outbox writes wait past expiry, the first reservation receipt is
+ *   refused too, and the caller rolls the intent and both evidence rows back;
  * - cancel is a one-way CAS (`STALE_VERSION` on a stale token), an idempotent
  *   replay on the current version, requires no new consent, and releases quota;
  * - the same policy version id with a different snapshot for one owner is a
@@ -674,6 +676,64 @@ fileReservationsIntegration('P03-04A file reservations on real PostgreSQL runtim
     }
     // The row is untouched: no revive, no state change from the failed read.
     expect(await intentRow(intent.intentId)).toMatchObject({ state: 'RESERVED', row_version: 1 });
+  }, 60_000);
+
+  it.each([
+    { expires: 'anchor', table: 'audit_logs', code: 'SESSION_EXPIRED' },
+    { expires: 'intent', table: 'outbox_events', code: 'INTENT_EXPIRED' },
+    { expires: 'policy', table: 'outbox_events', code: 'NOT_CONFIGURED' },
+  ] as const)('refuses the first full receipt when $expires expires during a wait on $table', async ({ expires, table, code }) => {
+    const deadline = new Date(Date.now() + 4_000);
+    // The intent cannot outlive the anchor or policy. Keep all other ceilings
+    // live where possible and assert the same refusal priority as a guarded read.
+    const anchor = await newConsentedAnchor(db, expires === 'anchor' ? deadline : undefined);
+    const snapshot = policy(expires === 'policy' ? { expiresAt: deadline } : {});
+    const baseline = await auditOutboxCount(db);
+    const intentsBefore = await intentCount(db);
+    const input = reserveInput(anchor, { policy: snapshot, expiresAt: deadline });
+    const appName = `file-reserve-expiry-${randomUUID()}`;
+    const blocker = await db.migrator.connect();
+    let pending: Promise<FileUploadReservation> | undefined;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`LOCK TABLE foundation.${table} IN ACCESS EXCLUSIVE MODE`);
+      const blockerPid = await backendPid(blocker);
+      pending = db.inTransaction(async (client) => {
+        await client.query("SELECT set_config('application_name',$1,true)", [appName]);
+        return reserveFileUpload(client, input);
+      });
+      // Observe the actual INSERT waiting on the target relation while the
+      // deadline is still live. The domain INSERT has already returned here.
+      void pending.catch(() => undefined);
+      let waiting = false;
+      while (Date.now() < deadline.getTime()) {
+        const { rows: [observed] } = await db.runtime.query<{ waiting: boolean }>(`SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid
+          WHERE a.datname=current_database() AND a.application_name=$1 AND a.wait_event_type='Lock'
+            AND a.query LIKE $2 AND $3=ANY(pg_blocking_pids(a.pid))
+            AND l.relation=$4::regclass AND l.mode='RowExclusiveLock' AND NOT l.granted
+        ) AND clock_timestamp() < $5::timestamptz AS waiting`, [
+          appName, `INSERT INTO foundation.${table}%`, blockerPid, `foundation.${table}`, deadline,
+        ]);
+        if (observed?.waiting) {
+          waiting = true;
+          break;
+        }
+        await sleep(20);
+      }
+      expect(waiting).toBe(true);
+      await blocker.query('SELECT pg_sleep_until($1::timestamptz)', [deadline]);
+    } finally {
+      await blocker.query('ROLLBACK').finally(() => { blocker.release(); });
+      if (pending) {
+        await Promise.allSettled([pending]);
+      }
+    }
+    await expect(pending).rejects.toMatchObject({ code });
+    // The fixture's caller rolls back all three writes on a port refusal.
+    expect(await intentCount(db)).toBe(intentsBefore);
+    expect(await intentCount(db, anchor.sessionId)).toBe(0);
+    expect(await auditOutboxCount(db)).toEqual(baseline);
   }, 60_000);
 
   it('cancels with a one-way CAS, replays the current version and releases the quota', async () => {

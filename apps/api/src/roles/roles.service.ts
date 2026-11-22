@@ -4,7 +4,7 @@ import type { PoolClient } from 'pg';
 import { AUTHORIZATION_SERVICE } from '../authz/authorization.resources.js';
 import { isSystemAdmin } from '../authz/authorization.service.js';
 import type { AuthorizationServiceApi, SessionProof, StaffWriteContext } from '../authz/authorization.service.js';
-import { GLOBAL_SCOPE, isCapability, isPermissionCode, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES } from '../authz/capability.js';
+import { GLOBAL_SCOPE, isCapability, isP03Capability, isPermissionCode, P03_CAPABILITY_METADATA, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES } from '../authz/capability.js';
 import type { Capability, GrantScope } from '../authz/capability.js';
 import { staffReadFilter } from '../staff/staff-policy.js';
 import type { StaffDto } from '../staff/staff.service.js';
@@ -16,7 +16,7 @@ interface RoleRecord {
   version: number; updatedAt: Date; updatedBy: string | null;
 }
 export interface RoleDto extends RoleRecord { assignedCount: number | null; activeAssignedCount: number | null; permissions: RoleGrant[] }
-interface StoredGrant { code: string; scope: string; active: boolean; protected: boolean }
+interface StoredGrant { code: string; scope: string; module: string; active: boolean; protected: boolean | null }
 interface Projection extends Omit<RoleDto, 'permissions'> { grants: StoredGrant[] }
 type RoleReceipt = Pick<RoleDto, 'id' | 'version'>;
 export type RoleResult = RoleDto | RoleReceipt;
@@ -42,7 +42,7 @@ async function projected(ctx: StaffWriteContext, id: string | null): Promise<Rol
     FROM visible GROUP BY role_id
   ) SELECT ${columns}, editor.id AS "updatedBy", CASE WHEN $2 THEN COALESCE(counts.total,0) END AS "assignedCount",
     CASE WHEN $2 THEN COALESCE(counts.active,0) END AS "activeAssignedCount",
-    COALESCE((SELECT jsonb_agg(jsonb_build_object('code',p.code,'scope',rp.scope_type,'active',p.active,'protected',p.protected) ORDER BY p.code)
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('code',p.code,'scope',rp.scope_type,'module',p.module,'active',p.active,'protected',p.protected) ORDER BY p.code)
       FROM foundation.role_permissions rp JOIN foundation.permissions p ON p.code=rp.permission_code
       WHERE rp.role_id=r.id AND rp.enabled),'[]'::jsonb) AS grants
     FROM foundation.roles r LEFT JOIN counts ON counts.role_id=r.id LEFT JOIN visible editor ON editor.id=r.updated_by
@@ -57,9 +57,10 @@ async function projected(ctx: StaffWriteContext, id: string | null): Promise<Rol
           && (!g.protected || isSystemAdmin(role))) { permissions.push({ code: g.code, scope: PERMISSION_CONTRACT[g.code] }); }
         continue;
       }
-      // Geography rows are projected only at a scope the target role may legally hold:
-      // a non-administrator role never shows GLOBAL or publish, even from a drifted DB.
+      // Display only the scopes this role is allowed to store. A P03 catalog collision or
+      // protected-domain drift must not become a delegable (or visible) grant.
       if (!isPermissionCode(g.code)) { continue; }
+      if (isP03Capability(g.code) && (g.protected !== false || g.module !== P03_CAPABILITY_METADATA[g.code].module)) { continue; }
       const scope = g.scope as GrantScope;
       if (!grantableScopes(g.code, role).includes(scope)) { continue; }
       permissions.push({ code: g.code, scope });

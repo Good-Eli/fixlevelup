@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "node scripts/next.mjs typegen && tsc --noEmit",
-    "build": "node scripts/next.mjs build",
+    "typecheck": "corepack pnpm --filter @fixlevelup/p03-contracts run build && node scripts/next.mjs typegen && tsc --noEmit",
+    "build": "corepack pnpm --filter @fixlevelup/p03-contracts run build && node scripts/next.mjs build",
     "start": "node scripts/next.mjs start --hostname 127.0.0.1"
   },
   "dependencies": {
+    "@fixlevelup/p03-contracts": "workspace:*",
     "next": "16.4.6",
     "react": "19.3.1",
     "react-dom": "19.3.1"

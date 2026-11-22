@@ -8,6 +8,7 @@ COPY apps/miniapp/package.json apps/miniapp/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/browser-tooling/package.json packages/browser-tooling/package.json
 COPY packages/database-tooling/package.json packages/database-tooling/package.json
+COPY packages/p03-contracts/package.json packages/p03-contracts/package.json
 COPY packages/storage-tooling/package.json packages/storage-tooling/package.json
 COPY packages/tooling/package.json packages/tooling/package.json
 RUN test "$(node -v)" = v24.22.3 && test "$(corepack pnpm -v)" = 12.21.0 \

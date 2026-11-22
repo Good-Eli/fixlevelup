@@ -1,6 +1,7 @@
 import { useState } from 'react';
+import { isP03Capability } from '@fixlevelup/p03-contracts';
 import type { Grant, Person, Role } from './api';
-import { allowedScopes, canEditGrant, fields, has, protects, roleLabel, type Snapshot, type Write } from './workspace';
+import { allowedScopes, canEditGrant, fields, has, hasP03, p03ReplacementAllowed, protects, roleLabel, type Snapshot, type Write } from './workspace';
 
 type Props = { data: Snapshot; selected: Role | null; members: Person[] | null; open: (id: string) => void; openMembers: (id: string) => void; write: Write };
 function RoleFields({ role }: { role?: Role }) {
@@ -14,6 +15,10 @@ function RoleCard({ data, role, members, openMembers, write }: Omit<Props,'selec
   const dirty = chosen.size !== original.size || [...chosen].some(([k, v]) => original.get(k) !== v);
   const known = [...original.keys()].every(k => data.catalog.some(p => k === p.code));
   const modules = [...new Set(data.catalog.map(p => p.module))];
+  const grants = data.catalog.flatMap(p => { const scope = chosen.get(p.code); return scope === undefined ? [] : [{ code: p.code, scope }]; });
+  const changedP03 = grants.filter(g => isP03Capability(g.code) && original.get(g.code) !== g.scope);
+  const scopeDetails = changedP03.map(g => `${g.code} · ${g.scope}`).join(', ');
+  const roleWide = `${scopeDetails}. Права получат все нынешние и будущие сотрудники этой роли, а не выбранный сотрудник. CITY действует в назначенных каждому городах; GLOBAL — без географической границы. Отзыв личного права основателя не снимет эти права роли.`;
   const impact = role.assignedCount === null ? 'Количество назначенных сотрудников скрыто правами доступа' : `Назначено сотрудников: ${String(role.assignedCount)}; активных: ${String(role.activeAssignedCount)} (в видимой области на момент загрузки)`;
   return <article className="panel"><h3>{role.name}</h3><p>{role.description || 'Без описания'}</p><dl>
     <dt>Код</dt><dd>{role.code}</dd><dt>Тип и статус</dt><dd>{role.type === 'SYSTEM' ? 'Системная' : 'Пользовательская'} · {active ? 'активна' : 'архивирована'}</dd>
@@ -31,14 +36,15 @@ function RoleCard({ data, role, members, openMembers, write }: Omit<Props,'selec
         <input type="checkbox" checked={current !== undefined} disabled={!known || !canEditGrant(a,role,p,p.protected)} onChange={e => {
           const selected = e.currentTarget.checked; choose(prev => { const next = new Map(prev); if (selected) { next.set(p.code, scopes[0] ?? p.scope); } else { next.delete(p.code); } return next; });
         }}/><span>{p.description}<small>{p.code} · {current ?? (scopes.length > 1 ? scopes.join('/') : p.scope)}{p.protected ? ' · защищённая возможность' : ''}</small></span>
-        {current !== undefined && scopes.length > 1 && <select value={current} disabled={!canEditGrant(a,role,p,p.protected)} onChange={e => {
+        {current !== undefined && scopes.length > 1 && <select aria-label={`Область ${p.code}`} value={current} disabled={!canEditGrant(a,role,p,p.protected) || (isP03Capability(p.code) && !hasP03(a, p.code, 'GLOBAL'))} onChange={e => {
           const value = e.currentTarget.value as Grant['scope']; choose(prev => { const next = new Map(prev); next.set(p.code, value); return next; });
         }}>{scopes.map(s => <option key={s} value={s}>{s}</option>)}</select>}
       </label>;
     })}</fieldset>)}
-    {active && protects(a,'roles.permissions.manage') && <button disabled={!dirty || !known} onClick={() => {
-      const grants = data.catalog.filter(p => chosen.has(p.code)).map(p => ({ code:p.code, scope: chosen.get(p.code) ?? p.scope }));
-      if (window.confirm(`Изменить права роли «${role.name}»? ${impact}. Новые права применятся немедленно.`)) { write(c => c.permissions(role,grants), 'Возможности роли обновлены.'); }
+    {changedP03.length > 0 && <p className="notice">{roleWide}</p>}
+    {active && protects(a,'roles.permissions.manage') && <button disabled={!dirty || !known || !p03ReplacementAllowed(a, role, grants)} onClick={() => {
+      const effect = changedP03.length ? ` ${roleWide}` : '';
+      if (window.confirm(`Изменить права роли «${role.name}»? ${impact}. Новые права применятся немедленно.${effect}`)) { write(c => c.permissions(role,grants), 'Возможности роли обновлены.'); }
     }}>Сохранить возможности</button>}
     {has(a,'staff.read') && <section><h4>Назначенные сотрудники</h4><button onClick={() => { openMembers(role.id); }}>Показать сотрудников роли</button>
       {members && (members.length ? <ul>{members.map(p => <li key={p.id}>{p.displayName ?? p.id} · {p.employmentState}</li>)}</ul> : <p>В доступной области сотрудников нет.</p>)}</section>}

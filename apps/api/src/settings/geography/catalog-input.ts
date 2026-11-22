@@ -15,6 +15,7 @@
  * response leak of contact data or free text.
  */
 import { BadRequestException, HttpException } from '@nestjs/common';
+import { P03_DEFAULT_LIMIT, P03_MAX_CURSOR_LENGTH, P03_MAX_LIMIT } from '@fixlevelup/p03-contracts';
 
 /** Seven ISO weekdays, Monday first; each slot is `[startMinute, endMinute)`. */
 export type OfficeHours = readonly (readonly (readonly [number, number])[])[];
@@ -42,6 +43,7 @@ export interface CityDeactivateInput {
 export interface ListQuery {
   readonly limit: number;
   readonly includeArchived: boolean;
+  readonly cursor?: string;
 }
 export interface DistrictCreateInput {
   readonly code: string;
@@ -78,8 +80,8 @@ const TIMEZONE = /^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+)+$/;
 /** Quantity limits. The schema stores unbounded text and unlimited coverage rows. */
 export const MAX_INTERVALS_PER_DAY = 12;
 export const MAX_COVERAGE_ENTRIES = 200;
-export const MAX_LIST_ROWS = 200;
-export const DEFAULT_LIST_ROWS = 50;
+export const MAX_LIST_ROWS = P03_MAX_LIMIT;
+export const DEFAULT_LIST_ROWS = P03_DEFAULT_LIMIT;
 export const MAX_DISPLAY_NAME = 200;
 export const MAX_ADDRESS_DISPLAY = 500;
 export const MAX_PUBLIC_CONTACT = 320;
@@ -275,12 +277,12 @@ export function cityDeactivateInput(body: unknown): CityDeactivateInput {
   return { suspendIntake: suspend === true };
 }
 
-export function listQuery(body: unknown): ListQuery {
+export function listQuery(body: unknown, allowArchived = true): ListQuery {
   if (body === undefined || body === null) {
     return { limit: DEFAULT_LIST_ROWS, includeArchived: true };
   }
   const value = bodyObject(body);
-  rejectUnknown(value, ['limit', 'includeArchived']);
+  rejectUnknown(value, allowArchived ? ['limit', 'cursor', 'includeArchived'] : ['limit', 'cursor']);
   // An explicit null is a type error, not "absent": only a missing key takes the default.
   const limit: unknown = Object.hasOwn(value, 'limit') ? value['limit'] : DEFAULT_LIST_ROWS;
   if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIST_ROWS) {
@@ -289,6 +291,12 @@ export function listQuery(body: unknown): ListQuery {
   const includeArchived: unknown = Object.hasOwn(value, 'includeArchived') ? value['includeArchived'] : true;
   if (typeof includeArchived !== 'boolean') {
     invalid();
+  }
+  const cursor = value['cursor'];
+  if (Object.hasOwn(value, 'cursor')) {
+    if (typeof cursor !== 'string' || cursor.length < 1 || cursor.length > P03_MAX_CURSOR_LENGTH
+      || !/^[A-Za-z0-9_-]+$/.test(cursor) || cursor.endsWith('\n')) { invalid(); }
+    return { limit, includeArchived, cursor };
   }
   return { limit, includeArchived };
 }

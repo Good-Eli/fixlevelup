@@ -1,0 +1,47 @@
+# P03 — полный аудит перед публикацией
+
+## 1. Основание и текущий статус
+
+22.11.2026 владелец принял P03-05 и поручил: полный аудит Astra всего P03, после **общего PASS** — commit и обычный push в GitHub. P03-01…P03-05 приняты в согласованных scopes: **100% (5 из 5)**. Это не production/live approval и не разрешение на P04.
+
+**Окончательный вердикт Astra: FULL P03 — PASS. Обе группы MUST исправлены; открытых MUST нет.** Предшествующие Gate 1 и Gate 2 P03-05 — PASS именно для их проверенных редакций; они не подменяют отдельно запрошенный аудит всего этапа. Baseline до нового коммита — `225af45`; условие разрешения владельца на commit/push выполнено общим PASS. Публикация и CI проверяются отдельно.
+
+## 2. Объём полного чтения Astra
+
+- P03-01/02: city context и неизменяемые версии; районы, зоны и FULL/PARTIAL mapping; same-city/period guards; рабочие допуски мастера против административных назначений; scoped geography commands и visibility.
+- P03-03: company settings, пять типов справочников, контент и provenance/fallback; legal revisions, раздельные цели согласия, current-version/anchor/liveness, caller-owned READ COMMITTED.
+- P03-04 A→E: no-byte reservation, quarantine upload/probes, scanner/decoder и READY, access chunks, privacy/hold/delete, внешний ledger/floor и copy-only restore. Файловый HTTP не включён.
+- P03-05: реальные persisted scope/type, права и их делегирование, личный bootstrap-источник, closed receipts/replay/отзыв/expiry, preparse limits, keyset/byte bounds, CRM identity/snapshot/version binding и безопасная readiness.
+- Стыки между этими контурами, сохранность SQL001–017, runtime ACL/schema checks и граница фактических доказательств. Применимость G01–G07 только к сущностям текущего этапа; price/request/dispatch не получают фиктивный PASS.
+
+## 3. Найденные межсрезовые MUST
+
+Полное чтение завершено; Astra выявила **ровно две группы**, иных блокеров не обнаружила:
+
+1. **Legal positive decision/replay:** перед `GRANTED` и успешными replay-квитанциями GIVEN/REVOKED нужна свежая проверка anchor по часам БД после последнего потенциально блокирующего чтения evidence. Предыдущая проверка перед чтением не покрывает истечение срока во время ожидания. Это замечание к внутреннему порту, не установленный обход внешних HTTP/file guards. Исправление внесено; три новых real-PG сценария воспроизвели ошибку до исправления и подтвердили отказ после него. Адресная сверка Astra по коду — без остаточных MUST.
+2. **Первый полный ответ reservation A:** после записи audit/outbox и до возврата полного intent DTO нужна свежая проверка сроков anchor, intent и policy. Отказ должен откатывать domain+evidence в транзакции вызывающего кода. Минимальный cancel не превращается в новый consent/policy grant. Исправление внесено; три новых real-PG сценария воспроизвели ошибку до исправления и подтвердили отказ после него. Адресная сверка Astra по коду — без остаточных MUST.
+
+Новых API, DDL, business policies, реальных данных или внешних зависимостей не добавлено. Проверены независимые PG-сессии, наблюдаемый lock wait на evidence до expiry и отказ после истечения срока по часам БД без новых domain/audit/outbox записей. Legal: **39/39** (21 PG +18 unit), reservation: **60/60** (20 PG +40 unit). API TypeScript и scoped ESLint обоих исправлений — exit 0. Порядок блокировок, отрицательные исторические решения и минимальная cancel-квитанция сохранены.
+
+## 4. Доказательства и граница версий
+
+- **История первого нового E:** [932/933](../node_modules/.cache/p03-acceptance/final/vitest.log#L309-L334), единственное падение — первый GET по односекундной signed URL Garage вернул400 вместо200. Причина по одному ответу не установлена; адресный повтор1/1 прошёл без правок. Неуспешный результат сохранён, не сложен с адресным PASS. Ни исходники, ни тест, ни TTL/часы/конфигурация не менялись; ниже — отдельный повторный полный gate.
+- **Новый полный E после двух исправлений:** **933/933 в 73 файлах**, без skipped/TODO, со всеми шестью opt-in P03-04. Generate, contract verify, workspace typecheck, source ESLint и production builds API/Web/MiniApp — exit 0. [Итог Vitest](../node_modules/.cache/p03-acceptance/final-retry/vitest-summary.json), [runtime flags/коды](../node_modules/.cache/p03-acceptance/final-retry/status.json), [журнал](../node_modules/.cache/p03-acceptance/final-retry/vitest.log).
+- **Зафиксированные входы прогона до последующего type-only форматирования:** 411 non-Markdown файлов (44 новых) до/после; общий SHA-256 `938848998AB1E067B7B60507A2773F3EF7E11F24363F188731C1D582FB38B0DC` совпал. Это хеш конкретного прогона933/933, не изменённого после форматирования дерева. `identical=true`, [delta](../node_modules/.cache/p03-acceptance/final-retry/delta.txt) пуст. SQL018 `7284C47ECF03AB4B382DD8C60DCDFB1F4E59D9E1D5174EE2DB6B3D67E4F7C9FC` и прежний worker descriptor `251CA2642E1214DEE14C67B24CDD267A5485BB5C0AC95610A0BF7DDFC1C21117` неизменны.
+- **Обязательные новые PG-регрессии реально выполнены:** legal PG21/unit18, reservation PG20/unit40. В каждой группе три наблюдаемых lock/expiry сценария дали RED до исправления и GREEN после него; domain/evidence/audit/outbox не меняются при отказе. Это не тест с подменёнными часами.
+- **Новый HTTPS smoke:** **1/1 PASS**, production Next→same-origin loopback TLS→Nest→новая isolated PG, штатные 18 миграций и console bootstrap. Admin CRM publication201, manager direct valid-session/CSRF POST403; exact actor, одна version/receipt/audit/outbox до и после отказа; unknown proxy requests0; Secure/HttpOnly/SameSite=Strict cookie. [Live report](../node_modules/.cache/p03-acceptance/browser/final-live-result.json), [безопасный лог](../node_modules/.cache/p03-acceptance/browser/final-live-sanitized.log). Image `sha256:25aed13ebb8422a24f56c66bd308a14f1fb9a8cd3fbe95f68dd5cbb1b13d31b7`; [оба исправленных source SHA совпали prebuild=image=workspace, compiled SHA сохранены](../node_modules/.cache/p03-acceptance/browser/final-image-source-sha256.txt).
+- **Ранее полученный UI150/150**, не новый прогон: 102 P03-05 +48 сохранённых, Chromium/Firefox/WebKit × desktop/mobile, без skipped/flaky/unexpected. Все **57** исполняемых Web/wire/QA/dependency inputs совпали с проверенной редакцией: [сверка SHA](../node_modules/.cache/p03-acceptance/browser/ui-57-reuse-sha256.txt), [прежний отчёт](../node_modules/.cache/p0305-browser-final-0601/browser-smoke.json#L4090-L4096). Astra согласовала адресное переиспользование неизменного UI-доказательства; серверные изменения покрыты новым E и HTTPS smoke.
+- **Ранее полученный migration proof18/188**, не новый прогон: SQL001–018, Prisma и migration proof scripts не менялись; [проверка SHA](../node_modules/.cache/p03-acceptance/closure-inputs.json), [прежний журнал](../node_modules/.cache/p0305-proof/migrations-frozen.log#L22-L37). Прежний E927/927 относится к своей редакции и заменён новым итогом выше, а не приписан изменённому серверу.
+- **Новые security gates:** dependencies525/advisories0, frozen lock unchanged, [dependency report](../node_modules/.cache/p03-acceptance/dependencies.json); [secret/history scan](../node_modules/.cache/p03-acceptance/secrets.json) PASS без новых исключений. Diff/whitespace проверяется до staging и до коммита.
+
+Astra повторно прочитала оба исправления, проверила наблюдаемые PG-регрессии, новый полный E, повторный HTTPS smoke, точные source hashes и итоговую документацию. **Окончательный FULL P03 PASS** охватывает весь P03-01…P03-05 и межсрезовые гарантии; остаточных MUST нет. Он не закрывает перечисленные ниже production/legal gates. Условие разрешения владельца на commit и обычный push в GitHub выполнено.
+
+### Форматная правка перед публикацией
+
+Посткоммитный Gitleaks history scan обнаружил ложное `generic-api-key` на TypeScript-объявлении `ReadOperation` в management controller; файловый scan не находил секретов. Push был остановлен. Владелец явно разрешил amend ещё не опубликованного коммита. Изменены только переносы строк в этом type alias и добавлен поясняющий комментарий, разделяющий аргументы типа; одних переносов строк было недостаточно для history scan. Токены TypeScript (кроме комментария), маршруты, декораторы и runtime-код прежние. Исключения и правила Gitleaks не менялись. На итоговом формате прошли API typecheck, ESLint, сборка и HTTP/PG19/19; скомпилированный JS контроллера до/после имеет одинаковый SHA-256 `D72D91B5D2AAEB4F1C54985BB044920467D6D034F2A10BCF0559B139CA995FAF`. Astra сверила узкую разницу и сохранила FULL P03 PASS без повторения933 неизменённых сценариев. После amend обязательны новый SHA, проверка состава и чистый полный secret/history scan перед обычным push. Неопубликованный прежний коммит не сохраняется в публикуемых refs.
+
+## 5. Сохраняемые ограничения
+
+Рабочая БД не мигрируется; нет production, реальных ПД, файловых HTTP/staff-download grants, клиентского F/intake, ADDRESS_COVERAGE HTTP, P04/P09, выдуманного TTL/retention или юридических текстов. Q02/Q12/Q13/Q16 и прежние F06/TTY/Telegram/production gates остаются открытыми. Scanner/decoder доказан в прежней exact offline OCI-границе, не как произвольный rebuild/updater или «0 CVE».
+
+Исходная пользовательская пояснительная таблица и её строка истории сохраняются отдельно, вне staging. Секреты, локальные БД, тома, caches, generated artifacts и отчёты локальных тестов не включаются в коммит. После проверок ненужные тестовые контейнеры удаляются адресно с сохранением evidence; тома и образы не удаляются.

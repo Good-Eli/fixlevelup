@@ -45,6 +45,7 @@ import { writeLegalAudit } from './legal-audit.js';
 import { guard } from './legal-errors.js';
 import { consentGivenInput, consentRevokeInput, currentConsentInput, purposeValue } from './legal-input.js';
 import { assertAnchorLiveAfterLock, requireAnchorProof, requireLiveAnchor } from './legal-sessions.js';
+import type { RequestSessionRow } from './legal-sessions.js';
 
 interface ConsentRow {
   id: string;
@@ -153,14 +154,14 @@ async function byEvidenceRef(
  * `(session_id,evidence_ref)` already exists.
  *
  * It re-validates everything the original acceptance depended on, because the
- * world may have moved: the anchor was re-proved live by the caller, the document
- * may have been republished (stale text) and the acceptance may have been revoked.
- * The exact revision named by *this* request is compared as well, so a replay
- * cannot be used to smuggle a different revision past the same evidence key.
+ * world may have moved: the document may have been republished (stale text), the
+ * acceptance may have been revoked, or the anchor may have expired. The exact
+ * revision named by *this* request is compared as well, so a replay cannot be
+ * used to smuggle a different revision past the same evidence key.
  */
 async function replayGiven(
-  client: LegalSqlClient, existing: ConsentRow, form: { documentId: string; currentVersionId: string },
-  purpose: LegalPurpose, requestedVersionId: string,
+  client: LegalSqlClient, anchor: RequestSessionRow, existing: ConsentRow,
+  form: { documentId: string; currentVersionId: string }, purpose: LegalPurpose, requestedVersionId: string,
 ): Promise<ConsentReceipt> {
   if (existing.action !== 'GIVEN' || existing.purpose !== purpose || existing.document_id !== form.documentId) {
     throw new LegalPortError('REPLAY_MISMATCH');
@@ -177,6 +178,8 @@ async function replayGiven(
   if ((await revokeOf(client, existing.id)) !== null) {
     throw new LegalPortError('CONSENT_REVOKED');
   }
+  // Evidence reads can wait on relation locks even though the anchor is locked.
+  await assertAnchorLiveAfterLock(client, anchor);
   return receipt(existing, true);
 }
 
@@ -210,7 +213,7 @@ export async function recordConsentGiven(client: LegalSqlClient, input: unknown)
 
   const existing = await byEvidenceRef(client, anchor.id, parsed.evidenceRef);
   if (existing !== null) {
-    return replayGiven(client, existing, form, parsed.purpose, parsed.documentVersionId);
+    return replayGiven(client, anchor, existing, form, parsed.purpose, parsed.documentVersionId);
   }
   // The accepted revision must be the current one. Checked before the insert so the
   // refusal is precise; the database guard re-checks it as the final authority.
@@ -266,6 +269,7 @@ export async function recordConsentRevoked(client: LegalSqlClient, input: unknow
       || existing.supersedes_id !== parsed.supersedesEvidenceId) {
       throw new LegalPortError('REPLAY_MISMATCH');
     }
+    await assertAnchorLiveAfterLock(client, anchor);
     return receipt(existing, true);
   }
 
@@ -397,6 +401,15 @@ export async function currentPurposeConsent(client: LegalSqlClient, input: unkno
   ));
   const given = current.rows[0];
   if (given) {
+    // The evidence SELECT may have waited past expiry after the document check.
+    try {
+      await assertAnchorLiveAfterLock(client, anchor);
+    } catch (error) {
+      if (error instanceof LegalPortError && (error.code === 'SESSION_EXPIRED' || error.code === 'SESSION_REVOKED')) {
+        return refusal(error.code);
+      }
+      throw error;
+    }
     return answer(form, given, 'GRANTED', true);
   }
 

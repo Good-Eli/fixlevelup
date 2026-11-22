@@ -30,8 +30,9 @@ export const privacyGarage = pg && privacy && process.env['FIXLEVELUP_STORAGE_S3
 export const signal = () => new AbortController().signal;
 
 export async function startPrivacyMain(namespace: string) {
-  if (!privacy || authFixtureMigrations.length !== 17) {
-    throw new Error('D tests require explicit opt-in and the full migration chain through 017');
+  if (!privacy || authFixtureMigrations.length !== 18
+    || authFixtureMigrations.at(-1) !== '20261122000400_settings_management') {
+    throw new Error('D tests require explicit opt-in and the full migration chain through 018');
   }
   const db = await startUploadDb();
   try {

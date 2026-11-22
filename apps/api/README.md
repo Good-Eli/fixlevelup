@@ -169,7 +169,7 @@ anchor доверенной серверной сессии. Порты покр
 
 - **Ни одного HTTP-маршрута, capability и роли** этот подэтап не добавляет; в
   `app.module.ts` контроллеры не регистрируются. Порты вызываются доверенным
-  серверным кодом (будущие P03-05/P05) внутри уже открытой транзакции: они не
+  серверным кодом (например, защищённым P03-05; intake P05 ещё не реализован) внутри уже открытой транзакции: они не
   аутентифицируют, не проверяют права и не являются защищёнными endpoints.
 - Требование вызывающей транзакции проверяется в рантайме: блокировка настроек
   компании транзакционная, вне явной транзакции запись отклоняется, а не
@@ -214,7 +214,13 @@ deletion, broker), `file-restore/` (инвентарь, объекты, запи
 
 Только внутренний F-путь: JPEG/PNG/WebP без анимации могут стать READY после двух реальных сканов и sanitization; PDF остаётся в карантине, видео/анимация не допускаются к READY. Выдача — по закрытому ticket с повторной проверкой на каждый chunk; после D freeze закрыты также A read/exact replay. Новые B/C записи разрешены только в исходной ACTIVE epoch 1; после restore epoch 2+ доступ и DELETE касаются лишь скопированных объектов под текущей властью. Отсутствующая runtime row сохраняет legacy B на полной схеме.
 
-Три межсрезовых MUST закрыты; полный Astra A→E — PASS (22.11.2026), E — 876/876 без пропусков. Владелец принял весь P03-04 22.11.2026; P03 — 80% (4 из 5 приняты), P03-05 не начинать. См. [актуальный статус P03-04 и evidence](../../docs/P03-04CDE-CONTRACT.md#6-current-status-and-evidence). C/D/E закоммичены; публикация и GitHub CI проверяются после push. Нет HTTP/DI, signed URL, staff grants, customer intake, production или реальных ПД; Q02/Q12/Q13/Q16 открыты. Рабочая dev БД не мигрировалась.
+Три межсрезовых MUST закрыты; полный Astra A→E — PASS (22.11.2026), E — 876/876 без пропусков. Владелец принял весь P03-04 22.11.2026; на тот момент P03 составлял 80% (4 из 5 приняты). Прежняя остановка до P03-05 относится к тому решению. См. [статус P03-04 и evidence](../../docs/P03-04CDE-CONTRACT.md#6-current-status-and-evidence). Принятый baseline `225af45` опубликован; [GitHub Actions 44972705234](https://github.com/Good-Eli/fixlevelup/actions/runs/44972705234) — success только на этом SHA. Нет файловых HTTP/DI, signed URL, staff-download grants, customer intake, production или реальных ПД; Q02/Q12/Q13/Q16 открыты. Рабочая dev БД не мигрировалась.
+
+## P03-05: закрытый staff management (synthetic)
+
+Nest регистрирует [поддерживаемые management routes](../../docs/P03-05-CONTRACT.md) в staff-web контуре с совместимой схемой 018. География переиспользует правила P03-02 и `geo-vN`, включая первую staff geography команду с `geo-v0` для нового сотрудника; десять P03-05 mutation operations используют I/V и положительные версии квитанций. Новые 18 кодов не выдаются роли автоматически; вариант A относится только к исходному bootstrap-assignment. RBAC lock сериализует изменение grants и управление; каждый ответ повторно проверяет свежие DB-часы после последнего ожидания/операции. Для обычной квитанции до 409 проверяются обе реальные цели и их тип/scope; bootstrap digest mismatch — фиксированный 404 после authority запрошенного кода. Lost COMMIT ACK допускает один авторизованный read-only lookup, не повтор мутации.
+
+Management поддерживает семь полей company settings, пять typed references, FAQ/FACT/SEO, legal REQUEST_PROCESSING/MARKETING и safe readiness. Нет `ADDRESS_COVERAGE` HTTP, editable DB draft для этих сущностей, файловых HTTP/DI, клиентских F/intake, external reviews/privacy cases, реальных ПД или production. Readiness технического `/health/ready` не является бизнес-готовностью; management projection не даёт manager policy refs/чужой primary или полный DTO компании. Пакет `@fixlevelup/p03-contracts` разделяется с CRM; новых внешних зависимостей нет. Независимые изолированные migration checks: 18 миграций / 188 CHECK — PASS. E927/927, browser150/150 и реальный HTTPS smoke1/1 прошли; окончательный Astra Gate 2 — PASS, открытых MUST нет. Владелец принял P03-05 22.11.2026 в synthetic scope; отдельный полный аудит Astra P03-01…P03-05 — PASS; два expiry-замечания исправлены без DDL/API, новый E933/933 и HTTPS smoke1/1 пройдены ([общий аудит](../../docs/P03-AUDIT.md)); [доказательства](../../docs/P03-05-CONTRACT.md#4-итоговые-доказательства-22112026).
 
 ## Поведение
 
@@ -226,8 +232,7 @@ deletion, broker), `file-restore/` (инвентарь, объекты, запи
   statement/lock timeout1000ms, без detached SQL после HTTP Promise.race.
   Shutdown останавливает новые probes, ждёт текущий, закрывает Prisma/pool.
 - При включённом web auth доступны также [защищённые операции RBAC](../../docs/RBAC.md); Mini App self-service регистрируется только при настроенном Telegram exchange.
-- JSON parser включается только вместе с web auth, strict и ограничен 4 KiB;
-  входные body не сохраняются и не логируются.
+- При web auth strict JSON parser оставляет 4 KiB для auth/RBAC и всех обычных routes. Только точные POST legal/content publish и PUT district coverage имеют 1 MiB / 128 KiB / 64 KiB соответственно; streaming byte cap и 10 секунд до DB, сжатие запрещено. Входные body не логируются; ошибка фрейминга HTTP может быть пустым 400 от Node до приложения.
 - X-Powered-By отключён; health/errors имеют Cache-Control:no-store.
 - Error response содержит только type/title/status/code и server-generated requestId.
 - SafeLogger через Nest ConsoleLogger пишет только fixed event+role, без raw

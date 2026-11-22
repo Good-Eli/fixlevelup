@@ -8,6 +8,7 @@ import { WorkerModule } from '../worker.module.js';
 import type { RuntimeConfig } from '../runtime/config.js';
 import { SafeLogger } from '../runtime/safe-logger.js';
 import { ProblemFilter } from '../runtime/problem.filter.js';
+import { boundedJson } from '../settings/management/body-parser.js';
 
 export async function createApi(config: RuntimeConfig, logger: SafeLogger, database?: DatabaseConfig, webAuth?: WebAuthConfig, telegramAuth?: TelegramAuthConfig) {
   // Nest's public options contract uses a structural class with no methods.
@@ -18,8 +19,7 @@ export async function createApi(config: RuntimeConfig, logger: SafeLogger, datab
     bodyParser: false,
   });
   if (webAuth || telegramAuth) {
-    const expressApp = app as unknown as { useBodyParser: (kind: 'json', options: { limit: string; strict: boolean }) => void };
-    expressApp.useBodyParser('json', { limit: '4kb', strict: true });
+    app.use(boundedJson);
   }
   app.useGlobalFilters(new ProblemFilter(logger));
   const server = app.getHttpAdapter().getInstance() as { disable: (name: string) => void };

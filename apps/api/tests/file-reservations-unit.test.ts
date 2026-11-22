@@ -924,7 +924,13 @@ describe('reserveFileUpload ordering and guards', () => {
     expect(intentInsert).toBeGreaterThan(documentLock);
     expect(db.countOf('INSERT INTO foundation.file_upload_intents')).toBe(1);
     expect(db.countOf('INSERT INTO foundation.audit_logs')).toBe(1);
+    const auditInsert = db.indexOf('INSERT INTO foundation.audit_logs');
+    const outboxInsert = db.indexOf('INSERT INTO foundation.outbox_events');
     expect(db.countOf('INSERT INTO foundation.outbox_events')).toBe(1);
+    expect(auditInsert).toBeGreaterThan(intentInsert);
+    expect(outboxInsert).toBeGreaterThan(auditInsert);
+    expect(db.statements.at(-1)?.text).toBe('SELECT clock_timestamp() AS db_now');
+    expect(db.statements.length - 1).toBeGreaterThan(outboxInsert);
     // No destructive or state-changing SQL other than the single intent INSERT.
     expect(db.writes.every((text) => text.startsWith('INSERT'))).toBe(true);
 

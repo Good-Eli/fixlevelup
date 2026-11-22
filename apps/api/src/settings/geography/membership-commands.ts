@@ -4,10 +4,15 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import type { PoolClient } from 'pg';
+import type { P03Page, P03TechnicianPickerItem } from '@fixlevelup/p03-contracts';
 import { isSystemAdmin } from '../../authz/authorization.service.js';
+import { requireP03CityExpansion } from '../../authz/p03-grants.js';
 import { uuid } from '../../authz/rbac-http.js';
 import type { GeoCapability, GeoGrant } from '../../authz/capability.js';
 import type { GeoCommand, GeoContext, GeoReceipt, GeoTarget } from './geo-contract.js';
+import { finishGeoPage, idPosition, readGeoPage } from './geo-page.js';
+
+const idKey = (row: { id: string }): readonly [string] => [row.id];
 
 /**
  * P03-02 administrative city assignments and technician territory commands.
@@ -288,26 +293,26 @@ async function requireGrantableArea(client: PoolClient, cityId: string, areaId: 
  * a technician who has no membership yet, but cannot enumerate unrelated employees by
  * guessing their id.
  */
-async function requireTechnicianAccess(ctx: GeoContext, subject: StaffRow, cityId: string): Promise<void> {
-  const technicianId = subject.id;
-  // P02 staff.read by a manager only exposes targets with the actual SYSTEM TECHNICIAN role.
-  if (ctx.cityIds === null || (hasStaffPermission(ctx, 'staff.read') && subject.role_type === 'SYSTEM' && subject.role_code === 'TECHNICIAN')) { return; }
-  const relation = await ctx.client.query(
-    'SELECT 1 FROM foundation.technician_city_memberships WHERE technician_id=$1 AND city_id=$2 LIMIT 1',
-    [technicianId, cityId]);
-  if (relation.rowCount === 0) { throw new NotFoundException(); }
+function technicianAccessSql(city: `$${number}`, global: `$${number}`, roster: `$${number}`): string {
+  // P02 staff.read by a manager exposes only an actual SYSTEM TECHNICIAN. The
+  // territory door is independent and deliberately includes historical relations.
+  return `s.role='TECHNICIAN' AND (${global}::boolean
+    OR (${roster}::boolean AND r.role_type='SYSTEM' AND r.code='TECHNICIAN')
+    OR EXISTS (SELECT 1 FROM foundation.technician_city_memberships relation
+      WHERE relation.technician_id=s.id AND relation.city_id=${city}))`;
 }
 
-async function requireVisibleTechnician(ctx: GeoContext, technicianId: string, cityId: string): Promise<StaffRow> {
-  const subject = await loadStaff(ctx.client, technicianId);
-  if (!subject || subject.channel_role !== 'TECHNICIAN') { throw new NotFoundException(); }
-  await requireTechnicianAccess(ctx, subject, cityId);
+async function requireTechnicianAccess(ctx: GeoContext, technicianId: string, cityId: string): Promise<StaffRow> {
+  const result = await ctx.client.query<StaffRow>(`${STAFF_SQL} WHERE s.id=$1 AND ${technicianAccessSql('$2', '$3', '$4')}`,
+    [technicianId, cityId, ctx.cityIds === null, hasStaffPermission(ctx, 'staff.read')]);
+  const subject = result.rows[0];
+  if (!subject) { throw new NotFoundException(); }
   return subject;
 }
 
 async function requireActiveTechnicianTarget(ctx: GeoContext, technicianId: string, cityId: string): Promise<StaffRow> {
   if (technicianId === ctx.staffId) { throw new ForbiddenException(); }
-  const subject = await requireVisibleTechnician(ctx, technicianId, cityId);
+  const subject = await requireTechnicianAccess(ctx, technicianId, cityId);
   if (subject.employment_state !== 'ACTIVE') { throw new NotFoundException(); }
   return subject;
 }
@@ -371,25 +376,26 @@ const adminList: GeoCommand = {
     if (!subject) { throw new NotFoundException(); }
     if (cityId !== undefined && (await cityLifecycle(ctx.client, cityId)) === null) { throw new NotFoundException(); }
   },
-  async run(ctx, target) {
+  async run(ctx, target, body) {
     const staffId = targetId(target, 'staffId');
     const cityId = optionalTargetId(target, 'cityId') ?? null;
     // The returned aggregate belongs to the *subject* whose territory is listed, so a
     // client can chain If-Match on the next assignment change of that employee.
     const version = await staffAggregate(ctx.client, staffId);
+    const page = readGeoPage(ctx, body, 'adminList', [cityId, staffId], idPosition);
     const result = await ctx.client.query<{
       id: string; staff_id: string; city_id: string; granted_at: Date; revoked_at: Date | null; active: boolean;
-    }>(`SELECT id, staff_id, city_id, granted_at, revoked_at, (revoked_at IS NULL) AS active
-      FROM foundation.staff_admin_city_assignments
-      WHERE staff_id=$1 AND ($2::uuid IS NULL OR city_id=$2)
-      ORDER BY city_id, granted_at, id`, [staffId, cityId]);
-    return {
-      items: result.rows.map((row) => ({
-        id: row.id, staffId: row.staff_id, cityId: row.city_id,
-        grantedAt: isoInstant(row.granted_at), revokedAt: isoInstant(row.revoked_at), active: row.active,
-      })),
-      version,
-    };
+    }>(`SELECT a.id,a.staff_id,a.city_id,a.granted_at,a.revoked_at,(a.revoked_at IS NULL) AS active
+      FROM foundation.staff_admin_city_assignments a
+      WHERE a.staff_id=$1 AND ($2::uuid IS NULL OR a.city_id=$2)
+        AND ($3::uuid IS NULL OR (a.city_id,a.granted_at,a.id)>(
+          SELECT anchor.city_id,anchor.granted_at,anchor.id FROM foundation.staff_admin_city_assignments anchor
+          WHERE anchor.id=$3 AND anchor.staff_id=$1 AND ($2::uuid IS NULL OR anchor.city_id=$2)))
+      ORDER BY a.city_id,a.granted_at,a.id LIMIT $4`, [staffId, cityId, page.after?.[0] ?? null, page.take]);
+    return { version, ...finishGeoPage(page, result.rows, row => ({
+      id: row.id, staffId: row.staff_id, cityId: row.city_id,
+      grantedAt: isoInstant(row.granted_at), revokedAt: isoInstant(row.revoked_at), active: row.active,
+    }), idKey) };
   },
 };
 
@@ -426,6 +432,9 @@ const adminAssign: GeoCommand = {
       'SELECT id FROM foundation.staff_admin_city_assignments WHERE staff_id=$1 AND city_id=$2 AND revoked_at IS NULL FOR UPDATE',
       [staffId, cityId]);
     if (active.rowCount !== 0) { throw new ConflictException(); }
+    // A new city widens every effective CITY P03 grant of the target. This runs
+    // under the RBAC write and target staff locks, only on the actual INSERT path.
+    await requireP03CityExpansion(ctx, staffId);
     const id = randomUUID();
     // `granted_at` is database-stamped and deliberately not insertable by the runtime:
     // the caller cannot backdate a grant.
@@ -469,6 +478,35 @@ const adminRevoke: GeoCommand = {
   },
 };
 
+const techPicker: GeoCommand = {
+  action: 'staff.geography.read',
+  write: false,
+  scoped: 'city',
+  async check(ctx, target) {
+    requireGeoGrant(ctx, 'staff.geography.read');
+    const cityId = targetId(target, 'cityId');
+    requireCityInScope(ctx, cityId);
+    if ((await cityLifecycle(ctx.client, cityId)) === null) { throw new NotFoundException(); }
+  },
+  async run(ctx, target, body): Promise<P03Page<P03TechnicianPickerItem>> {
+    const cityId = targetId(target, 'cityId');
+    const roster = hasStaffPermission(ctx, 'staff.read');
+    const page = readGeoPage(ctx, body, 'techPicker', [cityId, roster], idPosition);
+    const result = await ctx.client.query<Pick<StaffRow, 'id' | 'auth_version' | 'profile_version'> & { display_name: string | null }>(
+      `SELECT s.id,s.display_name,s.auth_version,s.profile_version
+       FROM foundation.staff s
+       JOIN foundation.staff_role_assignments a ON a.staff_id=s.id AND a.revoked_at IS NULL
+       JOIN foundation.roles r ON r.id=a.role_id AND r.status='ACTIVE'
+       WHERE ${technicianAccessSql('$1', '$2', '$3')} AND s.employment_state='ACTIVE'
+         AND (r.role_type='CUSTOM' OR (r.role_type='SYSTEM' AND r.code='TECHNICIAN'))
+         AND ($4::uuid IS NULL OR s.id>$4)
+       ORDER BY s.id LIMIT $5`, [cityId, ctx.cityIds === null, roster, page.after?.[0] ?? null, page.take]);
+    return finishGeoPage(page, result.rows, row => ({
+      id: row.id, displayName: row.display_name, version: aggregateVersion(row),
+    }), idKey);
+  },
+};
+
 const techCities: GeoCommand = {
   action: 'staff.geography.read',
   write: false,
@@ -478,29 +516,29 @@ const techCities: GeoCommand = {
     const cityId = targetId(target, 'cityId');
     const staffId = targetId(target, 'staffId');
     requireCityInScope(ctx, cityId);
-    await requireVisibleTechnician(ctx, staffId, cityId);
+    await requireTechnicianAccess(ctx, staffId, cityId);
   },
-  async run(ctx, target) {
+  async run(ctx, target, body) {
     const cityId = targetId(target, 'cityId');
     const staffId = targetId(target, 'staffId');
-    const subject = await loadStaff(ctx.client, staffId);
-    if (!subject) { throw new NotFoundException(); }
+    const version = await staffAggregate(ctx.client, staffId);
+    const page = readGeoPage(ctx, body, 'techCities', [cityId, staffId], idPosition);
     const result = await ctx.client.query<{
       id: string; city_id: string; valid_from: Date; valid_to: Date | null; revoked_at: Date | null; active: boolean;
-    }>(`SELECT id, city_id, valid_from, valid_to, revoked_at,
-        (revoked_at IS NULL AND valid_from <= statement_timestamp()
-          AND (valid_to IS NULL OR valid_to > statement_timestamp())) AS active
-      FROM foundation.technician_city_memberships
-      WHERE technician_id=$1 AND city_id=$2
-      ORDER BY valid_from, id`, [staffId, cityId]);
-    return {
-      items: result.rows.map((row) => ({
-        id: row.id, cityId: row.city_id,
-        validFrom: isoInstant(row.valid_from), validTo: isoInstant(row.valid_to),
-        revokedAt: isoInstant(row.revoked_at), active: row.active,
-      })),
-      version: aggregateVersion(subject),
-    };
+    }>(`SELECT m.id,m.city_id,m.valid_from,m.valid_to,m.revoked_at,
+        (m.revoked_at IS NULL AND m.valid_from <= statement_timestamp()
+          AND (m.valid_to IS NULL OR m.valid_to > statement_timestamp())) AS active
+      FROM foundation.technician_city_memberships m
+      WHERE m.technician_id=$1 AND m.city_id=$2
+        AND ($3::uuid IS NULL OR (m.valid_from,m.id)>(
+          SELECT anchor.valid_from,anchor.id FROM foundation.technician_city_memberships anchor
+          WHERE anchor.id=$3 AND anchor.technician_id=$1 AND anchor.city_id=$2))
+      ORDER BY m.valid_from,m.id LIMIT $4`, [staffId, cityId, page.after?.[0] ?? null, page.take]);
+    return { version, ...finishGeoPage(page, result.rows, row => ({
+      id: row.id, cityId: row.city_id,
+      validFrom: isoInstant(row.valid_from), validTo: isoInstant(row.valid_to),
+      revokedAt: isoInstant(row.revoked_at), active: row.active,
+    }), idKey) };
   },
 };
 
@@ -585,31 +623,32 @@ const techZones: GeoCommand = {
     const cityId = targetId(target, 'cityId');
     const staffId = targetId(target, 'staffId');
     requireCityInScope(ctx, cityId);
-    await requireVisibleTechnician(ctx, staffId, cityId);
+    await requireTechnicianAccess(ctx, staffId, cityId);
   },
-  async run(ctx, target) {
+  async run(ctx, target, body) {
     const cityId = targetId(target, 'cityId');
     const staffId = targetId(target, 'staffId');
-    const subject = await loadStaff(ctx.client, staffId);
-    if (!subject) { throw new NotFoundException(); }
+    const version = await staffAggregate(ctx.client, staffId);
+    const page = readGeoPage(ctx, body, 'techZones', [cityId, staffId], idPosition);
     const result = await ctx.client.query<{
       id: string; city_id: string; service_area_id: string; membership_id: string;
       valid_from: Date; valid_to: Date | null; revoked_at: Date | null; active: boolean;
-    }>(`SELECT g.id, g.city_id, g.service_area_id, g.membership_id, g.valid_from, g.valid_to, g.revoked_at,
+    }>(`SELECT g.id,g.city_id,g.service_area_id,g.membership_id,g.valid_from,g.valid_to,g.revoked_at,
         (g.revoked_at IS NULL AND g.valid_from <= statement_timestamp()
           AND (g.valid_to IS NULL OR g.valid_to > statement_timestamp())) AS active
       FROM foundation.technician_service_areas g
       JOIN foundation.service_areas a ON a.id=g.service_area_id AND a.city_id=g.city_id
       WHERE g.technician_id=$1 AND g.city_id=$2 AND a.current_version_id IS NOT NULL
-      ORDER BY g.service_area_id, g.valid_from, g.id`, [staffId, cityId]);
-    return {
-      items: result.rows.map((row) => ({
-        id: row.id, cityId: row.city_id, areaId: row.service_area_id, membershipId: row.membership_id,
-        validFrom: isoInstant(row.valid_from), validTo: isoInstant(row.valid_to),
-        revokedAt: isoInstant(row.revoked_at), active: row.active,
-      })),
-      version: aggregateVersion(subject),
-    };
+        AND ($3::uuid IS NULL OR (g.service_area_id,g.valid_from,g.id)>(
+          SELECT anchor.service_area_id,anchor.valid_from,anchor.id FROM foundation.technician_service_areas anchor
+          JOIN foundation.service_areas aa ON aa.id=anchor.service_area_id AND aa.city_id=anchor.city_id
+          WHERE anchor.id=$3 AND anchor.technician_id=$1 AND anchor.city_id=$2 AND aa.current_version_id IS NOT NULL))
+      ORDER BY g.service_area_id,g.valid_from,g.id LIMIT $4`, [staffId, cityId, page.after?.[0] ?? null, page.take]);
+    return { version, ...finishGeoPage(page, result.rows, row => ({
+      id: row.id, cityId: row.city_id, areaId: row.service_area_id, membershipId: row.membership_id,
+      validFrom: isoInstant(row.valid_from), validTo: isoInstant(row.valid_to),
+      revokedAt: isoInstant(row.revoked_at), active: row.active,
+    }), idKey) };
   },
 };
 
@@ -752,7 +791,7 @@ export const membershipCommands = {
   adminList, adminAssign, adminRevoke,
   techCities, techGrantCity, techRevokeCity,
   techZones, techGrantZone, techRevokeZone,
-  techSelf,
+  techPicker, techSelf,
 } as const satisfies Record<string, GeoCommand>;
 
 export type MembershipOperation = keyof typeof membershipCommands;

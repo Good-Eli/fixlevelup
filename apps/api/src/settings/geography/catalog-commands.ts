@@ -78,6 +78,7 @@
  * null list is accepted only for a verified SYSTEM ADMIN.
  */
 import { randomUUID } from 'node:crypto';
+import type { P03Page, P03VersionedPage } from '@fixlevelup/p03-contracts';
 import { acquireCompanySettingsLock } from '../configuration/company-lock.js';
 import { ConfigurationError } from '../configuration/configuration-errors.js';
 import {
@@ -86,13 +87,12 @@ import {
 import { isSystemAdmin } from '../../authz/authorization.service.js';
 import {
   areaCreateInput, areaVersionInput, areaVersionPatchInput, cityActivateInput, cityCreateInput, cityDeactivateInput,
-  cityVersionInput, coverageInput, districtCreateInput, districtUpdateInput, emptyBody, expectedVersion, listQuery,
-  noExpected, publicationAreaVersion, routeId,
+  cityVersionInput, coverageInput, districtCreateInput, districtUpdateInput, emptyBody, expectedVersion,
+  MAX_COVERAGE_ENTRIES, MAX_COVERAGE_ENTRY_DESCRIPTION, noExpected, publicationAreaVersion, routeId,
 } from './catalog-input.js';
-import type {
-  AreaVersionInput, AreaVersionPatch, CityVersionInput, CoverageEntryInput, ListQuery,
-} from './catalog-input.js';
+import type { AreaVersionInput, AreaVersionPatch, CityVersionInput, CoverageEntryInput } from './catalog-input.js';
 import type { GeoAction, GeoCommand, GeoContext, GeoReceipt, GeoTarget } from './geo-contract.js';
+import { codePosition, finishGeoPage, readGeoPage, versionPosition } from './geo-page.js';
 
 type CityLifecycle = 'DRAFT' | 'ACTIVE' | 'INACTIVE';
 type CoverageRelation = 'FULL' | 'PARTIAL';
@@ -141,10 +141,13 @@ export interface CoverageEntryView { districtId: string; relation: CoverageRelat
  * A nested collection carries its parent aggregate token: it is the value the next
  * nested write needs as `If-Match`, and it is the token the matching create returned,
  * so a list ETag and a write receipt never disagree. `cityList` spans aggregates and
- * therefore has no single token; it returns `items` only.
+ * therefore has no single token.
  */
 export interface CollectionView<T> { version: number; items: readonly T[] }
 export interface CoverageView extends CollectionView<CoverageEntryView> { areaVersionId: string }
+
+const codeKey = (row: { code: string; id: string }): readonly [string, string] => [row.code, row.id];
+const versionKey = (row: { version: number; id: string }): readonly [number, string] => [row.version, row.id];
 
 const CITY_COLUMNS = 'id,code,lifecycle,current_version_id,row_version';
 const CITY_VERSION_COLUMNS = 'id,version,display_name,address_display,timezone,public_contact,office_hours,published_at';
@@ -715,21 +718,16 @@ export const catalogCommands = {
     action: 'geography.read',
     write: false,
     scoped: 'list',
-    // The list has no target city: the runner authorizes a GLOBAL read and the
-    // SQL below restricts rows to the trusted membership list.
+    // The list has no target city; every page filters on the runner's trusted scope.
     check: (ctx) => { requireCatalogRole(ctx); return Promise.resolve(); },
-    run: async (ctx, _target, body) => {
-      const query = listQuery(body);
-      const result = ctx.cityIds === null
-        ? await ctx.client.query<CityRow>(
-          `SELECT ${CITY_COLUMNS} FROM foundation.service_cities ORDER BY code LIMIT $1`, [query.limit])
-        : await ctx.client.query<CityRow>(
-          `SELECT ${CITY_COLUMNS} FROM foundation.service_cities WHERE id=ANY($2::uuid[]) ORDER BY code LIMIT $1`,
-          [query.limit, ctx.cityIds]);
-      // Every list is an envelope; a bare array would make a future page/total
-      // addition a breaking change for the CRM client. A city list spans several
-      // aggregates, so it carries no single parent revision token.
-      return { items: result.rows.map(cityView) } satisfies Pick<CollectionView<CityView>, 'items'>;
+    run: async (ctx, _target, body): Promise<P03Page<CityView>> => {
+      const page = readGeoPage(ctx, body, 'cityList', [], codePosition, true);
+      const result = await ctx.client.query<CityRow>(
+        `SELECT ${CITY_COLUMNS} FROM foundation.service_cities
+         WHERE ($1::uuid[] IS NULL OR id=ANY($1::uuid[]))
+           AND ($2::text IS NULL OR (code,id)>($2::text,$3::uuid))
+         ORDER BY code,id LIMIT $4`, [ctx.cityIds, page.after?.[0] ?? null, page.after?.[1] ?? null, page.take]);
+      return finishGeoPage(page, result.rows, cityView, codeKey);
     },
   }),
 
@@ -784,15 +782,14 @@ export const catalogCommands = {
     check: cityReadCheck,
     run: async (ctx, target, body) => {
       const cityId = targetCity(target);
-      const query = listQuery(body);
       const city = await cityRow(ctx, cityId);
-      if (!city) {
-        throw new NotFoundException();
-      }
+      if (!city) { throw new NotFoundException(); }
+      const page = readGeoPage(ctx, body, 'cityVersions', [cityId], versionPosition, true);
       const result = await ctx.client.query<CityVersionRow>(
         `SELECT ${CITY_VERSION_COLUMNS} FROM foundation.service_city_versions
-         WHERE city_id=$1 ORDER BY version DESC LIMIT $2`, [cityId, query.limit]);
-      return { version: city.row_version, items: result.rows.map(cityVersionView) } satisfies CollectionView<CityVersionView>;
+         WHERE city_id=$1 AND ($2::int IS NULL OR (version,id)<($2::int,$3::uuid))
+         ORDER BY version DESC,id DESC LIMIT $4`, [cityId, page.after?.[0] ?? null, page.after?.[1] ?? null, page.take]);
+      return { version: city.row_version, ...finishGeoPage(page, result.rows, cityVersionView, versionKey) } satisfies P03VersionedPage<CityVersionView>;
     },
   }),
 
@@ -952,19 +949,15 @@ export const catalogCommands = {
     check: async (ctx, target) => { await cityReadCheck(ctx, target); },
     run: async (ctx, target, body) => {
       const cityId = targetCity(target);
-      const query: ListQuery = listQuery(body);
       const city = await cityRow(ctx, cityId);
-      if (!city) {
-        throw new NotFoundException();
-      }
-      const result = query.includeArchived
-        ? await ctx.client.query<DistrictRow>(
-          `SELECT ${DISTRICT_COLUMNS} FROM foundation.administrative_districts
-           WHERE city_id=$1 ORDER BY code LIMIT $2`, [cityId, query.limit])
-        : await ctx.client.query<DistrictRow>(
-          `SELECT ${DISTRICT_COLUMNS} FROM foundation.administrative_districts
-           WHERE city_id=$1 AND archived_at IS NULL ORDER BY code LIMIT $2`, [cityId, query.limit]);
-      return { version: city.row_version, items: result.rows.map(districtView) } satisfies CollectionView<DistrictView>;
+      if (!city) { throw new NotFoundException(); }
+      const page = readGeoPage(ctx, body, 'districtList', [cityId], codePosition, true);
+      const result = await ctx.client.query<DistrictRow>(
+        `SELECT ${DISTRICT_COLUMNS} FROM foundation.administrative_districts
+         WHERE city_id=$1 AND ($2::boolean OR archived_at IS NULL)
+           AND ($3::text IS NULL OR (code,id)>($3::text,$4::uuid))
+         ORDER BY code,id LIMIT $5`, [cityId, page.includeArchived, page.after?.[0] ?? null, page.after?.[1] ?? null, page.take]);
+      return { version: city.row_version, ...finishGeoPage(page, result.rows, districtView, codeKey) } satisfies P03VersionedPage<DistrictView>;
     },
   }),
 
@@ -1080,19 +1073,15 @@ export const catalogCommands = {
     check: async (ctx, target) => { await cityReadCheck(ctx, target); },
     run: async (ctx, target, body) => {
       const cityId = targetCity(target);
-      const query = listQuery(body);
       const city = await cityRow(ctx, cityId);
-      if (!city) {
-        throw new NotFoundException();
-      }
-      const result = query.includeArchived
-        ? await ctx.client.query<AreaRow>(
-          `SELECT ${AREA_COLUMNS} FROM foundation.service_areas WHERE city_id=$1 ORDER BY code LIMIT $2`,
-          [cityId, query.limit])
-        : await ctx.client.query<AreaRow>(
-          `SELECT ${AREA_COLUMNS} FROM foundation.service_areas
-           WHERE city_id=$1 AND archived_at IS NULL ORDER BY code LIMIT $2`, [cityId, query.limit]);
-      return { version: city.row_version, items: result.rows.map(areaView) } satisfies CollectionView<AreaView>;
+      if (!city) { throw new NotFoundException(); }
+      const page = readGeoPage(ctx, body, 'areaList', [cityId], codePosition, true);
+      const result = await ctx.client.query<AreaRow>(
+        `SELECT ${AREA_COLUMNS} FROM foundation.service_areas
+         WHERE city_id=$1 AND ($2::boolean OR archived_at IS NULL)
+           AND ($3::text IS NULL OR (code,id)>($3::text,$4::uuid))
+         ORDER BY code,id LIMIT $5`, [cityId, page.includeArchived, page.after?.[0] ?? null, page.after?.[1] ?? null, page.take]);
+      return { version: city.row_version, ...finishGeoPage(page, result.rows, areaView, codeKey) } satisfies P03VersionedPage<AreaView>;
     },
   }),
 
@@ -1186,15 +1175,14 @@ export const catalogCommands = {
     run: async (ctx, target, body) => {
       const cityId = targetCity(target);
       const areaId = requiredTarget(target.areaId);
-      const query = listQuery(body);
       const area = await areaRow(ctx, cityId, areaId);
-      if (!area) {
-        throw new NotFoundException();
-      }
+      if (!area) { throw new NotFoundException(); }
+      const page = readGeoPage(ctx, body, 'areaVersions', [cityId, areaId], versionPosition, true);
       const result = await ctx.client.query<AreaVersionRow>(
         `SELECT ${AREA_VERSION_COLUMNS} FROM foundation.service_area_versions
-         WHERE city_id=$1 AND area_id=$2 ORDER BY version DESC LIMIT $3`, [cityId, areaId, query.limit]);
-      return { version: area.row_version, items: result.rows.map(areaVersionView) } satisfies CollectionView<AreaVersionView>;
+         WHERE city_id=$1 AND area_id=$2 AND ($3::int IS NULL OR (version,id)<($3::int,$4::uuid))
+         ORDER BY version DESC,id DESC LIMIT $5`, [cityId, areaId, page.after?.[0] ?? null, page.after?.[1] ?? null, page.take]);
+      return { version: area.row_version, ...finishGeoPage(page, result.rows, areaVersionView, versionKey) } satisfies P03VersionedPage<AreaVersionView>;
     },
   }),
 
@@ -1347,9 +1335,18 @@ export const catalogCommands = {
       if (!version) {
         throw new NotFoundException();
       }
-      const result = await ctx.client.query<CoverageRow>(
-        `SELECT district_id,relation,description FROM foundation.service_area_district_coverage
-         WHERE city_id=$1 AND area_version_id=$2 ORDER BY district_id`, [cityId, versionId]);
+      const result = await ctx.client.query<CoverageRow & { oversized: boolean }>(
+        `SELECT district_id,relation,
+           CASE WHEN octet_length(description)<=$4 THEN description END AS description,
+           COALESCE(octet_length(description)>$4,false) AS oversized
+         FROM foundation.service_area_district_coverage
+         WHERE city_id=$1 AND area_version_id=$2 ORDER BY district_id LIMIT $3`,
+        [cityId, versionId, MAX_COVERAGE_ENTRIES + 1, MAX_COVERAGE_ENTRY_DESCRIPTION * 3]);
+      // Historical SQL imports may exceed the API cap. Never return an editable prefix.
+      if (result.rows.length > MAX_COVERAGE_ENTRIES || result.rows.some(row => row.oversized
+        || (row.description?.length ?? 0) > MAX_COVERAGE_ENTRY_DESCRIPTION)) {
+        throw new InternalServerErrorException();
+      }
       const items: CoverageEntryView[] = result.rows.map((row) => ({
         districtId: row.district_id, relation: row.relation, description: row.description,
       }));
@@ -1378,35 +1375,38 @@ export const catalogCommands = {
       if (currentArea.archived_at !== null) {
         throw new ConflictException();
       }
-      // Same-city district validation before any child change: missing is 404, an
-      // archived district is a conflict, and the city is always server-derived.
+      // An already mapped archived district can be retained verbatim or removed explicitly.
+      // It cannot be added or edited, and the publish command still rejects any archived map.
       if (entries.length !== 0) {
-        const found = await ctx.client.query<{ id: string; archived_at: Date | null }>(
-          `SELECT id,archived_at FROM foundation.administrative_districts
-           WHERE city_id=$1 AND id=ANY($2::uuid[])`, [cityId, entries.map((entry) => entry.districtId)]);
-        const byId = new Map(found.rows.map((row) => [row.id, row]));
-        for (const entry of entries) {
-          const district = byId.get(entry.districtId);
-          if (!district) {
-            throw new NotFoundException();
-          }
-          if (district.archived_at !== null) {
-            throw new ConflictException();
-          }
-        }
+        const found = await ctx.client.query<{ id: string; archived_at: Date | null; retained: boolean }>(
+          `SELECT district.id,district.archived_at,
+             (existing.district_id IS NOT NULL AND existing.relation=entry.relation
+               AND existing.description IS NOT DISTINCT FROM entry.description) AS retained
+           FROM unnest($3::uuid[],$4::text[],$5::text[]) AS entry(district_id,relation,description)
+           JOIN foundation.administrative_districts district ON district.id=entry.district_id AND district.city_id=$1
+           LEFT JOIN foundation.service_area_district_coverage existing
+             ON existing.city_id=$1 AND existing.area_version_id=$2 AND existing.district_id=district.id`,
+          [cityId, versionId, entries.map(entry => entry.districtId),
+            entries.map(entry => entry.relation), entries.map(entry => entry.description)]);
+        if (found.rows.length !== entries.length) { throw new NotFoundException(); }
+        if (found.rows.some(row => row.archived_at !== null && !row.retained)) { throw new ConflictException(); }
       }
-      // The mapping of a DRAFT revision is editable (011 explicitly permits DELETE
-      // here); every child change bumps the draft row_version through the guard.
+      // Replace the full set; retained rows are not deleted and reinserted.
       await ctx.client.query(
-        'DELETE FROM foundation.service_area_district_coverage WHERE city_id=$1 AND area_version_id=$2',
-        [cityId, versionId]);
+        `DELETE FROM foundation.service_area_district_coverage
+         WHERE city_id=$1 AND area_version_id=$2 AND NOT (district_id=ANY($3::uuid[]))`,
+        [cityId, versionId, entries.map(entry => entry.districtId)]);
       if (entries.length !== 0) {
         await ctx.client.query(
-          `INSERT INTO foundation.service_area_district_coverage (city_id,area_version_id,district_id,relation,description)
+          `INSERT INTO foundation.service_area_district_coverage AS existing (city_id,area_version_id,district_id,relation,description)
            SELECT $1,$2,entry.district_id,entry.relation,entry.description
-           FROM unnest($3::uuid[],$4::text[],$5::text[]) AS entry(district_id,relation,description)`,
-          [cityId, versionId, entries.map((entry) => entry.districtId),
-            entries.map((entry) => entry.relation), entries.map((entry) => entry.description)]);
+           FROM unnest($3::uuid[],$4::text[],$5::text[]) AS entry(district_id,relation,description)
+           WHERE NOT EXISTS (SELECT 1 FROM foundation.service_area_district_coverage AS prior
+             WHERE prior.city_id=$1 AND prior.area_version_id=$2 AND prior.district_id=entry.district_id
+               AND prior.relation=entry.relation AND prior.description IS NOT DISTINCT FROM entry.description)
+           ON CONFLICT(area_version_id,district_id) DO UPDATE SET relation=EXCLUDED.relation,description=EXCLUDED.description`,
+          [cityId, versionId, entries.map(entry => entry.districtId),
+            entries.map(entry => entry.relation), entries.map(entry => entry.description)]);
       }
       // Re-read the token: the coverage guard already advanced it once per child row,
       // so the pre-replace If-Match is stale for a following publish in the same tx.

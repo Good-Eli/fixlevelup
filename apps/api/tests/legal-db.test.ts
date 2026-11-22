@@ -33,9 +33,12 @@
  *   closed with a typed `CONFLICT` instead of answering `GRANTED`; the same guard
  *   covers the GIVEN replay, the revoke and the trusted-proof routes;
  * - a revoke whose document-lock wait crosses the anchor expiry is refused by the
- *   post-lock clock check, with no consent, audit or outbox row left behind.
+ *   post-lock clock check, with no consent, audit or outbox row left behind;
+ * - a current grant or a consent replay refuses when its evidence read waits
+ *   across expiry, without changing consent, audit or outbox state.
  */
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { PoolClient } from 'pg';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { LegalPortError } from '../src/settings/legal/legal-contract.js';
@@ -163,10 +166,97 @@ async function evidenceCount(sessionId: string): Promise<number> {
   return result.rows[0]?.n ?? -1;
 }
 
-async function auditOutboxCount(): Promise<{ audit: number; outbox: number }> {
-  const audit = await db.migrator.query<{ n: number }>('SELECT count(*)::int AS n FROM foundation.audit_logs');
-  const outbox = await db.migrator.query<{ n: number }>('SELECT count(*)::int AS n FROM foundation.outbox_events');
+async function auditOutboxCount(client: LegalSqlClient = db.migrator): Promise<{ audit: number; outbox: number }> {
+  const audit = await client.query<{ n: number }>('SELECT count(*)::int AS n FROM foundation.audit_logs');
+  const outbox = await client.query<{ n: number }>('SELECT count(*)::int AS n FROM foundation.outbox_events');
   return { audit: audit.rows[0]?.n ?? -1, outbox: outbox.rows[0]?.n ?? -1 };
+}
+
+async function consentState(client: LegalSqlClient, sessionId: string) {
+  const evidence = await client.query(
+    'SELECT * FROM foundation.consent_records WHERE session_id=$1 ORDER BY id', [sessionId]);
+  return { evidence: evidence.rows, ...await auditOutboxCount(client) };
+}
+
+async function untilObserved<T>(observe: () => Promise<T | undefined>, description: string): Promise<T> {
+  const deadline = performance.now() + 10_000;
+  while (performance.now() < deadline) {
+    const found = await observe();
+    if (found !== undefined) {
+      return found;
+    }
+    await delay(25);
+  }
+  throw new Error(`Did not observe ${description}`);
+}
+
+async function acrossEvidenceExpiry<T>(
+  sessionId: string, queryFragment: string, act: (client: LegalSqlClient) => Promise<T>,
+) {
+  const blocker = await db.migrator.connect();
+  try {
+    await blocker.query('BEGIN');
+    const blockerPid = (await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid;
+    expect(blockerPid).toBeDefined();
+    await blocker.query('LOCK TABLE ONLY foundation.consent_records IN ACCESS EXCLUSIVE MODE');
+    const caller = await db.runtime.connect();
+    const name = `legal-expiry-${randomUUID()}`;
+    try {
+      await beginLegalTransaction(caller);
+      await caller.query("SELECT set_config('application_name',$1,true)", [name]);
+      await caller.query("SET LOCAL statement_timeout = '25s'");
+      // Attach rejection handling now: the caller must not produce an unhandled
+      // rejection if a regression refuses too early or the observation times out.
+      const pending = act(caller).then(
+        (value) => ({ value }),
+        (error: unknown) => {
+          if (error instanceof LegalPortError) {
+            return { error: error.code };
+          }
+          return { unexpected: error };
+        },
+      );
+      try {
+        const waiting = await untilObserved(async () => {
+          const observed = await db.runtime.query<{ query: string; live: boolean }>(
+            `SELECT a.query, s.expires_at > clock_timestamp() AS live
+             FROM pg_stat_activity a
+             JOIN pg_locks l ON l.pid=a.pid AND l.relation='foundation.consent_records'::regclass
+               AND l.locktype='relation' AND l.mode='AccessShareLock' AND NOT l.granted
+             CROSS JOIN foundation.request_sessions s
+             WHERE a.application_name=$1 AND a.datname=current_database()
+               AND a.wait_event_type='Lock' AND $2=ANY(pg_blocking_pids(a.pid)) AND s.id=$3`,
+            [name, blockerPid, sessionId]);
+          return observed.rows[0];
+        }, 'the named caller waiting on the consent_records relation lock');
+        expect(waiting.query).toContain(queryFragment);
+        expect(waiting.live).toBe(true);
+        // The unblock is driven by the persisted expiry on PostgreSQL's clock,
+        // not a guessed elapsed delay after launching the port.
+        await untilObserved(async () => {
+          const clock = await blocker.query<{ expired: boolean }>(
+            'SELECT expires_at <= clock_timestamp() AS expired FROM foundation.request_sessions WHERE id=$1', [sessionId]);
+          return clock.rows[0]?.expired ? true : undefined;
+        }, 'anchor expiry on the database clock');
+      } finally {
+        await blocker.query('ROLLBACK');
+      }
+      const outcome = await pending;
+      return { outcome, inTransaction: await consentState(caller, sessionId) };
+    } finally {
+      try {
+        await caller.query('ROLLBACK');
+      } finally {
+        caller.release();
+      }
+    }
+  } finally {
+    try {
+      await blocker.query('ROLLBACK');
+    } finally {
+      blocker.release();
+    }
+  }
 }
 
 /**
@@ -1081,4 +1171,43 @@ legalIntegration('P03-03 legal documents and consent ports on real PostgreSQL ru
       'SELECT action,supersedes_id FROM foundation.consent_records WHERE id=$1', [given.evidenceId]);
     expect(original.rows[0]).toMatchObject({ action: 'GIVEN', supersedes_id: null });
   }, 60_000);
+
+  it.each(['current GRANTED', 'GIVEN replay', 'REVOKED replay'] as const)(
+    'refuses %s when the evidence SELECT waits across anchor expiry',
+    async (path) => {
+      const form = await publishNext('MARKETING', 'CONSENT_FORM');
+      const expiry = await db.migrator.query<{ at: Date }>("SELECT clock_timestamp() + interval '3 seconds' AS at");
+      const expiresAt = expiry.rows[0]?.at;
+      if (!expiresAt) {
+        throw new Error('Missing fixture database clock');
+      }
+      const anchor = await newAnchor(expiresAt);
+      const scope = { session: proof(anchor), purpose: 'MARKETING' };
+      const give = {
+        ...scope, documentVersionId: form.versionId, evidenceRef: randomUUID(), accepted: true,
+      };
+      const given = await tx((client) => recordConsentGiven(client, give));
+      const revoke = { ...scope, evidenceRef: randomUUID(), supersedesEvidenceId: given.evidenceId };
+      if (path === 'REVOKED replay') {
+        await tx((client) => recordConsentRevoked(client, revoke));
+      }
+      const before = await consentState(db.migrator, anchor.sessionId);
+      expect(before.evidence).toHaveLength(path === 'REVOKED replay' ? 2 : 1);
+      if (path === 'current GRANTED') {
+        const { outcome, inTransaction } = await acrossEvidenceExpiry(anchor.sessionId, 'c.action=\'GIVEN\'',
+          (client) => currentPurposeConsent(client, scope));
+        expect(inTransaction).toEqual(before);
+        expect(outcome).toEqual({ value: {
+          granted: false, reason: 'SESSION_EXPIRED', documentId: null, documentVersionId: null,
+          evidenceId: null, occurredAt: null,
+        } });
+      } else {
+        const { outcome, inTransaction } = await acrossEvidenceExpiry(anchor.sessionId, 'evidence_ref=$2',
+          (client) => path === 'GIVEN replay' ? recordConsentGiven(client, give) : recordConsentRevoked(client, revoke));
+        expect(inTransaction).toEqual(before);
+        expect(outcome).toEqual({ error: 'SESSION_EXPIRED' });
+      }
+      expect(await consentState(db.migrator, anchor.sessionId)).toEqual(before);
+    }, 60_000,
+  );
 });

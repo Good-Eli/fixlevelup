@@ -10,6 +10,7 @@ export class ProblemFilter implements ExceptionFilter {
 
   catch(exception: unknown, host: ArgumentsHost): void {
     const response = host.switchToHttp().getResponse<ServerResponse>();
+    if (response.headersSent || response.destroyed) { return; }
     const proposedStatus = exception instanceof HttpException ? exception.getStatus() : 500;
     const status = proposedStatus >= 400 && proposedStatus <= 599 ? proposedStatus : 500;
     const code = status === 503 ? 'NOT_READY' : status === 404 ? 'NOT_FOUND' : status === 500 ? 'INTERNAL_ERROR' : 'REQUEST_REJECTED';

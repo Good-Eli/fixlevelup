@@ -65,10 +65,10 @@ const telegramContext = (permissions: GeoContext['permissions'] = ['staff.self.r
   });
 
 describe('geography membership command registry', () => {
-  it('exposes exactly the ten named operations the transport routes use', () => {
+  it('exposes exactly the eleven named operations the transport routes use', () => {
     expect(Object.keys(membershipCommands).sort()).toEqual([
       'adminAssign', 'adminList', 'adminRevoke',
-      'techCities', 'techGrantCity', 'techGrantZone', 'techRevokeCity', 'techRevokeZone', 'techSelf', 'techZones',
+      'techCities', 'techGrantCity', 'techGrantZone', 'techPicker', 'techRevokeCity', 'techRevokeZone', 'techSelf', 'techZones',
     ]);
   });
 
@@ -81,6 +81,7 @@ describe('geography membership command registry', () => {
       techGrantCity: { action: 'staff.geography.manage', write: true, scoped: 'city' },
       techRevokeCity: { action: 'staff.geography.manage', write: true, scoped: 'city' },
       techZones: { action: 'staff.geography.read', write: false, scoped: 'city' },
+      techPicker: { action: 'staff.geography.read', write: false, scoped: 'city' },
       techGrantZone: { action: 'staff.geography.manage', write: true, scoped: 'city' },
       techRevokeZone: { action: 'staff.geography.manage', write: true, scoped: 'city' },
       techSelf: { action: 'geography.self.read', write: false, scoped: 'self' },

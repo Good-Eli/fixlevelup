@@ -44,6 +44,31 @@ describe('API runtime database readiness', () => {
     row = undefined;
   });
 
+  it('coalesces a bounded management probe and fails closed on missing or incompatible metadata', async () => {
+    const authOff = new RuntimeDatabase(undefined, false);
+    expect(await authOff.settingsManagementReady()).toBe(false);
+    const db = new RuntimeDatabase(undefined, true);
+    const internal = db as unknown as { client: { $queryRaw: (parts: TemplateStringsArray) => Promise<unknown[]> } };
+    let simulated: object[] = [];
+    let probes = 0;
+    let sql = '';
+    internal.client = { $queryRaw: (parts) => { probes += 1; sql = parts.join(''); return Promise.resolve(simulated); } };
+    const pending = db.settingsManagementReady();
+    expect(db.settingsManagementReady()).toBe(pending);
+    expect(await pending).toBe(false);
+    expect(probes).toBe(1);
+    simulated = [{ compatible: true, metadata: 'wrong-shape' }];
+    expect(await db.settingsManagementReady()).toBe(false);
+    simulated = [{ compatible: false, metadata: 'wrong-shape' }];
+    expect(await db.settingsManagementReady()).toBe(false);
+    internal.client.$queryRaw = () => Promise.reject(new Error('driver error never exposed'));
+    expect(await db.settingsManagementReady()).toBe(false);
+    expect(sql).toContain('p.prosrc');
+    expect(sql).toContain('has_column_privilege');
+    expect(sql).toContain('p03_command_receipts');
+    expect(sql).not.toContain(password);
+  });
+
   it('mocked auth readiness fails closed on missing schema or privileges', async () => {
     const db = new RuntimeDatabase(undefined, true);
     const internal = db as unknown as { client: { $queryRaw: (parts: TemplateStringsArray) => Promise<{ ready: boolean }[]> }; authReady: () => Promise<boolean> };
@@ -273,6 +298,106 @@ describe('API runtime database readiness', () => {
       await request(server).get('/health/ready').expect(503);
       await request(server).get('/health/live').expect(200);
     } finally { await app.close(); await fixture.end(); }
+  });
+
+  it.runIf(isolatedDbTests)('requires exact 018 guards, catalog and ACL without requiring founder or settings values', async () => {
+    const { Client } = await import('pg');
+    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'))?.[1];
+    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(source)?.[1];
+    if (!adminPassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    const name = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
+    const address = { host: '127.0.0.1', port: 55432 };
+    const admin = new Client({ ...address, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+    await admin.connect();
+    try {
+      await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
+    } finally { await admin.end(); }
+    const owner = new Client({ ...address, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+    await owner.connect();
+    const db = new RuntimeDatabase({ ...database, database: name }, true);
+    try {
+      expect(await db.settingsManagementReady()).toBe(false);
+      expect(await db.ready()).toBe(false);
+      await migrateAuthFixture(owner, name);
+      await owner.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
+      expect(await owner.query('SELECT 1 FROM foundation.p03_bootstrap_permissions')).toMatchObject({ rowCount: 0 });
+      expect(await db.settingsManagementReady()).toBe(true);
+      expect(await db.ready()).toBe(true);
+      const transactions = [
+        'ALTER TABLE foundation.p03_command_receipts RENAME TO broken_receipts',
+        'ALTER TABLE foundation.p03_command_receipts ADD COLUMN extra text',
+        'ALTER TABLE foundation.p03_command_receipts ALTER COLUMN revision_id SET NOT NULL',
+        'ALTER TABLE foundation.p03_command_receipts ALTER COLUMN created_at SET DEFAULT transaction_timestamp()',
+        'ALTER TABLE foundation.p03_command_receipts ALTER COLUMN created_at TYPE timestamptz(3)',
+        'ALTER TABLE foundation.p03_command_receipts DROP CONSTRAINT p03_command_receipts_revision_check; ALTER TABLE foundation.p03_command_receipts ADD CONSTRAINT p03_command_receipts_revision_check CHECK (true)',
+        'ALTER TABLE foundation.role_permissions DROP CONSTRAINT role_permissions_scope_check; ALTER TABLE foundation.role_permissions ADD CONSTRAINT role_permissions_scope_check CHECK (true)',
+        'ALTER TABLE foundation.p03_command_receipts DISABLE TRIGGER p03_receipts_immutable',
+        'ALTER TABLE foundation.p03_bootstrap_permissions DISABLE TRIGGER p03_bootstrap_write',
+        'ALTER TABLE foundation.role_permissions DISABLE TRIGGER p03_guard_role_grant',
+        'ALTER FUNCTION foundation.issue_first_p03_permissions() SECURITY DEFINER',
+        "CREATE OR REPLACE FUNCTION foundation.issue_first_p03_permissions() RETURNS void LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog AS $$ BEGIN RETURN; END $$",
+        "CREATE OR REPLACE FUNCTION foundation.p03_bootstrap_guard() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog AS $$ BEGIN RETURN NEW; END $$",
+        'GRANT EXECUTE ON FUNCTION foundation.issue_first_p03_permissions() TO fixlevelup_runtime',
+        'GRANT EXECUTE ON FUNCTION foundation.issue_first_p03_permissions() TO PUBLIC',
+        'GRANT SELECT(actor_id) ON foundation.p03_command_receipts TO PUBLIC',
+        'GRANT SELECT(created_at) ON foundation.p03_command_receipts TO fixlevelup_runtime',
+        'REVOKE SELECT(request_sha256) ON foundation.p03_command_receipts FROM fixlevelup_runtime',
+        'GRANT INSERT ON foundation.p03_bootstrap_permissions TO fixlevelup_runtime',
+        "UPDATE foundation.permissions SET active=false WHERE code='content.read'",
+        "UPDATE foundation.permissions SET description='incompatible' WHERE code='content.read'",
+      ];
+      // Each mutation commits to its own isolated database before the runtime probe.
+      // An exact inverse restores baseline without deleting the retained fixture.
+      const reverses = [
+        'ALTER TABLE foundation.broken_receipts RENAME TO p03_command_receipts',
+        'ALTER TABLE foundation.p03_command_receipts DROP COLUMN extra',
+        'ALTER TABLE foundation.p03_command_receipts ALTER COLUMN revision_id DROP NOT NULL',
+        'ALTER TABLE foundation.p03_command_receipts ALTER COLUMN created_at SET DEFAULT clock_timestamp()',
+        'ALTER TABLE foundation.p03_command_receipts ALTER COLUMN created_at TYPE timestamptz(6)',
+        undefined, undefined,
+        'ALTER TABLE foundation.p03_command_receipts ENABLE TRIGGER p03_receipts_immutable',
+        'ALTER TABLE foundation.p03_bootstrap_permissions ENABLE TRIGGER p03_bootstrap_write',
+        'ALTER TABLE foundation.role_permissions ENABLE TRIGGER p03_guard_role_grant',
+        'ALTER FUNCTION foundation.issue_first_p03_permissions() SECURITY INVOKER',
+        undefined, undefined,
+        'REVOKE EXECUTE ON FUNCTION foundation.issue_first_p03_permissions() FROM fixlevelup_runtime',
+        'REVOKE EXECUTE ON FUNCTION foundation.issue_first_p03_permissions() FROM PUBLIC',
+        'REVOKE SELECT(actor_id) ON foundation.p03_command_receipts FROM PUBLIC',
+        'REVOKE SELECT(created_at) ON foundation.p03_command_receipts FROM fixlevelup_runtime',
+        'GRANT SELECT(request_sha256) ON foundation.p03_command_receipts TO fixlevelup_runtime',
+        'REVOKE INSERT ON foundation.p03_bootstrap_permissions FROM fixlevelup_runtime',
+        "UPDATE foundation.permissions SET active=true WHERE code='content.read'",
+        undefined,
+      ];
+      reverses[5] = `ALTER TABLE foundation.p03_command_receipts DROP CONSTRAINT p03_command_receipts_revision_check;
+        ALTER TABLE foundation.p03_command_receipts ADD CONSTRAINT p03_command_receipts_revision_check CHECK (
+          CASE WHEN operation IN ('referencePublish','contentPublish','legalPublish')
+            THEN revision_id IS NOT NULL AND revision_version IS NOT NULL AND revision_version > 0
+            ELSE revision_id IS NULL AND revision_version IS NULL END)`;
+      reverses[6] = `ALTER TABLE foundation.role_permissions DROP CONSTRAINT role_permissions_scope_check;
+        ALTER TABLE foundation.role_permissions ADD CONSTRAINT role_permissions_scope_check CHECK (
+          CASE WHEN permission_code LIKE 'staff.self.%' THEN scope_type = 'SELF'
+            WHEN permission_code IN ('geography.read','geography.manage','geography.publish','staff.geography.read','staff.geography.manage',
+              'references.callbackinterval.read','references.callbackinterval.manage','content.read','content.manage','content.publish')
+            THEN scope_type IN ('CITY','GLOBAL') ELSE scope_type = 'GLOBAL' END)`;
+      const functions = (await owner.query<{ definition: string }>(`SELECT pg_get_functiondef(oid) AS definition
+        FROM pg_proc WHERE pronamespace='foundation'::regnamespace AND proname IN ('issue_first_p03_permissions','p03_bootstrap_guard') ORDER BY proname`)).rows;
+      reverses[11] = functions[0]?.definition;
+      reverses[12] = functions[1]?.definition;
+      const original = (await owner.query<{ literal: string }>("SELECT quote_literal(description) AS literal FROM foundation.permissions WHERE code='content.read'")).rows[0]?.literal;
+      if (!original) { throw new Error('Missing baseline fixture metadata'); }
+      reverses[20] = `UPDATE foundation.permissions SET description=${original} WHERE code='content.read'`;
+      for (const [index, broken] of transactions.entries()) {
+        const restore = reverses[index];
+        if (!restore) { throw new Error('Missing fixture drift restoration'); }
+        await owner.query(broken);
+        try { expect(await db.settingsManagementReady(), broken).toBe(false); }
+        finally { await owner.query(restore); }
+        expect(await db.settingsManagementReady(), restore).toBe(true);
+      }
+    } finally { await db.onModuleDestroy(); await owner.end(); }
   });
 
   it('closes a used runtime DB pool in the compiled API signal handler without leaking password', () => {

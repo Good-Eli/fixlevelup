@@ -19,3 +19,9 @@
 .desk ul { padding-inline-start: 1.2rem; }.desk li { margin-bottom: .35rem; }
 .desk dt { font-weight: 650; }.desk dd { margin-inline-start: 0; margin-bottom: .4rem; }
 .desk fieldset { min-width: 0; }.desk summary { cursor: pointer; }
+.desk .p03-fields { box-sizing: border-box; width: 100%; display: grid; justify-items: start; gap: .6rem; }
+.desk .p03-pages { margin-block: .75rem; }
+.desk .p03-plain { font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; padding: .65rem; background: #f5f8f7; }
+.desk .permission input { flex: none; }
+.desk .permission span { min-width: 0; }
+.desk button:focus-visible, .desk input:focus-visible, .desk select:focus-visible, .desk textarea:focus-visible { outline: .15rem solid #20675f; outline-offset: .15rem; }

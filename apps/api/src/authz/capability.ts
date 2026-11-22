@@ -1,3 +1,9 @@
+import { isP03Capability, P03_CAPABILITIES } from '@fixlevelup/p03-contracts';
+import type { P03Capability } from '@fixlevelup/p03-contracts';
+
+export { isP03Capability, P03_CAPABILITIES, P03_CAPABILITY_METADATA, P03_SCOPE_CONTRACT } from '@fixlevelup/p03-contracts';
+export type { P03Capability, P03Grant, P03Scope } from '@fixlevelup/p03-contracts';
+
 /** Known operation contracts, not grants. A new entry does not authorize anyone:
  * the DB catalog, scope and an enabled permission on the current role must also match. */
 export const PERMISSION_CONTRACT = {
@@ -26,7 +32,7 @@ export function scopeMatches(capability: Capability, scope: Scope, staffId: stri
 export const CAPABILITY_METADATA = Symbol('fixlevelup:require-capability');
 
 /** Grant scopes a stored role permission may carry. CITY is only meaningful for the
- * geography contract below; staff operations keep exactly one supported scope. */
+ * geography and P03 contracts; staff operations keep exactly one supported scope. */
 export type GrantScope = 'GLOBAL' | 'SELF' | 'CITY';
 
 /** Geography operation codes are a separate contract from the staff dictionary above:
@@ -51,13 +57,13 @@ export type GeoCapability = keyof typeof GEO_SCOPE_CONTRACT;
 export const GEO_CAPABILITIES = Object.freeze(Object.keys(GEO_SCOPE_CONTRACT) as GeoCapability[]);
 /** One explicitly granted geography operation and the geographic border it carries. */
 export interface GeoGrant { readonly code: GeoCapability; readonly scope: 'GLOBAL' | 'CITY' }
-export type PermissionCode = Capability | GeoCapability;
-export const PERMISSION_CODES: readonly PermissionCode[] = Object.freeze([...STAFF_CAPABILITIES, ...GEO_CAPABILITIES]);
+export type PermissionCode = Capability | GeoCapability | P03Capability;
+export const PERMISSION_CODES: readonly PermissionCode[] = Object.freeze([...STAFF_CAPABILITIES, ...GEO_CAPABILITIES, ...P03_CAPABILITIES]);
 export function isGeoCapability(value: unknown): value is GeoCapability {
   return typeof value === 'string' && Object.hasOwn(GEO_SCOPE_CONTRACT, value);
 }
 export function isPermissionCode(value: unknown): value is PermissionCode {
-  return isCapability(value) || isGeoCapability(value);
+  return isCapability(value) || isGeoCapability(value) || isP03Capability(value);
 }
 export function isGrantScope(value: unknown): value is GrantScope {
   return value === 'GLOBAL' || value === 'SELF' || value === 'CITY';

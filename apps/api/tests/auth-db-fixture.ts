@@ -19,6 +19,7 @@ const expectedSteps = [
   '20261122000100_file_upload_attempts',
   '20261122000200_file_processing_access',
   '20261122000300_file_privacy_deletion',
+  '20261122000400_settings_management',
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })

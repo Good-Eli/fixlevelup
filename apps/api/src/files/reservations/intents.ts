@@ -24,7 +24,8 @@
  * existing intent row → privacy control (`FOR UPDATE`) for a read/replay → a
  * fresh database-clock re-check of the anchor, the policy expiry
  * and the intent expiry after the last wait → exact current GIVEN basis → quota
- * sum/count → INSERT/receipt + audit + outbox.
+ * sum/count → INSERT + audit + outbox → fresh database-clock check before the
+ * first full reservation receipt.
  *
  * The session row lock serializes every reservation of one owner and every consent
  * revoke of that anchor, so the pending quota is counted under a stable view and no
@@ -47,7 +48,7 @@
  * bypasses these ports cannot write a reservation that the guard refuses.
  */
 import { randomUUID } from 'node:crypto';
-import { assertAnchorLiveAfterLock, assertCallerTransaction, currentPurposeConsent, requireLiveAnchor } from '../../settings/legal/index.js';
+import { anchorState, assertAnchorLiveAfterLock, assertCallerTransaction, currentPurposeConsent, requireLiveAnchor } from '../../settings/legal/index.js';
 import type { CurrentConsent } from '../../settings/legal/index.js';
 import { FileReservationError } from './contract.js';
 import type {
@@ -150,11 +151,16 @@ function intentState(value: string): FileIntentState {
   conflict();
 }
 
-function policyExpiry(row: FileIntentRow): Date {
+function assertIntentLive(row: FileIntentRow, now: Date): void {
   if (row.policy_expires_at === null) {
     conflict();
   }
-  return row.policy_expires_at;
+  if (row.policy_expires_at.getTime() <= now.getTime()) {
+    throw new FileReservationError('NOT_CONFIGURED');
+  }
+  if (row.expires_at.getTime() <= now.getTime()) {
+    throw new FileReservationError('INTENT_EXPIRED');
+  }
 }
 
 /** Safe projection: identifiers, versions, sizes, MIME, state and timestamps only. */
@@ -390,12 +396,7 @@ function replayReservation(
   if (row.state !== 'RESERVED') {
     conflict();
   }
-  if (policyExpiry(row).getTime() <= now.getTime()) {
-    throw new FileReservationError('NOT_CONFIGURED');
-  }
-  if (row.expires_at.getTime() <= now.getTime()) {
-    throw new FileReservationError('INTENT_EXPIRED');
-  }
+  assertIntentLive(row, now);
   assertCurrentBasis(row, basis);
   if (row.body_sha256 !== expectedBodySha256) {
     throw new FileReservationError('IDEMPOTENCY_CONFLICT');
@@ -465,6 +466,20 @@ export async function reserveFileUpload(
     state: 'RESERVED',
     rowVersion: row.row_version,
   });
+  // The evidence writes may wait. The first full receipt is a live projection,
+  // not just an immutable fact. The held anchor/document locks keep the current
+  // GIVEN stable; only the clock can invalidate it or the new intent's snapshot.
+  // Throwing here makes the caller roll back the intent and both evidence rows.
+  const receiptNow = await dbClock(client);
+  const state = anchorState({ ...anchor, db_now: receiptNow });
+  if (state === 'REVOKED') {
+    throw new FileReservationError('SESSION_REVOKED');
+  }
+  if (state === 'EXPIRED') {
+    throw new FileReservationError('SESSION_EXPIRED');
+  }
+  assertIntentLive(row, receiptNow);
+  assertCurrentBasis(row, basis);
   return { ...intentView(row), replayed: false };
 }
 
@@ -491,12 +506,7 @@ export async function readFileUploadIntent(
   await requireOpenMetadata(client, row.id);
   const now = await dbClock(client);
   await legalCall(() => assertAnchorLiveAfterLock(client, anchor));
-  if (policyExpiry(row).getTime() <= now.getTime()) {
-    throw new FileReservationError('NOT_CONFIGURED');
-  }
-  if (row.expires_at.getTime() <= now.getTime()) {
-    throw new FileReservationError('INTENT_EXPIRED');
-  }
+  assertIntentLive(row, now);
   // The stored basis must still be the exact current GIVEN: a stale document or a
   // revoke followed by a new GIVEN must deny the read.
   assertCurrentBasis(row, basis);

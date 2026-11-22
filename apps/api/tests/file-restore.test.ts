@@ -104,7 +104,8 @@ live('P03-04D copy-only isolated restore', () => {
     expect(process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS']).toBe('1');
     expect(process.env['FIXLEVELUP_STORAGE_S3_TESTS']).toBe('1');
     const schemaVersion = authFixtureMigrations.at(-1) ?? '';
-    expect(authFixtureMigrations).toHaveLength(17);
+    expect(authFixtureMigrations).toHaveLength(18);
+    expect(schemaVersion).toBe('20261122000400_settings_management');
     const sourceDb = await startFileReservationsDatabase();
     const [ops, writer, nextWriter, signer, floorOps, floorRuntime] = [ledgerPool('file_ledger_operator'), ledgerPool('file_ledger_writer'),
       ledgerPool('file_ledger_writer_next'), ledgerPool('file_ledger_signer'), ledgerPool('file_floor_operator'), ledgerPool('file_floor_verifier')] as const;
@@ -165,6 +166,10 @@ live('P03-04D copy-only isolated restore', () => {
       const oldInventory = await readRestoreInventory(sourceDb.migrator, limits);
       const archives = newArchives(sourceDb.database, destination, AUTHORITY_TABLES.map(([table]) => table), limits.maxDumpBytes);
       expect((await verifier.verifyLineage(scope, base)).head).toEqual(base);
+      const sourceRowsSql = `SELECT assignment_id,permission_code,row_version,revoked_at,revoked_by
+        FROM foundation.p03_bootstrap_permissions ORDER BY assignment_id,permission_code COLLATE "C"`;
+      const originalFounderSources = (await sourceDb.migrator.query(sourceRowsSql)).rows;
+      expect(originalFounderSources).toHaveLength(18);
       const dumpHash = archives.dump();
       for (const item of oldInventory) {if (item.disposition === 'COPY') {archives.artifact(item, await io.exportSource(item, sig));}}
       const payload: SnapshotManifest = { sourceDatabase: sourceDb.database, destinationDatabase: destination, schemaVersion,
@@ -260,6 +265,13 @@ live('P03-04D copy-only isolated restore', () => {
       } }, manifest, sig), 'RESTORE_OBJECT');
       const receipt = await rescrubFileRestore(ctx, manifest, sig);
       expect(receipt).toMatchObject({ mode: 'ACTIVE', epoch: { namespace, epoch: 2n }, copied: 7, tombstoned: 3, unresolved: 0 });
+      // The physical dump/restore must carry 018, not just claim its name in the manifest.
+      // The synthetic founder was commissioned, but no management commands ran.
+      expect((await targetOps.query(sourceRowsSql)).rows).toEqual(originalFounderSources);
+      expect((await targetOps.query(`SELECT
+        (SELECT count(*)::int FROM foundation.p03_command_receipts) AS receipts,
+        to_regprocedure('foundation.issue_first_p03_permissions()') IS NOT NULL AS issuer`)).rows)
+        .toEqual([{ receipts: 0, issuer: true }]);
       await maintenance.query(`GRANT CONNECT ON DATABASE "${destination}" TO fixlevelup_runtime`);
       const runtime = new Pool(restoreDbOptions(destination, 'runtime'));
       pools.push(runtime);

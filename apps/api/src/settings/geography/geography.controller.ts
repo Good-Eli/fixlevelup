@@ -1,5 +1,6 @@
-import { BadRequestException, Controller, createParamDecorator, Get, HttpCode, Inject, Patch, Post, Put } from '@nestjs/common';
+import { BadRequestException, Controller, createParamDecorator, Get, HttpCode, Inject, InternalServerErrorException, Patch, Post, Put, StreamableFile } from '@nestjs/common';
 import type { ExecutionContext } from '@nestjs/common';
+import { P03_MAX_CURSOR_LENGTH, P03_RESPONSE_BYTES, P03_ROUTES } from '@fixlevelup/p03-contracts';
 import type { ServerResponse } from 'node:http';
 import { envelope, expectExactOrigin, header, requireMutation, sessionToken } from '../../auth/http.js';
 import type { StaffRequest } from '../../auth/http.js';
@@ -24,15 +25,20 @@ function routeTarget(params: Record<string,string>): GeoTarget {
   if (params['permissionCode'] !== undefined) { target.permissionCode = params['permissionCode']; }
   return target;
 }
-const listOps: ReadonlySet<GeoOperation> = new Set(['cityList','cityVersions','districtList','areaList','areaVersions']);
-function readOptions(op: GeoOperation, query: URLSearchParams): Record<string, number | boolean> | undefined {
+const listOps: ReadonlySet<GeoOperation> = new Set([
+  'cityList','cityVersions','districtList','areaList','areaVersions','adminList','techCities','techZones','techPicker',
+]);
+// The original five catalog lists accepted includeArchived; only districts/areas have archived rows.
+const archiveFilterOps: ReadonlySet<GeoOperation> = new Set(['cityList','cityVersions','districtList','areaList','areaVersions']);
+function readOptions(op: GeoOperation, query: URLSearchParams): Record<string, number | boolean | string> | undefined {
   if (!query.size) { return undefined; }
   if (!listOps.has(op)) { throw new BadRequestException(); }
-  const options: Record<string, number | boolean> = {};
+  const options: Record<string, number | boolean | string> = {};
   for (const [k,v] of query) {
     if (Object.hasOwn(options,k)) { throw new BadRequestException(); }
-    if (k === 'limit' && /^[1-9][0-9]{0,2}$/.test(v)) { options[k] = Number(v); }
-    else if (k === 'includeArchived' && (v === 'true' || v === 'false')) { options[k] = v === 'true'; }
+    if (k === 'limit' && v.length <= 3 && /^[1-9][0-9]{0,2}$/.test(v) && !v.endsWith('\n')) { options[k] = Number(v); }
+    else if (k === 'cursor' && v.length <= P03_MAX_CURSOR_LENGTH && /^[A-Za-z0-9_-]+$/.test(v) && !v.endsWith('\n')) { options[k] = v; }
+    else if (k === 'includeArchived' && archiveFilterOps.has(op) && (v === 'true' || v === 'false')) { options[k] = v === 'true'; }
     else { throw new BadRequestException(); }
   }
   return options;
@@ -74,11 +80,18 @@ export class GeographyController {
     if (write && search.size) { throw new BadRequestException(); }
     const input = write ? req.body : readOptions(op,search);
     const { data: result, replayed } = await this.runner.execute({kind:'staff-web',token},op,target,input,guards);
+    const response = envelope(result);
+    // Outside the locked callback: send the exact checked UTF-8 body, not a second serialization.
+    const serialized = listOps.has(op) || op === 'areaCoverageGet' ? JSON.stringify(response) : undefined;
+    const bytes = serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
+    if (bytes > P03_RESPONSE_BYTES.list) { throw new InternalServerErrorException(); }
     if (replayed) { res.statusCode = 200; }
     if (result !== null && typeof result === 'object' && 'version' in result && typeof result.version === 'number') {
       res.setHeader('ETag',`"geo-v${String(result.version)}"`);
     }
-    return envelope(result);
+    if (serialized === undefined) { return response; }
+    // Keep Nest in charge of the HTTP lifecycle (including HEAD) without re-encoding JSON.
+    return new StreamableFile(Buffer.from(serialized, 'utf8'), { type: 'application/json; charset=utf-8', length: bytes });
   }
 
   @Get(base) cities(@Http() h: RequestContext) { return this.handle('cityList',h); }
@@ -111,6 +124,7 @@ export class GeographyController {
   @Post('settings/geography/bootstrap/:staffId/:permissionCode/revoke') @HttpCode(200)
   revokeBootstrap(@Http() h: RequestContext) { return this.handle('revokeBootstrap',h); }
 
+  @Get(P03_ROUTES.technicianPicker) technicianPicker(@Http() h: RequestContext) { return this.handle('techPicker',h); }
   @Get(admins) admins(@Http() h: RequestContext) { return this.handle('adminList',h); }
   @Post(admins) assignAdmin(@Http() h: RequestContext) { return this.handle('adminAssign',h); }
   @Post(`${admins}/:grantId/revoke`) @HttpCode(200) revokeAdmin(@Http() h: RequestContext) { return this.handle('adminRevoke',h); }

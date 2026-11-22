@@ -1,17 +1,18 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import {
-  GEO_SCOPE_CONTRACT, isCapability, isGeoCapability, isPermissionCode, PERMISSION_CONTRACT,
-  PERMISSION_CODES, PROTECTED_CAPABILITIES,
+  GEO_SCOPE_CONTRACT, isCapability, isGeoCapability, isP03Capability, isPermissionCode, P03_CAPABILITY_METADATA,
+  PERMISSION_CONTRACT, PERMISSION_CODES, PROTECTED_CAPABILITIES,
 } from '../authz/capability.js';
 import type { GeoCapability, GrantScope, PermissionCode } from '../authz/capability.js';
 import { isSystemAdmin } from '../authz/authorization.service.js';
 import type { AccessView, EffectiveRole } from '../authz/authorization.service.js';
+import { holdsGlobalP03, p03GrantableScopes } from '../authz/p03-grants.js';
 
 export interface RoleGrant { code: PermissionCode; scope: GrantScope }
 export interface PermissionDto extends RoleGrant {
   description: string; module: string; protected: boolean;
   /** Every scope this code may legally carry. `scope` above is kept for existing clients
-   * and always equals the first entry: a fixed staff scope or CITY for geography. */
+   * and always equals the first contract entry. */
   scopes: readonly GrantScope[];
 }
 export interface MetadataPatch { name?: string; description?: string }
@@ -50,6 +51,7 @@ export function emptyBody(body: unknown): void { fields(body, []); }
  * role at all (migration 012 enforces the same rule in the database). */
 export function grantableScopes(code: PermissionCode, target: Pick<EffectiveRole, 'type' | 'code'>): readonly GrantScope[] {
   if (isCapability(code)) { return [PERMISSION_CONTRACT[code]]; }
+  if (isP03Capability(code)) { return p03GrantableScopes(code, target); }
   if (target.type === 'SYSTEM' && target.code === 'TECHNICIAN') { return []; }
   const admin = isSystemAdmin({ id: '', type: target.type, code: target.code });
   if (code === 'geography.publish' && !admin) { return []; }
@@ -83,6 +85,12 @@ export function catalogEntry(row: { code: string; description: string; module: s
     const scope = PERMISSION_CONTRACT[row.code];
     return { code: row.code, module: row.module, description: row.description, protected: row.protected, scope, scopes: [scope] };
   }
+  if (isP03Capability(row.code)) {
+    const meta = P03_CAPABILITY_METADATA[row.code];
+    const [scope] = meta.scopes;
+    if (row.protected || row.module !== meta.module || scope === undefined) { return null; }
+    return { ...row, code: row.code, scope, scopes: meta.scopes };
+  }
   if (!isGeoCapability(row.code) || row.protected) { return null; }
   const scopes = GEO_SCOPE_CONTRACT[row.code];
   return { code: row.code, module: row.module, description: row.description, protected: false, scope: 'CITY', scopes };
@@ -110,8 +118,9 @@ export function checkReplacement(actor: AccessView, target: EffectiveRole, catal
       if ((item.protected && !targetAdmin) || (!actor.permissions.includes(grant.code) && !mayRetain)) { throw new ForbiddenException(); }
       continue;
     }
-    // Geography: an administrator may hand out only codes it holds at GLOBAL, and a
-    // non-administrator target can never receive GLOBAL or publish.
-    if (!holdsGlobalGeo(actor, grant.code) && !mayRetain) { throw new ForbiddenException(); }
+    // Domain grants are delegable only when the actor independently owns that exact
+    // code at GLOBAL (or retains the exact visible grant on another role).
+    const holdsGlobal = isP03Capability(grant.code) ? holdsGlobalP03(actor, grant.code) : holdsGlobalGeo(actor, grant.code);
+    if (!holdsGlobal && !mayRetain) { throw new ForbiddenException(); }
   }
 }

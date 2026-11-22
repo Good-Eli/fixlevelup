@@ -2,17 +2,19 @@ import { describe, expect, it } from 'vitest';
 import type { Capability, GeoCapability, Scope } from '../src/authz/capability.js';
 import {
   GEO_CAPABILITIES, GEO_SCOPE_CONTRACT, GLOBAL_SCOPE, isCapability, isGeoCapability, isPermissionCode,
-  PERMISSION_CONTRACT, PERMISSION_CODES, PROTECTED_CAPABILITIES, scopeMatches, STAFF_CAPABILITIES, staffScope,
+  P03_CAPABILITIES, PERMISSION_CONTRACT, PERMISSION_CODES, PROTECTED_CAPABILITIES, scopeMatches, STAFF_CAPABILITIES, staffScope,
 } from '../src/authz/capability.js';
 import { AuthorizationError, AuthorizationService, isSystemAdmin } from '../src/authz/authorization.service.js';
 import type { SessionProof } from '../src/authz/authorization.service.js';
 
 describe('server permission contracts are not grants', () => {
-  it('keeps the thirteen staff operations and adds exactly five geography codes', () => {
+  it('keeps thirteen staff, five geography and eighteen independent P03 codes', () => {
     expect(new Set(STAFF_CAPABILITIES).size).toBe(13);
     expect(GEO_CAPABILITIES).toEqual(['geography.read', 'geography.manage', 'geography.publish',
       'staff.geography.read', 'staff.geography.manage']);
-    expect(PERMISSION_CODES).toHaveLength(18);
+    expect(P03_CAPABILITIES).toHaveLength(18);
+    expect(new Set(PERMISSION_CODES).size).toBe(36);
+    expect(P03_CAPABILITIES.every((code) => !isCapability(code) && !isGeoCapability(code))).toBe(true);
     for (const input of [null, [], {}, 'staff.manage', 'jobs.create', '__proto__', 'constructor', 'roles.READ',
       'geography', 'geography.write', 'geography.self.read', 'geography.admin.assign', 'geography.bootstrap.revoke']) {
       expect(isPermissionCode(input)).toBe(false);
@@ -57,7 +59,8 @@ function pool(responses: Response[]) {
       if (sql.startsWith('BEGIN') || sql === 'COMMIT' || sql === 'ROLLBACK' || sql.includes('pg_advisory_xact_lock')) {
         return Promise.resolve({ rowCount: 0, rows: [] });
       }
-      const response = responses.find(candidate => sql.includes(candidate.contains));
+      const response: Response | undefined = responses.find(candidate => sql.includes(candidate.contains))
+        ?? (sql.includes('foundation.p03_bootstrap_permissions') ? { contains: 'foundation.p03_bootstrap_permissions', rows: [] } : undefined);
       if (!response) { throw new Error(`Unexpected query: ${sql}`); }
       statements.push(params ? { sql, params } : { sql });
       const rows = response.rows ?? [];
@@ -92,6 +95,7 @@ function webIdentity(role: 'ADMIN' | 'MANAGER') {
     { contains: 'FROM foundation.web_sessions WHERE token_hash=$1 AND channel=$2', rows: [{ staff_id: staffId, telegram_link_id: null }] },
     { contains: 'FROM foundation.staff WHERE id=$1', rows: [{ id: staffId, role, auth_version: 0 }] },
     { contains: 'SELECT id FROM foundation.web_sessions', rows: [{ id: 'session' }] },
+    freshClock,
   ];
 }
 function telegramIdentity() {
@@ -100,8 +104,10 @@ function telegramIdentity() {
     { contains: 'FROM foundation.staff WHERE id=$1', rows: [{ id: staffId, role: 'TECHNICIAN', auth_version: 0 }] },
     { contains: 'FROM foundation.staff_telegram_links', rows: [{ telegram_user_id: '7000000001' }] },
     { contains: 'SELECT id FROM foundation.web_sessions', rows: [{ id: 'session' }] },
+    freshClock,
   ];
 }
+const freshClock = { contains: 'FROM foundation.web_sessions ws', rowCount: 1 };
 const bootstrapEmpty = { contains: 'geography_bootstrap_permissions', rows: [] };
 const cityScopeRows = (...ids: string[]) => ({ contains: 'staff_admin_city_assignments', rows: ids.map(city_id => ({ city_id })) });
 

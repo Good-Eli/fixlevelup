@@ -82,7 +82,8 @@ test('independent create-only access never loads staff, self or role catalogs', 
   await page.getByLabel('Имя (необязательно)').fill('Тест'); const create = page.getByRole('button',{name:'Создать сотрудника'}); await create.click();
   await expect.poll(() => writes).toBe(1); await expect(create).toBeDisabled(); await expect(page.getByText('Профиль сотрудника создан.')).toHaveCount(0);
   complete(); await expect(page.getByText(`Профиль сотрудника создан. ID: ${target}. Версия: 0.`)).toBeVisible(); expect(writes).toBe(1);
-  expect(backend.calls).toEqual(['GET auth/me','GET access','GET auth/me','GET access']);
+  // A confirmed write checks identity again after reloading access before exposing its receipt.
+  expect(backend.calls).toEqual(['GET auth/me','GET access','GET auth/me','GET access','GET auth/me']);
 });
 for (const afterWrite of ['different actor','unavailable identity'] as const) {
   test(`confirmed creation stays private after ${afterWrite}`, async ({page}) => {

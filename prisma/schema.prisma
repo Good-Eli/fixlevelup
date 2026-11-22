@@ -56,6 +56,8 @@ model Staff {
   approvedZoneAdmissions  TechnicianServiceArea[]   @relation("TechnicianZoneApprover")
   revokedZoneAdmissions   TechnicianServiceArea[]   @relation("TechnicianZoneRevoker")
   geographyReceipts       GeographyCommandReceipt[] @relation("GeographyReceiptActor")
+  p03Receipts             P03CommandReceipt[]       @relation("P03ReceiptActor")
+  revokedP03BootstrapGrants P03BootstrapPermission[] @relation("P03BootstrapRevoker")
   reviewedReferenceEntryVersions  ReferenceEntryVersion[] @relation("ReferenceEntryVersionReviewer")
   reviewedContentBlockRevisions   ContentBlockRevision[]  @relation("ContentBlockRevisionReviewer")
   reviewedLegalDocumentVersions   LegalDocumentVersion[]  @relation("LegalDocumentVersionReviewer")
@@ -92,6 +94,7 @@ model Permission {
   active      Boolean          @default(true)
   grants      RolePermission[]
   bootstrapGrants GeographyBootstrapPermission[]
+  p03BootstrapGrants P03BootstrapPermission[]
 
   @@map("permissions")
   @@schema("foundation")
@@ -145,6 +148,7 @@ model StaffRoleAssignment {
   assigner   Staff?    @relation("RoleAssignedBy", fields: [assignedBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
   revoker    Staff?    @relation("RoleRevokedBy", fields: [revokedBy], references: [id], onUpdate: Restrict, onDelete: Restrict)
   bootstrapGrants GeographyBootstrapPermission[]
+  p03BootstrapGrants P03BootstrapPermission[]
 
   @@index([roleId, staffId], map: "staff_role_assignments_role_staff_idx")
   @@map("staff_role_assignments")
@@ -554,6 +558,44 @@ model GeographyCommandReceipt {
 
   @@id([actorId, operation, key])
   @@map("geography_command_receipts")
+  @@schema("foundation")
+}
+
+// P03-05 (018): a personal GLOBAL source, never a role grant. SQL guards pin the
+// original bootstrap assignment, the closed code set and the one-way 1 -> 2
+// revocation; the database stamps revokedAt and increments rowVersion.
+model P03BootstrapPermission {
+  assignmentId   String              @map("assignment_id") @db.Uuid
+  permissionCode String              @map("permission_code") @db.VarChar(64)
+  rowVersion     Int                 @default(1) @map("row_version")
+  revokedAt      DateTime?           @map("revoked_at") @db.Timestamptz(6)
+  revokedBy      String?             @map("revoked_by") @db.Uuid
+  assignment     StaffRoleAssignment @relation(fields: [assignmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  permission     Permission          @relation(fields: [permissionCode], references: [code], onDelete: Restrict, onUpdate: Restrict)
+  revoker        Staff?              @relation("P03BootstrapRevoker", fields: [revokedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([assignmentId, permissionCode])
+  @@map("p03_bootstrap_permissions")
+  @@schema("foundation")
+}
+
+// Immutable idempotency evidence, not a wire DTO. Entity and revision identity
+// are operation-specific; only actorId has a single concrete FK target. SQL owns
+// the closed operation and paired revision constraints and all write privileges.
+model P03CommandReceipt {
+  actorId         String   @map("actor_id") @db.Uuid
+  operation       String   @db.VarChar(64)
+  key             String   @db.Uuid
+  requestSha256   String   @map("request_sha256") @db.VarChar(64)
+  entityId        String   @map("entity_id") @db.Uuid
+  entityVersion   Int      @map("entity_version")
+  revisionId      String?  @map("revision_id") @db.Uuid
+  revisionVersion Int?     @map("revision_version")
+  createdAt       DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  actor           Staff    @relation("P03ReceiptActor", fields: [actorId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([actorId, operation, key])
+  @@map("p03_command_receipts")
   @@schema("foundation")
 }
 

@@ -8,6 +8,7 @@
 !apps/web/package.json
 !packages/browser-tooling/package.json
 !packages/database-tooling/package.json
+!packages/p03-contracts/package.json
 !packages/storage-tooling/package.json
 !packages/tooling/package.json
 !apps/api/src/files/file-processing/decoder-entry.ts

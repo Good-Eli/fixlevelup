@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "corepack pnpm --filter @fixlevelup/p03-contracts run build && tsc --noEmit",
+    "build": "corepack pnpm --filter @fixlevelup/p03-contracts run build && tsc -p tsconfig.build.json",
     "start": "node dist/bootstrap/api.js",
     "start:worker": "node dist/bootstrap/worker.js",
     "staff:bootstrap": "node dist/bootstrap/staff-bootstrap.js",
@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1172.0",
+    "@fixlevelup/p03-contracts": "workspace:*",
     "@nestjs/common": "12.5.1",
     "@nestjs/core": "12.5.1",
     "@nestjs/platform-express": "12.5.1",
