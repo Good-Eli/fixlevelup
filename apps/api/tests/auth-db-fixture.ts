@@ -21,6 +21,7 @@ const expectedSteps = [
   '20261122000300_file_privacy_deletion',
   '20261122000400_settings_management',
   '20261122000500_catalog_fixed_prices',
+  '20261122000600_pricing_rules_ranges',
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })

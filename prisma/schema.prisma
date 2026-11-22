@@ -66,6 +66,9 @@ model Staff {
   reviewedCatalogItemVersions      CatalogItemVersion[]      @relation("CatalogItemReviewer")
   publishedCatalogMappings         CatalogFaultServiceMapping[] @relation("CatalogMappingPublisher")
   reviewedCatalogPriceVersions     CatalogPriceVersion[]     @relation("CatalogPriceReviewer")
+  reviewedPriceRuleVersions        PriceRuleVersion[]         @relation("PriceRuleReviewer")
+  reviewedPricingPolicyVersions   PricingPolicyVersion[]    @relation("PricingPolicyReviewer")
+  reviewedPublicPriceEstimates    PublicPriceEstimate[]     @relation("PublicPriceEstimateReviewer")
 
   @@map("staff")
   @@schema("foundation")
@@ -288,6 +291,9 @@ model ServiceCity {
   contentBlocks    ContentBlock[] @relation("ContentBlockCity")
   requestSessions  RequestSession[] @relation("RequestSessionCity")
   catalogPriceSeries CatalogPriceSeries[]
+  priceRuleSeries PriceRuleSeries[]
+  pricingPolicySeries PricingPolicySeries?
+  publicPriceEstimateSeries PublicPriceEstimateSeries[]
 
   @@map("service_cities")
   @@schema("foundation")
@@ -315,6 +321,9 @@ model ServiceCityVersion {
   referenceEntryVersions ReferenceEntryVersion[] @relation("ReferenceEntryVersionCityVersion")
   requestSessions RequestSession[] @relation("RequestSessionCityVersion")
   catalogPriceVersions CatalogPriceVersion[] @relation("CatalogPriceCityVersion")
+  priceRuleVersions PriceRuleVersion[] @relation("PriceRuleCityVersion")
+  pricingPolicyVersions PricingPolicyVersion[] @relation("PricingPolicyCityVersion")
+  publicPriceEstimates PublicPriceEstimate[] @relation("PublicPriceEstimateCityVersion")
 
   @@unique([cityId, version], map: "service_city_versions_city_version_key")
   @@unique([cityId, id], map: "service_city_versions_city_id_key")
@@ -1081,6 +1090,8 @@ model CatalogDirectoryEntry {
   versions         CatalogDirectoryVersion[] @relation("CatalogDirectoryVersions")
   items            CatalogItem[] @relation("CatalogItemCategory")
   faultMappings    CatalogFaultServiceMapping[] @relation("CatalogMappingFault")
+  priceRuleScopes  PriceRuleScope[] @relation("PriceRuleScopeCategory")
+  publicPriceEstimateSeries PublicPriceEstimateSeries[] @relation("PublicPriceEstimateCategory")
 
   @@unique([kind, code], map: "catalog_directory_entries_kind_code_key")
   @@unique([id, kind], map: "catalog_directory_entries_id_kind_key")
@@ -1234,5 +1245,253 @@ model CatalogPricePeriod {
   requiredBy           CatalogPriceVersion? @relation("CatalogPriceRequiredPeriod")
 
   @@map("catalog_price_periods")
+  @@schema("foundation")
+}
+
+// P04-02: immutable pricing definitions, per-city schedules and internal ranges.
+// CHECKs, exact child counts, trigger guards and ACL are enforced by SQL 020.
+model PriceRule {
+  id           String    @id @db.Uuid
+  code         String    @unique(map: "price_rules_code_key") @db.VarChar(64)
+  kind         String    @db.VarChar(16)
+  rowVersion   Int       @default(1) @map("row_version")
+  archivedAt   DateTime? @map("archived_at") @db.Timestamptz(6)
+  series       PriceRuleSeries[]
+  versions     PriceRuleVersion[] @relation("PriceRuleKind")
+  priorities   PriceRulePriority[]
+  leftInPairs  PriceRuleCompatibility[] @relation("PriceRuleCompatibilityLeft")
+  rightInPairs PriceRuleCompatibility[] @relation("PriceRuleCompatibilityRight")
+
+  @@unique([id, kind], map: "price_rules_id_kind_key")
+  @@map("price_rules")
+  @@schema("foundation")
+}
+
+model PriceRuleSeries {
+  id         String @id @db.Uuid
+  cityId     String @map("city_id") @db.Uuid
+  ruleId     String @map("rule_id") @db.Uuid
+  rowVersion Int    @default(1) @map("row_version")
+  city       ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_series_city_fkey")
+  rule       PriceRule @relation(fields: [ruleId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_series_rule_fkey")
+  versions   PriceRuleVersion[]
+
+  @@unique([cityId, ruleId], map: "price_rule_series_city_rule_key")
+  @@unique([id, cityId, ruleId], map: "price_rule_series_identity_key")
+  @@map("price_rule_series")
+  @@schema("foundation")
+}
+
+model PriceRuleVersion {
+  id            String    @id @db.Uuid
+  seriesId      String    @map("series_id") @db.Uuid
+  cityId        String    @map("city_id") @db.Uuid
+  cityVersionId String    @map("city_version_id") @db.Uuid
+  version       Int
+  sourceRef     String    @map("source_ref")
+  reviewedBy    String    @map("reviewed_by") @db.Uuid
+  publishedAt   DateTime  @default(dbgenerated("clock_timestamp()")) @map("published_at") @db.Timestamptz(6)
+  validFrom     DateTime  @map("valid_from") @db.Timestamptz(6)
+  validUntil    DateTime? @map("valid_until") @db.Timestamptz(6)
+  ruleId        String    @map("rule_id") @db.Uuid
+  kind          String    @db.VarChar(16)
+  title         String
+  method        String    @db.VarChar(16)
+  base          String    @db.VarChar(16)
+  currency      String    @db.VarChar(3)
+  fixedMinor    BigInt?   @map("fixed_minor")
+  rateBps       Int?      @map("rate_bps")
+  minBase       BigInt?   @map("min_base")
+  maxBase       BigInt?   @map("max_base")
+  minDelta      BigInt?   @map("min_delta")
+  maxDelta      BigInt?   @map("max_delta")
+  startMinute   Int?      @map("start_minute")
+  endMinute     Int?      @map("end_minute")
+  wrapsMidnight Boolean?  @map("wraps_midnight")
+  scopeCount    Int       @map("scope_count")
+  series        PriceRuleSeries @relation(fields: [seriesId, cityId, ruleId], references: [id, cityId, ruleId], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_versions_series_fkey")
+  rule          PriceRule @relation("PriceRuleKind", fields: [ruleId, kind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_versions_rule_fkey")
+  cityVersion   ServiceCityVersion @relation("PriceRuleCityVersion", fields: [cityId, cityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_versions_city_version_fkey")
+  reviewer      Staff @relation("PriceRuleReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_versions_reviewer_fkey")
+  scopes        PriceRuleScope[]
+  requiredPeriod PriceRulePeriod @relation("PriceRuleRequiredPeriod", fields: [id], references: [versionId], onDelete: NoAction, onUpdate: NoAction, map: "price_rule_versions_period_fkey")
+  periodIdentity PriceRulePeriod[] @relation("PriceRulePeriodIdentity")
+
+  @@unique([seriesId, version], map: "price_rule_versions_series_version_key")
+  @@unique([id, seriesId, cityId], map: "price_rule_versions_identity_key")
+  @@map("price_rule_versions")
+  @@schema("foundation")
+}
+
+model PriceRuleScope {
+  ruleVersionId String @map("rule_version_id") @db.Uuid
+  categoryId    String @map("category_id") @db.Uuid
+  categoryKind  String @default("CATEGORY") @map("category_kind") @db.VarChar(16)
+  ruleVersion   PriceRuleVersion @relation(fields: [ruleVersionId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_scopes_version_fkey")
+  category      CatalogDirectoryEntry @relation("PriceRuleScopeCategory", fields: [categoryId, categoryKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_scopes_category_fkey")
+
+  @@id([ruleVersionId, categoryId])
+  @@map("price_rule_scopes")
+  @@schema("foundation")
+}
+
+model PricingPolicySeries {
+  id         String @id @db.Uuid
+  cityId     String @unique(map: "pricing_policy_series_city_key") @map("city_id") @db.Uuid
+  rowVersion Int    @default(1) @map("row_version")
+  city       ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "pricing_policy_series_city_fkey")
+  versions   PricingPolicyVersion[]
+
+  @@unique([id, cityId], map: "pricing_policy_series_identity_key")
+  @@map("pricing_policy_series")
+  @@schema("foundation")
+}
+
+model PricingPolicyVersion {
+  id                  String    @id @db.Uuid
+  seriesId            String    @map("series_id") @db.Uuid
+  cityId              String    @map("city_id") @db.Uuid
+  cityVersionId       String    @map("city_version_id") @db.Uuid
+  version             Int
+  sourceRef           String    @map("source_ref")
+  reviewedBy          String    @map("reviewed_by") @db.Uuid
+  publishedAt         DateTime  @default(dbgenerated("clock_timestamp()")) @map("published_at") @db.Timestamptz(6)
+  validFrom           DateTime  @map("valid_from") @db.Timestamptz(6)
+  validUntil          DateTime? @map("valid_until") @db.Timestamptz(6)
+  currency            String    @db.VarChar(3)
+  taxDisplay          String    @map("tax_display")
+  roundingMode        String    @map("rounding_mode") @db.VarChar(16)
+  units               Json      @db.JsonB
+  maxManualDeltaMinor BigInt    @map("max_manual_delta_minor")
+  priorityCount       Int       @map("priority_count")
+  compatibilityCount  Int       @map("compatibility_count")
+  series              PricingPolicySeries @relation(fields: [seriesId, cityId], references: [id, cityId], onDelete: Restrict, onUpdate: Restrict, map: "pricing_policy_versions_series_fkey")
+  cityVersion         ServiceCityVersion @relation("PricingPolicyCityVersion", fields: [cityId, cityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict, map: "pricing_policy_versions_city_version_fkey")
+  reviewer            Staff @relation("PricingPolicyReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "pricing_policy_versions_reviewer_fkey")
+  priorities          PriceRulePriority[]
+  compatibilities     PriceRuleCompatibility[]
+  requiredPeriod      PricingPolicyPeriod @relation("PricingPolicyRequiredPeriod", fields: [id], references: [versionId], onDelete: NoAction, onUpdate: NoAction, map: "pricing_policy_versions_period_fkey")
+  periodIdentity      PricingPolicyPeriod[] @relation("PricingPolicyPeriodIdentity")
+
+  @@unique([seriesId, version], map: "pricing_policy_versions_series_version_key")
+  @@unique([id, seriesId, cityId], map: "pricing_policy_versions_identity_key")
+  @@map("pricing_policy_versions")
+  @@schema("foundation")
+}
+
+model PriceRulePriority {
+  policyVersionId String @map("policy_version_id") @db.Uuid
+  ruleId          String @map("rule_id") @db.Uuid
+  priority        Int
+  policyVersion   PricingPolicyVersion @relation(fields: [policyVersionId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_priorities_version_fkey")
+  rule            PriceRule @relation(fields: [ruleId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_priorities_rule_fkey")
+
+  @@id([policyVersionId, ruleId])
+  @@map("price_rule_priorities")
+  @@schema("foundation")
+}
+
+model PriceRuleCompatibility {
+  policyVersionId String @map("policy_version_id") @db.Uuid
+  leftRuleId      String @map("left_rule_id") @db.Uuid
+  rightRuleId     String @map("right_rule_id") @db.Uuid
+  policyVersion   PricingPolicyVersion @relation(fields: [policyVersionId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_compatibilities_version_fkey")
+  leftRule        PriceRule @relation("PriceRuleCompatibilityLeft", fields: [leftRuleId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_compatibilities_left_rule_fkey")
+  rightRule       PriceRule @relation("PriceRuleCompatibilityRight", fields: [rightRuleId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_compatibilities_right_rule_fkey")
+
+  @@id([policyVersionId, leftRuleId, rightRuleId])
+  @@map("price_rule_compatibilities")
+  @@schema("foundation")
+}
+
+model PublicPriceEstimateSeries {
+  id           String    @id @db.Uuid
+  cityId       String    @map("city_id") @db.Uuid
+  categoryId   String    @map("category_id") @db.Uuid
+  categoryKind String    @default("CATEGORY") @map("category_kind") @db.VarChar(16)
+  code         String    @db.VarChar(64)
+  rowVersion   Int       @default(1) @map("row_version")
+  archivedAt   DateTime? @map("archived_at") @db.Timestamptz(6)
+  city         ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "public_price_estimate_series_city_fkey")
+  category     CatalogDirectoryEntry @relation("PublicPriceEstimateCategory", fields: [categoryId, categoryKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "public_price_estimate_series_category_fkey")
+  versions     PublicPriceEstimate[]
+
+  @@unique([cityId, categoryId, code], map: "public_price_estimate_series_city_category_code_key")
+  @@unique([id, cityId], map: "public_price_estimate_series_identity_key")
+  @@map("public_price_estimate_series")
+  @@schema("foundation")
+}
+
+model PublicPriceEstimate {
+  id            String    @id @db.Uuid
+  seriesId      String    @map("series_id") @db.Uuid
+  cityId        String    @map("city_id") @db.Uuid
+  cityVersionId String    @map("city_version_id") @db.Uuid
+  version       Int
+  sourceRef     String    @map("source_ref")
+  reviewedBy    String    @map("reviewed_by") @db.Uuid
+  publishedAt   DateTime  @default(dbgenerated("clock_timestamp()")) @map("published_at") @db.Timestamptz(6)
+  validFrom     DateTime  @map("valid_from") @db.Timestamptz(6)
+  validUntil    DateTime? @map("valid_until") @db.Timestamptz(6)
+  title         String
+  currency      String    @db.VarChar(3)
+  minMinor      BigInt    @map("min_minor")
+  maxMinor      BigInt    @map("max_minor")
+  conditions    String?
+  disclaimer    String
+  series        PublicPriceEstimateSeries @relation(fields: [seriesId, cityId], references: [id, cityId], onDelete: Restrict, onUpdate: Restrict, map: "public_price_estimates_series_fkey")
+  cityVersion   ServiceCityVersion @relation("PublicPriceEstimateCityVersion", fields: [cityId, cityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict, map: "public_price_estimates_city_version_fkey")
+  reviewer      Staff @relation("PublicPriceEstimateReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "public_price_estimates_reviewer_fkey")
+  requiredPeriod PublicPriceEstimatePeriod @relation("PublicPriceEstimateRequiredPeriod", fields: [id], references: [versionId], onDelete: NoAction, onUpdate: NoAction, map: "public_price_estimates_period_fkey")
+  periodIdentity PublicPriceEstimatePeriod[] @relation("PublicPriceEstimatePeriodIdentity")
+
+  @@unique([seriesId, version], map: "public_price_estimates_series_version_key")
+  @@unique([id, seriesId, cityId], map: "public_price_estimates_identity_key")
+  @@map("public_price_estimates")
+  @@schema("foundation")
+}
+
+// SQL enforces exact 1:1 pairing (including the reverse deferred FK),
+// finite millisecond boundaries, exclusion and one terminal closure.
+// Composite inverses are lists because only the versionId subset is the PK.
+model PriceRulePeriod {
+  versionId            String    @id @map("version_id") @db.Uuid
+  seriesId             String    @map("series_id") @db.Uuid
+  cityId               String    @map("city_id") @db.Uuid
+  validFrom            DateTime  @map("valid_from") @db.Timestamptz(6)
+  scheduledUntil       DateTime? @map("scheduled_until") @db.Timestamptz(6)
+  closedEffectiveUntil DateTime? @map("closed_effective_until") @db.Timestamptz(6)
+  version              PriceRuleVersion @relation("PriceRulePeriodIdentity", fields: [versionId, seriesId, cityId], references: [id, seriesId, cityId], onDelete: Restrict, onUpdate: Restrict, map: "price_rule_periods_version_fkey")
+  requiredBy           PriceRuleVersion? @relation("PriceRuleRequiredPeriod")
+
+  @@map("price_rule_periods")
+  @@schema("foundation")
+}
+
+model PricingPolicyPeriod {
+  versionId            String    @id @map("version_id") @db.Uuid
+  seriesId             String    @map("series_id") @db.Uuid
+  cityId               String    @map("city_id") @db.Uuid
+  validFrom            DateTime  @map("valid_from") @db.Timestamptz(6)
+  scheduledUntil       DateTime? @map("scheduled_until") @db.Timestamptz(6)
+  closedEffectiveUntil DateTime? @map("closed_effective_until") @db.Timestamptz(6)
+  version              PricingPolicyVersion @relation("PricingPolicyPeriodIdentity", fields: [versionId, seriesId, cityId], references: [id, seriesId, cityId], onDelete: Restrict, onUpdate: Restrict, map: "pricing_policy_periods_version_fkey")
+  requiredBy           PricingPolicyVersion? @relation("PricingPolicyRequiredPeriod")
+
+  @@map("pricing_policy_periods")
+  @@schema("foundation")
+}
+
+model PublicPriceEstimatePeriod {
+  versionId            String    @id @map("version_id") @db.Uuid
+  seriesId             String    @map("series_id") @db.Uuid
+  cityId               String    @map("city_id") @db.Uuid
+  validFrom            DateTime  @map("valid_from") @db.Timestamptz(6)
+  scheduledUntil       DateTime? @map("scheduled_until") @db.Timestamptz(6)
+  closedEffectiveUntil DateTime? @map("closed_effective_until") @db.Timestamptz(6)
+  version              PublicPriceEstimate @relation("PublicPriceEstimatePeriodIdentity", fields: [versionId, seriesId, cityId], references: [id, seriesId, cityId], onDelete: Restrict, onUpdate: Restrict, map: "public_price_estimate_periods_version_fkey")
+  requiredBy           PublicPriceEstimate? @relation("PublicPriceEstimateRequiredPeriod")
+
+  @@map("public_price_estimate_periods")
   @@schema("foundation")
 }

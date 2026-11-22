@@ -29,18 +29,18 @@ const rows = async (db, sql, params) => (await db.query(sql, params)).rows;
 const one = async (db, sql, params) => (await rows(db, sql, params))[0];
 const not = (sql, code, constraint) => assert.rejects(sql, { code, ...(constraint ? { constraint } : {}) });
 const quote = s => `"${s.replaceAll('"', '""')}"`;
-const history = db => rows(db, 'SELECT * FROM foundation._prisma_migrations ORDER BY migration_name COLLATE "C"');
+export const migrationHistory = db => rows(db, 'SELECT * FROM foundation._prisma_migrations ORDER BY migration_name COLLATE "C"');
 const identity = async (db, role, kind) => {
   const context = await one(db, 'SELECT current_database() AS db, current_user AS role');
   assert.equal(context.role, role);
   assert.match(context.db, new RegExp(`^fixlevelup_p017a_${kind}_[a-f0-9]{12}$`));
 };
-async function baseTables(db) {
+export async function baseTables(db) {
   return (await rows(db, `SELECT c.relname AS name FROM pg_class c
     WHERE c.relnamespace='foundation'::regnamespace AND c.relkind='r' AND c.relname<>'_prisma_migrations'
     ORDER BY c.relname COLLATE "C"`)).map(row => row.name);
 }
-async function snapshot(db, previous) {
+export async function snapshot(db, previous) {
   const data = [];
   for (const table of previous) {
     data.push(await rows(db, `SELECT to_jsonb(r)::text AS value FROM foundation.${quote(table)} r ORDER BY (to_jsonb(r)::text) COLLATE "C"`));
@@ -50,7 +50,7 @@ async function snapshot(db, previous) {
       FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns,
     (SELECT jsonb_agg(jsonb_build_array(k.conname,k.convalidated,pg_get_constraintdef(k.oid)) ORDER BY k.conname)
       FROM pg_constraint k WHERE k.conrelid=c.oid) AS constraints,
-    (SELECT jsonb_agg(jsonb_build_array(g.tgname,g.tgenabled,pg_get_triggerdef(g.oid)) ORDER BY g.tgname)
+    (SELECT jsonb_agg(jsonb_build_array(g.tgname,g.tgenabled,pg_get_triggerdef(g.oid), md5(pg_get_functiondef(g.tgfoid))) ORDER BY g.tgname)
       FROM pg_trigger g WHERE g.tgrelid=c.oid AND NOT g.tgisinternal) AS triggers
     FROM pg_class c WHERE c.relnamespace='foundation'::regnamespace AND c.relname=ANY($1::text[])
     ORDER BY c.relname COLLATE "C"`, [previous]);
@@ -61,7 +61,7 @@ async function snapshot(db, previous) {
 
 export async function proveCatalogMigrationUpgrade(db, migration, previousCount, deploy) {
   await identity(db, 'fixlevelup_migrator', 'upgrade');
-  const oldHistory = await history(db), previous = await baseTables(db);
+  const oldHistory = await migrationHistory(db), previous = await baseTables(db);
   assert.equal(oldHistory.length, previousCount);
   assert.ok(previous.includes('p03_command_receipts') && previous.includes('p03_bootstrap_permissions'));
   const old = await snapshot(db, previous);
@@ -69,7 +69,7 @@ export async function proveCatalogMigrationUpgrade(db, migration, previousCount,
     assert.ok(old.data[previous.indexOf(name)]?.length, `Missing populated 018 proof table: ${name}`);
   }
   deploy();
-  const applied = await history(db), expected = [...previous, ...Object.keys(tables)].sort();
+  const applied = await migrationHistory(db), expected = [...previous, ...Object.keys(tables)].sort();
   assert.equal(applied.length, previousCount + 1);
   assert.deepEqual(applied.slice(0, previousCount), oldHistory);
   assert.equal(applied.at(-1)?.migration_name, migration);
@@ -80,14 +80,14 @@ export async function proveCatalogMigrationUpgrade(db, migration, previousCount,
     assert.equal((await db.query(`SELECT FROM foundation.${name} LIMIT 1`)).rowCount, 0, `Unexpected data seed: ${name}`);
   }
   deploy();
-  assert.deepEqual(await history(db), applied);
+  assert.deepEqual(await migrationHistory(db), applied);
   assert.deepEqual(await snapshot(db, previous), old);
   assert.deepEqual(await baseTables(db), expected);
   console.log('019 populated 018 upgrade: exact old data/catalog/ACL and migration stamps, no seed, replay unchanged: PASS');
 }
 
-export async function proveCatalogMigrationAcl(db) {
-  await identity(db, 'fixlevelup_runtime', 'fresh');
+export async function proveCatalogMigrationAcl(db, kind = 'fresh') {
+  await identity(db, 'fixlevelup_runtime', kind);
   for (const [table, [inserts, updates]] of Object.entries(tables)) {
     const name = `foundation.${table}`;
     const acl = await rows(db, `SELECT a.attname,
@@ -121,7 +121,8 @@ export async function proveCatalogMigrationAcl(db) {
   })));
   const fences = await rows(db, `SELECT c.relname AS name,t.tgtype::int AS type,t.tgenabled AS enabled
     FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_proc p ON p.oid=t.tgfoid
-    WHERE c.relnamespace='foundation'::regnamespace AND p.proname='catalog_lock_write' ORDER BY c.relname COLLATE "C"`);
+    WHERE c.relnamespace='foundation'::regnamespace AND p.proname='catalog_lock_write'
+      AND c.relname=ANY($1::text[]) ORDER BY c.relname COLLATE "C"`, [Object.keys(tables)]);
   assert.deepEqual(fences, Object.entries(tables).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
     .map(([name, [, update]]) => ({ name, type: update ? 22 : 6, enabled: 'O' })));
   const exclusion = await one(db, `SELECT convalidated, contype, pg_get_constraintdef(oid) AS definition
@@ -147,9 +148,9 @@ async function transaction(db, run) {
 }
 
 // Direct SQL invariants are separate from TS tests and use the real runtime role.
-export async function proveCatalogMigrationRejections(owner, db, reviewer) {
-  await identity(owner, 'fixlevelup_migrator', 'fresh');
-  await identity(db, 'fixlevelup_runtime', 'fresh');
+export async function proveCatalogMigrationRejections(owner, db, reviewer, kind = 'fresh') {
+  await identity(owner, 'fixlevelup_migrator', kind);
+  await identity(db, 'fixlevelup_runtime', kind);
   const cityA = randomUUID(), cityB = randomUUID(), cityAV = randomUUID(), cityBV = randomUUID();
   for (const [id, version, code] of [[cityA, cityAV, 'p04-proof-a'], [cityB, cityBV, 'p04-proof-b']]) {
     await owner.query('INSERT INTO foundation.service_cities(id,code) VALUES($1,$2)', [id,code]);
@@ -215,4 +216,5 @@ export async function proveCatalogMigrationRejections(owner, db, reviewer) {
     { amount: '9223372036854775807', row_version: 1, closed: null },
   ]);
   console.log('019 real SQL negatives: kinds and immutable unit, missing/mismatched projections, cross-city basis, micros, scheduled close and overlap; overlapping different cities and BIGINT max preserved: PASS');
+  return { cityA, cityB, cityAV, cityBV, category };
 }
