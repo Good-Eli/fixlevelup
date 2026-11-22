@@ -201,9 +201,9 @@ Operator-only direct `src/files/upload-coordinator/reconcile.ts` делает bo
 
 Итог: 767/767 тестов, 56 файлов, real PG+S3 включены без skipped; B1 52/B2 36 адресных. Migration proof15/149CHECK, workspace tsc/source-lint/build, dependency525/audit0 и secret/diff PASS. Astra B2 PASS закрывает 3 MUST FIX: full GET, replay clock после SELECT, rollback/audit-outbox fault matrix. Владелец принял B1+B2 22.11.2026, разрешил отдельный коммит и push, поручил завершить остальные части P03-04. B опубликован в `e44fae8`, [GitHub Actions 44960486563](https://github.com/Good-Eli/fixlevelup/actions/runs/44960486563) — success. В границах принятого B не было HTTP/DI, READY, scanner/EXIF, выдачи/DELETE/restore или реальных ПД; Q02/Q12/Q13/Q16 открыты. Рабочая dev DB не мигрировалась.
 
-## P03-04C/D/E: технически завершено, internal synthetic scope
+## P03-04C/D/E: принято владельцем, internal synthetic scope
 
-Поверх принятого `e44fae8` в рабочем дереве лежат модули `src/files/file-processing/`
+В принятом C/D/E-коммите `dd87cb45fcdb828dc51995409a049b4f2af01063` добавлены модули `src/files/file-processing/`
 (локальный decoder, структура изображения, protocol), `file-lifecycle/`
 (публикация, processing registry/evidence, budget), `file-access/` (метаданные и
 выдача потоком по тикетам), `file-privacy/` (retention, hold, delete claim и
@@ -214,7 +214,7 @@ deletion, broker), `file-restore/` (инвентарь, объекты, запи
 
 Только внутренний F-путь: JPEG/PNG/WebP без анимации могут стать READY после двух реальных сканов и sanitization; PDF остаётся в карантине, видео/анимация не допускаются к READY. Выдача — по закрытому ticket с повторной проверкой на каждый chunk; после D freeze закрыты также A read/exact replay. Новые B/C записи разрешены только в исходной ACTIVE epoch 1; после restore epoch 2+ доступ и DELETE касаются лишь скопированных объектов под текущей властью. Отсутствующая runtime row сохраняет legacy B на полной схеме.
 
-Три межсрезовых MUST закрыты; полный Astra A→E — PASS (22.11.2026), E — 876/876 без пропусков. P03 технически завершён на 80% (4 из 5); P03-05 не начинать. См. [актуальный статус P03-04 и evidence](../../docs/P03-04CDE-CONTRACT.md#6-current-status-and-evidence). C/D/E ещё не закоммичены. Нет HTTP/DI, signed URL, staff grants, customer intake, production или реальных ПД; Q02/Q12/Q13/Q16 открыты. Рабочая dev БД не мигрировалась.
+Три межсрезовых MUST закрыты; полный Astra A→E — PASS (22.11.2026), E — 876/876 без пропусков. Владелец принял весь P03-04 22.11.2026; P03 — 80% (4 из 5 приняты), P03-05 не начинать. См. [актуальный статус P03-04 и evidence](../../docs/P03-04CDE-CONTRACT.md#6-current-status-and-evidence). C/D/E закоммичены; публикация и GitHub CI проверяются после push. Нет HTTP/DI, signed URL, staff grants, customer intake, production или реальных ПД; Q02/Q12/Q13/Q16 открыты. Рабочая dev БД не мигрировалась.
 
 ## Поведение
 

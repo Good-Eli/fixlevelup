@@ -64,4 +64,4 @@ Closed typed object `mode,endpoint,allowedEndpoint,region,bucket,accessKeyId,sec
 
 ## После standalone adapter
 
-B2 получил отдельный **Astra PASS** по [контракту](P03-04B2-CONTRACT.md), 767/767 и 15 миграций/149 CHECK. Владелец принял B1+B2 22.11.2026, B опубликован в `e44fae8`. C/D/E технически завершены после полного Astra A→E PASS, на момент записи без коммита; [актуальный статус P03-04 и evidence](P03-04CDE-CONTRACT.md#6-current-status-and-evidence). Q02/Q12/Q13/Q16 остаются отдельными live decisions.
+B2 получил отдельный **Astra PASS** по [контракту](P03-04B2-CONTRACT.md), 767/767 и 15 миграций/149 CHECK. Владелец принял B1+B2 22.11.2026, B опубликован в `e44fae8`. C/D/E технически завершены после полного Astra A→E PASS, приняты владельцем и зафиксированы в `dd87cb4`; [актуальный статус P03-04 и evidence](P03-04CDE-CONTRACT.md#6-current-status-and-evidence). Q02/Q12/Q13/Q16 остаются отдельными live decisions.

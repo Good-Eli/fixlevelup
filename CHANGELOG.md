@@ -2,9 +2,9 @@
 
 Техническая история репозитория по состоянию на 22.11.2026. Дата — дата коммитов в их локальном часовом поясе; номера релизов не назначались. Актуальные статусы P01 — в [Preflight](docs/PREFLIGHT_P01.md); контур P02 — в [RBAC](docs/RBAC.md) и [журнале подэтапов](docs/SUBTASKS.md); остальные документы R3.2 сохраняют исторические формулировки этапа 0.
 
-## 22.11.2026 — P03-04C/D/E, техническое завершение внутреннего synthetic scope
+## 22.11.2026 — P03-04 полностью принят владельцем во внутреннем synthetic scope
 
-- **Статус:** C/D/E реализованы поверх опубликованного `e44fae8`, но не закоммичены. Владелец разрешил commit/push после полного Astra A→E. Все три межсрезовых MUST исправлены и проверены; 22.11.2026 полный Astra A→E — PASS, новых MUST и блокеров Git нет. E — 876/876 в 66 файлах без пропусков. P03 — 80% технического прогресса (4 из 5); отдельная формальная приёмка C/D/E не заявляется, P03-05 не начинать; см. [актуальный статус P03-04 и evidence](docs/P03-04CDE-CONTRACT.md#6-current-status-and-evidence).
+- **Статус:** владелец принял весь P03-04 после полного Astra A→E PASS. C/D/E implementation: `dd87cb45fcdb828dc51995409a049b4f2af01063`; 113 файлов, без изменения исторических SQL014/015. Все три межсрезовых MUST закрыты, E — 876/876 в 66 файлах без пропусков. P03 — 80% (4 из 5 приняты); P03-05 не начинать. Публикация и GitHub CI проверяются после push; [контракт и evidence](docs/P03-04CDE-CONTRACT.md#6-current-status-and-evidence).
 - Миграция `016` `20261122000200_file_processing_access` — аддитивно: три UNIQUE-индекса как FK-targets для существующих неизменяемых строк, таблицы `file_runtime_epochs`, `file_privacy_controls`, `file_sanitized_attempts`, `file_publications`; runtime epoch не сеется.
 - Миграция `017` `20261122000300_file_privacy_deletion` — расширяет `file_privacy_controls` полями hold/delete/ledger и добавляет `file_delete_items`; дефолты описывают прежнее открытое состояние, а не политику хранения.
 - Модули `apps/api/src/files/`: `file-processing` (локальный decoder, структура изображения, protocol), `file-lifecycle` (публикация, processing registry/evidence, budget), `file-access` (метаданные и выдача потоком по тикетам), `file-privacy` (retention, hold, delete claim/deletion, broker), `file-restore` (инвентарь, объекты, записи, rescrub), `file-ledger` (кодек, verifier, PG-ledger).
