@@ -94,6 +94,9 @@ function Reference({ io, op, id, label }: { io:P04IO;op:'categoryGet'|'brandGet'
 }
 
 type RevisionSummary = { id:string; version:number; title:string; publishedAt:string };
+function companyRevisionProof(current:RevisionSummary|null) {
+  return current === null ? null : { id:current.id,version:current.version };
+}
 type RevisionPage = Page<RevisionSummary> & { readonly version:number };
 type RevisionedIdentity = { id:string; version:number; archivedAt:string|null; currentVersionId:string|null };
 function Revisions<R extends RevisionSummary>({ entry, load, get, snapshot, publish, archive, reload }: {
@@ -104,7 +107,11 @@ function Revisions<R extends RevisionSummary>({ entry, load, get, snapshot, publ
   const [history,setHistory] = useState<R|null>(null);
   const [stale,setStale] = useState(false);
   const currentId = entry.currentVersionId;
-  const saveAllowed = isActive(entry) && !stale;
+  // An active identity starts at V1 and advances only when a new revision is published.
+  const revisionMismatch = isActive(entry) && (currentId === null ? entry.version !== 1
+    : current !== null && (current.id !== currentId || entry.version !== current.version + 1));
+  const refreshRequired = stale || revisionMismatch;
+  const saveAllowed = isActive(entry) && !refreshRequired;
   return <><p>Версия карточки: {entry.version}</p>
     {currentId === null ? <p>Опубликованных версий пока нет.</p> : <>
       <button onClick={() => { get(currentId,setCurrent); }}>Загрузить текущую версию</button>
@@ -119,8 +126,9 @@ function Revisions<R extends RevisionSummary>({ entry, load, get, snapshot, publ
     }} render={row => <li key={row.id}><button onClick={() => { setHistory(null); get(row.id,setHistory); }}>
       {`Версия ${String(row.version)} · ${row.title}`}</button>{row.id === currentId && ' · текущая по карточке'}</li>}/>
     {history && <section><h5>Историческая версия · {history.version} · {history.title}</h5><p>Опубликована: {history.publishedAt}</p>{snapshot(history)}</section>}
-    {stale && <p role="status">Карточка изменилась. Перечитайте её перед записью. <button onClick={reload}>Получить актуальную карточку</button></p>}
-    {saveAllowed && publish && (currentId === null || current?.id === currentId ? publish(current) : <p>Загрузите текущую версию перед публикацией новой.</p>)}
+    {refreshRequired && <p role="status">Карточка изменилась. Перечитайте её перед записью. <button onClick={reload}>Получить актуальную карточку</button></p>}
+    {saveAllowed && publish && (currentId === null ? publish(null) : current?.id === currentId
+      ? publish(current) : <p>Загрузите текущую версию перед публикацией новой.</p>)}
     {saveAllowed && archive && <Archive action={archive}/>}
   </>;
 }
@@ -172,7 +180,7 @@ function DirectoryPanel({ io, manage, group }: CompanyIO & { group:Directory }) 
           snapshot={r => <p>{r.description ?? 'Описание не указано.'}</p>}
           publish={manage ? current => <P04Form title="Новая неизменяемая версия" submit="Опубликовать версию" draftKey={`${group}Publish:${entry.id}`}
             action={f => { const op = `${group}Publish` as const;
-              io.write(op,{ params:{ id:entry.id },expectedVersion:entry.version,body:checkedBody(op,titleDescription(f)) }); }}>
+              io.write(op,{ params:{ id:entry.id },expectedVersion:entry.version,receiptCompanyRevision:companyRevisionProof(current),body:checkedBody(op,titleDescription(f)) }); }}>
             <TitleDescription revision={current}/></P04Form> : undefined}
           archive={manage ? () => { io.write(`${group}Archive`,{ params:{ id:entry.id },expectedVersion:entry.version,body:{} }); } : undefined}/></>}/>
     {manage && <section>{needsCategory && <CategoryChoice io={io} selected={category} select={setCategory}/>}
@@ -216,7 +224,7 @@ function Items({ io, manage, kind }: CompanyIO & { kind:ItemKind }) {
             if (r.itemId === entry.id && r.kind === kind && r.id === versionId) { done(r); }
           }); }} snapshot={r => <ItemSnapshot revision={r}/>}
           publish={manage ? current => <P04Form title="Новая неизменяемая версия" submit="Опубликовать версию" draftKey={`itemPublish:${entry.id}`}
-            action={f => { io.write('itemPublish',{ params:{ id:entry.id },expectedVersion:entry.version,body:itemPublication(kind,f) }); }}>
+            action={f => { io.write('itemPublish',{ params:{ id:entry.id },expectedVersion:entry.version,receiptCompanyRevision:companyRevisionProof(current),body:itemPublication(kind,f) }); }}>
             <ItemFields kind={kind} revision={current}/></P04Form> : undefined}
           archive={manage ? () => { io.write('itemArchive',{ params:{ id:entry.id },expectedVersion:entry.version,body:{} }); } : undefined}/></>}/>
     {manage && <section><p>{kind === 'WORK' ? 'Выберите обязательную категорию работы.' : 'Категория необязательна.'} Категория и единица измерения не меняются после создания.</p>
@@ -311,7 +319,7 @@ function AvitoPanel({ io, manage, publish, kind }: CompanyIO & { publish:boolean
           }); }} snapshot={r => <AvitoSnapshot revision={r}/>}
           publish={publish ? current => <P04Form title="Новая внутренняя версия" submit="Опубликовать версию" draftKey={`avitoPublish:${entry.id}`}
             prompt="Сохранить неизменяемую версию только для внутреннего использования в CRM?"
-            action={f => { io.write('avitoPublish',{ params:{ id:entry.id },expectedVersion:entry.version,body:avitoPublication(kind,f) }); }}>
+            action={f => { io.write('avitoPublish',{ params:{ id:entry.id },expectedVersion:entry.version,receiptCompanyRevision:companyRevisionProof(current),body:avitoPublication(kind,f) }); }}>
             <AvitoFields kind={kind} revision={current}/></P04Form> : undefined}
           archive={manage ? () => { io.write('avitoArchive',{ params:{ id:entry.id },expectedVersion:entry.version,body:{} }); } : undefined}/></>}/>
     {manage && <section>{kind === 'REVIEW' && <ChoiceList<AvitoRow> label="Профиль Авито" selected={profile} select={setProfile}

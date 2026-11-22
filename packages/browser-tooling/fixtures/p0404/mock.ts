@@ -39,7 +39,11 @@ export function expectCommand(hit: Hit | undefined, expected: unknown, prior?: n
 interface Identity { id: string; code: string; version: number; archivedAt: string | null }
 interface Versioned extends Identity { title: string | null; currentVersionId: string | null }
 function entity(n: number, code: string): Identity { return { id: uuid(n), code, version: 2, archivedAt: null }; }
-function withTitle(n: number, code: string, title: string | null = null): Versioned { return { ...entity(n, code), title, currentVersionId: null }; }
+function withTitle(n: number, code: string): Identity & { title: null; currentVersionId: null };
+function withTitle(n: number, code: string, title: string): Identity & { title: string; currentVersionId: string };
+function withTitle(n: number, code: string, title: string | null = null): Versioned {
+  return { ...entity(n, code), version: title === null ? 1 : 2, title, currentVersionId: title === null ? null : uuid(n + 400) };
+}
 export function label(row: { code: string; title?: string | null }) { return row.title ? `${row.title} · ${row.code}` : row.code; }
 export type DirectoryKind = keyof typeof directories;
 interface Directory extends Versioned { kind: DirectoryKind; categoryId: string | null; brandId: string | null }
@@ -47,9 +51,9 @@ export const category = { ...withTitle(110, 'qa-device', 'Техника QA'), k
 export const brand = { ...withTitle(111, 'qa-brand', 'Бренд QA'), kind: 'BRAND', categoryId: null, brandId: null } satisfies Directory;
 export const model = { ...withTitle(112, 'qa-model'), kind: 'MODEL', categoryId: category.id, brandId: brand.id } satisfies Directory;
 export const fault = { ...withTitle(113, 'qa-fault', 'Симптом QA'), kind: 'FAULT', categoryId: category.id, brandId: null } satisfies Directory;
-export const otherCategory = { ...category, id: uuid(115), title: 'Другая категория', code: 'qa-other' };
-export const otherFault = { ...fault, id: uuid(116), code: 'qa-wrong-fault', title: null, categoryId: otherCategory.id };
-export const archivedBrand = { ...brand, id: uuid(117), code: 'qa-archived-brand', title: null, archivedAt: timestamp };
+export const otherCategory = { ...category, ...withTitle(115, 'qa-other', 'Другая категория') };
+export const otherFault = { ...fault, ...withTitle(116, 'qa-wrong-fault'), categoryId: otherCategory.id };
+export const archivedBrand = { ...brand, ...withTitle(117, 'qa-archived-brand'), version: 2, archivedAt: timestamp };
 export type ItemKind = 'WORK' | 'PART' | 'MATERIAL' | 'TRAVEL' | 'DIAGNOSTICS';
 interface Item extends Versioned { kind: ItemKind; categoryId: string | null; unit: string }
 export const items = {
@@ -59,7 +63,7 @@ export const items = {
   TRAVEL: { ...withTitle(123, 'qa-travel'), kind: 'TRAVEL', categoryId: null, unit: 'trip' },
   DIAGNOSTICS: { ...withTitle(124, 'qa-diagnosis'), kind: 'DIAGNOSTICS', categoryId: null, unit: 'job' },
 } satisfies Record<ItemKind, Item>;
-export const otherWork = { ...items.WORK, id: uuid(125), code: 'qa-wrong-work', categoryId: otherCategory.id };
+export const otherWork = { ...items.WORK, ...withTitle(125, 'qa-wrong-work'), categoryId: otherCategory.id };
 export const itemRows = Object.values(items);
 export const mapping = { id: uuid(126), version: 2, archivedAt: null, publishedAt: null, categoryId: category.id, faultId: fault.id, itemId: items.WORK.id };
 export type RuleKind = 'EVENING' | 'NIGHT' | 'EXPRESS' | 'SURCHARGE' | 'DISCOUNT';
@@ -71,8 +75,8 @@ export const rules = {
 export const rulePath = (kind: RuleKind) => `${cityPath}/rules/${rules[kind].id}/versions`;
 export const pricePath = (kind: ItemKind) => `${cityPath}/items/${items[kind].id}/price-versions`;
 interface Avito extends Versioned { kind: 'PROFILE' | 'REVIEW'; profileId: string | null }
-export const profile = { ...withTitle(140, 'qa-profile'), kind: 'PROFILE', profileId: null } satisfies Avito;
-export const review = { ...withTitle(141, 'qa-review'), kind: 'REVIEW', profileId: profile.id } satisfies Avito;
+export const profile = { ...withTitle(140, 'qa-profile', 'Профиль QA'), kind: 'PROFILE', profileId: null } satisfies Avito;
+export const review = { ...withTitle(141, 'qa-review', 'Ранее сохранённый отзыв QA'), kind: 'REVIEW', profileId: profile.id } satisfies Avito;
 export const city = { id: id.city, code: 'qa-city', name: 'Свои городские цены' };
 export const outsideCity = { id: uuid(150), code: 'qa-outside', name: 'Другой город' };
 export const estimate = { ...entity(151, 'qa-estimate'), cityId: city.id, categoryId: category.id };

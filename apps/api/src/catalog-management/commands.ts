@@ -1,9 +1,8 @@
 import { BadRequestException, HttpException, InternalServerErrorException } from '@nestjs/common';
-import { decodeP04Body, P04_ROUTES } from '@fixlevelup/p03-contracts/p04';
+import { decodeP04Body, decodeP04IdempotencyKey, P04_ROUTES } from '@fixlevelup/p03-contracts/p04';
 import type { P04MutationOperation } from '@fixlevelup/p03-contracts/p04';
 import { header } from '../auth/http.js';
 import type { StaffRequest } from '../auth/http.js';
-import { uuid } from '../authz/rbac-http.js';
 import * as catalog from '../catalog/index.js';
 import type { CatalogClient, CatalogReceipt, CatalogRevisionReceipt } from '../catalog/index.js';
 import { canonicalPricingJson, parseStrictPricingJson } from '../pricing/codec/index.js';
@@ -37,7 +36,13 @@ function field(p: Params, key: string): string {
 }
 
 export function commandFor(req: StaffRequest, operation: P04MutationOperation, params: Params): Command {
-  const key = uuid(header(req, 'idempotency-key'));
+  let key: string;
+  try {
+    key = decodeP04IdempotencyKey(operation, header(req, 'idempotency-key'));
+  } catch (error) {
+    if (error instanceof TypeError) { throw new BadRequestException(); }
+    throw error;
+  }
   const rawTag = header(req, 'if-match');
   const spec = P04_ROUTES[operation];
   let expectedVersion: number | null = null;

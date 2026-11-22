@@ -12,7 +12,8 @@ const other = '55555555-5555-4555-8555-555555555555';
 const signal = () => new AbortController().signal;
 const meta = { requestId: actor.staffId };
 const receipt = { id: category, version: 3, revisionId: revision, revisionVersion: 2 };
-const edit = () => ({ params: { id: category }, body: { title: 'Synthetic report' }, expectedVersion: 2 });
+const edit = () => ({ params: { id: category }, body: { title: 'Synthetic report' }, expectedVersion: 2,
+  receiptCompanyRevision: { id: other, version: 1 } });
 const reply = (data: unknown, status: number, tag?: string) => Response.json({ data, meta }, { status,
   headers: { 'cache-control': 'no-store', ...(tag === undefined ? {} : { etag: tag }) } });
 const failure = (status: number, data: unknown = { type: 'about:blank', status, title: 'EXPECTED', code: 'EXPECTED', requestId: revision }) =>
@@ -150,6 +151,80 @@ describe('P04 CRM exact generated transport', () => {
     await expect(prepareP04Command('fixedPublish', { ...input, expectedVersion: 0, receiptSeriesId: category }, actor)).rejects.toBeInstanceOf(FormError);
     await expect(prepareP04Command('fixedPublish', { ...input, expectedVersion: 0 }, actor)).resolves.toHaveProperty('family', 'P04');
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(['categoryPublish', 'brandPublish', 'modelPublish', 'faultPublish', 'itemPublish', 'avitoPublish'] as const)(
+    'requires the next revision with a fresh ID for %s on initial send and explicit retry', async op => {
+      const prior = { id: other, version: 1 };
+      const common = { ...edit(), receiptCompanyRevision: prior };
+      const prepared = {
+        categoryPublish: () => prepareP04Command('categoryPublish', common, actor),
+        brandPublish: () => prepareP04Command('brandPublish', common, actor),
+        modelPublish: () => prepareP04Command('modelPublish', common, actor),
+        faultPublish: () => prepareP04Command('faultPublish', common, actor),
+        itemPublish: () => prepareP04Command('itemPublish', { ...common, body: { ...common.body, kind: 'PART',
+          technicianVisible: true, publicVisible: false } }, actor),
+        avitoPublish: () => prepareP04Command('avitoPublish', { ...common, body: { ...common.body,
+          sourceUrl: 'https://www.avito.ru/profile/synthetic', permissionRef: 'Synthetic permission' } }, actor),
+      };
+      const fetch = mock(reply({ ...receipt, revisionVersion: 99 }, 201, '"p04-v3"'),
+        reply({ ...receipt, revisionId: other }, 200, '"p04-v3"'), reply(receipt, 200, '"p04-v3"'));
+      const command = await prepared[op]();
+      prior.id = city; prior.version = 99;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(sendPreparedP04(signal(), actor, command)).rejects.toThrow('Invalid staff receipt');
+        expect(fetch).toHaveBeenCalledTimes(attempt + 1);
+      }
+      await expect(sendPreparedP04(signal(), actor, command)).resolves.toBeUndefined();
+      expect(fetch).toHaveBeenCalledTimes(3);
+      const exact = fetch.mock.calls.map(([url, init]) => [url, init?.headers, init?.body]);
+      expect(exact[1]).toEqual(exact[0]); expect(exact[2]).toEqual(exact[0]);
+      expect(command.wire.body).not.toContain('receiptCompanyRevision');
+      expect(command.wire.path).not.toContain(other);
+      expect(Object.values(command.wire.headers)).not.toContain(other);
+    },
+  );
+
+  it('requires current COMPANY revision evidence or a fresh draft and never sends a missing proof', async () => {
+    const fetch = mock(reply({ ...receipt, version: 2, revisionVersion: 2 }, 201, '"p04-v2"'),
+      reply({ ...receipt, version: 2, revisionVersion: 1 }, 200, '"p04-v2"'));
+    for (const input of [{ ...edit(), receiptCompanyRevision: null },
+      { ...edit(), receiptCompanyRevision: { id: other, version: 2 } },
+      { ...edit(), receiptCompanyRevision: { id: `${other}\n`, version: 1 } },
+      { ...edit(), expectedVersion: 1 }]) {
+      await expect(prepareP04Command('categoryPublish', input, actor)).rejects.toBeInstanceOf(FormError);
+    }
+    const wire = { operation: 'categoryPublish' as const, method: 'POST' as const,
+      path: `/api/v1/catalog/categories/${category}/versions`, headers: { 'If-Match': '"p04-v2"' } };
+    await expect(p04Transport(signal())(wire)).rejects.toThrow('Missing current staff revision');
+    expect(fetch).not.toHaveBeenCalled();
+    const prepared = await prepareP04Command('categoryPublish', { ...edit(), expectedVersion: 1, receiptCompanyRevision: null }, actor);
+    await expect(sendPreparedP04(signal(), actor, prepared)).rejects.toThrow('Invalid staff receipt');
+    await expect(sendPreparedP04(signal(), actor, prepared)).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects decoded duplicate response members before accepting any success or definitive refusal', async () => {
+    const data = JSON.stringify(receipt);
+    const raw = (status: number, text: string, media = 'application/json') => new Response(text, {
+      status, headers: { 'cache-control': 'no-store', 'content-type': media, etag: '"p04-v3"' },
+    });
+    const okBody = JSON.stringify({ data: receipt, meta });
+    const problemBody = `{"type":"about:blank","title":"REJECTED","code":"REJECTED","status":503,"st\\u0061tus":412,"requestId":"${revision}"}`;
+    const fetch = mock(
+      raw(201, `{"data":${data.replace('"revisionVersion":2', '"revisionVersion":99,"revision\\u0056ersion":2')},"meta":${JSON.stringify(meta)}}`),
+      raw(200, `{"data":null,"d\\u0061ta":${data},"meta":${JSON.stringify(meta)}}`),
+      raw(412, problemBody, 'application/problem+json'),
+      raw(200, `\uFEFF${okBody}`),
+      raw(200, okBody),
+    );
+    const command = await prepareP04Command('categoryPublish', edit(), actor);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await expect(sendPreparedP04(signal(), actor, command)).rejects.not.toHaveProperty('status');
+      expect(fetch).toHaveBeenCalledTimes(attempt + 1);
+    }
+    await expect(sendPreparedP04(signal(), actor, command)).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(5);
   });
 
   it('binds exact/history reads to requested immutable parents and rejects extra fields or private cache drift', async () => {

@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
-    "./p04": { "types": "./dist/p04.d.ts", "import": "./dist/p04.js" }
+    "./p04": { "types": "./dist/p04.d.ts", "import": "./dist/p04.js" },
+    "./p04-json": { "types": "./dist/p04-json.d.ts", "import": "./dist/p04-json.js" }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node generate-p04.mjs",

@@ -73,7 +73,7 @@ export function isUncertain(e: unknown) {
   return !(e instanceof ApiError) || e.status >= 500;
 }
 
-export async function boundedJson(response: Response, limit: number): Promise<unknown> {
+export async function boundedResponseText(response: Response, limit: number, keepBom = false): Promise<string> {
   const reported = response.headers.get('content-length');
   const reader = response.body?.getReader();
   if (!reader) { throw new Error('Missing response'); }
@@ -81,7 +81,7 @@ export async function boundedJson(response: Response, limit: number): Promise<un
     if (reported !== null && Number(reported) > limit) { throw new Error('Invalid response size'); }
     let size = 0;
     let text = '';
-    const utf8 = new TextDecoder('utf-8', { fatal: true });
+    const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: keepBom });
     for (;;) {
       const part = await reader.read();
       if (part.done) { break; }
@@ -89,9 +89,12 @@ export async function boundedJson(response: Response, limit: number): Promise<un
       if (size > limit) { throw new Error('Invalid response size'); }
       text += utf8.decode(part.value, { stream: true });
     }
-    text += utf8.decode();
-    return JSON.parse(text) as unknown;
+    return text + utf8.decode();
   } finally { void reader.cancel().catch(() => undefined); }
+}
+
+async function boundedJson(response: Response, limit: number): Promise<unknown> {
+  return JSON.parse(await boundedResponseText(response, limit)) as unknown;
 }
 
 async function request<T>(path: string, read: Decoder<T>, signal: AbortSignal, limit: number, write?: PreparedCommand): Promise<T> {

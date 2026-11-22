@@ -91,6 +91,61 @@ integration('P04-03 staff HTTP on isolated PostgreSQL', () => {
     expect(check(await f.read(`${path}?limit=1`), 200).data).not.toHaveProperty('reviewedBy');
   }, TIMEOUT);
 
+  it('projects legacy P03 city names safely on both P04 discovery routes without changing city history', async () => {
+    const f = fixture();
+    await f.asCatalog();
+    const { primary } = await f.cities();
+    const cityPath = `/settings/service-cities/${primary.id}`;
+    const versionPath = `${cityPath}/versions`;
+    const cases = [
+      { original: 'North\t\u200b\tCity', projected: 'North City' },
+      { original: '\u200b\u2060', projected: null },
+    ];
+    const observed = [];
+    for (const { original, projected } of cases) {
+      const before = check(await f.geo.cityDetail(f.admin, primary.id), 200);
+      const code = text(before.data, 'code');
+      const added = check(await f.geo.write(f.admin, 'post', versionPath, {
+        displayName: original, timezone: 'Europe/Moscow', publicContact: '+70000000000',
+        officeHours: Array.from({ length: 7 }, () => [[540, 1080]]),
+      }, { etag: geoTag(versionOf(before)) }), 201);
+      const versionId = text(added.data, 'id');
+      check(await f.geo.publishCityVersion(f.admin, primary.id, versionId, versionOf(added)), 200);
+      observed.push({
+        cities: await f.read(CITIES), readiness: await f.read('/pricing/readiness'), code, name: projected ?? code,
+      });
+      const current = check(await f.geo.cityDetail(f.admin, primary.id), 200);
+      expect(current.data['currentVersion']).toMatchObject({ id: versionId, displayName: original });
+      const history = check(await f.geo.read(f.admin, versionPath), 200);
+      expect(records(history.data['items'])).toContainEqual(expect.objectContaining({ id: versionId, displayName: original }));
+    }
+    for (const { cities, readiness, code, name } of observed) {
+      const cityLabel = { id: primary.id, code, name };
+      expect(page(check(cities, 200))).toEqual([cityLabel]);
+      expect(page(check(readiness, 200))).toEqual([{ ...cityLabel, fixed: 'MISSING', policy: 'MISSING' }]);
+    }
+  }, TIMEOUT);
+
+  it('requires a lowercase P04 idempotency key before write and replay', async () => {
+    const f = fixture();
+    await f.asCatalog();
+    // Force one alphabetic digit so the uppercase variant is always different.
+    const key = `a${randomUUID().slice(1)}`;
+    const upper = key.toUpperCase();
+    const body = { code: fixtureCode('lowercase-key') };
+    const before = await f.evidence();
+    problem(await f.post(CATEGORIES, body, { key: upper }), 400);
+    expect(await f.evidence()).toEqual(before);
+    expect(await f.readReceipt(key)).toEqual([]);
+    const written = receipt(await f.post(CATEGORIES, body, { key }), 201);
+    const committed = await f.evidence();
+    problem(await f.post(CATEGORIES, body, { key: upper }), 400);
+    const replay = receipt(await f.post(CATEGORIES, body, { key }), 200);
+    expect([replay.data, replay.etag]).toEqual([written.data, written.etag]);
+    expect(await f.evidence()).toEqual(committed);
+    expect(await f.readReceipt(key)).toHaveLength(1);
+  }, TIMEOUT);
+
   it('uses real CITY read/manage intersection and conceals receipts after their old city is revoked', async () => {
     const f = fixture();
     await f.asCatalog();

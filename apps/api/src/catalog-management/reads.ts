@@ -318,6 +318,17 @@ function normalizeParams(params: Params, fields: readonly string[]): Params {
   return Object.fromEntries(fields.map((field) => [field, uuid(params[field], field)]));
 }
 
+function projectCityLabel(dto: Dto): Dto {
+  const { name, code } = dto;
+  if (typeof name !== 'string' || typeof code !== 'string') {
+    throw new CatalogInternalError();
+  }
+  // Older P03 revisions permit these characters. Keep their stored/history form
+  // intact and project only the already-paged P04 label.
+  const visible = name.replace(/[\p{Cc}\p{Cf}\p{Cs}]+/gu, ' ').trim();
+  return { ...dto, name: visible || code };
+}
+
 async function discover(client: CatalogClient, operation: string, params: Params, raw: unknown, authorized: readonly string[] | null) {
   const values = new SqlValues();
   const isCityList = operation === 'cityList' || operation === 'pricingReadiness';
@@ -326,7 +337,8 @@ async function discover(client: CatalogClient, operation: string, params: Params
     const page = managementPageQuery(raw, { order: 'code' }, scopeKey(operation, bound, authorized));
     const where = `e.lifecycle='ACTIVE'${authorized === null ? '' : ` AND e.id=ANY(${values.add(authorized)}::uuid[])`}`;
     const fields = operation === 'pricingReadiness' ? `${CITY_LABEL},${READINESS}` : CITY_LABEL;
-    return selectPage(client, values, page, 'code', fields, OPEN_CITY, where, 'e.id');
+    const result = await selectPage(client, values, page, 'code', fields, OPEN_CITY, where, 'e.id');
+    return { ...result, items: result.items.map(projectCityLabel) };
   }
   if (!Object.hasOwn(LABELS, operation)) {throw new CatalogInternalError();}
   const cityId = boundCity(bound, authorized);

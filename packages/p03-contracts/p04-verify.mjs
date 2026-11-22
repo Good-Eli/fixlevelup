@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { p04Dist, renderP04 } from './generate-p04.mjs';
 import {
   P04_PREFIX, P04_ROUTES, P04BodyLimit, createP04Client, decodeP04Body, decodeP04Data,
-  decodeP04Params, decodeP04Query, matchP04Route,
+  decodeP04Params, decodeP04Query, decodeP04IdempotencyKey, matchP04Route,
 } from './dist/p04.js';
 
 for (const [file, content] of Object.entries(renderP04())) {
@@ -93,6 +93,7 @@ for (const [op, [method, path]] of Object.entries(expected)) {
     assert(!headers.has('Idempotency-Key') && !headers.has('If-Match'));
     assert(!headers.get('Origin').required);
     only(() => decodeP04Body(op, {}));
+    only(() => decodeP04IdempotencyKey(op, id));
     continue;
   }
   assert.equal(route.status, /Create$|Publish$|Replace$/u.test(op) ? 201 : 200);
@@ -105,6 +106,10 @@ for (const [op, [method, path]] of Object.entries(expected)) {
   assert.equal(route.allowZero, ['fixedPublish','ruleVersionPublish','policyPublish'].includes(op));
   assert.deepEqual(spec.security, [{ staffSession: [], sessionCsrf: [] }]);
   assert(headers.get('Origin').required && headers.get('Idempotency-Key').required && spec.requestBody.required);
+  assert.equal(decodeP04IdempotencyKey(op, id), id);
+  for (const invalid of [id.toUpperCase(), `${id}\n`, ` ${id}`, `${id},${id}`, undefined, [id]]) {
+    only(() => decodeP04IdempotencyKey(op, invalid));
+  }
   assert.equal(headers.has('If-Match'), route.versioned);
   if (route.versioned) { assert(headers.get('If-Match').required); assert(spec.responses[428] && spec.responses[412]); }
   assert(spec.responses[200].headers.ETag.required && spec.responses[409]);

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { sealPricing, verifyPricingSnapshot } from '../src/pricing/codec/index.js';
 import { calculatePricing, normalizePricingInput, PricingError } from '../src/pricing/engine/index.js';
 import type {
   PricingContext, PricingErrorCode, PricingEvidence, PricingInput, PricingItem, PricingItemKind, PricingPolicy, PricingRule, PricingRuleKind,
@@ -186,7 +187,8 @@ describe('P04-02 pricing engine (pure, without PostgreSQL)', () => {
     const discount = rule(1, 'DISCOUNT', { method: 'RATE', fixedMinor: null, rateBps: 10000 });
     const approved = manual(discount, MAX, MAX);
     const express = rule(2, 'EXPRESS', { base: 'ORDER_BASE', maxBase: '100' });
-    const input = fixture({ policy: withPriorities([express]), rules: [discount, express],
+    const policy = { ...withPriorities([express]), compatibilities: [{ leftRuleId: discount.ruleId, rightRuleId: express.ruleId }] };
+    const input = fixture({ policy, rules: [discount, express],
       items: [item(10, 'WORK', MAX), item(11, 'PART', '1')], adjustments: [approved.adjustment], evidence: [approved.evidence] });
     const actual = calculatePricing(input);
     expect(actual.totalMinor).toBe('1');
@@ -194,6 +196,36 @@ describe('P04-02 pricing engine (pure, without PostgreSQL)', () => {
     expect(actual.lines).toHaveLength(3);
     expect(actual.lines.some(line => line.source === 'RULE' && line.ruleId === express.ruleId)).toBe(false);
     denied({ ...input, rules: [discount, { ...express, maxBase: null }] }, 'OVERFLOW');
+  });
+
+  it('bounds an automatic rule base only after priority selection and replays the winning trace', () => {
+    const discount = rule(1, 'DISCOUNT', { fixedMinor: MAX });
+    const wide = rule(2, 'EXPRESS', { base: 'ORDER_BASE', fixedMinor: '1' });
+    const narrow = rule(3, 'EXPRESS', { fixedMinor: '1' });
+    const policy = { ...withPriorities([wide, narrow]),
+      compatibilities: [{ leftRuleId: discount.ruleId, rightRuleId: narrow.ruleId }] };
+    const approved = manual(discount, MAX, MAX, policy);
+    const input = fixture({ policy, rules: [narrow, discount, wide], items: [item(10, 'WORK', MAX), item(11, 'PART', '1')],
+      adjustments: [approved.adjustment], evidence: [approved.evidence] });
+
+    const actual = calculatePricing(input);
+    expect(actual.totalMinor).toBe('2');
+    expect(actual.breakdown).toMatchObject({ works: MAX, parts: '1', approvedDiscounts: MAX, expressSurcharge: '1' });
+    expect(actual.lines.filter((line) => line.source === 'RULE').map(({ ruleId, baseMinor, appliedMinor }) =>
+      ({ ruleId, baseMinor, appliedMinor }))).toEqual([
+      { ruleId: discount.ruleId, baseMinor: MAX, appliedMinor: MAX },
+      { ruleId: narrow.ruleId, baseMinor: MAX, appliedMinor: '1' },
+    ]);
+    const sealed = sealPricing(input);
+    expect(sealPricing({ ...input, rules: [...input.rules].reverse(), items: [...input.items].reverse() })).toEqual(sealed);
+    expect(verifyPricingSnapshot(sealed.bytes, sealed.sha256)).toStrictEqual(actual);
+
+    denied({ ...input, policy: { ...policy, priorities: withPriorities([narrow, wide]).priorities,
+      compatibilities: [{ leftRuleId: discount.ruleId, rightRuleId: wide.ruleId }] } }, 'OVERFLOW');
+    denied({ ...input, policy: { ...policy, priorities: policy.priorities.map((row) => ({ ...row, priority: 1 })) } },
+      'PRICING_CONFIGURATION_AMBIGUOUS');
+    denied({ ...input, policy: { ...policy, priorities: policy.priorities.filter((row) => row.ruleId !== wide.ruleId) } },
+      'PRICING_CONFIGURATION_AMBIGUOUS');
   });
 
   it('checks local window boundaries, DST repeat/gap and provided historical seconds with no timezone lookup', () => {

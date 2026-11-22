@@ -130,6 +130,10 @@ function runtime(P04_PREFIX, P04_ROUTES, schemas, operationShapes, csrfSchema) {
     return schema ? assert(schema, value) : invalid();
   };
   const decodeP04Data = (operation, value) => assert(known(operation).data, value);
+  const decodeP04IdempotencyKey = (operation, value) => {
+    const schema = known(operation).headers['Idempotency-Key'];
+    return schema ? assert(schema, value) : invalid();
+  };
   const decodeP04Query = (operation, value) => assert(closed(known(operation).query), value);
   const decodeP04Params = (operation, value) => assert(closed(known(operation).parameters, P04_ROUTES[operation].params), value);
   const routeLookup = new Map();
@@ -179,7 +183,7 @@ function runtime(P04_PREFIX, P04_ROUTES, schemas, operationShapes, csrfSchema) {
         body = JSON.stringify(decodeP04Body(operation, Object.hasOwn(input, 'body') ? input.body : undefined));
         if (new TextEncoder().encode(body).length > route.bodyLimit) { return invalid(); }
         headers['Content-Type'] = 'application/json; charset=utf-8';
-        headers['Idempotency-Key'] = assert(headerSchemas['Idempotency-Key'], Object.hasOwn(input, 'idempotencyKey') ? input.idempotencyKey : undefined);
+        headers['Idempotency-Key'] = decodeP04IdempotencyKey(operation, Object.hasOwn(input, 'idempotencyKey') ? input.idempotencyKey : undefined);
         headers['X-CSRF-Token'] = assert(csrfSchema, Object.hasOwn(input, 'csrfToken') ? input.csrfToken : undefined);
         if (route.versioned) {
           const expectedVersion = Object.hasOwn(input, 'expectedVersion') && input.expectedVersion;
@@ -193,7 +197,7 @@ function runtime(P04_PREFIX, P04_ROUTES, schemas, operationShapes, csrfSchema) {
       return { ...envelope, status: reply.status };
     } });
   }
-  return { matchP04Route, decodeP04Params, decodeP04Body, decodeP04Data, decodeP04Query, createP04Client };
+  return { matchP04Route, decodeP04Params, decodeP04Body, decodeP04Data, decodeP04Query, decodeP04IdempotencyKey, createP04Client };
 }
 
 export function renderP04() {
@@ -209,7 +213,7 @@ export function renderP04() {
     + `const csrfSchema = ${pretty(P04_OPENAPI.components.securitySchemes.sessionCsrf['x-p04-schema'])};\n`
     + `export const P04_ROUTES = ${pretty(routes)};\n`
     + `for (const route of Object.values(P04_ROUTES)) {\n  for (const field of ['permissions', 'params', 'query']) { Object.freeze(route[field]); }\n  Object.freeze(route);\n}\nObject.freeze(P04_ROUTES);\n`
-    + `export const { matchP04Route, decodeP04Params, decodeP04Body, decodeP04Data, decodeP04Query, createP04Client } = (${runtime.toString()})(P04_PREFIX, P04_ROUTES, schemas, operationShapes, csrfSchema);\n`;
+    + `export const { matchP04Route, decodeP04Params, decodeP04Body, decodeP04Data, decodeP04Query, decodeP04IdempotencyKey, createP04Client } = (${runtime.toString()})(P04_PREFIX, P04_ROUTES, schemas, operationShapes, csrfSchema);\n`;
   const permissions = [...new Set(Object.values(routes).flatMap(route => route.permissions))];
   const pathsDeclaration = operationEntries.map(([id, {metadata, query, parameters}]) => {
     const entries = Object.entries(metadata).map(([key, value]) => {
@@ -244,6 +248,7 @@ export declare function decodeP04Params<Op extends P04Operation>(operation: Op, 
 export declare function decodeP04Body<Op extends P04MutationOperation>(operation: Op, value: unknown): P04Body<Op>;
 export declare function decodeP04Data<Op extends P04Operation>(operation: Op, value: unknown): P04Data<Op>;
 export declare function decodeP04Query<Op extends P04Operation>(operation: Op, value: unknown): P04Query<Op>;
+export declare function decodeP04IdempotencyKey(operation: P04MutationOperation, value: unknown): string;
 export interface P04TransportRequest {
   readonly operation: P04Operation;
   readonly method: 'GET' | 'POST';

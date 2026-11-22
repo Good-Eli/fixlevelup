@@ -74,7 +74,8 @@ function applicable(rule: PricingRule, items: readonly PricedItem[]): Applicable
     }
   }
   if (matchingLineIds.length === 0 || (rule.minBase !== null && base < BigInt(rule.minBase))) { return undefined; }
-  return { rule, base: checked(base), matchingLineIds: Object.freeze(matchingLineIds) };
+  // Rank every eligible candidate, even if its base would not fit a stored rule line.
+  return { rule, base, matchingLineIds: Object.freeze(matchingLineIds) };
 }
 
 interface Ranked {
@@ -167,6 +168,7 @@ function ruleComponent(kind: PricingRule['kind']): PricingRuleComponent {
 
 function priceRule(input: PricingInput, applied: AppliedRule, index: number): PricingRuleLine {
   const { match: { rule, base, matchingLineIds }, adjustment, evidence } = applied;
+  const baseMinor = checked(base).toString();
   const denominator = rule.fixedMinor === null ? 10000n : 1n;
   // Validation ensured FIXED xor RATE; do not round an intermediate product.
   const numerator = rule.fixedMinor === null
@@ -176,7 +178,6 @@ function priceRule(input: PricingInput, applied: AppliedRule, index: number): Pr
   const cap = rule.maxDelta === null ? null : BigInt(rule.maxDelta);
   const floored = floor !== null && amount < floor ? floor : amount;
   const capped = checked(cap !== null && floored > cap ? cap : floored);
-  const baseMinor = base.toString();
   const cappedMinor = capped.toString();
   if (adjustment !== null) {
     authorize(input, rule, adjustment, evidence ?? unauthorized('evidence'), baseMinor, cappedMinor);

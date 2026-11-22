@@ -48,7 +48,7 @@ test('catalogue directories, scoped metadata choices, exact history, and same-ca
   const s = await rig(page); companyReads(s);
   const archive = `${directories.BRAND}/${brand.id}/archive`;
   const history = `${directories.CATEGORY}/${category.id}/versions`;
-  const r = { id: uuid(170), entryId: category.id, version: 1, title: 'История категории QA', publishedAt: timestamp };
+  const r = { id: category.currentVersionId, entryId: category.id, version: 1, title: category.title, publishedAt: timestamp };
   s.handlers.push((route, h) => {
     if (h.method === 'GET' && h.path === history) { return wire(route, { ...listing([r]), version: category.version }); }
     if (h.method === 'GET' && h.path === `${history}/${r.id}`) { return wire(route, { ...r, description: 'Точное описание прошлой версии' }); }
@@ -64,6 +64,8 @@ test('catalogue directories, scoped metadata choices, exact history, and same-ca
   expect(s.hitsFor('GET', `${history}/${r.id}`)).toHaveLength(0);
   await click(page, `Версия 1 · ${r.title}`);
   await expect(page.getByText('Точное описание прошлой версии')).toBeVisible();
+  await expect(button(page, 'Опубликовать версию')).toHaveCount(0);
+  await click(page, 'Загрузить текущую версию');
   await fill(page, { Название: 'Обновлённая техника', Описание: 'Обновлённое описание техники' });
   await click(page, 'Опубликовать версию'); await success(page);
   exact(s, history, { title: 'Обновлённая техника', description: 'Обновлённое описание техники' }, 2);
@@ -101,7 +103,7 @@ test('WORK/PART/MATERIAL/TRAVEL/DIAGNOSTICS publish their exact kind and permitt
   s.handlers.push((route, h) => {
     if (h.method !== 'POST') { return; }
     for (const item of Object.values(items)) {
-      if (h.path === `${itemsPath}/${item.id}/versions`) { return receipt(route, item.id, 3, 1); }
+      if (h.path === `${itemsPath}/${item.id}/versions`) { return receipt(route, item.id, 2, 1); }
     }
   });
   await s.signIn(); await click(page, catalog);
@@ -130,7 +132,7 @@ test('WORK/PART/MATERIAL/TRAVEL/DIAGNOSTICS publish their exact kind and permitt
     if (item.kind === 'MATERIAL') { await field(page, 'Публичная видимость').check(); }
     await click(page, 'Опубликовать версию'); await success(page);
     exact(s, path, { kind: item.kind, title, description: null, technicianVisible: true, publicVisible: item.kind === 'MATERIAL',
-      ...(duration ? { durationMinutes: Number(duration) } : {}) }, 2);
+      ...(duration ? { durationMinutes: Number(duration) } : {}) }, item.version);
   }
   s.done();
 });
@@ -332,18 +334,23 @@ test('Avito profile and review are manually published, validated, and displayed 
   const common = { title: 'Внутренняя запись QA', sourceUrl, permissionRef: 'synthetic-manual-consent-ref' };
   const reviewRequest = { ...common, sourceDate: '2026-02-28', excerpt: 'Синтетическая выдержка QA', rating: 5 };
   const profileVersions = `${avitoPath}/${profile.id}/versions`, reviewVersions = `${avitoPath}/${review.id}/versions`;
-  const reviewSummary = { id: uuid(208), version: 1, kind: 'REVIEW' as const, entryId: review.id, title: 'Ранее сохранённый отзыв QA', publishedAt: timestamp };
+  const profileCurrent = { id: profile.currentVersionId, version: 1, kind: 'PROFILE' as const, entryId: profile.id,
+    title: profile.title, sourceUrl, permissionRef: common.permissionRef, sourceDate: null, excerpt: null, rating: null,
+    profileRevisionId: null, publishedAt: timestamp };
+  const reviewSummary = { id: review.currentVersionId, version: 1, kind: 'REVIEW' as const, entryId: review.id, title: review.title, publishedAt: timestamp };
   s.handlers.push((route, h) => {
+    if (h.method === 'GET' && h.path === `${profileVersions}/${profileCurrent.id}`) { return wire(route, profileCurrent); }
     if (h.method === 'GET' && h.path === reviewVersions) { return wire(route, { ...listing([reviewSummary]), version: 2 }); }
     if (h.method === 'GET' && h.path === `${reviewVersions}/${reviewSummary.id}`) {
-      return wire(route, { ...reviewRequest, ...reviewSummary, profileRevisionId: uuid(209) });
+      return wire(route, { ...reviewRequest, ...reviewSummary, profileRevisionId: profileCurrent.id });
     }
     if (h.method !== 'POST') { return; }
-    if (h.path === profileVersions) { return receipt(route, profile.id, 3, 1); }
+    if (h.path === profileVersions) { return receipt(route, profile.id, 3, 2); }
     if (h.path === avitoPath) { return receipt(route, review.id, 1); }
     if (h.path === reviewVersions) { return receipt(route, review.id, 3, 2); }
   });
   await s.signIn(); await click(page, avito); await companyCard(page, 'Загрузить профили', profile);
+  await click(page, 'Загрузить текущую версию');
   await expect(field(page, 'Дата источника (ГГГГ-ММ-ДД)')).toHaveCount(0);
   await fill(page, { Название: common.title, 'URL источника': 'https://example.invalid/profile/synthetic-qa', 'Основание разрешения': common.permissionRef });
   await confirmed(page, 'Опубликовать версию'); await error(page, /Проверьте формат/);
@@ -353,15 +360,16 @@ test('Avito profile and review are manually published, validated, and displayed 
   expect(s.hitsFor('POST', profileVersions)).toHaveLength(0);
   await confirmed(page, 'Опубликовать версию'); await success(page); exact(s, profileVersions, common, 2);
   await click(page, 'Отзывы (REVIEW)'); await expect(button(page, 'Создать отзыв')).toHaveCount(0);
-  await click(page, 'Загрузить варианты: Профиль Авито'); await click(page, `Выбрать: ${profile.code}`);
+  await click(page, 'Загрузить варианты: Профиль Авито'); await click(page, `Выбрать: ${label(profile)}`);
   await expect(button(page, `Выбрать: ${review.code}`)).toHaveCount(0);
   await field(page, 'Код').fill(review.code); await click(page, 'Создать отзыв'); await success(page);
   exact(s, avitoPath, { code: review.code, kind: 'REVIEW', profileId: profile.id });
   await click(page, 'Отзывы (REVIEW)'); await companyCard(page, 'Загрузить отзывы', review);
   await click(page, 'История версий'); await click(page, `Версия 1 · ${reviewSummary.title}`);
   await expect(page.getByText(sourceUrl, { exact: true })).toBeVisible();
-  await expect(page.getByText(uuid(209), { exact: true })).toBeVisible();
+  await expect(page.getByText(profileCurrent.id, { exact: true })).toBeVisible();
   await expect(page.locator('a[href*="avito.ru"], iframe, img[src*="avito.ru"]')).toHaveCount(0);
+  await click(page, 'Загрузить текущую версию');
   await fill(page, { Название: common.title, 'URL источника': sourceUrl, 'Основание разрешения': common.permissionRef,
     'Дата источника (ГГГГ-ММ-ДД)': '2026-02-30', Выдержка: reviewRequest.excerpt, Оценка: '5' });
   await confirmed(page, 'Опубликовать версию'); await error(page, /Проверьте формат/);
@@ -373,18 +381,25 @@ test('Avito profile and review are manually published, validated, and displayed 
 
 const lifecyclePath = `${directories.CATEGORY}/${category.id}/versions`;
 const originalFields = { title: 'Черновик QA до ответа сервера', description: 'Локальные поля QA' };
+const lifecycleCurrent = { id: category.currentVersionId, entryId: category.id, version: 1, title: category.title, description: null, publishedAt: timestamp };
+function lifecycleReads(s: Fixture) {
+  s.handlers.push((route, h) => {
+    if (h.method === 'GET' && h.path === `${lifecyclePath}/${lifecycleCurrent.id}`) { return wire(route, lifecycleCurrent); }
+  });
+}
 async function startLifecycle(page: Page, s: Fixture) {
   await s.signIn(); await click(page, catalog); await companyCard(page, 'Загрузить категории', category);
+  await click(page, 'Загрузить текущую версию');
   await fill(page, { Название: originalFields.title, Описание: originalFields.description });
   await click(page, 'Опубликовать версию');
 }
 for (const swap of [false, true]) {
   test(`503 unknown: ${swap ? 'changed session discards pending command' : 'only explicit identical replay is sent'}`, async ({ page }) => {
-    const s = await rig(page); companyReads(s);
+    const s = await rig(page); companyReads(s); lifecycleReads(s);
     let writes = 0;
     s.handlers.push((route, h) => {
       if (h.method === 'POST' && h.path === lifecyclePath) {
-        return ++writes === 1 ? problem(route, 503) : receipt(route, category.id, 3, 1, 200);
+        return ++writes === 1 ? problem(route, 503) : receipt(route, category.id, 3, 2, 200);
       }
     });
     await startLifecycle(page, s);
@@ -404,7 +419,9 @@ for (const swap of [false, true]) {
       await expect(button(page, retry)).toHaveCount(0);
       await fill(page, { Логин: 'synthetic-ui', Пароль: 'synthetic-ui-only' }); await click(page, 'Войти');
       await click(page, catalog); await companyCard(page, 'Загрузить категории', category);
-      await expect(field(page, 'Название')).toHaveValue('');
+      await expect(field(page, 'Название')).toHaveCount(0);
+      await click(page, 'Загрузить текущую версию');
+      await expect(field(page, 'Название')).toHaveValue(lifecycleCurrent.title);
       await expect(button(page, 'Восстановить черновик')).toHaveCount(0);
       expect(s.hitsFor('POST', lifecyclePath)).toHaveLength(1);
     } else {
@@ -423,7 +440,7 @@ test('412 reloads the fresh card; restore is explicit and sends only a fresh com
   const currentId = uuid(210);
   s.handlers.push((route, h) => {
     if (h.method === 'GET' && h.path === `${directories.CATEGORY}/${category.id}`) {
-      return wire(route, { ...category, version, currentVersionId: version === 2 ? null : currentId });
+      return wire(route, { ...category, version, currentVersionId: version === 2 ? lifecycleCurrent.id : currentId });
     }
     if (h.method === 'GET' && h.path === `${lifecyclePath}/${currentId}`) {
       return wire(route, { id: currentId, entryId: category.id, version: 2, title: 'Новые серверные поля QA', description: 'От другой команды', publishedAt: timestamp });
@@ -433,7 +450,7 @@ test('412 reloads the fresh card; restore is explicit and sends only a fresh com
       return receipt(route, category.id, 4, 3);
     }
   });
-  companyReads(s);
+  companyReads(s); lifecycleReads(s);
   await startLifecycle(page, s);
   await status(page, /Версия изменилась/);
   await expect(button(page, retry)).toHaveCount(0);

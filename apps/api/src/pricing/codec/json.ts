@@ -1,34 +1,13 @@
 import { Buffer } from 'node:buffer';
 import { TextDecoder, types } from 'node:util';
+import { parseP04JsonText, requireP04JsonScalar, P04_JSON_MAX_BYTES as MAX_BYTES,
+  P04_JSON_MAX_DEPTH as MAX_DEPTH, P04_JSON_MAX_NODES as MAX_NODES } from '@fixlevelup/p03-contracts/p04-json';
+import type { P04Json } from '@fixlevelup/p03-contracts/p04-json';
 
-// Shared limits apply in both directions, including the root at depth one.
-const MAX_BYTES = 2 * 1024 * 1024;
-const MAX_DEPTH = 64;
-const MAX_NODES = 100_000;
+export type PricingJson = P04Json;
 
-export type PricingJson =
-  | null
-  | boolean
-  | string
-  | number
-  | PricingJson[]
-  | { [key: string]: PricingJson };
-
-export function invalidPricingJson(): never {
+function invalidPricingJson(): never {
   throw new TypeError('Invalid pricing JSON');
-}
-
-function requireScalarUnicode(text: string): void {
-  for (let index = 0; index < text.length; index += 1) {
-    const unit = text.charCodeAt(index);
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      index += 1;
-      const next = text.charCodeAt(index);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) { invalidPricingJson(); }
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      invalidPricingJson();
-    }
-  }
 }
 
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -36,7 +15,7 @@ const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as objec
 export function boundedPricingText(bytes: string | Uint8Array): string {
   if (typeof bytes === 'string') {
     if (bytes.length > MAX_BYTES || Buffer.byteLength(bytes) > MAX_BYTES) { invalidPricingJson(); }
-    requireScalarUnicode(bytes);
+    requireP04JsonScalar(bytes);
     return bytes;
   }
   // Use the intrinsic accessor: an input view may have a shadowing getter.
@@ -52,116 +31,7 @@ export function boundedPricingText(bytes: string | Uint8Array): string {
 }
 
 export function parseStrictPricingJson(bytes: string | Uint8Array): PricingJson {
-  const text = boundedPricingText(bytes);
-  let offset = 0;
-  let nodes = 0;
-  const integer = /-?(?:0|[1-9][0-9]{0,15})/y;
-
-  function space(): void {
-    while (
-      text[offset] === ' ' || text[offset] === '\t' ||
-      text[offset] === '\r' || text[offset] === '\n'
-    ) { offset += 1; }
-  }
-
-  function readString(): string {
-    const start = offset++;
-    while (offset < text.length) {
-      const char = text[offset++];
-      if (char === '\\') {
-        offset += 1;
-      } else if (char === '"') {
-        let value: string;
-        try {
-          // Decode a single string token only. Objects are never sent to JSON.parse.
-          value = JSON.parse(text.slice(start, offset)) as string;
-        } catch {
-          return invalidPricingJson();
-        }
-        requireScalarUnicode(value);
-        return value;
-      }
-    }
-    return invalidPricingJson();
-  }
-
-  function readObject(depth: number): { [key: string]: PricingJson } {
-    const result = Object.create(null) as { [key: string]: PricingJson };
-    offset += 1;
-    space();
-    if (text[offset] === '}') {
-      offset += 1;
-      return result;
-    }
-    while (text[offset] === '"') {
-      const key = readString();
-      if (Object.hasOwn(result, key)) { invalidPricingJson(); }
-      space();
-      if (text[offset++] !== ':') { invalidPricingJson(); }
-      result[key] = readValue(depth + 1);
-      space();
-      const next = text[offset++];
-      if (next === '}') { return result; }
-      if (next !== ',') { invalidPricingJson(); }
-      space();
-    }
-    return invalidPricingJson();
-  }
-
-  function readArray(depth: number): PricingJson[] {
-    const result: PricingJson[] = [];
-    offset += 1;
-    space();
-    if (text[offset] === ']') {
-      offset += 1;
-      return result;
-    }
-    while (offset < text.length) {
-      result.push(readValue(depth + 1));
-      space();
-      const next = text[offset++];
-      if (next === ']') { return result; }
-      if (next !== ',') { invalidPricingJson(); }
-    }
-    return invalidPricingJson();
-  }
-
-  function readValue(depth: number): PricingJson {
-    nodes += 1;
-    if (depth > MAX_DEPTH || nodes > MAX_NODES) { invalidPricingJson(); }
-    space();
-    switch (text[offset]) {
-      case '{': return readObject(depth);
-      case '[': return readArray(depth);
-      case '"': return readString();
-      case 't':
-        if (!text.startsWith('true', offset)) { invalidPricingJson(); }
-        offset += 4;
-        return true;
-      case 'f':
-        if (!text.startsWith('false', offset)) { invalidPricingJson(); }
-        offset += 5;
-        return false;
-      case 'n':
-        if (!text.startsWith('null', offset)) { invalidPricingJson(); }
-        offset += 4;
-        return null;
-      default: {
-        integer.lastIndex = offset;
-        const token = integer.exec(text)?.[0];
-        if (token === undefined || token === '-0') { invalidPricingJson(); }
-        const value = Number(token);
-        if (!Number.isSafeInteger(value)) { invalidPricingJson(); }
-        offset = integer.lastIndex;
-        return value;
-      }
-    }
-  }
-
-  const result = readValue(1);
-  space();
-  if (offset !== text.length) { invalidPricingJson(); }
-  return result;
+  return parseP04JsonText(boundedPricingText(bytes));
 }
 
 export function canonicalPricingJson(value: unknown): string {
@@ -177,7 +47,7 @@ export function canonicalPricingJson(value: unknown): string {
 
   function string(text: string): void {
     if (text.length > MAX_BYTES - size) { invalidPricingJson(); }
-    requireScalarUnicode(text);
+    requireP04JsonScalar(text);
     append(JSON.stringify(text));
   }
 
