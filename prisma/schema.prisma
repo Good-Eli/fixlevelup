@@ -62,6 +62,10 @@ model Staff {
   reviewedContentBlockRevisions   ContentBlockRevision[]  @relation("ContentBlockRevisionReviewer")
   reviewedLegalDocumentVersions   LegalDocumentVersion[]  @relation("LegalDocumentVersionReviewer")
   fileUploadIntents               FileUploadIntent[]      @relation("FileUploadIntentStaff")
+  reviewedCatalogDirectoryVersions CatalogDirectoryVersion[] @relation("CatalogDirectoryReviewer")
+  reviewedCatalogItemVersions      CatalogItemVersion[]      @relation("CatalogItemReviewer")
+  publishedCatalogMappings         CatalogFaultServiceMapping[] @relation("CatalogMappingPublisher")
+  reviewedCatalogPriceVersions     CatalogPriceVersion[]     @relation("CatalogPriceReviewer")
 
   @@map("staff")
   @@schema("foundation")
@@ -283,6 +287,7 @@ model ServiceCity {
   referenceEntryVersions ReferenceEntryVersion[] @relation("ReferenceEntryVersionCity")
   contentBlocks    ContentBlock[] @relation("ContentBlockCity")
   requestSessions  RequestSession[] @relation("RequestSessionCity")
+  catalogPriceSeries CatalogPriceSeries[]
 
   @@map("service_cities")
   @@schema("foundation")
@@ -309,6 +314,7 @@ model ServiceCityVersion {
   currentFor     ServiceCity[] @relation("ServiceCityCurrentVersion")
   referenceEntryVersions ReferenceEntryVersion[] @relation("ReferenceEntryVersionCityVersion")
   requestSessions RequestSession[] @relation("RequestSessionCityVersion")
+  catalogPriceVersions CatalogPriceVersion[] @relation("CatalogPriceCityVersion")
 
   @@unique([cityId, version], map: "service_city_versions_city_version_key")
   @@unique([cityId, id], map: "service_city_versions_city_id_key")
@@ -1051,5 +1057,182 @@ model FileDeleteItem {
   @@id([eventId, attemptKind, attemptId])
   @@unique([eventId, targetEndpoint, targetBucket, targetRegion, objectKey], map: "file_delete_items_event_target_key")
   @@map("file_delete_items")
+  @@schema("foundation")
+}
+
+// P04-01: ordinary tables. Fixed discriminator CHECKs, canonical publication,
+// history protection and column-level runtime privileges live in SQL 019.
+model CatalogDirectoryEntry {
+  id               String    @id @db.Uuid
+  kind             String    @db.VarChar(16)
+  code             String    @db.VarChar(64)
+  categoryId       String?   @map("category_id") @db.Uuid
+  brandId          String?   @map("brand_id") @db.Uuid
+  categoryKind     String    @default("CATEGORY") @map("category_kind") @db.VarChar(16)
+  brandKind        String    @default("BRAND") @map("brand_kind") @db.VarChar(16)
+  rowVersion       Int       @default(1) @map("row_version")
+  currentVersionId String?   @map("current_version_id") @db.Uuid
+  archivedAt       DateTime? @map("archived_at") @db.Timestamptz(6)
+  category         CatalogDirectoryEntry? @relation("CatalogDirectoryCategory", fields: [categoryId, categoryKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_entries_category_fkey")
+  brand            CatalogDirectoryEntry? @relation("CatalogDirectoryBrand", fields: [brandId, brandKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_entries_brand_fkey")
+  categoryChildren CatalogDirectoryEntry[] @relation("CatalogDirectoryCategory")
+  brandChildren    CatalogDirectoryEntry[] @relation("CatalogDirectoryBrand")
+  currentVersion   CatalogDirectoryVersion? @relation("CatalogDirectoryCurrentVersion", fields: [id, currentVersionId], references: [entryId, id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_entries_current_version_fkey")
+  versions         CatalogDirectoryVersion[] @relation("CatalogDirectoryVersions")
+  items            CatalogItem[] @relation("CatalogItemCategory")
+  faultMappings    CatalogFaultServiceMapping[] @relation("CatalogMappingFault")
+
+  @@unique([kind, code], map: "catalog_directory_entries_kind_code_key")
+  @@unique([id, kind], map: "catalog_directory_entries_id_kind_key")
+  @@unique([id, kind, categoryId], map: "catalog_directory_entries_category_identity_key")
+  @@map("catalog_directory_entries")
+  @@schema("foundation")
+}
+
+model CatalogDirectoryVersion {
+  id          String   @id @db.Uuid
+  entryId     String   @map("entry_id") @db.Uuid
+  version     Int
+  title       String
+  description String?
+  reviewedBy  String   @map("reviewed_by") @db.Uuid
+  publishedAt DateTime @default(dbgenerated("clock_timestamp()")) @map("published_at") @db.Timestamptz(6)
+  entry       CatalogDirectoryEntry @relation("CatalogDirectoryVersions", fields: [entryId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_versions_entry_fkey")
+  reviewer    Staff @relation("CatalogDirectoryReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_versions_reviewer_fkey")
+  currentFor  CatalogDirectoryEntry[] @relation("CatalogDirectoryCurrentVersion")
+
+  @@unique([entryId, version], map: "catalog_directory_versions_entry_version_key")
+  @@unique([entryId, id], map: "catalog_directory_versions_entry_id_key")
+  @@map("catalog_directory_versions")
+  @@schema("foundation")
+}
+
+model CatalogItem {
+  id               String    @id @db.Uuid
+  kind             String    @db.VarChar(16)
+  code             String    @unique(map: "catalog_items_code_key") @db.VarChar(64)
+  categoryId       String?   @map("category_id") @db.Uuid
+  categoryKind     String    @default("CATEGORY") @map("category_kind") @db.VarChar(16)
+  unit             String    @db.VarChar(24)
+  rowVersion       Int       @default(1) @map("row_version")
+  currentVersionId String?   @map("current_version_id") @db.Uuid
+  archivedAt       DateTime? @map("archived_at") @db.Timestamptz(6)
+  category         CatalogDirectoryEntry? @relation("CatalogItemCategory", fields: [categoryId, categoryKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "catalog_items_category_fkey")
+  currentVersion   CatalogItemVersion? @relation("CatalogItemCurrentVersion", fields: [id, currentVersionId], references: [itemId, id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_items_current_version_fkey")
+  versions         CatalogItemVersion[] @relation("CatalogItemVersions")
+  faultMappings    CatalogFaultServiceMapping[] @relation("CatalogMappingItem")
+  priceSeries      CatalogPriceSeries[]
+
+  @@unique([id, kind], map: "catalog_items_id_kind_key")
+  @@unique([id, kind, categoryId], map: "catalog_items_category_identity_key")
+  @@map("catalog_items")
+  @@schema("foundation")
+}
+
+model CatalogItemVersion {
+  id                String   @id @db.Uuid
+  itemId            String   @map("item_id") @db.Uuid
+  kind              String   @db.VarChar(16)
+  version           Int
+  title             String
+  description       String?
+  durationMinutes   Int?     @map("duration_minutes")
+  technicianVisible Boolean  @map("technician_visible")
+  publicVisible     Boolean  @map("public_visible")
+  reviewedBy        String   @map("reviewed_by") @db.Uuid
+  publishedAt       DateTime @default(dbgenerated("clock_timestamp()")) @map("published_at") @db.Timestamptz(6)
+  item              CatalogItem @relation("CatalogItemVersions", fields: [itemId, kind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "catalog_item_versions_item_fkey")
+  reviewer          Staff @relation("CatalogItemReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_item_versions_reviewer_fkey")
+  currentFor        CatalogItem[] @relation("CatalogItemCurrentVersion")
+  prices            CatalogPriceVersion[] @relation("CatalogPriceItemVersion")
+
+  @@unique([itemId, version], map: "catalog_item_versions_item_version_key")
+  @@unique([itemId, id], map: "catalog_item_versions_item_id_key")
+  @@map("catalog_item_versions")
+  @@schema("foundation")
+}
+
+model CatalogFaultServiceMapping {
+  id          String    @id @db.Uuid
+  categoryId  String    @map("category_id") @db.Uuid
+  faultId     String    @map("fault_id") @db.Uuid
+  faultKind   String    @default("FAULT") @map("fault_kind") @db.VarChar(16)
+  itemId      String    @map("item_id") @db.Uuid
+  itemKind    String    @default("WORK") @map("item_kind") @db.VarChar(16)
+  rowVersion  Int       @default(1) @map("row_version")
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(6)
+  publishedBy String?   @map("published_by") @db.Uuid
+  archivedAt  DateTime? @map("archived_at") @db.Timestamptz(6)
+  fault       CatalogDirectoryEntry @relation("CatalogMappingFault", fields: [faultId, faultKind, categoryId], references: [id, kind, categoryId], onDelete: Restrict, onUpdate: Restrict, map: "catalog_fault_service_mappings_fault_fkey")
+  item        CatalogItem @relation("CatalogMappingItem", fields: [itemId, itemKind, categoryId], references: [id, kind, categoryId], onDelete: Restrict, onUpdate: Restrict, map: "catalog_fault_service_mappings_item_fkey")
+  publisher   Staff? @relation("CatalogMappingPublisher", fields: [publishedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_fault_service_mappings_publisher_fkey")
+
+  @@unique([faultId, itemId], map: "catalog_fault_service_mappings_pair_key")
+  @@map("catalog_fault_service_mappings")
+  @@schema("foundation")
+}
+
+model CatalogPriceSeries {
+  id         String @id @db.Uuid
+  cityId     String @map("city_id") @db.Uuid
+  itemId     String @map("item_id") @db.Uuid
+  rowVersion Int    @default(1) @map("row_version")
+  city       ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_price_series_city_fkey")
+  item       CatalogItem @relation(fields: [itemId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_price_series_item_fkey")
+  versions   CatalogPriceVersion[]
+
+  @@unique([cityId, itemId], map: "catalog_price_series_city_item_key")
+  @@unique([id, cityId, itemId], map: "catalog_price_series_identity_key")
+  @@map("catalog_price_series")
+  @@schema("foundation")
+}
+
+// The reviewed price and original schedule are entirely immutable. SQL owns
+// the reverse FK's DEFERRABLE INITIALLY DEFERRED semantics.
+model CatalogPriceVersion {
+  id            String    @id @db.Uuid
+  seriesId      String    @map("series_id") @db.Uuid
+  cityId        String    @map("city_id") @db.Uuid
+  cityVersionId String    @map("city_version_id") @db.Uuid
+  itemId        String    @map("item_id") @db.Uuid
+  itemVersionId String    @map("item_version_id") @db.Uuid
+  version       Int
+  amountMinor   BigInt    @map("amount_minor")
+  currency      String    @db.VarChar(3)
+  zeroBasis     String?   @map("zero_basis")
+  sourceRef     String    @map("source_ref")
+  reviewedBy    String    @map("reviewed_by") @db.Uuid
+  publishedAt   DateTime  @default(dbgenerated("clock_timestamp()")) @map("published_at") @db.Timestamptz(6)
+  validFrom     DateTime  @map("valid_from") @db.Timestamptz(6)
+  validUntil    DateTime? @map("valid_until") @db.Timestamptz(6)
+  series        CatalogPriceSeries @relation(fields: [seriesId, cityId, itemId], references: [id, cityId, itemId], onDelete: Restrict, onUpdate: Restrict, map: "catalog_price_versions_series_fkey")
+  cityVersion   ServiceCityVersion @relation("CatalogPriceCityVersion", fields: [cityId, cityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_price_versions_city_version_fkey")
+  itemVersion   CatalogItemVersion @relation("CatalogPriceItemVersion", fields: [itemId, itemVersionId], references: [itemId, id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_price_versions_item_version_fkey")
+  reviewer      Staff @relation("CatalogPriceReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_price_versions_reviewer_fkey")
+  requiredPeriod CatalogPricePeriod @relation("CatalogPriceRequiredPeriod", fields: [id], references: [priceVersionId], onDelete: NoAction, onUpdate: NoAction, map: "catalog_price_versions_period_fkey")
+  periodIdentity CatalogPricePeriod[] @relation("CatalogPricePeriodIdentity")
+
+  @@unique([cityId, id], map: "catalog_price_versions_city_id_key")
+  @@unique([seriesId, version], map: "catalog_price_versions_series_version_key")
+  @@unique([id, seriesId, cityId, itemId], map: "catalog_price_versions_identity_key")
+  @@map("catalog_price_versions")
+  @@schema("foundation")
+}
+
+// The PK and two FKs enforce exact 1:1 pairing in SQL. Prisma models the
+// composite link as a list inverse because the uniqueness is on its PK subset.
+// Finite millisecond alignment, the GiST exclusion and final clock are SQL-only.
+model CatalogPricePeriod {
+  priceVersionId       String    @id @map("price_version_id") @db.Uuid
+  seriesId             String    @map("series_id") @db.Uuid
+  cityId               String    @map("city_id") @db.Uuid
+  itemId               String    @map("item_id") @db.Uuid
+  validFrom            DateTime  @map("valid_from") @db.Timestamptz(6)
+  scheduledUntil       DateTime? @map("scheduled_until") @db.Timestamptz(6)
+  closedEffectiveUntil DateTime? @map("closed_effective_until") @db.Timestamptz(6)
+  priceVersion         CatalogPriceVersion @relation("CatalogPricePeriodIdentity", fields: [priceVersionId, seriesId, cityId, itemId], references: [id, seriesId, cityId, itemId], onDelete: Restrict, onUpdate: Restrict, map: "catalog_price_periods_version_fkey")
+  requiredBy           CatalogPriceVersion? @relation("CatalogPriceRequiredPeriod")
+
+  @@map("catalog_price_periods")
   @@schema("foundation")
 }

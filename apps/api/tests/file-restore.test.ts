@@ -104,8 +104,8 @@ live('P03-04D copy-only isolated restore', () => {
     expect(process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS']).toBe('1');
     expect(process.env['FIXLEVELUP_STORAGE_S3_TESTS']).toBe('1');
     const schemaVersion = authFixtureMigrations.at(-1) ?? '';
-    expect(authFixtureMigrations).toHaveLength(18);
-    expect(schemaVersion).toBe('20261122000400_settings_management');
+    expect(authFixtureMigrations[17]).toBe('20261122000400_settings_management');
+    expect(schemaVersion).toBe('20261122000500_catalog_fixed_prices');
     const sourceDb = await startFileReservationsDatabase();
     const [ops, writer, nextWriter, signer, floorOps, floorRuntime] = [ledgerPool('file_ledger_operator'), ledgerPool('file_ledger_writer'),
       ledgerPool('file_ledger_writer_next'), ledgerPool('file_ledger_signer'), ledgerPool('file_floor_operator'), ledgerPool('file_floor_verifier')] as const;

@@ -161,11 +161,14 @@ export async function proveSettingsManagementUpgrade(db, deploy, historyDiff, sc
   assert.deepEqual(await history(db), after);
   assert.deepEqual(await snapshot(db, fullTables), replay);
   await preservedAcl(db, grants);
-  if (historyDiff && schemaDiff) {
-    historyDiff(0); schemaDiff(0);
+  if (historyDiff) {
+    // Once a later migration exists, only the exact capped SQL history represents 018.
+    // The workspace Prisma schema is proved against the latest fresh and upgrade databases.
+    historyDiff(0); schemaDiff?.(0);
     await db.query(`ALTER TABLE ${receipts} ADD COLUMN p018_drift_probe integer`);
-    try { historyDiff(2); schemaDiff(2); } finally { await db.query(`ALTER TABLE ${receipts} DROP COLUMN p018_drift_probe`); }
-    historyDiff(0); schemaDiff(0);
+    try { historyDiff(2); schemaDiff?.(2); }
+    finally { await db.query(`ALTER TABLE ${receipts} DROP COLUMN p018_drift_probe`); }
+    historyDiff(0); schemaDiff?.(0);
   }
   console.log(`018 upgrade/replay (${tables.length} prior tables, ${Object.values(before).reduce((n, records) => n + records.length, 0)} prior rows): ${founder ? 'exact founder issuance' : 'no eligible founder, full drift detection/restoration'}, old ACLs/data preserved: PASS`);
 }

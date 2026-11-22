@@ -10,6 +10,8 @@ import { filePrivacyChecks, proveFilePrivacyRuntime, proveFilePrivacyUpgrade } f
 import { settingsManagementChecks, settingsManagementCodes, proveSettingsManagementUpgrade, proveSettingsManagementCollision,
   proveSettingsManagementRuntime, prepareSettingsManagementFounder } from './test-settings-management-migration.mjs';
 import { areaChecks, proveAreaUpgrade } from './test-area-migration.mjs';
+import { catalogFixedPriceChecks, proveCatalogMigrationUpgrade, proveCatalogMigrationAcl,
+  proveCatalogMigrationRejections } from './test-catalog-fixed-prices-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { admin, credentials, connection, prepareDatabase, runPrisma, root } from './migration-local.mjs';
@@ -37,7 +39,8 @@ async function uniqueViolation(client, sql, values = []) {
   catch (error) { assert(error.code === '23505', `Expected unique_violation, got ${error.code}`); uniqueViolations += 1; return; }
   throw new Error('Duplicate row accepted');
 }
-const migrations = [
+const p04CatalogMigration = '20261122000500_catalog_fixed_prices';
+const p03Migrations = [
   'technical_audit_outbox', 'technical_outbox_attempts', 'technical_outbox_leases', 'staff_identity',
   'web_auth', 'authorization', 'staff_telegram_auth', 'staff_deactivation_grant', 'rbac',
 ].map((name, index) => `20261120${String(index + 1).padStart(4, '0')}00_${name}`)
@@ -45,10 +48,11 @@ const migrations = [
     '20261121000400_settings_legal_references', '20261121000500_file_upload_reservations',
     '20261122000100_file_upload_attempts', '20261122000200_file_processing_access',
     '20261122000300_file_privacy_deletion', '20261122000400_settings_management');
+const migrations = [...p03Migrations, p04CatalogMigration];
 const expectedChecks = [
   ...cityChecks,
   ...areaChecks, ...geoAccessChecks, ...settingsChecks, ...fileReservationChecks, ...fileUploadChecks, ...fileProcessingChecks, ...filePrivacyChecks,
-  ...settingsManagementChecks,
+  ...settingsManagementChecks, ...catalogFixedPriceChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -95,13 +99,14 @@ const fourteenthHistory = resolve(historyRoot, 'fourteenth/migrations');
 const fifteenthHistory = resolve(historyRoot, 'fifteenth/migrations');
 const sixteenthHistory = resolve(historyRoot, 'sixteenth/migrations');
 const seventeenthHistory = resolve(historyRoot, 'seventeenth/migrations');
+const eighteenthHistory = resolve(historyRoot, 'eighteenth/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
   for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, upgradeTwelfth, upgradeSeventeenth, collisionSeventeenth, shadow]) { await prepareDatabase(client, database, true); }
   console.log(`Isolated test databases: ${fresh}, ${upgrade}, ${upgradeSecond}, ${upgradeThird}, ${upgradeFourth}, ${upgradeFifth}, ${upgradeEighth}, ${upgradeTwelfth}, ${upgradeSeventeenth}, ${collisionSeventeenth}, ${shadow}`);
   for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)], [tenthHistory, migrations.slice(0,10)], [eleventhHistory, migrations.slice(0,11)],
     [twelfthHistory, migrations.slice(0,12)], [thirteenthHistory, migrations.slice(0,13)], [fourteenthHistory, migrations.slice(0,14)],
-    [fifteenthHistory, migrations.slice(0,15)], [sixteenthHistory, migrations.slice(0,16)], [seventeenthHistory, migrations.slice(0,17)]]) {
+    [fifteenthHistory, migrations.slice(0,15)], [sixteenthHistory, migrations.slice(0,16)], [seventeenthHistory, migrations.slice(0,17)], [eighteenthHistory, p03Migrations]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -151,10 +156,13 @@ try {
       (expected) => command(['migrate', 'diff', '--from-migrations', seventeenthHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow),
       () => {}); // The live Prisma schema now describes 018, never the capped 017 fixture.
     await proveSettingsManagementUpgrade(eighthReader,
-      () => command(['migrate', 'deploy'], upgradeEighth),
-      (expected) => command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow),
-      (expected) => command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth, expected),
-      migrations, undefined, true);
+      () => command(['migrate', 'deploy'], upgradeEighth, 0, undefined, eighteenthHistory),
+      (expected) => command(['migrate', 'diff', '--from-migrations', eighteenthHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow),
+      undefined, p03Migrations, undefined, true);
+    await proveCatalogMigrationUpgrade(eighthReader, p04CatalogMigration, p03Migrations.length,
+      () => command(['migrate', 'deploy'], upgradeEighth));
+    command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeEighth, 0, shadow);
+    command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth);
   } finally { await eighthReader.end(); }
   for (const database of [collisionSeventeenth, upgradeSeventeenth]) {
     command(['migrate', 'deploy'], database, 0, undefined, seventeenthHistory);
@@ -163,7 +171,8 @@ try {
     try {
       if (database === collisionSeventeenth) { await proveSettingsManagementCollision(owner); continue; }
       const founder = await prepareSettingsManagementFounder(owner);
-      await proveSettingsManagementUpgrade(owner, () => command(['migrate', 'deploy'], database), undefined, undefined, migrations, founder);
+      await proveSettingsManagementUpgrade(owner, () => command(['migrate', 'deploy'], database, 0, undefined, eighteenthHistory),
+        undefined, undefined, p03Migrations, founder);
       await proveSettingsManagementRuntime(owner, passwords.fixlevelup_runtime, founder);
     } finally { await owner.end(); }
   }
@@ -575,6 +584,14 @@ try {
   await freshManagementOwner.connect();
   try { await proveSettingsManagementRuntime(freshManagementOwner, passwords.fixlevelup_runtime); }
   finally { await freshManagementOwner.end(); }
+  const catalogOwner = connection('fixlevelup_migrator', passwords.fixlevelup_migrator, fresh);
+  const catalogRuntime = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, fresh);
+  try {
+    await catalogOwner.connect();
+    await catalogRuntime.connect();
+    await proveCatalogMigrationAcl(catalogRuntime);
+    await proveCatalogMigrationRejections(catalogOwner, catalogRuntime, runtimeStaffId);
+  } finally { await Promise.all([catalogOwner.end(), catalogRuntime.end()]); }
   console.log('P01-01.9A migration integration proofs: PASS. Test databases retained; no dev data reset.');
 } catch (error) {
   console.error(`Migration proof failed: ${error.message}`);

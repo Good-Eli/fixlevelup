@@ -9,7 +9,7 @@ import { hashPassword } from '../../apps/api/dist/staff/password.js';
 const requireApi = createRequire(new URL('../../apps/api/package.json', import.meta.url));
 const { Pool } = requireApi('pg');
 const migrationRoot = new URL('../../prisma/migrations/', import.meta.url);
-const head = '20261122000400_settings_management';
+const head = '20261122000500_catalog_fixed_prices';
 export const database = 'fixlevelup_dev'; // Required by compiled production API, inside a new network namespace only.
 export const token = () => randomBytes(32).toString('hex');
 
@@ -54,7 +54,9 @@ export async function provision() {
   const manager = { id: randomUUID(), login: `p0305-manager-${randomUUID()}`, password: token() };
   try {
     const steps = (await readdir(migrationRoot)).filter(name => /^\d{14}_/.test(name)).sort();
-    if (steps.length !== 18 || steps.at(-1) !== head) { throw new Error('Unexpected P03 migration chain'); }
+    if (steps.length !== 19 || steps[17] !== '20261122000400_settings_management' || steps.at(-1) !== head) {
+      throw new Error('Unexpected migration chain for P03 regression smoke');
+    }
     const databaseTooling = new URL('../../packages/database-tooling/', import.meta.url);
     const requirePrisma = createRequire(new URL('package.json', databaseTooling));
     const deployed = spawnSync(process.execPath, [requirePrisma.resolve('prisma/build/index.js'), 'migrate', 'deploy', '--config', 'prisma.config.ts'], {
