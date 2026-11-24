@@ -395,8 +395,11 @@ async function addStaff(db, { role, login, marker = false, assignedBy = null }) 
 
 // Use exactly the two fixture namespaces accepted by the SQL guard; never enlarge the shared deployment allowlist.
 export async function proveCatalogManagementIssuer(admin, passwords, migrations) {
-  assert.equal(migrations.length,21);
-  assert.equal(migrations.at(-1),migration);
+  // The issuer proof is anchored at exactly the 021 capped chain; a later
+  // slice appends migrations, so the pinned count here refers to the 021
+  // prefix of the chain, not to the live repository length.
+  assert.equal(migrations.length >= 21 ? migrations[20] : migrations.at(-1), migration);
+  assert.equal(migrations.indexOf(migration), 20);
   assert.deepEqual(await one(admin, 'SELECT current_database() AS db,current_user AS role,current_setting(\'server_version_num\') AS pg'),
     {db:'fixlevelup_dev',role:'fixlevelup_dev',pg:'180007'}); // only database provisioning uses the admin connection; all migration/data SQL runs in isolated DBs
   const requireApi = createRequire(new URL('../../../apps/api/package.json',import.meta.url));
@@ -415,7 +418,10 @@ export async function proveCatalogManagementIssuer(admin, passwords, migrations)
     try {
       await owner.connect();
       assert.equal(await isolated(owner,'fixlevelup_migrator',allowedFixture),name);
-      for (const step of migrations) { await owner.query(sql(step)); }
+      // The issuer proof deploys the EXACT capped 021 chain into its fixture
+      // databases: a later slice's migrations must never silently enter this
+      // proof's schema profile.
+      for (const step of migrations.slice(0, migrations.indexOf(migration) + 1)) { await owner.query(sql(step)); }
       await db.connect();
       assert.equal(await isolated(db,'fixlevelup_runtime',allowedFixture),name);
       await inert(owner);

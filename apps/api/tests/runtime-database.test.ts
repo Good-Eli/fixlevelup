@@ -4,7 +4,6 @@ import { createServer } from 'node:net';
 import type { Server } from 'node:http';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import request from 'supertest';
 import { describe, expect, it } from 'vitest';
@@ -14,6 +13,8 @@ import { loadDatabaseConfig, RuntimeDatabase } from '../src/infrastructure/datab
 import type { DatabaseConfig } from '../src/infrastructure/database/runtime-database.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 import { authFixtureMigrations, migrateAuthFixture } from './auth-db-fixture.js';
+import { admitFixture, syntheticAdmission } from './admission-fixture.js';
+import { startLauncher } from './launcher-harness.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 const source = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
@@ -95,27 +96,45 @@ describe('API runtime database readiness', () => {
   });
 
   it('serves real HTTP readiness under runtime role and shuts down the pool', async () => {
-    const app = await createApi(config, new SafeLogger('api'), database);
-    const server = app.getHttpServer() as Server;
+    const { Client } = await import('pg');
+    // P05-01: a real launcher witness on the dev database pins the admission.
+    const holder = new Client({ host: '127.0.0.1', port: 55432, database: 'fixlevelup_dev', user: 'fixlevelup_runtime', password });
+    await holder.connect();
+    const admission = await admitFixture(holder, 'fixlevelup_dev', 'API');
     try {
-      const responses = await Promise.all(Array.from({ length: 5 }, () => request(server).get('/health/ready')));
-      expect(responses.every((response) => response.status === 200)).toBe(true);
-      expect(responses[0]?.body).toEqual({ status: 'ok' });
-      expect(responses[0]?.headers['cache-control']).toBe('no-store');
-      await request(server).get('/health/live').expect(200);
-    } finally { await app.close(); }
+      const app = await createApi(config, new SafeLogger('api'), database, undefined, undefined, admission.authorization);
+      const server = app.getHttpServer() as Server;
+      try {
+        const responses = await Promise.all(Array.from({ length: 5 }, () => request(server).get('/health/ready')));
+        expect(responses.every((response) => response.status === 200)).toBe(true);
+        expect(responses[0]?.body).toEqual({ status: 'ok' });
+        expect(responses[0]?.headers['cache-control']).toBe('no-store');
+        await request(server).get('/health/live').expect(200);
+      } finally { await app.close(); }
+    } finally { await admission.release(); await holder.end(); }
   });
 
   it('keeps liveness healthy on invalid password and never exposes driver errors', async () => {
-    const app = await createApi(config, new SafeLogger('api'), { ...database, password: 'synthetic-invalid-password-canary' });
+    // A GENUINE process admission (real witness on the dev database, issued by
+    // the production admitProcess) for an application whose pool carries an
+    // invalid password: every checkout fails closed, nothing is logged, and
+    // liveness stays independent of providers.
+    const { Client } = await import('pg');
+    const holder = new Client({ host: '127.0.0.1', port: 55432, database: 'fixlevelup_dev', user: 'fixlevelup_runtime', password });
+    await holder.connect();
+    const admitted = await admitFixture(holder, 'fixlevelup_dev', 'API');
     try {
-      const server = app.getHttpServer() as Server;
-      const started = Date.now();
-      const response = await request(server).get('/health/ready').expect(503);
-      expect(Date.now() - started).toBeLessThan(2500);
-      expect(JSON.stringify(response.body)).not.toMatch(/synthetic-invalid|password|postgresql|stack/);
-      await request(server).get('/health/live').expect(200);
-    } finally { await app.close(); }
+      const app = await createApi(config, new SafeLogger('api'), { ...database, password: 'synthetic-invalid-password-canary' },
+        undefined, undefined, admitted.authorization);
+      try {
+        const server = app.getHttpServer() as Server;
+        const started = Date.now();
+        const response = await request(server).get('/health/ready').expect(503);
+        expect(Date.now() - started).toBeLessThan(2500);
+        expect(JSON.stringify(response.body)).not.toMatch(/synthetic-invalid|password|postgresql|stack/);
+        await request(server).get('/health/live').expect(200);
+      } finally { await app.close(); }
+    } finally { await admitted.release(); await holder.end(); }
   });
 
   it('bounds stalled TCP handshake and closes pending sockets without changing Docker', async () => {
@@ -129,7 +148,7 @@ describe('API runtime database readiness', () => {
     await new Promise<void>((resolve) => { stalled.listen(0, '127.0.0.1', resolve); });
     const address = stalled.address();
     if (!address || typeof address === 'string') { throw new Error('Expected TCP port'); }
-    const db = new RuntimeDatabase({ ...database, port: address.port });
+    const db = new RuntimeDatabase({ ...database, port: address.port }, false, syntheticAdmission('API').admission);
     try {
       const started = Date.now();
       const first = db.ready();
@@ -162,7 +181,9 @@ describe('API runtime database readiness', () => {
     } finally { await admin.end(); }
     const fixture = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: name, user: 'fixlevelup_dev', password: adminPassword });
     await fixture.connect();
-    const app = await createApi(config, new SafeLogger('api'), { ...database, database: name });
+    // P05-01: the launcher witness lives on the fixture owner connection.
+    const admission = await admitFixture(fixture, name, 'API');
+    const app = await createApi(config, new SafeLogger('api'), { ...database, database: name }, undefined, undefined, admission.authorization);
     const server = app.getHttpServer() as Server;
     try {
       for (const migration of ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases']) {
@@ -223,7 +244,7 @@ describe('API runtime database readiness', () => {
       await fixture.query('DROP INDEX foundation.outbox_events_queue_idx; CREATE INDEX outbox_events_queue_idx ON foundation.outbox_events(created_at,status)');
       await request(server).get('/health/ready').expect(503);
       await request(server).get('/health/live').expect(200);
-    } finally { await app.close(); await fixture.end(); }
+    } finally { await app.close(); await admission.release(); await fixture.end(); }
   });
 
   it.runIf(isolatedDbTests)('rejects weakened 013 settings/legal guards and grants on an isolated full-migration DB', async () => {
@@ -250,7 +271,9 @@ describe('API runtime database readiness', () => {
     // The runtime must not read migration history, but auth readiness expects the table.
     await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
     const webAuth = { origin: 'https://127.0.0.1:3100', csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
-    const app = await createApi(config, new SafeLogger('api'), { ...database, database: name }, webAuth);
+    // P05-01: the launcher witness lives on the migrator fixture connection.
+    const admission = await admitFixture(fixture, name, 'API');
+    const app = await createApi(config, new SafeLogger('api'), { ...database, database: name }, webAuth, undefined, admission.authorization);
     const server = app.getHttpServer() as Server;
     try {
       await request(server).get('/health/ready').expect(200);
@@ -297,7 +320,7 @@ describe('API runtime database readiness', () => {
       await fixture.query('DROP INDEX foundation.reference_entries_company_code_key; CREATE UNIQUE INDEX reference_entries_company_code_key ON foundation.reference_entries(type, code)');
       await request(server).get('/health/ready').expect(503);
       await request(server).get('/health/live').expect(200);
-    } finally { await app.close(); await fixture.end(); }
+    } finally { await app.close(); await admission.release(); await fixture.end(); }
   });
 
   it.runIf(isolatedDbTests)('requires exact 018 guards, catalog and ACL without requiring founder or settings values', async () => {
@@ -316,7 +339,9 @@ describe('API runtime database readiness', () => {
     } finally { await admin.end(); }
     const owner = new Client({ ...address, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
     await owner.connect();
-    const db = new RuntimeDatabase({ ...database, database: name }, true);
+    // P05-01: the launcher witness lives on the migrator owner connection.
+    const admission = await admitFixture(owner, name, 'TEST');
+    const db = new RuntimeDatabase({ ...database, database: name }, true, admission.admission);
     try {
       expect(await db.settingsManagementReady()).toBe(false);
       expect(await db.ready()).toBe(false);
@@ -397,29 +422,171 @@ describe('API runtime database readiness', () => {
         finally { await owner.query(restore); }
         expect(await db.settingsManagementReady(), restore).toBe(true);
       }
+    } finally { await db.onModuleDestroy(); await admission.release(); await owner.end(); }
+  });
+
+  it.runIf(isolatedDbTests)('P05-01 S1 gate: positive on the exact 022 profile, negative on every listed drift', async () => {
+    const { Client } = await import('pg');
+    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'))?.[1];
+    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(source)?.[1];
+    if (!adminPassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    const name = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
+    const address = { host: '127.0.0.1', port: 55432 };
+    const admin = new Client({ ...address, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+    await admin.connect();
+    try {
+      await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
+    } finally { await admin.end(); }
+    const owner = new Client({ ...address, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+    await owner.connect();
+    // P05-01: the launcher witness lives on the migrator owner connection.
+    const admission = await admitFixture(owner, name, 'TEST');
+    const db = new RuntimeDatabase({ ...database, database: name }, true, admission.admission);
+    try {
+      // Before the chain exists the S1 gate is closed...
+      expect(await db.requestIntakeReady()).toBe(false);
+      // ...and legacy readiness never depends on it (no P05 tables at all yet).
+      await migrateAuthFixture(owner, name);
+      await owner.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
+      // The S1 gate turns true exactly on the full 022 profile.
+      expect(await db.requestIntakeReady()).toBe(true);
+      const drift = [
+        // A disabled fence trigger on a LEGACY basis table must fail the gate.
+        'ALTER TABLE foundation.service_cities DISABLE TRIGGER service_cities_geo_cfg_fence',
+        // A no-op replacement of the fence guard body must fail the gate.
+        "CREATE OR REPLACE FUNCTION foundation.geo_cfg_fence_guard() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog AS $$ BEGIN RETURN NULL; END $$",
+        // A dropped P05 guard trigger and a weakened CHECK both fail closed.
+        'ALTER TABLE foundation.requests DISABLE TRIGGER requests_guard',
+        'ALTER TABLE foundation.requests DROP CONSTRAINT requests_status_check; ALTER TABLE foundation.requests ADD CONSTRAINT requests_status_check CHECK (true)',
+        // Extra table-level runtime privilege on a P05 table fails closed.
+        'GRANT DELETE ON foundation.request_events TO fixlevelup_runtime',
+        // A PUBLIC grant on a P05 table fails closed.
+        'GRANT SELECT(id) ON foundation.request_policy_packages TO PUBLIC',
+        // A fence trigger missing entirely from one of the nine relations.
+        'DROP TRIGGER reference_entries_geo_cfg_fence ON foundation.reference_entries',
+        // Persistence drift: an unlogged P05 table changes crash durability.
+        'ALTER TABLE foundation.request_events SET UNLOGGED',
+        // An extra table-level runtime UPDATE privilege on a P05 table (the
+        // stored ACL beyond the reviewed column grants) fails closed.
+        'GRANT UPDATE ON foundation.request_policy_packages TO fixlevelup_runtime',
+        // An extra individual runtime privilege on a FENCE relation where a
+        // sibling from the same former any-of group is already granted: 012
+        // grants DELETE on the coverage table, so only the per-privilege
+        // fence_acl booleans can see the new TRUNCATE.
+        'GRANT TRUNCATE ON foundation.service_area_district_coverage TO fixlevelup_runtime',
+        // A PUBLIC grant on a FENCE relation (not only on the ten P05
+        // tables) fails closed: public_acl covers all 19 relations.
+        'GRANT SELECT ON foundation.service_cities TO PUBLIC',
+        // A RUNTIME column-only privilege on a FENCE relation where no
+        // table-level boolean changes: 012 grants the runtime no UPDATE
+        // column at all on service_city_versions (only SELECT/INSERT lists),
+        // so only the per-column fence_column_grants shape can see the new
+        // UPDATE(display_name) — administrative_districts would not do here
+        // because 012 already grants UPDATE(name,archived_at) there.
+        'GRANT UPDATE(display_name) ON foundation.service_city_versions TO fixlevelup_runtime',
+        // A GRANT OPTION upgrade of a privilege the runtime already holds:
+        // 012 grants plain table DELETE on the coverage table, so no
+        // per-privilege boolean changes — only the per-privilege grantable
+        // variant in fence_acl can see the authority change. The owner can
+        // re-grant with grant option because it owns the table.
+        'GRANT DELETE ON foundation.service_area_district_coverage TO fixlevelup_runtime WITH GRANT OPTION',
+        // A third role gaining COLUMN-level SELECT on the ciphertext must also
+        // fail closed (the attacl entry is part of the fingerprint). The admin
+        // connection creates the one-off probe role first.
+        undefined,
+      ];
+      const restore = [
+        'ALTER TABLE foundation.service_cities ENABLE TRIGGER service_cities_geo_cfg_fence',
+        undefined,
+        'ALTER TABLE foundation.requests ENABLE TRIGGER requests_guard',
+        'ALTER TABLE foundation.requests DROP CONSTRAINT requests_status_check; ALTER TABLE foundation.requests ADD CONSTRAINT requests_status_check CHECK (status COLLATE "C" IN (\'NEW\',\'CALLBACK_REQUIRED\',\'WAITING_TELEGRAM_LINK\',\'WAITING_CHANNEL_LINK\',\'MANAGER_REVIEW\',\'WAITING_ASSIGNMENT\',\'ASSIGNED\',\'TECHNICIAN_ACCEPTED\',\'ON_THE_WAY\',\'ARRIVED\',\'DIAGNOSTICS\',\'WAITING_ESTIMATE_APPROVAL\',\'IN_PROGRESS\',\'WAITING_PARTS\',\'PAUSED\',\'TECHNICIAN_COMPLETED\',\'REVISIT_REQUIRED\',\'CLOSED\',\'CANCELLED\'))',
+        'REVOKE DELETE ON foundation.request_events FROM fixlevelup_runtime',
+        'REVOKE SELECT(id) ON foundation.request_policy_packages FROM PUBLIC',
+        'CREATE TRIGGER reference_entries_geo_cfg_fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON foundation.reference_entries FOR EACH STATEMENT EXECUTE FUNCTION foundation.geo_cfg_fence_guard()',
+        'ALTER TABLE foundation.request_events SET LOGGED',
+        'REVOKE UPDATE ON foundation.request_policy_packages FROM fixlevelup_runtime',
+        'REVOKE TRUNCATE ON foundation.service_area_district_coverage FROM fixlevelup_runtime',
+        'REVOKE SELECT ON foundation.service_cities FROM PUBLIC',
+        'REVOKE UPDATE(display_name) ON foundation.service_city_versions FROM fixlevelup_runtime',
+        // REVOKE GRANT OPTION FOR removes only the grant option and keeps
+        // the base DELETE privilege, so the hash returns exactly to baseline.
+        'REVOKE GRANT OPTION FOR DELETE ON foundation.service_area_district_coverage FROM fixlevelup_runtime',
+        undefined,
+      ];
+      const fenceDef = (await owner.query<{ definition: string }>(`SELECT pg_get_functiondef(oid) AS definition
+        FROM pg_proc WHERE pronamespace='foundation'::regnamespace AND proname='geo_cfg_fence_guard'`)).rows[0]?.definition;
+      if (!fenceDef) { throw new Error('Missing fence guard definition'); }
+      restore[1] = fenceDef;
+      // The attacl probe role: created and dropped by the admin connection
+      // (the migrator has no CREATEROLE); the drift loop only grants/revokes,
+      // and the migrator runs the plain REVOKE from the restore list. The
+      // role name is unique per run and NOLOGIN: a plain CREATE ROLE cannot
+      // collide with (or silently mask) any pre-existing cluster role, and
+      // the teardown drop can only ever touch this run's own role.
+      const probeRole = `fixlevelup_s1_probe_${randomBytes(6).toString('hex')}`;
+      {
+        const admin2 = new Client({ ...address, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+        await admin2.connect();
+        try { await admin2.query(`CREATE ROLE "${probeRole}" NOLOGIN`); }
+        finally { await admin2.end(); }
+      }
+      drift[drift.length - 1] = `GRANT SELECT(ciphertext) ON foundation.request_payload_cells TO "${probeRole}"`;
+      restore[restore.length - 1] = `REVOKE SELECT(ciphertext) ON foundation.request_payload_cells FROM "${probeRole}"`;
+      const driftStatements = drift.map((statement): string => {
+        if (statement === undefined) { throw new Error('Unresolved S1 drift statement'); }
+        return statement;
+      });
+      const dropProbe = new Client({ ...address, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+      await dropProbe.connect();
+      try {
+        for (const [index, broken] of driftStatements.entries()) {
+          const undo = restore[index];
+          if (!undo) { throw new Error('Missing S1 drift restoration'); }
+          await owner.query(broken);
+          try { expect(await db.requestIntakeReady(), broken).toBe(false); }
+          finally {
+            // Every restore is a plain REVOKE/DDL the migrator is allowed to
+            // run, including the attacl one; only the role DROP needs the
+            // admin connection, and that happens in the teardown below.
+            await owner.query(undo);
+          }
+          expect(await db.requestIntakeReady(), undo).toBe(true);
+        }
+      } finally {
+        await dropProbe.query(`DROP ROLE IF EXISTS "${probeRole}"`).catch(() => undefined);
+        await dropProbe.end();
+      }
     } finally { await db.onModuleDestroy(); await owner.end(); }
   });
 
-  it('closes a used runtime DB pool in the compiled API signal handler without leaking password', () => {
-    const source = `
-      import {createApi} from ${JSON.stringify(pathToFileURL(resolve(root, 'apps/api/dist/bootstrap/factories.js')).href)};
-      import {loadConfig} from ${JSON.stringify(pathToFileURL(resolve(root, 'apps/api/dist/runtime/config.js')).href)};
-      import {loadDatabaseConfig} from ${JSON.stringify(pathToFileURL(resolve(root, 'apps/api/dist/infrastructure/database/runtime-database.js')).href)};
-      import {SafeLogger} from ${JSON.stringify(pathToFileURL(resolve(root, 'apps/api/dist/runtime/safe-logger.js')).href)};
-      import {registerShutdown} from ${JSON.stringify(pathToFileURL(resolve(root, 'apps/api/dist/runtime/lifecycle.js')).href)};
-      const c=loadConfig(process.env),logger=new SafeLogger('api');
-      const app=await createApi(c,logger,loadDatabaseConfig(process.env));registerShutdown(app,c,logger);
-      const r=await fetch((await app.getUrl())+'/health/ready');if(r.status!==200)throw new Error('not-ready');
-      process.emit('SIGTERM');
-    `;
-    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', source], {
-      cwd: root, encoding: 'utf8', timeout: 10000, env: {
-        ...process.env, NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0', SHUTDOWN_TIMEOUT_MS: '5000',
-        DB_HOST: database.host, DB_PORT: String(database.port), DB_NAME: database.database, DB_USER: database.user, DB_PASSWORD: password,
-      },
-    });
-    expect(result.error).toBeUndefined();
+  it('closes a used runtime DB pool in the compiled API signal handler without leaking password', async () => {
+    // P05-01 §7 (round 6): the compiled API entrypoint is spawned with the real
+    // private IPC channel; this parent acts as the launcher (witness, one-time
+    // registry row, production decideLaunch). The child only listens after
+    // the single approval + acknowledgement, and shuts its pool down on SIGTERM.
+    const launcher = await startLauncher('API');
+    let result;
+    try {
+      result = await launcher.launch({
+        timeoutMs: 20_000,
+        env: { ...process.env, NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0', SHUTDOWN_TIMEOUT_MS: '5000',
+          DB_HOST: database.host, DB_PORT: String(database.port), DB_NAME: database.database, DB_USER: database.user,
+          DB_PASSWORD: password, LAUNCH_APPROVAL_TIMEOUT_MS: '10000' },
+        source: `
+        await import(${JSON.stringify(pathToFileURL(resolve(root, 'apps/api/dist/bootstrap/api.js')).href)});
+        setTimeout(()=>{process.emit('SIGTERM');},600);
+        `,
+      });
+    } finally {
+      await launcher.close();
+    }
     expect(result.status).toBe(0);
+    expect(result.approvals).toBe(1);
+    expect(result.acked).toBe(true);
+    expect(result.decision).toBe('approved:acked');
+    expect(result.stdout).toContain('"event":"started"');
     expect(result.stdout).toContain('shutdown_completed');
     expect(result.stdout + result.stderr).not.toContain(password);
   });

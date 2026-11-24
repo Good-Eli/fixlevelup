@@ -57,6 +57,7 @@ model Staff {
   revokedZoneAdmissions   TechnicianServiceArea[]   @relation("TechnicianZoneRevoker")
   geographyReceipts       GeographyCommandReceipt[] @relation("GeographyReceiptActor")
   p03Receipts             P03CommandReceipt[]       @relation("P03ReceiptActor")
+  requestEvents          RequestEvent[]            @relation("RequestEventActor")
   revokedP03BootstrapGrants P03BootstrapPermission[] @relation("P03BootstrapRevoker")
   reviewedReferenceEntryVersions  ReferenceEntryVersion[] @relation("ReferenceEntryVersionReviewer")
   reviewedContentBlockRevisions   ContentBlockRevision[]  @relation("ContentBlockRevisionReviewer")
@@ -300,6 +301,7 @@ model ServiceCity {
   pricingPolicySeries PricingPolicySeries?
   publicPriceEstimateSeries PublicPriceEstimateSeries[]
   p04Receipts P04CommandReceipt[] @relation("P04ReceiptCity")
+  requests Request[] @relation("RequestCity")
 
   @@map("service_cities")
   @@schema("foundation")
@@ -330,6 +332,7 @@ model ServiceCityVersion {
   priceRuleVersions PriceRuleVersion[] @relation("PriceRuleCityVersion")
   pricingPolicyVersions PricingPolicyVersion[] @relation("PricingPolicyCityVersion")
   publicPriceEstimates PublicPriceEstimate[] @relation("PublicPriceEstimateCityVersion")
+  intakeRequests Request[] @relation("RequestIntakeCityVersion")
 
   @@unique([cityId, version], map: "service_city_versions_city_version_key")
   @@unique([cityId, id], map: "service_city_versions_city_id_key")
@@ -385,6 +388,7 @@ model AdministrativeDistrict {
   rowVersion Int      @default(1) @map("row_version")
   city      ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   coverage  ServiceAreaDistrictCoverage[]
+  addressRevisions RequestAddressRevision[]
 
   @@unique([cityId, code], map: "administrative_districts_city_code_key")
   @@unique([cityId, id], map: "administrative_districts_city_id_key")
@@ -788,6 +792,7 @@ model RequestSession {
   intakeCityVersion   ServiceCityVersion @relation("RequestSessionCityVersion", fields: [intakeCityId, intakeCityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
   consents            ConsentRecord[]
   fileUploadIntents   FileUploadIntent[] @relation("FileUploadIntentSession")
+  requestEvents       RequestEvent[]
 
   @@map("request_sessions")
   @@schema("foundation")
@@ -1098,6 +1103,9 @@ model CatalogDirectoryEntry {
   faultMappings    CatalogFaultServiceMapping[] @relation("CatalogMappingFault")
   priceRuleScopes  PriceRuleScope[] @relation("PriceRuleScopeCategory")
   publicPriceEstimateSeries PublicPriceEstimateSeries[] @relation("PublicPriceEstimateCategory")
+  applianceCategories RequestApplianceRevision[] @relation("RequestApplianceCategory")
+  applianceModels    RequestApplianceRevision[] @relation("RequestApplianceModel")
+  requestFaults      RequestFault[] @relation("RequestFaultEntry")
 
   @@unique([kind, code], map: "catalog_directory_entries_kind_code_key")
   @@unique([id, kind], map: "catalog_directory_entries_id_kind_key")
@@ -1117,6 +1125,9 @@ model CatalogDirectoryVersion {
   entry       CatalogDirectoryEntry @relation("CatalogDirectoryVersions", fields: [entryId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_versions_entry_fkey")
   reviewer    Staff @relation("CatalogDirectoryReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_versions_reviewer_fkey")
   currentFor  CatalogDirectoryEntry[] @relation("CatalogDirectoryCurrentVersion")
+  requestFaults RequestFault[] @relation("RequestFaultRevision")
+  applianceCategories RequestApplianceRevision[] @relation("RequestApplianceCategoryRevision")
+  applianceModels    RequestApplianceRevision[] @relation("RequestApplianceModelRevision")
 
   @@unique([entryId, version], map: "catalog_directory_versions_entry_version_key")
   @@unique([entryId, id], map: "catalog_directory_versions_entry_id_key")
@@ -1600,5 +1611,233 @@ model ExternalReviewRevision {
   @@unique([entryId, version], map: "external_review_revisions_entry_version_key")
   @@unique([entryId, kind, id], map: "external_review_revisions_entry_kind_id_key")
   @@map("external_review_revisions")
+  @@schema("foundation")
+}
+
+// ---------------------------------------------------------------------------
+// P05-01 (022, schema profile S1): request intake foundation. Immutable policy
+// packages, the business customer record, the request aggregate and its typed
+// encrypted history. All SQL guards/triggers/grants live in migration 022.
+// ---------------------------------------------------------------------------
+
+// Reviewed intake/workflow policy metadata pair; versions are provisioned by
+// the isolated test stand, never by a runtime seed. Append-only.
+model RequestPolicyPackage {
+  id              String   @id @db.Uuid
+  workflowVersion String   @map("workflow_version") @unique @db.VarChar(64)
+  policyRevision  String   @map("policy_revision") @unique @db.VarChar(68)
+  metadataSha256  String   @map("metadata_sha256") @db.VarChar(64)
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  requests           Request[] @relation("RequestWorkflowPackage")
+  intakePolicyFor    Request[] @relation("RequestIntakePolicy")
+
+  @@map("request_policy_packages")
+  @@schema("foundation")
+}
+
+// Q03: a business record, not an auth principal. No plaintext personal column;
+// every personal value lives in RequestPayloadCell ciphertext.
+model Customer {
+  id        String   @id @db.Uuid
+  createdAt DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  requests  Request[]
+
+  @@map("customers")
+  @@schema("foundation")
+}
+
+// One random DEK per payload, wrapped under a versioned external KEK. The AAD
+// is rebuilt from the immutable (request, kind, revision) identity.
+model RequestPayloadCell {
+  id         String   @id @db.Uuid
+  requestId  String   @map("request_id") @db.Uuid
+  kind       String   @db.VarChar(24)
+  revision   Int
+  keyId      String   @map("key_id") @db.VarChar(64)
+  wrappedDek Bytes    @map("wrapped_dek")
+  nonce      Bytes
+  ciphertext Bytes
+  authTag    Bytes    @map("auth_tag")
+  aadContext String   @map("aad_context") @db.VarChar(128)
+  createdAt  DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request    Request @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_payload_cells_request_id_fkey")
+  contacts   RequestContactRevision[]
+  addresses  RequestAddressRevision[]
+  appliances RequestApplianceRevision[]
+
+  @@unique([requestId, kind, revision], map: "request_payload_cells_request_kind_revision_key")
+  @@unique([requestId, id], map: "request_payload_cells_request_id_id_key")
+  @@map("request_payload_cells")
+  @@schema("foundation")
+}
+
+model Request {
+  id                          String  @id @db.Uuid
+  publicNumber                BigInt  @default(autoincrement()) @map("public_number")
+  type                        String  @db.VarChar(16)
+  status                      String  @db.VarChar(32)
+  rowVersion                  Int     @default(1) @map("row_version")
+  customerId                  String  @map("customer_id") @db.Uuid
+  cityId                      String  @map("city_id") @db.Uuid
+  intakeCityVersionId         String  @map("intake_city_version_id") @db.Uuid
+  workflowPackageId           String  @map("workflow_package_id") @db.Uuid
+  intakePolicyRevisionId      String  @map("intake_policy_revision_id") @db.Uuid
+  currentContactRevisionId    String? @map("current_contact_revision_id") @db.Uuid
+  currentAddressRevisionId    String? @map("current_address_revision_id") @db.Uuid
+  currentApplianceRevisionId  String? @map("current_appliance_revision_id") @db.Uuid
+  currentPreferenceRevisionId String? @map("current_preference_revision_id") @db.Uuid
+  createdAt                   DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime @default(dbgenerated("clock_timestamp()")) @map("updated_at") @db.Timestamptz(6)
+  isWaitingLink               Boolean @default(dbgenerated("((status)::text = ANY ((ARRAY['WAITING_TELEGRAM_LINK'::character varying, 'WAITING_CHANNEL_LINK'::character varying])::text[]))")) @map("is_waiting_link")
+  customer                    Customer @relation(fields: [customerId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "requests_customer_id_fkey")
+  city                        ServiceCity @relation("RequestCity", fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "requests_city_id_fkey")
+  intakeCityVersion           ServiceCityVersion @relation("RequestIntakeCityVersion", fields: [cityId, intakeCityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_city_id_intake_city_version_id_fkey")
+  workflowPackage             RequestPolicyPackage @relation("RequestWorkflowPackage", fields: [workflowPackageId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "requests_workflow_package_id_fkey")
+  intakePolicyRevision        RequestPolicyPackage @relation("RequestIntakePolicy", fields: [intakePolicyRevisionId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "requests_intake_policy_revision_id_fkey")
+  currentContactRevision      RequestContactRevision? @relation("RequestCurrentContact", fields: [id, currentContactRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_current_contact_revision_fkey")
+  currentAddressRevision      RequestAddressRevision? @relation("RequestCurrentAddress", fields: [id, currentAddressRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_current_address_revision_fkey")
+  currentApplianceRevision    RequestApplianceRevision? @relation("RequestCurrentAppliance", fields: [id, currentApplianceRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_current_appliance_revision_fkey")
+  currentPreferenceRevision   RequestPreferenceRevision? @relation("RequestCurrentPreference", fields: [id, currentPreferenceRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_current_preference_revision_fkey")
+  payloadCells                RequestPayloadCell[]
+  contacts                    RequestContactRevision[] @relation("RequestContactHistory")
+  addresses                   RequestAddressRevision[] @relation("RequestAddressHistory")
+  appliances                  RequestApplianceRevision[] @relation("RequestApplianceHistory")
+  preferences                 RequestPreferenceRevision[]
+  events                      RequestEvent[]
+
+  @@unique([publicNumber], map: "requests_public_number_key")
+  @@unique([id, customerId], map: "requests_id_customer_id_key")
+  @@unique([id, cityId, intakeCityVersionId], map: "requests_id_city_id_intake_city_version_id_key")
+  @@unique([id, currentContactRevisionId], map: "requests_current_contact_key")
+  @@unique([id, currentAddressRevisionId], map: "requests_current_address_key")
+  @@unique([id, currentApplianceRevisionId], map: "requests_current_appliance_key")
+  @@unique([id, currentPreferenceRevisionId], map: "requests_current_preference_key")
+  @@index([customerId], map: "requests_customer_id_idx")
+  @@map("requests")
+  @@schema("foundation")
+}
+
+model RequestContactRevision {
+  id            String   @id @db.Uuid
+  requestId     String   @map("request_id") @db.Uuid
+  revision      Int
+  mode          String   @db.VarChar(16)
+  payloadCellId String   @map("payload_cell_id") @db.Uuid
+  createdAt     DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request       Request @relation("RequestContactHistory", fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_contact_revisions_request_id_fkey")
+  payloadCell   RequestPayloadCell @relation(fields: [requestId, payloadCellId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_contact_revisions_payload_fkey")
+  currentFor    Request[] @relation("RequestCurrentContact")
+
+  @@unique([requestId, revision], map: "request_contact_revisions_request_revision_key")
+  @@unique([requestId, id], map: "request_contact_revisions_request_id_id_key")
+  @@map("request_contact_revisions")
+  @@schema("foundation")
+}
+
+model RequestAddressRevision {
+  id            String   @id @db.Uuid
+  requestId     String   @map("request_id") @db.Uuid
+  revision      Int
+  districtId         String?  @map("district_id") @db.Uuid
+  districtRowVersion Int?     @map("district_row_version")
+  payloadCellId String   @map("payload_cell_id") @db.Uuid
+  createdAt     DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request       Request @relation("RequestAddressHistory", fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_address_revisions_request_id_fkey")
+  district      AdministrativeDistrict? @relation(fields: [districtId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_address_revisions_district_fkey")
+  payloadCell   RequestPayloadCell @relation(fields: [requestId, payloadCellId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_address_revisions_payload_fkey")
+  currentFor    Request[] @relation("RequestCurrentAddress")
+
+  @@unique([requestId, revision], map: "request_address_revisions_request_revision_key")
+  @@unique([requestId, id], map: "request_address_revisions_request_id_id_key")
+  @@map("request_address_revisions")
+  @@schema("foundation")
+}
+
+model RequestApplianceRevision {
+  id            String   @id @db.Uuid
+  requestId     String   @map("request_id") @db.Uuid
+  revision      Int
+  categoryId         String   @map("category_id") @db.Uuid
+  categoryKind       String   @default("CATEGORY") @map("category_kind") @db.VarChar(16)
+  categoryVersionId  String   @map("category_version_id") @db.Uuid
+  modelId            String?  @map("model_id") @db.Uuid
+  modelKind          String   @default("MODEL") @map("model_kind") @db.VarChar(16)
+  modelVersionId     String?  @map("model_version_id") @db.Uuid
+  payloadCellId String   @map("payload_cell_id") @db.Uuid
+  createdAt     DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request       Request @relation("RequestApplianceHistory", fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_request_id_fkey")
+  category      CatalogDirectoryEntry @relation("RequestApplianceCategory", fields: [categoryId, categoryKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_category_fkey")
+  model         CatalogDirectoryEntry? @relation("RequestApplianceModel", fields: [modelId, modelKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_model_fkey")
+  categoryVersion CatalogDirectoryVersion @relation("RequestApplianceCategoryRevision", fields: [categoryId, categoryVersionId], references: [entryId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_category_revision_fkey")
+  modelVersion    CatalogDirectoryVersion? @relation("RequestApplianceModelRevision", fields: [modelId, modelVersionId], references: [entryId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_model_revision_fkey")
+  payloadCell   RequestPayloadCell @relation(fields: [requestId, payloadCellId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_payload_fkey")
+  currentFor    Request[] @relation("RequestCurrentAppliance")
+  faults        RequestFault[]
+
+  @@unique([requestId, revision], map: "request_appliance_revisions_request_revision_key")
+  @@unique([requestId, id], map: "request_appliance_revisions_request_id_id_key")
+  @@map("request_appliance_revisions")
+  @@schema("foundation")
+}
+
+model RequestFault {
+  id                   String  @id @db.Uuid
+  requestId            String  @map("request_id") @db.Uuid
+  applianceRevisionId  String  @map("appliance_revision_id") @db.Uuid
+  isOther              Boolean @default(false) @map("is_other")
+  faultId              String? @map("fault_id") @db.Uuid
+  faultKind            String  @default("FAULT") @map("fault_kind") @db.VarChar(16)
+  faultVersionId       String? @map("fault_version_id") @db.Uuid
+  categoryId           String  @map("category_id") @db.Uuid
+  categoryKind         String  @default("CATEGORY") @map("category_kind") @db.VarChar(16)
+  applianceRevision    RequestApplianceRevision @relation(fields: [requestId, applianceRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_faults_request_id_appliance_revision_id_fkey")
+  fault                CatalogDirectoryEntry? @relation("RequestFaultEntry", fields: [faultId, faultKind, categoryId], references: [id, kind, categoryId], onDelete: Restrict, onUpdate: Restrict, map: "request_faults_fault_entry_fkey")
+  faultVersion         CatalogDirectoryVersion? @relation("RequestFaultRevision", fields: [faultId, faultVersionId], references: [entryId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_faults_fault_revision_fkey")
+
+  @@unique([requestId, applianceRevisionId, faultId], map: "request_faults_request_revision_key")
+  @@map("request_faults")
+  @@schema("foundation")
+}
+
+model RequestPreferenceRevision {
+  id               String   @id @db.Uuid
+  requestId        String   @map("request_id") @db.Uuid
+  revision         Int
+  urgency          String?  @db.VarChar(16)
+  preferredWindows Json     @default("[]") @map("preferred_windows")
+  createdAt        DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request          Request @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_preference_revisions_request_id_fkey")
+  currentFor       Request[] @relation("RequestCurrentPreference")
+
+  @@unique([requestId, revision], map: "request_preference_revisions_request_revision_key")
+  @@unique([requestId, id], map: "request_preference_revisions_request_id_id_key")
+  @@map("request_preference_revisions")
+  @@schema("foundation")
+}
+
+// Append-only business event; UNIQUE(principal,operation,idempotency_key) is
+// the durable command identity of the idempotency contract.
+model RequestEvent {
+  id               String   @id @db.Uuid
+  requestId        String   @map("request_id") @db.Uuid
+  command          String   @db.VarChar(64)
+  principal        String   @db.VarChar(160)
+  operation        String   @db.VarChar(64)
+  idempotencyKey   String   @map("idempotency_key") @db.Uuid
+  actorType        String   @map("actor_type") @db.VarChar(12)
+  actorSessionId   String?  @map("actor_session_id") @db.Uuid
+  actorStaffId     String?  @map("actor_staff_id") @db.Uuid
+  resultingVersion Int      @map("resulting_version")
+  correlationId    String   @map("correlation_id") @db.Uuid
+  details          Json     @default("{}")
+  createdAt        DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request          Request @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_events_request_id_fkey")
+  actorSession     RequestSession? @relation(fields: [actorSessionId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_events_actor_session_id_fkey")
+  actorStaff       Staff? @relation("RequestEventActor", fields: [actorStaffId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_events_actor_staff_id_fkey")
+
+  @@unique([principal, operation, idempotencyKey], map: "request_events_principal_operation_key_key")
+  @@index([requestId, createdAt], map: "request_events_request_idx")
+  @@map("request_events")
   @@schema("foundation")
 }

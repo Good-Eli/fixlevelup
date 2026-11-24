@@ -11,6 +11,8 @@ import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, vi } from 'vitest';
 import { createApi } from '../src/bootstrap/factories.js';
 import { authFixtureMigrations } from './auth-db-fixture.js';
+import { admitFixture } from './admission-fixture.js';
+import type { AdmittedHandle } from './admission-fixture.js';
 import { loadConfig } from '../src/runtime/config.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
@@ -45,6 +47,7 @@ export class RbacFixture {
   }
   readonly botToken = `7000000002:${random()}`;
   private pool?: Pool;
+  private admission?: AdmittedHandle;
   private app?: Awaited<ReturnType<typeof createApi>>;
   private server!: Server;
   admin!: Web;
@@ -83,9 +86,12 @@ export class RbacFixture {
     await this.db.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
     const login = random(); const password = random();
     const { staffId } = await bootstrapFirstAdmin(this.db, { login, password });
+    // P05-01: the app is admitted through the same launch gate contour — a real
+    // migrator-held witness in this fixture DB pins the admission.
+    this.admission = await admitFixture(this.db, this.database, 'API');
     this.app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'),
       { ...connection, database: this.database, user: 'fixlevelup_runtime', password: runtimePassword },
-      { origin, csrfSecret: random(), throttleSecret: random() }, { botToken: this.botToken });
+      { origin, csrfSecret: random(), throttleSecret: random() }, { botToken: this.botToken }, this.admission.authorization);
     this.server = this.app.getHttpServer() as Server;
     this.admin = await this.login(staffId, login, password); this.initialized = true;
   }
@@ -102,7 +108,7 @@ export class RbacFixture {
     } finally { client.release(); }
   }
   async close(): Promise<void> {
-    try { await this.app?.close(); } finally { try { await this.pool?.end(); } finally { this.logs.mockRestore(); } }
+    try { await this.app?.close(); } finally { try { await this.admission?.release(); } finally { try { await this.pool?.end(); } finally { this.logs.mockRestore(); } } }
   }
   private safe(value: unknown): void {
     const json = JSON.stringify(value); expect(this.secrets.some((secret) => json.includes(secret))).toBe(false);

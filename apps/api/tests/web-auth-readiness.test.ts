@@ -5,6 +5,8 @@ import { Client } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RuntimeDatabase } from '../src/infrastructure/database/runtime-database.js';
 import { authFixtureMigrations as migrations } from './auth-db-fixture.js';
+import { admitFixture } from './admission-fixture.js';
+import type { AdmissionHandle } from './admission-fixture.js';
 
 // Explicit opt-in: preserve the random fixture database and never modify the dev schema.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
@@ -13,6 +15,7 @@ const root = resolve(import.meta.dirname, '../../..');
 integration('web auth readiness against isolated PostgreSQL', () => {
   let admin: Client | undefined;
   let fixture: Client | undefined;
+  let admission: AdmissionHandle | undefined;
   let db: RuntimeDatabase | undefined;
   let authReady: () => Promise<boolean>;
 
@@ -39,13 +42,16 @@ integration('web auth readiness against isolated PostgreSQL', () => {
     await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
     // Construct the production Prisma adapter/pool with the isolated DB and actual runtime role.
     // Invoke the auth-specific probe directly: the surrounding probe has its own DB identity checks.
-    db = new RuntimeDatabase({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword }, true);
+    // P05-01: the pool is admitted through the launch gate (migrator-held witness).
+    admission = await admitFixture(fixture, database, 'TEST');
+    db = new RuntimeDatabase({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword }, true, admission.admission);
     const internal = db as unknown as { authReady: () => Promise<boolean> };
     authReady = () => internal.authReady();
   }, 30000);
 
   afterAll(async () => {
-    await db?.onModuleDestroy();
+    try { await db?.onModuleDestroy(); }
+    finally { await admission?.release(); }
     await fixture?.end();
     await admin?.end();
   });

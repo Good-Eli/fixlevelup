@@ -145,18 +145,30 @@ export async function startFileReservationsDatabase(): Promise<FileReservationsF
   };
 }
 
-/** One city with one published reviewed version, inserted as the migrator. */
+/** One city with one published reviewed version, inserted as the migrator under
+ * the unified GEO/CFG writer fence on one pinned client. */
 async function seedCity(db: Pool, staffId: string): Promise<FixtureCity> {
   const cityId = randomUUID();
   const cityVersionId = randomUUID();
   const hours = JSON.stringify(Array.from({ length: 7 }, () => [[540, 1080]]));
-  await db.query("INSERT INTO foundation.service_cities (id,code,lifecycle) VALUES ($1,$2,'DRAFT')",
-    [cityId, `files-${cityId.slice(0, 8)}`]);
-  await db.query(`INSERT INTO foundation.service_city_versions
-      (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
-    VALUES ($1,$2,1,'File fixture city','Europe/Moscow','+70000000000',$3::jsonb,$4)`,
-  [cityVersionId, cityId, hours, staffId]);
-  await db.query('UPDATE foundation.service_cities SET current_version_id=$2 WHERE id=$1', [cityId, cityVersionId]);
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+    await client.query("INSERT INTO foundation.service_cities (id,code,lifecycle) VALUES ($1,$2,'DRAFT')",
+      [cityId, `files-${cityId.slice(0, 8)}`]);
+    await client.query(`INSERT INTO foundation.service_city_versions
+        (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
+      VALUES ($1,$2,1,'File fixture city','Europe/Moscow','+70000000000',$3::jsonb,$4)`,
+    [cityVersionId, cityId, hours, staffId]);
+    await client.query('UPDATE foundation.service_cities SET current_version_id=$2 WHERE id=$1', [cityId, cityVersionId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
   return { cityId, cityVersionId };
 }
 

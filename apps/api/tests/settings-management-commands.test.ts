@@ -272,8 +272,36 @@ integration('P03 commands through real Nest authorization, domain ports and Post
     await f.assertSafeEvidence();
   });
 
-  it.each(evidenceTables)('rolls back every domain and evidence write when %s INSERT actually fails', async (table) => {
+  it('maps a reference prelock timeout to 409 with no receipt or domain effect (P05 fence regression)', async () => {
     const f = fixture();
+    const entry = check(await f.post(PAYMENT, { code: 'lock-timeout-fixture' }), 201);
+    const before = await snapshot(f);
+    const holder = await f.base.db.connect();
+    try {
+      await holder.query('BEGIN');
+      // Another session holds the unified GEO/CFG writer fence: the runner's
+      // PRE-CHECK prelock must time out (app pool lock_timeout is 1s) and map
+      // to the P03 409 transport contract, never a 500.
+      await holder.query('SELECT pg_advisory_xact_lock(734305,1)');
+      const path = `${PAYMENT}/${idOf(entry)}`;
+      const key = randomUUID();
+      problem(await f.post(`${path}/versions`, publishedRef, { key, etag: entry.etag }), 409);
+      expect(await snapshot(f)).toEqual(before);
+      expect(await f.base.count('SELECT count(*)::int n FROM foundation.p03_command_receipts WHERE key=$1', [key])).toBe(0);
+      await holder.query('ROLLBACK');
+    } finally {
+      await holder.query('ROLLBACK').catch(() => undefined);
+      holder.release();
+    }
+    // After the fence clears the same command succeeds: 201, one receipt.
+    const key2 = randomUUID();
+    const fresh = check(await f.post(`${PAYMENT}/${idOf(entry)}/versions`, publishedRef, { key: key2, etag: entry.etag }), 201);
+    minimal(fresh, true);
+    expect(await f.base.count('SELECT count(*)::int n FROM foundation.p03_command_receipts WHERE key=$1', [key2])).toBe(1);
+    await f.assertSafeEvidence();
+  });
+
+  it.each(evidenceTables)('rolls back every domain and evidence write when %s INSERT actually fails', async (table) => {    const f = fixture();
     const entry = check(await f.post(PAYMENT, { code: 'fault-fixture' }), 201);
     const path = `${PAYMENT}/${idOf(entry)}`;
     const before = await snapshot(f);

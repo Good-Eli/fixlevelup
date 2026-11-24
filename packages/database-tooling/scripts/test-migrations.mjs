@@ -15,6 +15,7 @@ import { catalogFixedPriceChecks, proveCatalogMigrationUpgrade, proveCatalogMigr
 import { pricingChecks, provePricingMigrationUpgrade, provePricingFresh } from './test-pricing-rules-ranges-migration.mjs';
 import { catalogManagementChecks, catalogManagementCodes, proveCatalogManagementUpgrade, proveCatalogManagementFresh,
   proveCatalogManagementIssuer, proveCatalogManagementCollision } from './test-catalog-management-migration.mjs';
+import { requestIntakeChecks, proveRequestIntakeUpgrade } from './test-request-intake-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { admin, credentials, connection, prepareDatabase, runPrisma, root } from './migration-local.mjs';
@@ -53,11 +54,12 @@ const p03Migrations = [
     '20261122000300_file_privacy_deletion', '20261122000400_settings_management');
 const catalogHistoryNames = [...p03Migrations, p04CatalogMigration];
 const pricingHistoryNames = [...catalogHistoryNames, '20261122000600_pricing_rules_ranges'];
-const migrations = [...pricingHistoryNames, '20261122000700_catalog_management'];
+const catalogManagementNames = [...pricingHistoryNames, '20261122000700_catalog_management'];
+const migrations = [...catalogManagementNames, '20261123000100_request_intake_foundation'];
 const expectedChecks = [
   ...cityChecks,
   ...areaChecks, ...geoAccessChecks, ...settingsChecks, ...fileReservationChecks, ...fileUploadChecks, ...fileProcessingChecks, ...filePrivacyChecks,
-  ...settingsManagementChecks, ...catalogFixedPriceChecks, ...pricingChecks, ...catalogManagementChecks,
+  ...settingsManagementChecks, ...catalogFixedPriceChecks, ...pricingChecks, ...catalogManagementChecks, ...requestIntakeChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -107,6 +109,9 @@ const seventeenthHistory = resolve(historyRoot, 'seventeenth/migrations');
 const eighteenthHistory = resolve(historyRoot, 'eighteenth/migrations');
 const nineteenthHistory = resolve(historyRoot, 'nineteenth/migrations');
 const twentiethHistory = resolve(historyRoot, 'twentieth/migrations');
+// 021's proof anchor: capped at exactly catalog_management so the 022 slice
+// cannot silently enter the P04 comparison.
+const twentyFirstHistory = resolve(historyRoot, 'twentyfirst/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
   for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, upgradeTwelfth, upgradeSeventeenth, collisionSeventeenth, shadow]) { await prepareDatabase(client, database, true); }
@@ -114,7 +119,8 @@ try {
   for (const [history, names] of [[firstHistory, migrations.slice(0, 1)], [secondHistory, migrations.slice(0, 2)], [thirdHistory, migrations.slice(0, 3)], [fourthHistory, migrations.slice(0, 4)], [fifthHistory, migrations.slice(0, 5)], [eighthHistory, migrations.slice(0,8)], [ninthHistory, migrations.slice(0,9)], [tenthHistory, migrations.slice(0,10)], [eleventhHistory, migrations.slice(0,11)],
     [twelfthHistory, migrations.slice(0,12)], [thirteenthHistory, migrations.slice(0,13)], [fourteenthHistory, migrations.slice(0,14)],
     [fifteenthHistory, migrations.slice(0,15)], [sixteenthHistory, migrations.slice(0,16)], [seventeenthHistory, migrations.slice(0,17)],
-    [eighteenthHistory, p03Migrations], [nineteenthHistory, catalogHistoryNames], [twentiethHistory, pricingHistoryNames]]) {
+    [eighteenthHistory, p03Migrations], [nineteenthHistory, catalogHistoryNames], [twentiethHistory, pricingHistoryNames],
+    [twentyFirstHistory, catalogManagementNames]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -183,10 +189,26 @@ try {
         expected => command(['migrate', 'diff', '--from-migrations', twentiethHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow));
       await provePricingFresh(eighthReader, catalogRuntime, reviewer.rows[0].id, fixtures, 'upgrade');
       await proveCatalogManagementCollision(eighthReader);
-      await proveCatalogManagementUpgrade(eighthReader, migrations, () => command(['migrate', 'deploy'], upgradeEighth), expected => {
-        command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow);
-        command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth, expected);
-      });
+      await proveCatalogManagementUpgrade(eighthReader, catalogManagementNames,
+        () => command(['migrate', 'deploy'], upgradeEighth, 0, undefined, twentyFirstHistory), expected => {
+          command(['migrate', 'diff', '--from-migrations', twentyFirstHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow);
+        });
+      // P05-01 (022): deploy the S1 request intake foundation on the same
+      // populated chain from the live migrations directory, prove the exact
+      // history, replay idempotency and both full drift checks, then run the
+      // 022 grants/fence/guards proof with a runtime connection.
+      command(['migrate', 'deploy'], upgradeEighth);
+      {
+        const history = await eighthReader.query('SELECT migration_name,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
+        assert(history.rowCount === migrations.length
+          && JSON.stringify(history.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
+          && history.rows.every((entry) => entry.finished_at instanceof Date), '022 populated history mismatch');
+      }
+      command(['migrate', 'deploy'], upgradeEighth);
+      command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeEighth, 0, shadow);
+      command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth, 0);
+      await proveRequestIntakeUpgrade(eighthReader, catalogRuntime,
+        () => connection('fixlevelup_migrator', passwords.fixlevelup_migrator, upgradeEighth));
     } finally { await catalogRuntime.end(); }
   } finally { await eighthReader.end(); }
   for (const database of [collisionSeventeenth, upgradeSeventeenth]) {
@@ -425,11 +447,12 @@ try {
   await runtime.connect();
   try {
     // 012's exact ACL was proven on the database capped at exactly 012 (upgradeTwelfth).
-    // Here the final fresh database must carry the full 013 ACL delta plus every previous grant.
-    await proveSettingsGrants(runtime);
+    // Here the final fresh database must carry the full 013 ACL delta plus every previous grant;
+    // the full chain also installs the P05-01 GEO/CFG fence triggers on the reference basis.
+    await proveSettingsGrants(runtime, { expectFenceTriggers: true });
     // 014's exact ACL on the same final fresh database, plus the proof that 013's ACL
     // (including consent_records) is unchanged by the additive consent-basis index.
-    await proveFileReservationsGrants(runtime, reservationFixtures);
+    await proveFileReservationsGrants(runtime, reservationFixtures, { expectFenceTriggers: true });
     await proveFileUploadGrants(runtime, reservationFixtures);
     await proveFilePrivacyRuntime(runtime, passwords.fixlevelup_migrator, fresh);
     const role = await runtime.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolinherit FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator')");

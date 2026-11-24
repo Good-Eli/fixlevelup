@@ -14,6 +14,8 @@ import { loadConfig } from '../src/runtime/config.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { migrateAuthFixture } from './auth-db-fixture.js';
+import { admitFixture } from './admission-fixture.js';
+import type { AdmittedHandle } from './admission-fixture.js';
 
 // Explicit opt-in: preserve the random fixture database, never modify the dev schema.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
@@ -41,6 +43,7 @@ integration('web auth real HTTP against isolated PostgreSQL', () => {
   let admin: Client | undefined;
   let fixture: Client | undefined;
   let migrator: Pool | undefined;
+  let admission: AdmittedHandle | undefined;
   let app: Awaited<ReturnType<typeof createApi>> | undefined;
   let server: Server;
   let staffId: string;
@@ -67,17 +70,23 @@ integration('web auth real HTTP against isolated PostgreSQL', () => {
     ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));
     const dbConfig = { ...connection, database, user: 'fixlevelup_runtime' as const, password: runtimePassword } as DatabaseConfig;
     const webAuth: WebAuthConfig = { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
-    app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'), dbConfig, webAuth);
+    // P05-01: the app is admitted through the same launch gate contour — a real
+    // migrator-held witness in this fixture DB pins the admission.
+    admission = await admitFixture(migrator, database, 'API');
+    app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'), dbConfig, webAuth, undefined, admission.authorization);
     server = app.getHttpServer() as Server;
   }, 30000);
 
   afterAll(async () => {
     try { await app?.close(); }
     finally {
-      try { await migrator?.end(); }
+      try { await admission?.release(); }
       finally {
-        try { await fixture?.end(); }
-        finally { await admin?.end(); vi.restoreAllMocks(); }
+        try { await migrator?.end(); }
+        finally {
+          try { await fixture?.end(); }
+          finally { try { await admin?.end(); } finally { vi.restoreAllMocks(); } }
+        }
       }
     }
   });

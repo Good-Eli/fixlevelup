@@ -296,35 +296,53 @@ integration('membership commands against isolated PostgreSQL', () => {
   const liveZone = { validFrom: day(-10), validTo: day(10) };
 
   const TOKEN = () => randomBytes(32).toString('base64url');
-  const cityVersion = async (cityId: string, timezone: string) => {
-    const id = randomUUID();
-    await migrator.query(`INSERT INTO foundation.service_city_versions
-      (id, city_id, version, display_name, timezone, public_contact, office_hours, reviewed_by)
-      VALUES ($1,$2,1,'Synthetic city',$3,'office@example.test',$4::jsonb,$5)`,
-    [id, cityId, timezone, JSON.stringify(Array.from({ length: 7 }, () => [])), adminId]);
-    return id;
+  /** Wraps guarded GEO/CFG basis DML (migration 022) in one transaction that takes
+   * the unified writer fence before its first statement, on one pinned client. */
+  const fencedDml = async <T,>(run: (client: PoolClient) => Promise<T>): Promise<T> => {
+    const client = await migrator.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+      const result = await run(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   };
   const createCity = async (code: string, lifecycle: string, timezone = 'Europe/Moscow') => {
     const id = randomUUID();
-    await migrator.query('INSERT INTO foundation.service_cities (id, code) VALUES ($1,$2)', [id, code]);
-    const versionId = await cityVersion(id, timezone);
-    await migrator.query('UPDATE foundation.service_cities SET current_version_id=$2, lifecycle=$3 WHERE id=$1',
-      [id, versionId, lifecycle]);
+    const versionId = randomUUID();
+    await fencedDml(async (client) => {
+      await client.query('INSERT INTO foundation.service_cities (id, code) VALUES ($1,$2)', [id, code]);
+      await client.query(`INSERT INTO foundation.service_city_versions
+        (id, city_id, version, display_name, timezone, public_contact, office_hours, reviewed_by)
+        VALUES ($1,$2,1,'Synthetic city',$3,'office@example.test',$4::jsonb,$5)`,
+      [versionId, id, timezone, JSON.stringify(Array.from({ length: 7 }, () => [])), adminId]);
+      await client.query('UPDATE foundation.service_cities SET current_version_id=$2, lifecycle=$3 WHERE id=$1',
+        [id, versionId, lifecycle]);
+    });
     return id;
   };
   const createArea = async (cityId: string, code: string) => {
     const id = randomUUID();
-    await migrator.query('INSERT INTO foundation.service_areas (id, city_id, code) VALUES ($1,$2,$3)', [id, cityId, code]);
+    await fencedDml((client) => client.query('INSERT INTO foundation.service_areas (id, city_id, code) VALUES ($1,$2,$3)',
+      [id, cityId, code]));
     return id;
   };
   const publishArea = async (cityId: string, areaId: string, name: string) => {
     const versionId = randomUUID();
-    await migrator.query(`INSERT INTO foundation.service_area_versions
-      (id, city_id, area_id, version, name, created_by) VALUES ($1,$2,$3,1,$4,$5)`,
-    [versionId, cityId, areaId, name, adminId]);
-    await migrator.query('UPDATE foundation.service_area_versions SET published_at=statement_timestamp(), published_by=$2 WHERE id=$1',
-      [versionId, adminId]);
-    await migrator.query('UPDATE foundation.service_areas SET current_version_id=$2 WHERE id=$1', [areaId, versionId]);
+    await fencedDml(async (client) => {
+      await client.query(`INSERT INTO foundation.service_area_versions
+        (id, city_id, area_id, version, name, created_by) VALUES ($1,$2,$3,1,$4,$5)`,
+      [versionId, cityId, areaId, name, adminId]);
+      await client.query('UPDATE foundation.service_area_versions SET published_at=statement_timestamp(), published_by=$2 WHERE id=$1',
+        [versionId, adminId]);
+      await client.query('UPDATE foundation.service_areas SET current_version_id=$2 WHERE id=$1', [areaId, versionId]);
+    });
     return versionId;
   };
   /** The 009 deferred constraint requires a live role and a matching channel by commit,
@@ -441,7 +459,8 @@ integration('membership commands against isolated PostgreSQL', () => {
     areaDraftOnly = await createArea(cityA, 'zone-draft');
     areaArchived = await createArea(cityA, 'zone-archived');
     await publishArea(cityA, areaArchived, 'Archived zone');
-    await migrator.query('UPDATE foundation.service_areas SET archived_at=statement_timestamp() WHERE id=$1', [areaArchived]);
+    await fencedDml((client) => client.query(
+      'UPDATE foundation.service_areas SET archived_at=statement_timestamp() WHERE id=$1', [areaArchived]));
     areaB = await createArea(cityB, 'zone-b');
     await publishArea(cityB, areaB, 'Zone B');
   }, 60000);
@@ -586,7 +605,8 @@ integration('membership commands against isolated PostgreSQL', () => {
   });
 
   it('revocation still works after the city is suspended, but new admission does not', async () => {
-    await migrator.query("UPDATE foundation.service_cities SET lifecycle='INACTIVE' WHERE id=$1", [cityA]);
+    await fencedDml((client) => client.query(
+      "UPDATE foundation.service_cities SET lifecycle='INACTIVE' WHERE id=$1", [cityA]));
     expect(await status(exec(managerProof, 'techGrantCity', { cityId: cityA, staffId: technicianId },
       { validFrom: day(0) }, 3))).toBe(409);
     const receipt = await exec(adminProof, 'adminRevoke',

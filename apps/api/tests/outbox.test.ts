@@ -8,12 +8,15 @@ import { OutboxStore } from '../src/infrastructure/outbox/outbox-store.js';
 import type { OutboxLease } from '../src/infrastructure/outbox/outbox-store.js';
 import { OutboxWorker } from '../src/infrastructure/outbox/outbox-worker.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
+import { admitFixture } from './admission-fixture.js';
+import type { AdmittedHandle } from './admission-fixture.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 const databaseName = `fixlevelup_p019a_worker_${randomBytes(6).toString('hex')}`;
 const clients: Client[] = [];
 const stores: OutboxStore[] = [];
 const workers: OutboxWorker[] = [];
+let admission: AdmittedHandle;
 let config: DatabaseConfig;
 let migrator: Client;
 let runtime: Client;
@@ -173,9 +176,12 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     contender = await connect('fixlevelup_runtime', runtimePassword);
     config = { host: '127.0.0.1', port: 55432, database: databaseName,
       user: 'fixlevelup_runtime', password: runtimePassword };
-    first = new OutboxStore(config);
+    // P05-01: the stores/workers are admitted through the launch gate — a real
+    // migrator-held witness in this isolated DB pins the admission.
+    admission = await admitFixture(migrator, databaseName, 'WORKER');
+    first = new OutboxStore(config, admission.admission);
     stores.push(first);
-    second = new OutboxStore(config);
+    second = new OutboxStore(config, admission.admission);
     stores.push(second);
   }, 30_000);
 
@@ -183,8 +189,9 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     // Keep the isolated database for inspection; never drop or truncate it or the development DB.
     const stopped = await Promise.allSettled(workers.map(async (worker) => { await worker.onModuleDestroy(); }));
     const closed = await Promise.allSettled(stores.map(async (store) => { await store.close(); }));
+    const released = await Promise.allSettled([admission.release()]);
     const ended = await Promise.allSettled(clients.map(async (client) => { await client.end(); }));
-    for (const result of [...stopped, ...closed, ...ended]) {
+    for (const result of [...stopped, ...closed, ...released, ...ended]) {
       if (result.status === 'rejected') { throw new Error('Failed to close an isolated outbox test resource'); }
     }
   });
@@ -438,7 +445,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const scheduled = vi.spyOn(globalThis, 'setTimeout');
     const cleared = vi.spyOn(globalThis, 'clearTimeout');
     const close = vi.spyOn(OutboxStore.prototype, 'close');
-    const worker = new OutboxWorker(config, logger);
+    const worker = new OutboxWorker(config, logger, new Map(), admission.authorization);
     workers.push(worker);
     try {
       await worker.runOnce();
@@ -471,7 +478,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const handler = vi.fn<(lease: OutboxLease, signal: AbortSignal) => Promise<void>>(() => Promise.resolve());
     const logger = new SafeLogger('worker');
     const log = vi.spyOn(logger, 'event').mockImplementation(() => undefined);
-    const worker = new OutboxWorker(config, logger, new Map([[type, handler]]));
+    const worker = new OutboxWorker(config, logger, new Map([[type, handler]]), admission.authorization);
     workers.push(worker);
     const hide = missing === 'metadata'
       ? 'ALTER TABLE foundation._prisma_migrations RENAME TO _prisma_migrations_test_hidden'
@@ -497,7 +504,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const type = eventType();
     const fixture = await seed(type);
     const handler = vi.fn<(lease: OutboxLease, signal: AbortSignal) => Promise<void>>(() => Promise.resolve());
-    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]));
+    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]), admission.authorization);
     workers.push(worker);
     try {
       await worker.runOnce();
@@ -521,7 +528,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const handler = vi.fn((): Promise<void> => Promise.reject(new Error(canary)));
     const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     const errors = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]));
+    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]), admission.authorization);
     workers.push(worker);
     try {
       await worker.runOnce();
@@ -558,7 +565,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
       handlerFinished = true;
     });
     const close = vi.spyOn(OutboxStore.prototype, 'close');
-    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]));
+    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]), admission.authorization);
     workers.push(worker);
     const pending = worker.runOnce();
     try {

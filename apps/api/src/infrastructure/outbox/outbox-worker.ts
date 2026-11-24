@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
+import { ConfigurationError } from '../../runtime/config.js';
 import { RuntimeDatabase } from '../database/runtime-database.js';
 import type { DatabaseConfig } from '../database/runtime-database.js';
+import type { RuntimeAdmission } from '../admission/runtime-admission.js';
+import { validateAuthorization } from '../admission/process-admission.js';
+import type { ProcessAuthorization } from '../admission/process-admission.js';
 import { SafeLogger } from '../../runtime/safe-logger.js';
 import { OutboxStore } from './outbox-store.js';
 import type { OutboxLease } from './outbox-store.js';
@@ -21,9 +25,17 @@ export class OutboxWorker implements OnApplicationBootstrap, OnModuleDestroy {
   private shutdown: Promise<void> | undefined;
 
   constructor(config: DatabaseConfig | undefined, private readonly logger: SafeLogger,
-    handlers: ReadonlyMap<string, OutboxHandler> = new Map()) {
+    handlers: ReadonlyMap<string, OutboxHandler> = new Map(), authorization?: ProcessAuthorization) {
     this.handlers = new Map(handlers);
-    if (config) { this.database = new RuntimeDatabase(config); this.store = new OutboxStore(config); }
+    if (config) {
+      // P05-01 §7: the worker's DB consumers exist only behind a COMPLETED
+      // process admission (launcher-approved); the branded authorization
+      // cannot be produced from an offline loader output.
+      if (!authorization) { throw new ConfigurationError(['LAUNCH_PROOF_TOKEN']); }
+      const admission: RuntimeAdmission = validateAuthorization(authorization);
+      this.database = new RuntimeDatabase(config, false, admission);
+      this.store = new OutboxStore(config, admission);
+    }
   }
 
   onApplicationBootstrap(): void {

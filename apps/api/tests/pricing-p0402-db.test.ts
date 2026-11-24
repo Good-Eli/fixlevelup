@@ -123,7 +123,20 @@ configurationIntegration('P04-02 real pricing ports and single-snapshot calculat
     const sealed=sealPricing(actual);
     expect(verifyPricingSnapshot(sealed.bytes,sealed.sha256)).toMatchObject({totalMinor:'7950',breakdown:{works:'6200',timeSurcharge:'1550',expressSurcharge:'200'}});
     const nextCityVersion=await addSyntheticCityVersion(f,city,{timezone:'UTC',version:2});
-    await f.migrator.query('UPDATE foundation.service_cities SET current_version_id=$2 WHERE id=$1',[city.id,nextCityVersion]);
+    // Guarded GEO/CFG basis write (migration 022): the unified writer fence must be
+    // held before the statement, on the same pinned migrator client.
+    {
+      const client=await f.migrator.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+        await client.query('UPDATE foundation.service_cities SET current_version_id=$2 WHERE id=$1',[city.id,nextCityVersion]);
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK').catch(()=>undefined);
+        throw error;
+      } finally { client.release(); }
+    }
     const replacementAt=await dbAt(1300);
     const changed=await tx(async(c,a)=>{
       const renamed=await publishItem(c,a,{id:item.id,expectedVersion:item.version,kind:'WORK',title:'Renamed labor',durationMinutes:35,

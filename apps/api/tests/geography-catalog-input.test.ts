@@ -257,11 +257,21 @@ describe('geography catalog command registry', () => {
     }
   });
 
-  it('validates the body before touching the transaction on every write', async () => {
-    // A write with a malformed body must fail as a client error without a query:
-    // the fake client records every statement so an accidental DB touch is visible.
+  it('validates the body before touching the domain on every write', async () => {
+    // A write with a malformed body must fail as a client error without a
+    // DOMAIN query. The unified GEO/CFG fence (an advisory lock, not domain
+    // data) may legitimately precede body validation per P05-01 §5.1: it must
+    // be taken before the first domain read; the fake client records every
+    // statement so an accidental domain touch stays visible.
     const statements: string[] = [];
-    const client = { query: (sql: string) => { statements.push(sql); return Promise.reject(new Error('unexpected query')); } };
+    const client = { query: (sql: string) => {
+      statements.push(sql);
+      // The advisory fence statements are answered; a DOMAIN statement must
+      // never run before the malformed body is refused.
+      if (sql.includes('pg_advisory_xact_lock')) { return Promise.resolve({ rows: [], rowCount: 0 }); }
+      if (sql.includes('pg_locks')) { return Promise.resolve({ rows: [{ held: true }], rowCount: 1 }); }
+      return Promise.reject(new Error('unexpected query'));
+    } };
     const ctx = {
       staffId: uuid(99),
       role: { id: uuid(98), code: 'ADMIN', type: 'SYSTEM' },
@@ -274,7 +284,9 @@ describe('geography catalog command registry', () => {
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(HttpException);
     expect((failure as HttpException).getStatus()).toBe(400);
-    expect(statements).toEqual([]);
+    // Only the advisory fence (lock + its held-probe) may appear; any domain
+    // statement is a failure.
+    expect(statements.filter((sql) => !sql.includes('pg_advisory_xact_lock') && !sql.includes('pg_locks'))).toEqual([]);
   });
 });
 
@@ -289,6 +301,15 @@ function scripted(responses: readonly (readonly [RegExp, Reply])[]) {
   const statements: string[] = [];
   const query = (sql: string): Promise<Reply> => {
     statements.push(sql);
+    // The unified GEO/CFG fence precedes every scripted write: lock plus its
+    // pg_locks held-probe (P05-01 §5.1) are advisory infrastructure, answered
+    // generically instead of polluting each command's script.
+    if (/pg_advisory_xact_lock/.test(sql)) {
+      return Promise.resolve({ rows: [], rowCount: 0 });
+    }
+    if (/FROM pg_locks/.test(sql)) {
+      return Promise.resolve({ rows: [{ held: true }], rowCount: 1 });
+    }
     for (const [pattern, reply] of responses) {
       if (pattern.test(sql)) {
         return Promise.resolve(reply);

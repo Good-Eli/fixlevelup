@@ -19,6 +19,7 @@ import { changeFileHold, planRetention } from '../src/files/file-privacy/retenti
 import type { RetentionPolicy } from '../src/files/file-privacy/contract.js';
 import type { RestoreContext, RestoreLimits, SnapshotManifest } from '../src/files/file-restore/contract.js';
 import { AUTHORITY_TABLES, readAuthorityInventory, readRestoreInventory } from '../src/files/file-restore/inventory.js';
+import { assertP05AbsentAfterDrain } from '../src/files/file-restore/p05-inventory.js';
 import { createRestoreObjectIO } from '../src/files/file-restore/objects.js';
 import { readSnapshot, sha256, signApproval, signAuthority, signSnapshot } from '../src/files/file-restore/records.js';
 import { createRestoredReadyStorage, rescrubFileRestore } from '../src/files/file-restore/rescrub.js';
@@ -107,7 +108,10 @@ live('P03-04D copy-only isolated restore', () => {
     expect(authFixtureMigrations[17]).toBe('20261122000400_settings_management');
     expect(authFixtureMigrations[18]).toBe('20261122000500_catalog_fixed_prices');
     expect(authFixtureMigrations[19]).toBe('20261122000600_pricing_rules_ranges');
-    expect(schemaVersion).toBe('20261122000700_catalog_management');
+    expect(authFixtureMigrations[20]).toBe('20261122000700_catalog_management');
+    // The restore contour now runs on the S1 profile (022 request intake);
+    // its source-side P05 fact is SCHEMA-verified through the new callback.
+    expect(schemaVersion).toBe('20261123000100_request_intake_foundation');
     const sourceDb = await startFileReservationsDatabase();
     const [ops, writer, nextWriter, signer, floorOps, floorRuntime] = [ledgerPool('file_ledger_operator'), ledgerPool('file_ledger_writer'),
       ledgerPool('file_ledger_writer_next'), ledgerPool('file_ledger_signer'), ledgerPool('file_floor_operator'), ledgerPool('file_floor_verifier')] as const;
@@ -230,10 +234,21 @@ live('P03-04D copy-only isolated restore', () => {
           || row.live_runtime || await readAuthorityInventory(sourceDb.migrator, limits) !== inventorySha256) {throw new Error('Current authority is not fenced');}
         return signAuthority({ challenge, manifestSha256, overlaySha256, inventorySha256, head }, authorityKeys.privateKey);
       };
+      // §5.3 synthetic operator bridge: the fixture source is the full S1 chain,
+      // so the proven post-drain fact is P05_EMPTY_AFTER_DRAIN. Nonces are fresh
+      // per handoff (captured for the challenge-distinction check below).
+      const p05Nonces: string[] = [];
+      const readP05SourceState: RestoreContext['readP05SourceState'] = async ({ challenge, manifestSha256 }) => {
+        if (manifestSha256 !== authHash) {throw new Error('Unknown manifest');}
+        if (p05Nonces.includes(challenge)) {throw new Error('Challenge reuse');}
+        p05Nonces.push(challenge);
+        const fact = await assertP05AbsentAfterDrain(sourceDb.migrator);
+        return { fact, profile: 'S1', nonce: randomUUID() };
+      };
       const ctx: RestoreContext = {
         mode: 'local-synthetic', schemaVersion, sourceDatabase: sourceDb.database, destinationDatabase: destination, oldScope: scope,
         nextEpoch: nextScope.writerEpoch, limits, targetOperatorPool: targetOps, snapshotKey: snapshotKeys.publicKey,
-        approvalKey: approvalKeys.publicKey, authorityKey: authorityKeys.publicKey, verifier, currentAuthority,
+        approvalKey: approvalKeys.publicKey, authorityKey: authorityKeys.publicKey, verifier, currentAuthority, readP05SourceState,
         async restoreArchives(snapshot, authority) {
           await archives.restore(snapshot.dumpSha256, authority.overlaySha256, async () => {
             await maintenance.query(`CREATE DATABASE "${destination}" OWNER fixlevelup_migrator TEMPLATE template0 ALLOW_CONNECTIONS false`);
@@ -267,6 +282,9 @@ live('P03-04D copy-only isolated restore', () => {
       } }, manifest, sig), 'RESTORE_OBJECT');
       const receipt = await rescrubFileRestore(ctx, manifest, sig);
       expect(receipt).toMatchObject({ mode: 'ACTIVE', epoch: { namespace, epoch: 2n }, copied: 7, tombstoned: 3, unresolved: 0 });
+      // §5.3: the two activation handoffs each presented a FRESH challenge nonce.
+      expect(p05Nonces).toHaveLength(2);
+      expect(new Set(p05Nonces).size).toBe(2);
       // The physical dump/restore must carry 018, not just claim its name in the manifest.
       // The synthetic founder was commissioned, but no management commands ran.
       expect((await targetOps.query(sourceRowsSql)).rows).toEqual(originalFounderSources);

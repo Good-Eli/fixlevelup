@@ -181,13 +181,23 @@ export async function currentFileReservationFixtures(db) {
 export async function seedFileReservationFixtures(db, reviewer) {
   const cityId = randomUUID(), cityVersionId = randomUUID();
   const hours = JSON.stringify(Array.from({ length: 7 }, () => [[540, 1080]]));
-  await db.query("INSERT INTO foundation.service_cities(id,code,lifecycle) VALUES($1,$2,'DRAFT')",
-    [cityId, `files-${cityId.slice(0, 8)}`]);
-  await db.query(`INSERT INTO foundation.service_city_versions
-    (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
-    VALUES($1,$2,1,'Synthetic reservation city','Europe/Moscow','+70000000000',$3::jsonb,$4)`,
-  [cityVersionId, cityId, hours, reviewer]);
-  await db.query('UPDATE foundation.service_cities SET current_version_id=$2 WHERE id=$1', [cityId, cityVersionId]);
+  // The guarded geography basis requires the unified writer fence from the
+  // first P05 schema act (S1) even for synthetic fixture DDL.
+  await db.query('BEGIN');
+  try {
+    await db.query('SELECT pg_advisory_xact_lock(734305,1)');
+    await db.query("INSERT INTO foundation.service_cities(id,code,lifecycle) VALUES($1,$2,'DRAFT')",
+      [cityId, `files-${cityId.slice(0, 8)}`]);
+    await db.query(`INSERT INTO foundation.service_city_versions
+      (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
+      VALUES($1,$2,1,'Synthetic reservation city','Europe/Moscow','+70000000000',$3::jsonb,$4)`,
+    [cityVersionId, cityId, hours, reviewer]);
+    await db.query('UPDATE foundation.service_cities SET current_version_id=$2 WHERE id=$1', [cityId, cityVersionId]);
+    await db.query('COMMIT');
+  } catch (error) {
+    await db.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  }
   const documentId = randomUUID(), versionId = randomUUID();
   const body = `Synthetic p0304a runtime consent ${randomUUID()}`;
   await db.query("INSERT INTO foundation.legal_documents(id,purpose,kind) VALUES($1,'REQUEST_PROCESSING','CONSENT_FORM')",
@@ -204,7 +214,7 @@ export async function seedFileReservationFixtures(db, reviewer) {
 // Exact runtime ACL of 014 on the final fresh database. A missing, extra or table-level
 // privilege fails here, and proveSettingsGrants re-proves that 013's ACL (including
 // consent_records) is byte-for-byte unchanged: the new unique index carries no ACL.
-export async function proveFileReservationsGrants(runtime, fixtures) {
+export async function proveFileReservationsGrants(runtime, fixtures, options = {}) {
   const acl = {
     [reservationTable]: {
       select: ['id', 'owner_request_session_id', 'owner_staff_id', 'consent_record_id', 'consent_document_version_id',
@@ -352,8 +362,10 @@ export async function proveFileReservationsGrants(runtime, fixtures) {
     'SELECT foundation.file_upload_intents_reject_truncate()',
   ];
   for (const sql of denials) { await denied(runtime.query(sql), '42501', undefined, sql); }
-  // 013's exact ACL, including consent_records, must be untouched by 014.
-  await proveSettingsGrants(runtime);
+  // 013's exact ACL, including consent_records, must be untouched by 014. On
+  // the full chain the P05-01 GEO/CFG fence triggers on the reference basis
+  // tables are expected by name; a database capped at 014 has none of them.
+  await proveSettingsGrants(runtime, { expectFenceTriggers: options.expectFenceTriggers === true });
   console.log('014 runtime: exact column ACL, cancel-only UPDATE, no DELETE/TRUNCATE/DDL, '
     + 'no callable guard, 013 ACL unchanged: PASS');
 }

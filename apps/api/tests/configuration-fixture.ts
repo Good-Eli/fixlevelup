@@ -15,14 +15,16 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
+import type { PoolClient } from 'pg';
 import { describe } from 'vitest';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
-import { migrateAuthFixture } from './auth-db-fixture.js';
+import { authFixtureMigrations, migrateAuthFixture } from './auth-db-fixture.js';
 
 export const configurationIntegration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1'
   ? describe : describe.skip;
 
 const root = resolve(import.meta.dirname, '../../..');
+const migrationRoot = resolve(root, 'prisma/migrations');
 const connection = { host: '127.0.0.1' as const, port: 55432 };
 
 export interface ConfigurationFixture {
@@ -51,17 +53,21 @@ function credentials(): { admin: string; migrator: string; runtime: string } {
 }
 
 /**
- * Creates one isolated database and applies the whole migration chain. The
+ * Creates one isolated database and applies the migration chain. The
  * `database` name matches the auth-fixture guard pattern so `migrateAuthFixture`
- * accepts it.
+ * accepts it. `capBefore` optionally stops the chain before the named migration
+ * (exclusive), reproducing an older schema profile for baseline proofs.
  */
-export async function createConfigurationFixture(): Promise<ConfigurationFixture> {
+export async function createConfigurationFixture(options: { readonly capBefore?: string } = {}): Promise<ConfigurationFixture> {
   // Explicit opt-in is checked before any database is created, so an accidental
   // call in a normal test run cannot provision anything.
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') {
     throw new Error('Configuration fixture requires FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1');
   }
   const { admin: adminPassword, migrator: migratorPassword, runtime: runtimePassword } = credentials();
+  const capIndex = options.capBefore === undefined ? -1 : authFixtureMigrations.indexOf(options.capBefore);
+  if (options.capBefore !== undefined && capIndex < 0) { throw new Error(`Unknown cap migration: ${options.capBefore}`); }
+  const chain = capIndex >= 0 ? authFixtureMigrations.slice(0, capIndex) : null;
   const database = `fixlevelup_configuration_test_${randomBytes(12).toString('hex')}`;
   const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
   await admin.connect();
@@ -75,7 +81,20 @@ export async function createConfigurationFixture(): Promise<ConfigurationFixture
   const fixtureClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
   await fixtureClient.connect();
   try {
-    await migrateAuthFixture(fixtureClient, database);
+    if (chain) {
+      // Same isolation guard as migrateAuthFixture, applied to the capped chain.
+      // (The opt-in env was checked by the caller above; here only the disposable
+      // name pattern and the actual connection identity are re-proved.)
+      if (!/^fixlevelup_(bootstrap|recovery|web_auth|auth_e2e|legal|configuration)_test_[a-f0-9]{24}$/.test(database)
+        || (await fixtureClient.query<{ db: string }>('SELECT current_database() AS db')).rows[0]?.db !== database) {
+        throw new Error('Refusing non-isolated capped fixture');
+      }
+      for (const migration of chain) {
+        await fixtureClient.query(readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8'));
+      }
+    } else {
+      await migrateAuthFixture(fixtureClient, database);
+    }
   } finally {
     await fixtureClient.end();
   }
@@ -147,6 +166,24 @@ export interface SyntheticCity {
   readonly timezone: string;
 }
 
+/** Runs guarded-basis fixture DML under the unified writer fence (S1+). The lock
+ * and the statements must share one backend, so the pinned client is passed in. */
+async function fenced<T>(fixture: ConfigurationFixture, run: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await fixture.migrator.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+    const result = await run(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Creates a synthetic city with one reviewed version, as the migration owner.
  * `lifecycle` is ACTIVE for a city the resolver would serve.
@@ -159,14 +196,16 @@ export async function createSyntheticCity(
   const lifecycle = options.lifecycle ?? 'ACTIVE';
   const id = randomUUID();
   const versionId = randomUUID();
-  await fixture.migrator.query('INSERT INTO foundation.service_cities (id,code) VALUES ($1,$2)',
-    [id, `city-${id.slice(0, 8)}`]);
-  await fixture.migrator.query(`INSERT INTO foundation.service_city_versions
-    (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
-    VALUES ($1,$2,$3,'Synthetic city',$4,'office@example.test',$5::jsonb,$6)`,
-  [versionId, id, options.version ?? 1, timezone, JSON.stringify(Array.from({ length: 7 }, () => [])), fixture.reviewer]);
-  await fixture.migrator.query('UPDATE foundation.service_cities SET current_version_id=$2,lifecycle=$3 WHERE id=$1',
-    [id, versionId, lifecycle]);
+  await fenced(fixture, async (client) => {
+    await client.query('INSERT INTO foundation.service_cities (id,code) VALUES ($1,$2)',
+      [id, `city-${id.slice(0, 8)}`]);
+    await client.query(`INSERT INTO foundation.service_city_versions
+      (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
+      VALUES ($1,$2,$3,'Synthetic city',$4,'office@example.test',$5::jsonb,$6)`,
+    [versionId, id, options.version ?? 1, timezone, JSON.stringify(Array.from({ length: 7 }, () => [])), fixture.reviewer]);
+    await client.query('UPDATE foundation.service_cities SET current_version_id=$2,lifecycle=$3 WHERE id=$1',
+      [id, versionId, lifecycle]);
+  });
   return { id, versionId, timezone };
 }
 
@@ -177,11 +216,13 @@ export async function addSyntheticCityVersion(
   options: { timezone: string; version: number },
 ): Promise<string> {
   const versionId = randomUUID();
-  await fixture.migrator.query(`INSERT INTO foundation.service_city_versions
-    (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
-    VALUES ($1,$2,$3,'Synthetic city',$4,'office@example.test',$5::jsonb,$6)`,
-  [versionId, city.id, options.version, options.timezone,
-    JSON.stringify(Array.from({ length: 7 }, () => [])), fixture.reviewer]);
+  await fenced(fixture, async (client) => {
+    await client.query(`INSERT INTO foundation.service_city_versions
+      (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
+      VALUES ($1,$2,$3,'Synthetic city',$4,'office@example.test',$5::jsonb,$6)`,
+    [versionId, city.id, options.version, options.timezone,
+      JSON.stringify(Array.from({ length: 7 }, () => [])), fixture.reviewer]);
+  });
   return versionId;
 }
 
@@ -195,12 +236,15 @@ export async function createSyntheticSettingsBaseline(
   city: { id: string },
 ): Promise<{ id: string; version: number }> {
   const id = randomUUID();
-  const result = await fixture.migrator.query<{ version: number }>(
-    `INSERT INTO foundation.business_settings_versions (id,version,launch_mode,primary_city_id,reviewed_by)
-     SELECT $1,COALESCE(max(version),0)+1,'SINGLE_CITY',$2,$3 FROM foundation.business_settings_versions
-     RETURNING version`,
-    [id, city.id, fixture.reviewer]);
-  const version = result.rows[0]?.version;
+  let version: number | undefined;
+  await fenced(fixture, async (client) => {
+    const result = await client.query<{ version: number }>(
+      `INSERT INTO foundation.business_settings_versions (id,version,launch_mode,primary_city_id,reviewed_by)
+       SELECT $1,COALESCE(max(version),0)+1,'SINGLE_CITY',$2,$3 FROM foundation.business_settings_versions
+       RETURNING version`,
+      [id, city.id, fixture.reviewer]);
+    version = result.rows[0]?.version;
+  });
   if (version === undefined) {
     throw new Error('Missing settings baseline');
   }

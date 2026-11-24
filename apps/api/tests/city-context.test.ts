@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
+import type { PoolClient } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CityContextError, readSingleCityContext, SINGLE_CITY_CONTEXT_SQL } from '../src/settings/geography/city-context.js';
 import type { CityContextReader } from '../src/settings/geography/city-context.js';
@@ -94,35 +95,65 @@ integration('single city context against isolated PostgreSQL', () => {
   const city = (zone: string) => ({ id: randomUUID(), zone });
   let settingsVersion = 0;
 
+  /** Wraps guarded-basis fixture DML in one transaction that holds the unified
+   * GEO/CFG writer fence before its first statement (migration 022 guard). */
+  async function fenced<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await migrator.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+      const result = await run(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async function addCity(target: { id: string; zone: string }, lifecycle: 'DRAFT' | 'ACTIVE' | 'INACTIVE') {
-    await migrator.query('INSERT INTO foundation.service_cities (id, code) VALUES ($1, $2)',
-      [target.id, `test-${target.id.slice(0, 8)}`]);
-    const versionId = await addVersion(target, 1);
-    await migrator.query('UPDATE foundation.service_cities SET current_version_id = $2, lifecycle = $3 WHERE id = $1',
-      [target.id, versionId, lifecycle]);
+    const versionId = randomUUID();
+    // One pinned client owns the whole fenced transaction: the migrator pool has
+    // max 1, so a nested fenced call would wait forever for this held client.
+    await fenced(async (client) => {
+      await client.query('INSERT INTO foundation.service_cities (id, code) VALUES ($1, $2)',
+        [target.id, `test-${target.id.slice(0, 8)}`]);
+      await client.query(`INSERT INTO foundation.service_city_versions
+        (id, city_id, version, display_name, timezone, public_contact, office_hours, reviewed_by)
+        VALUES ($1, $2, 1, 'Synthetic city', $3, 'office@example.test', $4::jsonb, $5)`,
+      [versionId, target.id, target.zone, JSON.stringify(Array.from({ length: 7 }, () => [])), reviewer]);
+      await client.query('UPDATE foundation.service_cities SET current_version_id = $2, lifecycle = $3 WHERE id = $1',
+        [target.id, versionId, lifecycle]);
+    });
     return versionId;
   }
 
   async function addVersion(target: { id: string; zone: string }, version: number) {
     const versionId = randomUUID();
-    await migrator.query(`INSERT INTO foundation.service_city_versions
-      (id, city_id, version, display_name, timezone, public_contact, office_hours, reviewed_by)
-      VALUES ($1, $2, $3, 'Synthetic city', $4, 'office@example.test', $5::jsonb, $6)`,
-    [versionId, target.id, version, target.zone, JSON.stringify(Array.from({ length: 7 }, () => [])), reviewer]);
+    await fenced(async (client) => {
+      await client.query(`INSERT INTO foundation.service_city_versions
+        (id, city_id, version, display_name, timezone, public_contact, office_hours, reviewed_by)
+        VALUES ($1, $2, $3, 'Synthetic city', $4, 'office@example.test', $5::jsonb, $6)`,
+      [versionId, target.id, version, target.zone, JSON.stringify(Array.from({ length: 7 }, () => [])), reviewer]);
+    });
     return versionId;
   }
 
   async function publishSettings(launchMode: string, primaryCityId: string) {
     settingsVersion += 1;
-    await migrator.query(`INSERT INTO foundation.business_settings_versions
-      (id, version, launch_mode, primary_city_id, reviewed_by) VALUES ($1, $2, $3, $4, $5)`,
-    [randomUUID(), settingsVersion, launchMode, primaryCityId, reviewer]);
+    await fenced(async (client) => {
+      await client.query(`INSERT INTO foundation.business_settings_versions
+        (id, version, launch_mode, primary_city_id, reviewed_by) VALUES ($1, $2, $3, $4, $5)`,
+      [randomUUID(), settingsVersion, launchMode, primaryCityId, reviewer]);
+    });
   }
 
   const setLifecycle = (id: string, lifecycle: string) =>
-    migrator.query('UPDATE foundation.service_cities SET lifecycle = $2 WHERE id = $1', [id, lifecycle]);
+    fenced((client) => client.query('UPDATE foundation.service_cities SET lifecycle = $2 WHERE id = $1', [id, lifecycle]));
   const setCurrentVersion = (id: string, versionId: string) =>
-    migrator.query('UPDATE foundation.service_cities SET current_version_id = $2 WHERE id = $1', [id, versionId]);
+    fenced((client) => client.query('UPDATE foundation.service_cities SET current_version_id = $2 WHERE id = $1', [id, versionId]));
 
   it('resolves exactly one ACTIVE SINGLE_CITY primary and follows committed revisions', async () => {
     // No published revision yet.

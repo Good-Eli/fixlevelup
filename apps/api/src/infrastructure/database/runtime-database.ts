@@ -1,10 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import type { OnModuleDestroy } from '@nestjs/common';
-import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../../generated/prisma/client.js';
 import { ConfigurationError } from '../../runtime/config.js';
 import { P04_CAPABILITIES } from '../../authz/capability.js';
+import { admittedPool } from '../admission/pool-guard.js';
+import type { GuardedPool } from '../admission/pool-guard.js';
+import type { RuntimeAdmission } from '../admission/runtime-admission.js';
 
 export interface DatabaseConfig {
   readonly host: '127.0.0.1';
@@ -303,8 +305,7 @@ const settingsGrants: Readonly<Record<string, { select: readonly string[]; inser
 
 
 const expectedConstraints = [
-  ['audit_logs', 'audit_logs_pkey', 'p', 'PRIMARY KEY (id)'],
-  ['audit_logs', 'audit_logs_operation_check', 'c', 'CHECK ((length((operation)::text) > 0))'],
+  ['audit_logs', 'audit_logs_pkey', 'p', 'PRIMARY KEY (id)'],  ['audit_logs', 'audit_logs_operation_check', 'c', 'CHECK ((length((operation)::text) > 0))'],
   ['outbox_events', 'outbox_events_pkey', 'p', 'PRIMARY KEY (id)'],
   ['outbox_events', 'outbox_events_status_check', 'c', "CHECK (((status)::text = ANY ((ARRAY['PENDING'::character varying, 'EXPANDED'::character varying, 'FAILED'::character varying])::text[])))"],
   ['outbox_events', 'outbox_events_type_check', 'c', 'CHECK ((length((event_type)::text) > 0))'],
@@ -315,18 +316,35 @@ const expectedConstraints = [
   ['outbox_events', 'outbox_events_last_error_code_check', 'c', "CHECK (((last_error_code)::text = ANY ((ARRAY['HANDLER_FAILED'::character varying, 'ATTEMPTS_EXHAUSTED'::character varying])::text[])))"],
 ];
 
+// P05-01 (022, S1) exact physical profile hashes of the request intake
+// foundation, captured from the reviewed DDL on a clean PostgreSQL 18.7
+// baseline (fingerprint includes tables, columns, constraints, indexes,
+// triggers, guard function bodies and the exact runtime grants — including
+// the effective column privileges on all 19 relations and the runtime's
+// per-privilege table-level grantability). An empty
+// list fails closed (S1 never claimed ready until pinned).
+const S1_METADATA_HASHES: readonly string[] = [
+  '6626dcc51bf6f5c59da82b1d1d5e05e55bb7757d77ce9963d1b182d90d3dde27',
+];
+
 @Injectable()
-export class RuntimeDatabase implements OnModuleDestroy {
-  private readonly pool: Pool | undefined;
+export class RuntimeDatabase implements OnModuleDestroy {  private readonly pool: GuardedPool | undefined;
   private readonly client: PrismaClient | undefined;
   private pending: Promise<boolean> | undefined;
   private pendingManagement: Promise<boolean> | undefined;
   private pendingCatalog: Promise<boolean> | undefined;
+  private pendingRequests: Promise<boolean> | undefined;
   private closing = false;
 
-  constructor(private readonly config?: DatabaseConfig, private readonly authEnabled = false) {
+  constructor(private readonly config?: DatabaseConfig, private readonly authEnabled = false, admission?: RuntimeAdmission) {
     if (!config) { return; }
-    this.pool = new Pool({ ...config, max: 2, connectionTimeoutMillis: 1000,
+    // P05-01 §7: this is a runtime DB consumer — its pool exists only behind the
+    // admission gate. No admission means no pool and no DB work (fail closed).
+    if (!admission) { throw new ConfigurationError(['LAUNCH_PROOF_TOKEN']); }
+    // The real pool is created here (plain pg.Pool options) but is only ever
+    // reachable through the guard: every checkout is verified before use, and
+    // the Prisma adapter drives the same guarded connect()/query() paths.
+    this.pool = admittedPool({ gate: admission.gate }, { ...config, max: 2, connectionTimeoutMillis: 1000,
       query_timeout: 1000, statement_timeout: 1000, idleTimeoutMillis: 1000,
       options: '-c lock_timeout=1000',
       application_name: 'fixlevelup-api-runtime' });
@@ -721,6 +739,254 @@ export class RuntimeDatabase implements OnModuleDestroy {
         AND NOT has_function_privilege(current_user,'foundation.issue_p04_synthetic_permissions()','EXECUTE') AS compatible
     `, [P04_CAPABILITIES, this.config.database]);
     return !this.closing && rows[0]?.compatible === true && rows[0].metadata === '00a7323a31b502c1bb375aa3ca84cdc570da9bbffd4b87da5e4e0c463964725c';
+  }
+
+  /** P05-01 (022, schema profile S1) readiness: exact physical contract of the
+   * request intake foundation. Separate gate like the P04 one: legacy readiness
+   * never depends on this probe, and a missing/modified S1 object fails closed. */
+  requestIntakeReady(): Promise<boolean> {
+    if (!this.authEnabled || this.closing || !this.pool || !this.config) { return Promise.resolve(false); }
+    this.pendingRequests ??= this.probeRequestIntake().catch(() => false)
+      .finally(() => { this.pendingRequests = undefined; });
+    return this.pendingRequests;
+  }
+
+  /**
+   * P05-01 schema profile S0, POSITIVE check (round-7 audit MUST 3): the
+   * pre-022 profile is verified by what must be ABSENT, never inferred from a
+   * false S1 probe (which also means "drifted 022" or "probe error"). True
+   * only when NO 022 object exists in foundation: none of the ten request
+   * intake tables, none of the 022 guard/history functions, and no runtime
+   * grant on any of them. A damaged 022 (tables present, a guard dropped)
+   * therefore never qualifies as S0 — it is neither profile.
+   */
+  async preIntakeProfileAbsent(): Promise<boolean> {
+    if (!this.authEnabled || this.closing || !this.pool || !this.config) { return false; }
+    try {
+      const { rows } = await this.pool.query<{ absent: boolean }>(`
+        SELECT NOT EXISTS(
+          SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname='foundation' AND c.relkind IN ('r','p','S','v') AND c.relname IN (
+            'request_policy_packages','customers','requests','request_payload_cells',
+            'request_contact_revisions','request_address_revisions','request_appliance_revisions',
+            'request_preference_revisions','request_faults','request_events','request_public_numbers')
+        ) AND NOT EXISTS(
+          SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+          WHERE n.nspname='foundation' AND p.proname IN (
+            'geo_cfg_fence_guard','request_history_payload_guard','requests_guard',
+            'request_address_revisions_guard_city','request_appliance_revisions_guard_basis',
+            'request_faults_category_guard')
+        ) AS absent
+      `);
+      return rows[0]?.absent === true;
+    } catch { return false; }
+  }
+
+  private async probeRequestIntake(): Promise<boolean> {
+    if (!this.pool || !this.config) { return false; }
+    // Fingerprint the exact 022 objects: the ten tables, their constraints,
+    // the fence/history/guard triggers and their functions, the sequence ACL
+    // and the runtime's effective column privileges on all 19 relations
+    // (SELECT/INSERT/UPDATE/REFERENCES+grant-option per column) — PLUS the
+    // nine legacy basis relations' new fence triggers and their runtime
+    // table-ACL shape, so a dropped/weakened fence or a runtime column-grant
+    // drift on the legacy side also fails this gate.
+    // No business rows enter the hash.
+    const { rows } = await this.pool.query<{ metadata: string; compatible: boolean }>(`
+      WITH tables AS (
+        SELECT * FROM pg_class WHERE relnamespace='foundation'::regnamespace AND relname IN (
+          'request_policy_packages','customers','requests','request_payload_cells',
+          'request_contact_revisions','request_address_revisions','request_appliance_revisions',
+          'request_faults','request_preference_revisions','request_events')
+      ), fence_relations AS (
+        SELECT * FROM pg_class WHERE relnamespace='foundation'::regnamespace AND relname IN (
+          'business_settings_versions','service_cities','service_city_versions','administrative_districts',
+          'service_areas','service_area_versions','service_area_district_coverage',
+          'reference_entries','reference_entry_versions')
+      ), columns AS (
+        SELECT t.relname,a.*,p.typname,pg_get_expr(d.adbin,d.adrelid) AS default_expr
+        FROM tables t JOIN pg_attribute a ON a.attrelid=t.oid JOIN pg_type p ON p.oid=a.atttypid
+        LEFT JOIN pg_attrdef d ON d.adrelid=t.oid AND d.adnum=a.attnum
+        WHERE a.attnum>0 AND NOT a.attisdropped
+      ), triggers AS (
+        SELECT g.* FROM pg_trigger g WHERE NOT g.tgisinternal AND g.tgrelid IN (SELECT oid FROM tables)
+      ), fence_triggers AS (
+        SELECT g.* FROM pg_trigger g
+        WHERE NOT g.tgisinternal AND g.tgrelid IN (SELECT oid FROM fence_relations)
+          AND g.tgfoid='foundation.geo_cfg_fence_guard()'::regprocedure
+      ), functions AS (
+        SELECT p.* FROM pg_proc p WHERE p.oid IN (SELECT tgfoid FROM triggers)
+          OR (p.pronamespace='foundation'::regnamespace AND p.proname IN (
+            'geo_cfg_fence_guard','requests_guard','request_faults_category_guard',
+            'request_appliance_revisions_guard_basis','request_address_revisions_guard_city',
+            'request_history_payload_guard'))
+      ), metadata(category,name,shape) AS (
+        SELECT 'table',t.relname,jsonb_build_array(pg_get_userbyid(t.relowner),t.relkind,t.relpersistence,
+          t.relrowsecurity,t.relforcerowsecurity)
+        FROM tables t
+        UNION ALL
+        SELECT 'fence_table',r.relname,jsonb_build_array(pg_get_userbyid(r.relowner),r.relkind,r.relpersistence,
+          r.relrowsecurity,r.relforcerowsecurity)
+        FROM fence_relations r
+        UNION ALL
+        SELECT 'column',a.relname||'.'||a.attname,jsonb_build_array(a.attnum,a.typname,a.atttypmod,a.attnotnull,
+          a.attidentity,a.attgenerated,a.default_expr)
+        FROM columns a
+        UNION ALL
+        SELECT 'constraint',k.conname,jsonb_build_array(k.conrelid::regclass::text,k.contype,k.convalidated,
+          pg_get_constraintdef(k.oid))
+        FROM pg_constraint k WHERE k.conrelid IN (SELECT oid FROM tables)
+        UNION ALL
+        SELECT 'index',c.relname,jsonb_build_array(i.indisvalid,i.indisunique,pg_get_indexdef(c.oid))
+        FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid IN (SELECT oid FROM tables)
+        UNION ALL
+        SELECT 'trigger',g.tgname,jsonb_build_array(g.tgrelid::regclass::text,g.tgenabled,pg_get_triggerdef(g.oid))
+        FROM triggers g
+        UNION ALL
+        SELECT 'fence_trigger',g.tgname,jsonb_build_array(g.tgrelid::regclass::text,g.tgenabled,pg_get_triggerdef(g.oid))
+        FROM fence_triggers g
+        UNION ALL
+        SELECT 'function',p.proname,jsonb_build_array(pg_get_userbyid(p.proowner),p.prosecdef,p.proconfig,
+          encode(sha256(convert_to(replace(p.prosrc,chr(13),''),'UTF8')),'hex'))
+        FROM functions p
+      ), grants AS (
+        SELECT a.relname||'.'||a.attname AS name,jsonb_build_array(
+          has_column_privilege(current_user,a.attrelid,a.attnum,'SELECT'),
+          has_column_privilege(current_user,a.attrelid,a.attnum,'INSERT'),
+          has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE'),
+          has_column_privilege(current_user,a.attrelid,a.attnum,'REFERENCES,SELECT WITH GRANT OPTION,INSERT WITH GRANT OPTION,UPDATE WITH GRANT OPTION')) AS shape
+        FROM columns a
+      ), fence_column_grants AS (
+        -- Same effective-privilege shape as grants, but for every column of
+        -- the nine fence relations: fence_acl sees only the per-table
+        -- booleans, and other_acl/public_acl deliberately exclude the runtime
+        -- role, so without this CTE a column-only UPDATE/SELECT/INSERT drift
+        -- on a fence relation (e.g. UPDATE(display_name) on
+        -- service_city_versions, where the runtime holds no UPDATE at all)
+        -- would not move the hash.
+        SELECT r.relname||'.'||a.attname AS name,jsonb_build_array(
+          has_column_privilege(current_user,a.attrelid,a.attnum,'SELECT'),
+          has_column_privilege(current_user,a.attrelid,a.attnum,'INSERT'),
+          has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE'),
+          has_column_privilege(current_user,a.attrelid,a.attnum,'REFERENCES,SELECT WITH GRANT OPTION,INSERT WITH GRANT OPTION,UPDATE WITH GRANT OPTION')) AS shape
+        FROM fence_relations r JOIN pg_attribute a ON a.attrelid=r.oid
+        WHERE a.attnum>0 AND NOT a.attisdropped
+      ), fence_acl AS (
+        -- Runtime table privileges per PRIVILEGE, never as one any-of
+        -- boolean: with DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN merged
+        -- into a single has_table_privilege() call, an extra runtime grant
+        -- (e.g. TRUNCATE where DELETE is already held) would not move the
+        -- hash. Each privilege is its own array element instead. Runtime
+        -- table GRANTABILITY is fingerprinted per privilege as well: the
+        -- owner upgrading an existing plain grant to WITH GRANT OPTION
+        -- changes the runtime's authority without moving any plain boolean,
+        -- so each privilege's '... WITH GRANT OPTION' variant is its own
+        -- element too.
+        SELECT r.relname AS name,jsonb_build_array(pg_get_userbyid(r.relowner),
+          has_table_privilege(current_user,r.oid,'SELECT'),
+          has_table_privilege(current_user,r.oid,'INSERT'),
+          has_table_privilege(current_user,r.oid,'UPDATE'),
+          has_table_privilege(current_user,r.oid,'DELETE'),
+          has_table_privilege(current_user,r.oid,'TRUNCATE'),
+          has_table_privilege(current_user,r.oid,'REFERENCES'),
+          has_table_privilege(current_user,r.oid,'TRIGGER'),
+          has_table_privilege(current_user,r.oid,'MAINTAIN'),
+          has_table_privilege(current_user,r.oid,'SELECT WITH GRANT OPTION'),
+          has_table_privilege(current_user,r.oid,'INSERT WITH GRANT OPTION'),
+          has_table_privilege(current_user,r.oid,'UPDATE WITH GRANT OPTION'),
+          has_table_privilege(current_user,r.oid,'DELETE WITH GRANT OPTION'),
+          has_table_privilege(current_user,r.oid,'TRUNCATE WITH GRANT OPTION')) AS shape
+        FROM fence_relations r
+        UNION ALL
+        SELECT t.relname,jsonb_build_array(pg_get_userbyid(t.relowner),
+          has_table_privilege(current_user,t.oid,'SELECT'),
+          has_table_privilege(current_user,t.oid,'INSERT'),
+          has_table_privilege(current_user,t.oid,'UPDATE'),
+          has_table_privilege(current_user,t.oid,'DELETE'),
+          has_table_privilege(current_user,t.oid,'TRUNCATE'),
+          has_table_privilege(current_user,t.oid,'REFERENCES'),
+          has_table_privilege(current_user,t.oid,'TRIGGER'),
+          has_table_privilege(current_user,t.oid,'MAINTAIN'),
+          has_table_privilege(current_user,t.oid,'SELECT WITH GRANT OPTION'),
+          has_table_privilege(current_user,t.oid,'INSERT WITH GRANT OPTION'),
+          has_table_privilege(current_user,t.oid,'UPDATE WITH GRANT OPTION'),
+          has_table_privilege(current_user,t.oid,'DELETE WITH GRANT OPTION'),
+          has_table_privilege(current_user,t.oid,'TRUNCATE WITH GRANT OPTION')) AS shape
+        FROM tables t
+      ), public_acl AS (
+        -- PUBLIC entries of any privilege on the ten P05 tables AND the nine
+        -- fence relations — all 19 relations (table or column level), checked
+        -- against the stored ACL so a duplicate PUBLIC grant cannot hide
+        -- behind an existing runtime grant or behind being on a fence
+        -- relation instead of a P05 table.
+        SELECT c.relname AS name,jsonb_build_array(x.privilege_type) AS shape
+        FROM (SELECT * FROM tables UNION ALL SELECT * FROM fence_relations) c
+        CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x
+        WHERE x.grantee=0
+        UNION ALL
+        SELECT c.relname||'.'||a.attname,jsonb_build_array(y.privilege_type)
+        FROM (SELECT * FROM tables UNION ALL SELECT * FROM fence_relations) c
+        JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+        CROSS JOIN LATERAL aclexplode(a.attacl) y
+        WHERE y.grantee=0
+      ), sequence AS (
+        SELECT 'sequence'||s.relname AS name,jsonb_build_array(pg_get_userbyid(s.relowner),
+          has_sequence_privilege(current_user,s.oid,'USAGE'),has_sequence_privilege(current_user,s.oid,'SELECT,UPDATE'),
+          -- Raw stored sequence ACL entries: any grantee beyond the owner and
+          -- this runtime role changes the hash (no silent third-party access).
+          (SELECT coalesce(jsonb_agg(jsonb_build_array(pg_get_userbyid(a.grantor),
+             CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END,
+             a.privilege_type,a.is_grantable) ORDER BY a.grantee,a.privilege_type),'[]'::jsonb)
+           FROM aclexplode(coalesce(s.relacl,acldefault('S',s.relowner))) a)) AS shape
+        FROM pg_class s WHERE s.oid='foundation.request_public_numbers'::regclass
+      ), other_acl AS (
+        -- Every non-runtime, non-owner, non-PUBLIC ACL entry on the ten P05
+        -- tables and the nine fence relations, at TABLE level (relacl).
+        -- Runtime and PUBLIC are deliberately excluded here: the runtime
+        -- role's exact per-privilege shape is already fingerprinted by
+        -- fence_acl (individual booleans), and PUBLIC is covered by
+        -- public_acl across all 19 relations — so this raw branch catches
+        -- exactly the third-party entries nothing else would see.
+        SELECT c.relname AS name,jsonb_build_array(pg_get_userbyid(a.grantor),
+          CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END,
+          a.privilege_type,a.is_grantable) AS shape
+        FROM (SELECT * FROM tables UNION ALL SELECT * FROM fence_relations) c
+        CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a
+        WHERE a.grantee NOT IN (0, (SELECT oid FROM pg_roles WHERE rolname=current_user), c.relowner)
+        UNION ALL
+        -- ...and at COLUMN level (attacl): a third role gaining column SELECT
+        -- on the ciphertext must also change the hash. Runtime and PUBLIC are
+        -- excluded for the same reasons as in the table-level branch above
+        -- (fence_acl per-privilege booleans and public_acl respectively).
+        SELECT c.relname||'.'||a2.attname AS name,jsonb_build_array(pg_get_userbyid(x.grantor),
+          CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,
+          x.privilege_type,x.is_grantable) AS shape
+        FROM (SELECT * FROM tables UNION ALL SELECT * FROM fence_relations) c
+        JOIN pg_attribute a2 ON a2.attrelid=c.oid AND a2.attnum>0 AND NOT a2.attisdropped
+        CROSS JOIN LATERAL aclexplode(a2.attacl) x
+        WHERE x.grantee NOT IN (0, (SELECT oid FROM pg_roles WHERE rolname=current_user), c.relowner)
+      ), checked AS (
+        SELECT * FROM metadata
+        UNION ALL SELECT 'grant',name,shape FROM grants
+        UNION ALL SELECT 'fence_grant',name,shape FROM fence_column_grants
+        UNION ALL SELECT 'fence_acl',name,shape FROM fence_acl
+        UNION ALL SELECT 'public_acl',name,shape FROM public_acl
+        UNION ALL SELECT 'other_acl',name,shape FROM other_acl
+        UNION ALL SELECT 'metadata',name,shape FROM sequence
+      )
+      SELECT encode(sha256(convert_to((SELECT jsonb_agg(jsonb_build_array(category,name,shape)
+          ORDER BY category COLLATE "C",name COLLATE "C",shape::text COLLATE "C")::text FROM checked),'UTF8')),'hex') AS metadata,
+        current_database()=$1 AND current_user='fixlevelup_runtime'
+        AND NOT EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user))
+        AND NOT has_schema_privilege(current_user,'foundation','CREATE')
+        AND NOT has_schema_privilege(current_user,'public','CREATE')
+        AND NOT has_database_privilege(current_user,current_database(),'CREATE,TEMP')
+        AND NOT (SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls OR rolinherit
+          FROM pg_roles WHERE rolname=current_user)
+        AND NOT EXISTS(SELECT FROM functions f WHERE has_function_privilege(current_user,f.oid,'EXECUTE'))
+        AND (SELECT count(*) FROM fence_triggers) = 9 AS compatible
+    `, [this.config.database]);
+    return !this.closing && rows[0]?.compatible === true && S1_METADATA_HASHES.includes(rows[0].metadata);
   }
 
   private async authReady(): Promise<boolean> {

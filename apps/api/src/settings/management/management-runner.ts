@@ -224,6 +224,15 @@ export class ManagementRunner {
     const required = requirements(command);
     const authorizationTarget = targetOf(command);
     return this.auth.withP03(proof, 'write', required, authorizationTarget, async ctx => {
+      // P05-01 unified GEO/CFG writer fence (§5.1): reference writers take the
+      // shared exclusive lock BEFORE the first reference-basis read — including
+      // the visibility/version read below — so a fenced reader can never
+      // observe a half-decided replay/412 against an unfenced basis.
+      const fencesBasis = command.op === 'referencePublish' || command.op === 'referenceArchive' || command.op === 'referenceCreate';
+      // The prelock must map a lock timeout to the P03 409 transport contract,
+      // not let ConfigurationError surface as a 500 through the authorization
+      // transaction wrapper.
+      if (fencesBasis) { await acquireCompanySettingsLock(ctx.client).catch(managementFailure); }
       const { bootstrap, version } = await commandVisibility(ctx, command);
       const target = commandTarget(ctx, command, bootstrap);
       const requestSha = digest(ctx, command, guards, target);

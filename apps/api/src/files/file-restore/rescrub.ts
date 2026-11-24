@@ -1,13 +1,105 @@
 import { randomBytes } from 'node:crypto';
 import type { LedgerItem, LedgerScope } from '../file-ledger/contract.js';
 import type { StorageTarget } from '../storage/attempt.js';
-import type { RestoreContext, RestoreObject, RestoreReaderTarget, RestoreGateReceipt, SignedSnapshotManifest, FileRestoreFailure } from './contract.js';
-import { refuseRestore } from './contract.js';
+import type { RestoreContext, RestoreObject, RestoreReaderTarget, RestoreGateReceipt, SignedSnapshotManifest, FileRestoreFailure, SnapshotManifest } from './contract.js';
+import { FileRestoreError, refuseRestore } from './contract.js';
 import { readAuthorityInventory, readRestoreInventory, requireExactTombstones, requireMatchingInventory } from './inventory.js';
+import { assertP05AbsentAfterDrain, P05InventoryError } from './p05-inventory.js';
+import { verifyP05Attestation } from './p05-attestation.js';
 import { objectId, readAuthority, readSnapshot, sameHead, sha256, targetId, validateLimits, verifyApproval } from './records.js';
 import { issueReadyGetGrant, requireLifecycleGetGrant, type ReadyGetGrant } from '../storage/lifecycle-proof.js';
 import type { ReadyReadStorage } from '../file-lifecycle/contract.js';
 import { privateStorageError } from '../storage/errors.js';
+
+/** §5.3 gate: file-only activation requires a proven P05-absent TARGET whose
+ * fact matches the manifest's schema profile exactly — a clean pre-P05 target
+ * (schema absent) for an S0 restore, a fully drained S1 target (all ten
+ * tables empty) for an S1 restore. Surviving rows, a partial P05 schema or a
+ * target/source profile mismatch refuse activation. Exported for the isolated
+ * profile-mismatch proof (tests/file-restore-p05.test.ts, round-4 audit
+ * finding #9): the full rescrubFileRestore contour needs S3/Garage IO, while
+ * this gate is provable against real disposable PostgreSQL targets alone. */
+export async function requireP05AbsentForActivation(client: { readonly query: import('pg').PoolClient['query'] },
+  manifest: Pick<SnapshotManifest, 'schemaVersion'>): Promise<'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'> {
+  let expected: 'P05_SCHEMA_ABSENT_AFTER_DRAIN' | 'P05_EMPTY_AFTER_DRAIN';
+  try {
+    expected = manifestSourceSchemaProfile(manifest) === 'S0' ? 'P05_SCHEMA_ABSENT_AFTER_DRAIN' : 'P05_EMPTY_AFTER_DRAIN';
+  } catch {return refuseRestore('RESTORE_AUTHORITY');}
+  try {
+    const fact = await assertP05AbsentAfterDrain(client);
+    if (fact !== expected) {refuseRestore('RESTORE_AUTHORITY');}
+    return fact;
+  } catch (error) {
+    if (error instanceof P05InventoryError) {refuseRestore('RESTORE_AUTHORITY');}
+    throw error;
+  }
+}
+
+/** Only REVIEWED heads resolve (docs/P05-01-CONTRACT.md): the exact reviewed
+ * pre-P05 baseline 021 `20261122000700_catalog_management` (S0, docs/P05-PLAN.md
+ * §1 base 7a60d4c = 021, the only pre-P05 profile the P05 plan accepts as a
+ * restore source) and the reviewed P05 head 022 = migration
+ * `20261123000100_request_intake_foundation` (S1). The manifest schemaVersion
+ * is the exact reviewed migration directory name (records.ts enforces
+ * `^\d{14}_[a-z_]+$`). Any other head — earlier unknown, later unknown or
+ * malformed-but-syntax-valid — is never silently classified; it refuses as an
+ * unreviewed profile. Callers that need the classification must treat a thrown
+ * refusal as RESTORE_AUTHORITY. */
+const REVIEWED_S0_HEAD = '20261122000700_catalog_management';
+const REVIEWED_S1_HEAD = '20261123000100_request_intake_foundation';
+
+export function manifestSourceSchemaProfile(manifest: Pick<SnapshotManifest, 'schemaVersion'>): 'S0' | 'S1' {
+  const version = manifest.schemaVersion;
+  if (version === REVIEWED_S0_HEAD) { return 'S0'; }
+  if (version === REVIEWED_S1_HEAD) { return 'S1'; }
+  throw new Error(`Unreviewed schema profile: ${version}`);
+}
+
+/** The bridge callback returns no clock reading: the drain fact is bound to the
+ * observation instant of this handoff, and cross-handoff freshness is the nonce
+ * inequality below. maxAgeMs therefore only covers verify-time parsing slack. */
+const P05_SOURCE_FACT_MAX_AGE_MS = 60_000;
+
+/** §5.3: the fact a drained source may return is bound to the manifest's exact
+ * schema profile — schema absence only for the pre-P05 S0 source, emptiness
+ * only for the S1 source. `previousNonce` is undefined on the first handoff and
+ * the recorded nonce of the first handoff on the second, so a replayed fact
+ * across the two activation checks refuses. */
+export function requireP05ProfileFact(manifest: Pick<SnapshotManifest, 'schemaVersion' | 'sourceDatabase'>,
+  attestation: { readonly fact: 'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'; readonly profile: 'S0' | 'S1'; readonly nonce: string },
+  previousNonce: string | undefined, observedAt: Date): void {
+  const expected = manifestSourceSchemaProfile(manifest);
+  if (attestation.profile !== expected || typeof attestation.nonce !== 'string' || attestation.nonce === ''
+    || attestation.nonce === previousNonce || !verifyP05Attestation(
+      { kind: attestation.fact, sourceDatabase: manifest.sourceDatabase, sourceSchemaProfile: attestation.profile,
+        nonce: attestation.nonce, recordedAt: observedAt.toISOString() },
+      { sourceDatabase: manifest.sourceDatabase, sourceSchemaProfile: expected,
+        fact: expected === 'S0' ? 'P05_SCHEMA_ABSENT_AFTER_DRAIN' : 'P05_EMPTY_AFTER_DRAIN',
+        maxAgeMs: P05_SOURCE_FACT_MAX_AGE_MS, now: observedAt },
+    )) {refuseRestore('RESTORE_AUTHORITY');}
+}
+
+/** §5.3 source-drain fact from the trusted operator callback. Refuses with
+ * RESTORE_AUTHORITY on any callback error; a fresh challenge is presented on
+ * every handoff, and the two handoffs must agree on the exact fact and profile. */
+async function requireP05SourceDrained(ctx: RestoreContext, manifest: Pick<SnapshotManifest, 'schemaVersion' | 'sourceDatabase'>, manifestSha256: string,
+  previous: { readonly fact: 'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'; readonly nonce: string } | undefined, signal: AbortSignal): Promise<{ readonly fact: 'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'; readonly nonce: string }> {
+  const challenge = NONCE();
+  let result: Awaited<ReturnType<RestoreContext['readP05SourceState']>>;
+  try {
+    result = await ctx.readP05SourceState({ manifestSha256, challenge }, signal);
+  } catch {return refuseRestore('RESTORE_AUTHORITY');}
+  try {
+    requireP05ProfileFact(manifest, result, previous?.nonce, new Date());
+  } catch (error) {
+    // An unreviewed manifest profile (or any helper refusal) closes the
+    // handoff as an authority failure instead of surfacing a raw error.
+    if (error instanceof Error) {return refuseRestore('RESTORE_AUTHORITY');}
+    throw error;
+  }
+  if (previous !== undefined && result.fact !== previous.fact) {refuseRestore('RESTORE_AUTHORITY');}
+  return { fact: result.fact, nonce: result.nonce };
+}
 
 const IDLE = new WeakSet<object>();
 // Native getter enforces the brand and cannot be overridden by an own property.
@@ -92,6 +184,19 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
       FROM foundation.file_runtime_epochs WHERE singleton`);
     if (epoch === undefined || epoch.db !== manifest.destinationDatabase || epoch.namespace !== old.namespace
       || epoch.epoch !== old.writerEpoch.toString() || epoch.mode !== 'RESTORE_CLOSED' || epoch.connect) {refuseRestore('RESTORE_CLOSED');}
+    // P05-01 §5.3: before any object is copied, prove on the drained SOURCE
+    // (via the trusted operator callback bound to it) and on the fresh TARGET
+    // that no P05 operational rows survive; either side refusing keeps the
+    // target closed with runtime CONNECT withheld.
+    let drained: { readonly fact: 'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'; readonly nonce: string };
+    try {
+      drained = await requireP05SourceDrained(ctx, manifest, hash, undefined, signal);
+      await requireP05AbsentForActivation(conn, manifest);
+    } catch (error) {
+      if (!(error instanceof FileRestoreError)) {throw error;}
+      stage = error.code;
+      throw error;
+    }
     stage = 'RESTORE_AUTHORITY';
     if (await readAuthorityInventory(conn, limits) !== auth.record.inventorySha256) {refuseRestore('RESTORE_AUTHORITY');}
     const current = await readRestoreInventory(conn, limits);
@@ -134,6 +239,21 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
     const client = await conn.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      // §5.3 second check: re-prove the absence of P05 operational rows inside
+      // the same closed transaction that flips the epoch to ACTIVE, so a late
+      // row committed after the first check cannot ride along. Both the source
+      // callback (fresh challenge; same fact/profile as the first handoff) and
+      // the target inventory are re-checked; a P05 refusal must surface as
+      // RESTORE_AUTHORITY, not be remapped by the stage-catch below.
+      try {
+        await requireP05SourceDrained(ctx, manifest, hash, drained, signal);
+        await requireP05AbsentForActivation(client, manifest);
+      } catch (error) {
+        if (!(error instanceof FileRestoreError)) {throw error;}
+        await client.query('ROLLBACK').catch(() => undefined);
+        stage = error.code;
+        throw error;
+      }
       const cas = await client.query(`UPDATE foundation.file_runtime_epochs SET mode='ACTIVE',epoch=$3
         WHERE singleton AND namespace_id=$1 AND epoch=$2 AND mode='RESTORE_CLOSED'
         AND current_database()=$4 AND NOT has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT')`,

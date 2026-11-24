@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { syntheticAdmission } from './admission-fixture.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 const moduleUrl = (path: string): string => pathToFileURL(resolve(root, 'apps/api/dist', path)).href;
@@ -12,6 +13,9 @@ const env = {
   DB_PASSWORD: 'synthetic-runtime-password-placeholder',
   NEST_LOG_LEVEL: 'synthetic-secret-canary', BOT_TOKEN: 'synthetic-secret-canary',
 };
+// P05-01: the entrypoints load the admission contour from the operator env; the
+// synthetic admission pins unreachable facts so no child performs DB work here.
+const launchEnv = { api: syntheticAdmission('API').env, worker: syntheticAdmission('WORKER').env } as const;
 
 function run(source: string, overrides: NodeJS.ProcessEnv = {}) {
   const result = spawnSync(process.execPath, ['--input-type=module', '--eval', source], {
@@ -41,18 +45,20 @@ describe('compiled Node 24 runtime', () => {
     expect(result.stderr).toBe('');
   });
 
-  it.each(['api', 'worker'])('boots the actual %s entrypoint and closes on an internally emitted signal', (role) => {
-    // Windows child.kill(SIGTERM) is forceful. This checks the actual compiled
-    // handler with an in-process signal simulation; Linux OS-signal proof is deferred.
+  it.each(['api', 'worker'] as const)('refuses to boot the %s entrypoint without the launcher private channel', (role) => {
+    // P05-01 §7 (round 5): the child NEVER consumes its own proof. A process
+    // started outside the launcher contour has no private IPC channel, so
+    // admitProcess refuses with ADMISSION_NO_CHANNEL before any live check,
+    // any listener and any worker tick — `started` is unreachable.
     const result = run(`
       await import(${JSON.stringify(moduleUrl(`bootstrap/${role}.js`))});
       setTimeout(()=>{process.emit('SIGTERM');process.emit('SIGINT');},100);
-    `);
-    expect(result.status).toBe(0);
+    `, launchEnv[role]);
+    expect(result.status).toBe(1);
     expect(result.stderr).toBe('');
-    expect(result.stdout).toContain('"event":"started"');
-    expect(result.stdout.match(/"event":"shutdown_started"/g)).toHaveLength(1);
-    expect(result.stdout).toContain('"event":"shutdown_completed"');
+    expect(result.stdout).toContain('"event":"admission_denied"');
+    expect(result.stdout).not.toContain('"event":"started"');
+    expect(result.stdout).not.toContain('"event":"shutdown_started"');
     expect(result.stdout).not.toContain('synthetic-secret-canary');
   });
 

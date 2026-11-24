@@ -3,6 +3,8 @@ import { BadRequestException, ConflictException, ForbiddenException, HttpExcepti
 import { AUTHORIZATION_SERVICE } from '../../authz/authorization.resources.js';
 import type { SessionProof } from '../../authz/authorization.service.js';
 import { authFailure, uuid } from '../../authz/rbac-http.js';
+import { acquireCompanySettingsLock } from '../configuration/company-lock.js';
+import { ConfigurationError } from '../configuration/configuration-errors.js';
 import { catalogCommands } from './catalog-commands.js';
 import { membershipCommands } from './membership-commands.js';
 import type { GeoCommand, GeographyAuthorizationApi, GeoReceipt, GeoTarget } from './geo-contract.js';
@@ -66,6 +68,21 @@ export class GeoRunner {
       if (command.scoped === 'global' && (ctx.cityIds !== null || ctx.role.type !== 'SYSTEM' || ctx.role.code !== 'ADMIN')) { throw new ForbiddenException(); }
       if (target.cityId && ctx.cityIds !== null && !ctx.cityIds.includes(target.cityId)) { throw new NotFoundException(); }
       if (command.scoped === 'self' && (ctx.principal.kind !== 'staff-telegram' || target.staffId !== undefined)) { throw new ForbiddenException(); }
+      // P05-01 unified GEO/CFG writer fence: a catalog write takes the shared
+      // exclusive advisory lock BEFORE its first domain read — check() reads
+      // city/area/coverage rows, so the fence must precede it. Membership and
+      // bootstrap-revoke commands keep their own RBAC serialization per §5.1
+      // and are deliberately not fenced here.
+      if (write && op in catalogCommands) {
+        try { await acquireCompanySettingsLock(ctx.client); }
+        catch (error) {
+          if (error instanceof ConfigurationError) {
+            if (error.code === 'CONFLICT') { throw new ConflictException(); }
+            throw new InternalServerErrorException();
+          }
+          throw error;
+        }
+      }
       await command.check(ctx, target); // Includes visibility of the actual object, on this transaction, even for replay.
       if (!write) { return { data: await command.run(ctx, target, body, null), replayed: false }; }
       const digest = createHash('sha256').update(canonical({ target, body, expected: write.expected, key: write.key })).digest('hex');

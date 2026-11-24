@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebAuthController, WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE } from '../src/auth/web-auth.controller.js';
 import { WebAuthError, WebAuthService } from '../src/auth/web-auth.service.js';
 import { createApi } from '../src/bootstrap/factories.js';
+import { admitFixture } from './admission-fixture.js';
 import { loadConfig } from '../src/runtime/config.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 
@@ -62,9 +63,21 @@ describe('web auth HTTP boundary', () => {
     const events = vi.spyOn(logger, 'event').mockImplementation(() => undefined);
     const output = vi.spyOn(ConsoleLogger.prototype, 'log').mockImplementation(() => undefined);
     const config = loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' });
+    // The application's database is unreachable by construction; the
+    // admission is GENUINE (a real witness on the local dev database, issued
+    // by the production admitProcess), so no connection is ever attempted by
+    // the mocked login path — no DB work at all.
+    const { Client } = await import('pg');
+    const { readFileSync } = await import('node:fs');
+    const nodePath = await import('node:path');
+    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(nodePath.resolve(import.meta.dirname, '../../../packages/database-tooling/.env'), 'utf8'))?.[1] ?? '';
+    const holder = new Client({ host: '127.0.0.1', port: 55432, database: 'fixlevelup_dev', user: 'fixlevelup_runtime', password: runtimePassword });
+    await holder.connect();
+    const admitted = await admitFixture(holder, 'fixlevelup_dev', 'API');
+    closers.push(async () => { await admitted.release(); await holder.end(); });
     const app = await createApi(config, logger,
       { host: '127.0.0.1', port: 1, database: 'unused', user: 'fixlevelup_runtime', password: 'unused' },
-      { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) });
+      { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) }, undefined, admitted.authorization);
     closers.push(() => app.close());
     const server = app.getHttpServer() as Server;
     const malformed = await request(server).post('/api/v1/auth/login').set('Origin', origin).set('X-CSRF-Token', 'login')

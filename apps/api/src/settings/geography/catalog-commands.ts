@@ -593,6 +593,14 @@ function command(spec: CommandSpec): GeoCommand {
     scoped: spec.scoped,
     check: spec.check,
     run: async (ctx, target, body, expected) => {
+      if (spec.write) {
+        // P05-01 unified GEO/CFG writer fence (docs/P05-PLAN.md §5.1): every
+        // geography writer takes the shared exclusive advisory lock before its
+        // first domain read or row lock, so the S1 statement guards accept it
+        // and a P05 reader with S can never observe a half-published basis.
+        // Reentrant with commands that lock company settings again inside run.
+        await lockCompanySettings(ctx);
+      }
       const result = await spec.run(ctx, target, body, expected);
       if (spec.write && !isReceipt(result)) {
         // A programming error, not a client error: never leak a partial projection.

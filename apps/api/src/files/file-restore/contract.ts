@@ -77,6 +77,14 @@ export interface RestoreContext {
   readonly verifier: FileLedgerVerifier;
   /** Re-read immutable source fence + pinned authority, bound to this run/manifest/nonce. */
   readonly currentAuthority: (request: { readonly manifestSha256: string; readonly challenge: string }, signal: AbortSignal) => Promise<SignedRestoreRecord>;
+  /** §5.3 source-drain fact. The trusted operator bridge runs this ONLY inside the
+   * fenced post-drain window on the SOURCE primary (after the §5.3 FENCED/drain
+   * steps revoked writer CONNECT and waited out active transactions): it executes
+   * readP05SourceState/assertP05AbsentAfterDrain (./p05-inventory.js) on that same
+   * primary and returns only the typed fact — no P05 row ever crosses. The
+   * challenge is fresh per handoff and the returned nonce must differ between the
+   * two activation checks. */
+  readonly readP05SourceState: (input: { readonly manifestSha256: string; readonly challenge: string }, signal: AbortSignal) => Promise<{ readonly fact: 'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'; readonly profile: 'S0' | 'S1'; readonly nonce: string }>;
   /** Must verify actual archives, retain them, CREATE a fresh target with runtime CONNECT withheld, and install the closed epoch. */
   readonly restoreArchives: (manifest: SnapshotManifest, authority: AuthorityRecord, signal: AbortSignal) => Promise<void>;
   /** Byte artifact lookup by manifest item only; returns full bounded object, with no remote target authority. */
