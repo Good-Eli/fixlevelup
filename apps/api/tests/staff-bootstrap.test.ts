@@ -9,8 +9,8 @@ import { insertWebStaff, migrateAuthFixture, reassignFixture, spareAdmin } from 
 
 // Opt in only on the documented local development PostgreSQL instance. Each run
 // creates three empty, randomly named databases; it never writes to dev tables.
-// Databases are deliberately retained, not dropped, in accordance with the
-// repository's local-data preservation policy.
+// Each database is dropped by this run's own teardown (only names this run
+// created and that match the strict disposable-name pattern).
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
 const root = resolve(import.meta.dirname, '../../..');
 const syntheticPassword = 'Synthetic-Password-Canary-2026!';
@@ -74,6 +74,33 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
   const pools: Pool[] = [];
   const fixtures: Client[] = [];
   const runtimePools: Pool[] = [];
+  /** Database names created by THIS run (pushed exactly when CREATE succeeded). */
+  const createdNames: string[] = [];
+  let tornDown = false;
+
+  /** Ownership proof for the teardown drop, consumed exactly once: each pushed name
+   * is a CREATE that succeeded in this run AND matches the strict disposable pattern. */
+  const takeOwnedDatabases = (): string[] => {
+    return createdNames.splice(0).filter((item) => /^fixlevelup_bootstrap_test_[a-f0-9]{24}$/.test(item));
+  };
+
+  /** The afterAll teardown, exactly once: this run's pools/clients down first, then
+   * the drop of exactly the databases this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const owned = takeOwnedDatabases();
+    try {
+      await Promise.all([...pools, ...runtimePools].map((pool) => pool.end()));
+      await Promise.all(fixtures.map((fixture) => fixture.end()));
+    } finally {
+      try {
+        for (const name of owned) {
+          await admin?.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+        }
+      } finally { await admin?.end(); }
+    }
+  }
 
   beforeAll(async () => {
     const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
@@ -85,26 +112,31 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
     const connection = { host: '127.0.0.1', port: 55432 };
     admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
-    for (let i = 0; i < 3; i++) {
-      // The name consists solely of a fixed prefix and cryptographic random hex.
-      const name = `fixlevelup_bootstrap_test_${randomBytes(12).toString('hex')}`;
-      await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
-      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
-      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_runtime`);
-      const fixture = new Client({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
-      fixtures.push(fixture);
-      await fixture.connect();
-      await migrateAuthFixture(fixture, name);
-      pools.push(new Pool({ ...connection, application_name: 'fixture-bootstrap', database: name, user: 'fixlevelup_migrator', password: migratorPassword }));
-      runtimePools.push(new Pool({ ...connection, database: name, user: 'fixlevelup_runtime', password: runtimePassword }));
+    try {
+      for (let i = 0; i < 3; i++) {
+        // The name consists solely of a fixed prefix and cryptographic random hex.
+        const name = `fixlevelup_bootstrap_test_${randomBytes(12).toString('hex')}`;
+        await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+        // CREATE is the reuse guard: an existing name is a hard error, so a successful
+        // CREATE proves this run owns the disposable database (the name gates the drop).
+        createdNames.push(name);
+        await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+        await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_runtime`);
+        const fixture = new Client({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+        fixtures.push(fixture);
+        await fixture.connect();
+        await migrateAuthFixture(fixture, name);
+        pools.push(new Pool({ ...connection, application_name: 'fixture-bootstrap', database: name, user: 'fixlevelup_migrator', password: migratorPassword }));
+        runtimePools.push(new Pool({ ...connection, database: name, user: 'fixlevelup_runtime', password: runtimePassword }));
+      }
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
     }
   }, 30000);
 
-  afterAll(async () => {
-    await Promise.all([...pools, ...runtimePools].map((pool) => pool.end()));
-    await Promise.all(fixtures.map((fixture) => fixture.end()));
-    await admin?.end();
-  });
+  afterAll(teardown);
 
   it('rolls back staff and credentials when the audit insert fails, without logging secrets', async () => {
     const logs = [vi.spyOn(console, 'log'), vi.spyOn(console, 'warn'), vi.spyOn(console, 'error')];

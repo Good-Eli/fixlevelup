@@ -26,6 +26,32 @@ const config = loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '
 // same opt-in as every other isolated integration suite.
 const isolatedDbTests = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1';
 
+/** Credential of the local dev PostgreSQL maintenance role (read in-memory only). */
+function devAdminPassword(): string | undefined {
+  return /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'))?.[1];
+}
+
+/**
+ * Drops one disposable database created earlier by THIS test run. Ownership is proven
+ * twice: the `created` flag, set exactly when this run's CREATE DATABASE succeeded
+ * (CREATE is the reuse guard — an existing name is a hard error), and the strict
+ * disposable-name pattern of that fixture. The drop runs from a maintenance connection
+ * after the test's own app/pool/client teardown; never touches fixlevelup_dev.
+ */
+async function dropDisposableDatabase(name: string, created: boolean, pattern: RegExp): Promise<void> {
+  if (!created) { return; }
+  const adminPassword = devAdminPassword();
+  if (!pattern.test(name) || !adminPassword) { throw new Error('Refusing to drop a non-fixture database'); }
+  const { Client } = await import('pg');
+  const admin = new Client({ host: '127.0.0.1', port: 55432, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+  try {
+    await admin.connect();
+    await admin.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
 describe('API runtime database readiness', () => {
   it('mocked settings readiness fails closed on missing schema or grants', async () => {
     const db = new RuntimeDatabase(undefined, true);
@@ -173,19 +199,25 @@ describe('API runtime database readiness', () => {
     const pgModule = await import(pathToFileURL(apiRequire.resolve('pg')).href) as typeof import('pg');
     const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'))?.[1];
     const name = `fixlevelup_p018b_incompatible_${randomBytes(6).toString('hex')}`;
-    const admin = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
-    try { await admin.query(`CREATE DATABASE "${name}" TEMPLATE template0`);
-      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
-      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_runtime`);
-    } finally { await admin.end(); }
-    const fixture = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: name, user: 'fixlevelup_dev', password: adminPassword });
-    await fixture.connect();
-    // P05-01: the launcher witness lives on the fixture owner connection.
-    const admission = await admitFixture(fixture, name, 'API');
-    const app = await createApi(config, new SafeLogger('api'), { ...database, database: name }, undefined, undefined, admission.authorization);
-    const server = app.getHttpServer() as Server;
+    let fixture: import('pg').Client | undefined;
+    let admission: Awaited<ReturnType<typeof admitFixture>> | undefined;
+    let app: Awaited<ReturnType<typeof createApi>> | undefined;
+    // Set exactly when this run's CREATE DATABASE succeeded (CREATE is the reuse guard).
+    let dbCreated = false;
     try {
+      const admin = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
+      await admin.connect();
+      try { await admin.query(`CREATE DATABASE "${name}" TEMPLATE template0`);
+        dbCreated = true;
+        await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+        await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_runtime`);
+      } finally { await admin.end(); }
+      fixture = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: name, user: 'fixlevelup_dev', password: adminPassword });
+      await fixture.connect();
+      // P05-01: the launcher witness lives on the fixture owner connection.
+      admission = await admitFixture(fixture, name, 'API');
+      app = await createApi(config, new SafeLogger('api'), { ...database, database: name }, undefined, undefined, admission.authorization);
+      const server = app.getHttpServer() as Server;
       for (const migration of ['20261120000100_technical_audit_outbox', '20261120000200_technical_outbox_attempts', '20261120000300_technical_outbox_leases']) {
         await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
       }
@@ -244,7 +276,17 @@ describe('API runtime database readiness', () => {
       await fixture.query('DROP INDEX foundation.outbox_events_queue_idx; CREATE INDEX outbox_events_queue_idx ON foundation.outbox_events(created_at,status)');
       await request(server).get('/health/ready').expect(503);
       await request(server).get('/health/live').expect(200);
-    } finally { await app.close(); await admission.release(); await fixture.end(); }
+    } finally {
+      // Same lifecycle cleanup for the failure path: app down, admission released, client
+      // ended, then exactly this run's disposable database dropped.
+      try { await app?.close(); } finally {
+        try { await admission?.release(); } finally {
+          try { await fixture?.end(); } finally {
+            await dropDisposableDatabase(name, dbCreated, /^fixlevelup_p018b_incompatible_[a-f0-9]{12}$/);
+          }
+        }
+      }
+    }
   });
 
   it.runIf(isolatedDbTests)('rejects weakened 013 settings/legal guards and grants on an isolated full-migration DB', async () => {
@@ -255,27 +297,33 @@ describe('API runtime database readiness', () => {
     if (!adminPassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
     // The fixture isolation guard requires the opt-in flag and an allowlisted name.
     const name = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
-    const admin = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    let fixture: import('pg').Client | undefined;
+    let admission: Awaited<ReturnType<typeof admitFixture>> | undefined;
+    let app: Awaited<ReturnType<typeof createApi>> | undefined;
+    // Set exactly when this run's CREATE DATABASE succeeded (CREATE is the reuse guard).
+    let dbCreated = false;
     try {
-      await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
-      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
-      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    } finally { await admin.end(); }
-    const fixture = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
-    await fixture.connect();
-    try { await migrateAuthFixture(fixture, name); } finally { /* keep the client open for the mutations below */ }
-    // The full fixture must include 013; later additive migrations must not make
-    // this regression stop checking the still-required settings/legal guards.
-    expect(authFixtureMigrations).toContain('20261121000400_settings_legal_references');
-    // The runtime must not read migration history, but auth readiness expects the table.
-    await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
-    const webAuth = { origin: 'https://127.0.0.1:3100', csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
-    // P05-01: the launcher witness lives on the migrator fixture connection.
-    const admission = await admitFixture(fixture, name, 'API');
-    const app = await createApi(config, new SafeLogger('api'), { ...database, database: name }, webAuth, undefined, admission.authorization);
-    const server = app.getHttpServer() as Server;
-    try {
+      const admin = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+      await admin.connect();
+      try {
+        await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+        dbCreated = true;
+        await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+        await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      } finally { await admin.end(); }
+      fixture = new pgModule.Client({ host: '127.0.0.1', port: 55432, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+      await fixture.connect();
+      await migrateAuthFixture(fixture, name);
+      // The full fixture must include 013; later additive migrations must not make
+      // this regression stop checking the still-required settings/legal guards.
+      expect(authFixtureMigrations).toContain('20261121000400_settings_legal_references');
+      // The runtime must not read migration history, but auth readiness expects the table.
+      await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
+      const webAuth = { origin: 'https://127.0.0.1:3100', csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
+      // P05-01: the launcher witness lives on the migrator fixture connection.
+      admission = await admitFixture(fixture, name, 'API');
+      app = await createApi(config, new SafeLogger('api'), { ...database, database: name }, webAuth, undefined, admission.authorization);
+      const server = app.getHttpServer() as Server;
       await request(server).get('/health/ready').expect(200);
       // A weakened named CHECK must be detected even under the same constraint name.
       await fixture.query('ALTER TABLE foundation.consent_records DROP CONSTRAINT consent_records_action_check; ALTER TABLE foundation.consent_records ADD CONSTRAINT consent_records_action_check CHECK (true)');
@@ -320,7 +368,17 @@ describe('API runtime database readiness', () => {
       await fixture.query('DROP INDEX foundation.reference_entries_company_code_key; CREATE UNIQUE INDEX reference_entries_company_code_key ON foundation.reference_entries(type, code)');
       await request(server).get('/health/ready').expect(503);
       await request(server).get('/health/live').expect(200);
-    } finally { await app.close(); await admission.release(); await fixture.end(); }
+    } finally {
+      // Same lifecycle cleanup for the failure path: app down, admission released, client
+      // ended, then exactly this run's disposable database dropped.
+      try { await app?.close(); } finally {
+        try { await admission?.release(); } finally {
+          try { await fixture?.end(); } finally {
+            await dropDisposableDatabase(name, dbCreated, /^fixlevelup_legal_test_[a-f0-9]{24}$/);
+          }
+        }
+      }
+    }
   });
 
   it.runIf(isolatedDbTests)('requires exact 018 guards, catalog and ACL without requiring founder or settings values', async () => {
@@ -330,19 +388,25 @@ describe('API runtime database readiness', () => {
     if (!adminPassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
     const name = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
     const address = { host: '127.0.0.1', port: 55432 };
-    const admin = new Client({ ...address, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    let owner: import('pg').Client | undefined;
+    let admission: Awaited<ReturnType<typeof admitFixture>> | undefined;
+    let db: RuntimeDatabase | undefined;
+    // Set exactly when this run's CREATE DATABASE succeeded (CREATE is the reuse guard).
+    let dbCreated = false;
     try {
-      await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
-      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
-      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    } finally { await admin.end(); }
-    const owner = new Client({ ...address, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
-    await owner.connect();
-    // P05-01: the launcher witness lives on the migrator owner connection.
-    const admission = await admitFixture(owner, name, 'TEST');
-    const db = new RuntimeDatabase({ ...database, database: name }, true, admission.admission);
-    try {
+      const admin = new Client({ ...address, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+      await admin.connect();
+      try {
+        await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+        dbCreated = true;
+        await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+        await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      } finally { await admin.end(); }
+      owner = new Client({ ...address, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+      await owner.connect();
+      // P05-01: the launcher witness lives on the migrator owner connection.
+      admission = await admitFixture(owner, name, 'TEST');
+      db = new RuntimeDatabase({ ...database, database: name }, true, admission.admission);
       expect(await db.settingsManagementReady()).toBe(false);
       expect(await db.ready()).toBe(false);
       await migrateAuthFixture(owner, name);
@@ -422,7 +486,17 @@ describe('API runtime database readiness', () => {
         finally { await owner.query(restore); }
         expect(await db.settingsManagementReady(), restore).toBe(true);
       }
-    } finally { await db.onModuleDestroy(); await admission.release(); await owner.end(); }
+    } finally {
+      // Same lifecycle cleanup for the failure path: runtime pool down, admission
+      // released, client ended, then exactly this run's disposable database dropped.
+      try { await db?.onModuleDestroy(); } finally {
+        try { await admission?.release(); } finally {
+          try { await owner?.end(); } finally {
+            await dropDisposableDatabase(name, dbCreated, /^fixlevelup_legal_test_[a-f0-9]{24}$/);
+          }
+        }
+      }
+    }
   });
 
   it.runIf(isolatedDbTests)('P05-01 S1 gate: positive on the exact 022 profile, negative on every listed drift', async () => {
@@ -432,19 +506,24 @@ describe('API runtime database readiness', () => {
     if (!adminPassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
     const name = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
     const address = { host: '127.0.0.1', port: 55432 };
-    const admin = new Client({ ...address, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    let owner: import('pg').Client | undefined;
+    let db: RuntimeDatabase | undefined;
+    // Set exactly when this run's CREATE DATABASE succeeded (CREATE is the reuse guard).
+    let dbCreated = false;
     try {
-      await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
-      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
-      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    } finally { await admin.end(); }
-    const owner = new Client({ ...address, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
-    await owner.connect();
-    // P05-01: the launcher witness lives on the migrator owner connection.
-    const admission = await admitFixture(owner, name, 'TEST');
-    const db = new RuntimeDatabase({ ...database, database: name }, true, admission.admission);
-    try {
+      const admin = new Client({ ...address, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+      await admin.connect();
+      try {
+        await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+        dbCreated = true;
+        await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+        await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      } finally { await admin.end(); }
+      owner = new Client({ ...address, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+      await owner.connect();
+      // P05-01: the launcher witness lives on the migrator owner connection.
+      const admission = await admitFixture(owner, name, 'TEST');
+      db = new RuntimeDatabase({ ...database, database: name }, true, admission.admission);
       // Before the chain exists the S1 gate is closed...
       expect(await db.requestIntakeReady()).toBe(false);
       // ...and legacy readiness never depends on it (no P05 tables at all yet).
@@ -558,7 +637,15 @@ describe('API runtime database readiness', () => {
         await dropProbe.query(`DROP ROLE IF EXISTS "${probeRole}"`).catch(() => undefined);
         await dropProbe.end();
       }
-    } finally { await db.onModuleDestroy(); await owner.end(); }
+    } finally {
+      // Same lifecycle cleanup for the failure path: runtime pool down, client
+      // ended, then exactly this run's disposable database dropped.
+      try { await db?.onModuleDestroy(); } finally {
+        try { await owner?.end(); } finally {
+          await dropDisposableDatabase(name, dbCreated, /^fixlevelup_legal_test_[a-f0-9]{24}$/);
+        }
+      }
+    }
   });
 
   it('closes a used runtime DB pool in the compiled API signal handler without leaking password', async () => {

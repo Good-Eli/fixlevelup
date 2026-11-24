@@ -18,6 +18,35 @@ integration('web auth readiness against isolated PostgreSQL', () => {
   let admission: AdmissionHandle | undefined;
   let db: RuntimeDatabase | undefined;
   let authReady: () => Promise<boolean>;
+  let dbName: string | undefined;
+  let dbCreated = false;
+  let tornDown = false;
+
+  /** Ownership proof for the teardown drop, consumed exactly once: this run's CREATE
+   * result (flag) AND the strict disposable-name pattern. */
+  const takeOwnedDatabase = (): string | undefined => {
+    if (!dbCreated) { return undefined; }
+    dbCreated = false;
+    return dbName !== undefined && /^fixlevelup_auth_readiness_test_[a-f0-9]{24}$/.test(dbName) ? dbName : undefined;
+  };
+
+  /** The afterAll teardown, exactly once: this run's resources down first, then the
+   * drop of exactly the database this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const ownedDatabase = takeOwnedDatabase();
+    try { await db?.onModuleDestroy(); }
+    finally { await admission?.release(); }
+    try { await fixture?.end(); }
+    finally {
+      try {
+        if (ownedDatabase !== undefined) {
+          await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        }
+      } finally { await admin?.end(); }
+    }
+  }
 
   beforeAll(async () => {
     const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
@@ -30,31 +59,36 @@ integration('web auth readiness against isolated PostgreSQL', () => {
     admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     const database = `fixlevelup_auth_readiness_test_${randomBytes(12).toString('hex')}`;
-    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    await fixture.connect();
-    await fixture.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
-    for (const migration of migrations) {
-      await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
+    try {
+      await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      // CREATE is the reuse guard: an existing name is a hard error, so a successful
+      // CREATE proves this run owns the disposable database (the flag gates the drop).
+      dbName = database;
+      dbCreated = true;
+      await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      await fixture.connect();
+      await fixture.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
+      for (const migration of migrations) {
+        await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
+      }
+      await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
+      // Construct the production Prisma adapter/pool with the isolated DB and actual runtime role.
+      // Invoke the auth-specific probe directly: the surrounding probe has its own DB identity checks.
+      // P05-01: the pool is admitted through the launch gate (migrator-held witness).
+      admission = await admitFixture(fixture, database, 'TEST');
+      db = new RuntimeDatabase({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword }, true, admission.admission);
+      const internal = db as unknown as { authReady: () => Promise<boolean> };
+      authReady = () => internal.authReady();
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
     }
-    await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
-    // Construct the production Prisma adapter/pool with the isolated DB and actual runtime role.
-    // Invoke the auth-specific probe directly: the surrounding probe has its own DB identity checks.
-    // P05-01: the pool is admitted through the launch gate (migrator-held witness).
-    admission = await admitFixture(fixture, database, 'TEST');
-    db = new RuntimeDatabase({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword }, true, admission.admission);
-    const internal = db as unknown as { authReady: () => Promise<boolean> };
-    authReady = () => internal.authReady();
   }, 30000);
 
-  afterAll(async () => {
-    try { await db?.onModuleDestroy(); }
-    finally { await admission?.release(); }
-    await fixture?.end();
-    await admin?.end();
-  });
+  afterAll(teardown);
 
   it('accepts the migrated schema with the runtime role', async () => {
     await expect(authReady()).resolves.toBe(true);

@@ -47,6 +47,42 @@ integration('web auth real HTTP against isolated PostgreSQL', () => {
   let app: Awaited<ReturnType<typeof createApi>> | undefined;
   let server: Server;
   let staffId: string;
+  let dbName: string | undefined;
+  let dbCreated = false;
+  let tornDown = false;
+
+  /** Ownership proof for the teardown drop, consumed exactly once: this run's CREATE
+   * result (flag) AND the strict disposable-name pattern. */
+  const takeOwnedDatabase = (): string | undefined => {
+    if (!dbCreated) { return undefined; }
+    dbCreated = false;
+    return dbName !== undefined && /^fixlevelup_auth_e2e_test_[a-f0-9]{24}$/.test(dbName) ? dbName : undefined;
+  };
+
+  /** The afterAll teardown, exactly once: this run's pools/clients down first, then
+   * the drop of exactly the database this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const ownedDatabase = takeOwnedDatabase();
+    try { await app?.close(); }
+    finally {
+      try { await admission?.release(); }
+      finally {
+        try { await migrator?.end(); }
+        finally {
+          try { await fixture?.end(); }
+          finally {
+            try {
+              if (ownedDatabase !== undefined) {
+                await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+              }
+            } finally { try { await admin?.end(); } finally { vi.restoreAllMocks(); } }
+          }
+        }
+      }
+    }
+  }
 
   beforeAll(async () => {
     const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
@@ -60,36 +96,34 @@ integration('web auth real HTTP against isolated PostgreSQL', () => {
     await admin.connect();
     const database = `fixlevelup_auth_e2e_test_${randomBytes(12).toString('hex')}`;
     await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    await fixture.connect();
-    await migrateAuthFixture(fixture, database);
-    await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
-    migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));
-    const dbConfig = { ...connection, database, user: 'fixlevelup_runtime' as const, password: runtimePassword } as DatabaseConfig;
-    const webAuth: WebAuthConfig = { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
-    // P05-01: the app is admitted through the same launch gate contour — a real
-    // migrator-held witness in this fixture DB pins the admission.
-    admission = await admitFixture(migrator, database, 'API');
-    app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'), dbConfig, webAuth, undefined, admission.authorization);
-    server = app.getHttpServer() as Server;
+    // CREATE is the reuse guard: an existing name is a hard error, so a successful
+    // CREATE proves this run owns the disposable database (the flag gates the drop).
+    dbName = database;
+    dbCreated = true;
+    try {
+      await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      await fixture.connect();
+      await migrateAuthFixture(fixture, database);
+      await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
+      migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));
+      const dbConfig = { ...connection, database, user: 'fixlevelup_runtime' as const, password: runtimePassword } as DatabaseConfig;
+      const webAuth: WebAuthConfig = { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
+      // P05-01: the app is admitted through the same launch gate contour — a real
+      // migrator-held witness in this fixture DB pins the admission.
+      admission = await admitFixture(migrator, database, 'API');
+      app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'), dbConfig, webAuth, undefined, admission.authorization);
+      server = app.getHttpServer() as Server;
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
+    }
   }, 30000);
 
-  afterAll(async () => {
-    try { await app?.close(); }
-    finally {
-      try { await admission?.release(); }
-      finally {
-        try { await migrator?.end(); }
-        finally {
-          try { await fixture?.end(); }
-          finally { try { await admin?.end(); } finally { vi.restoreAllMocks(); } }
-        }
-      }
-    }
-  });
+  afterAll(teardown);
 
   it('enforces CSRF and rotates credentials through the complete session lifecycle', async () => {
     const logs = vi.spyOn(ConsoleLogger.prototype, 'log').mockImplementation(() => undefined);

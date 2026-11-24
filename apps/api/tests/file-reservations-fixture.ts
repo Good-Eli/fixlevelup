@@ -96,53 +96,97 @@ export async function startFileReservationsDatabase(): Promise<FileReservationsF
   // The existing auth fixture guard already accepts this prefix; the random suffix
   // makes CREATE DATABASE the reuse check (an existing name is a hard error).
   const database = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
+  if (!/^fixlevelup_legal_test_[a-f0-9]{24}$/.test(database)) {
+    throw new Error('Invalid file reservation fixture database name');
+  }
   const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
   await admin.connect();
+  // Set exactly when this run's CREATE DATABASE succeeded: CREATE is the reuse
+  // guard (an existing name is a hard error), so a successful CREATE proves the
+  // database is this run's own disposable artifact.
+  let databaseCreated = false;
   try {
     await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
+    databaseCreated = true;
     await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
     await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
   } finally {
     await admin.end();
   }
-  const migrationClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-  await migrationClient.connect();
-  try {
-    await migrateAuthFixture(migrationClient, database);
-  } finally {
-    await migrationClient.end();
-  }
   const migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 4 });
   const runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 6 });
-  const reviewer = (await bootstrapFirstAdmin(migrator, {
-    login: `files-${randomBytes(12).toString('hex')}`,
-    password: `Synthetic-Files-${randomBytes(12).toString('hex')}!`,
-  })).staffId;
-  const city = await seedCity(migrator, reviewer);
-  return {
-    database,
-    migrator,
-    runtime,
-    reviewer,
-    city,
-    async inTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
-      const client = await runtime.connect();
-      try {
-        await beginLegalTransaction(client);
-        const result = await run(client);
-        await client.query('COMMIT');
-        return result;
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        throw error;
-      } finally {
-        client.release();
-      }
-    },
-    async close(): Promise<void> {
-      await Promise.all([runtime.end(), migrator.end()]);
-    },
+  let closed = false;
+  /** Ownership proof for the teardown drop: the `databaseCreated` flag (set exactly
+   * when this run's CREATE DATABASE succeeded — CREATE is the reuse guard, an
+   * existing name is a hard error) AND the strict disposable-name pattern. Consumes
+   * the flag, so a second call never drops anything. */
+  const takeCreatedDatabase = (): string | undefined => {
+    if (!databaseCreated) { return undefined; }
+    databaseCreated = false;
+    return /^fixlevelup_legal_test_[a-f0-9]{24}$/.test(database) ? database : undefined;
   };
+  /** Ends this run's pools first, then drops exactly the database this run created.
+   * Idempotent: the ownership flag is consumed by the first call. */
+  const dispose = async (): Promise<void> => {
+    if (closed) { return; }
+    closed = true;
+    const ownedDatabase = takeCreatedDatabase();
+    try {
+      await Promise.all([runtime.end(), migrator.end()]);
+    } finally {
+      if (ownedDatabase !== undefined) {
+        const maintenance = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+        try {
+          await maintenance.connect();
+          await maintenance.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        } finally {
+          await maintenance.end().catch(() => undefined);
+        }
+      }
+    }
+  };
+  try {
+    const migrationClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+    await migrationClient.connect();
+    try {
+      await migrateAuthFixture(migrationClient, database);
+    } finally {
+      await migrationClient.end();
+    }
+    const reviewer = (await bootstrapFirstAdmin(migrator, {
+      login: `files-${randomBytes(12).toString('hex')}`,
+      password: `Synthetic-Files-${randomBytes(12).toString('hex')}!`,
+    })).staffId;
+    const city = await seedCity(migrator, reviewer);
+    return {
+      database,
+      migrator,
+      runtime,
+      reviewer,
+      city,
+      async inTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+        const client = await runtime.connect();
+        try {
+          await beginLegalTransaction(client);
+          const result = await run(client);
+          await client.query('COMMIT');
+          return result;
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+      async close(): Promise<void> {
+        await dispose();
+      },
+    };
+  } catch (error) {
+    // Provisioning failed after CREATE: the same lifecycle cleanup runs before rethrowing.
+    await dispose().catch(() => undefined);
+    throw error;
+  }
 }
 
 /** One city with one published reviewed version, inserted as the migrator under

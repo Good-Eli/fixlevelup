@@ -9,7 +9,8 @@ import { recoverAdmin } from '../src/staff/recovery.js';
 import { migrateAuthFixture, reassignFixture, spareAdmin } from './auth-db-fixture.js';
 
 // Identical opt-in and isolation policy to staff-bootstrap.test.ts: only random,
-// newly created databases are changed, and they are retained rather than dropped.
+// newly created databases are changed, and this run's teardown drops exactly the
+// databases it created (strict disposable-name pattern).
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
 const root = resolve(import.meta.dirname, '../../..');
 const oldPassword = 'Synthetic-Old-Password-Canary-2026!';
@@ -74,6 +75,35 @@ integration('administrator recovery against isolated PostgreSQL', () => {
   const pools: Pool[] = [];
   let staffId: string;
   let spare: string;
+  let dbName: string | undefined;
+  let dbCreated = false;
+  let tornDown = false;
+
+  /** Ownership proof for the teardown drop, consumed exactly once: this run's CREATE
+   * result (flag) AND the strict disposable-name pattern. */
+  const takeOwnedDatabase = (): string | undefined => {
+    if (!dbCreated) { return undefined; }
+    dbCreated = false;
+    return dbName !== undefined && /^fixlevelup_recovery_test_[a-f0-9]{24}$/.test(dbName) ? dbName : undefined;
+  };
+
+  /** The afterAll teardown, exactly once: this run's pools/clients down first, then
+   * the drop of exactly the database this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const ownedDatabase = takeOwnedDatabase();
+    try {
+      await Promise.all(pools.map((item) => item.end()));
+      await Promise.all(fixtures.map((item) => item.end()));
+    } finally {
+      try {
+        if (ownedDatabase !== undefined) {
+          await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        }
+      } finally { await admin?.end(); }
+    }
+  }
 
   beforeAll(async () => {
     const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
@@ -86,31 +116,37 @@ integration('administrator recovery against isolated PostgreSQL', () => {
     admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     const name = `fixlevelup_recovery_test_${randomBytes(12).toString('hex')}`;
-    await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    fixture = new Client({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
-    fixtures.push(fixture);
-    await fixture.connect();
-    await migrateAuthFixture(fixture, name);
-    pool = new Pool({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
-    pools.push(pool);
-    const runtime = new Pool({ ...connection, database: name, user: 'fixlevelup_runtime', password: runtimePassword });
-    pools.push(runtime);
-    ({ staffId } = await bootstrapFirstAdmin(pool, { login, password: oldPassword }));
-    spare = await spareAdmin(fixture, staffId);
-    await expect(runtime.query('SELECT * FROM foundation.staff_bootstrap_marker')).rejects.toMatchObject({ code: '42501' });
-    // Valid, active, credentialed ADMIN exists: denial cannot be due to a missing target.
-    const before = (await fixture.query('SELECT password_hash FROM foundation.staff_web_credentials WHERE staff_id=$1', [staffId])).rows;
-    await expect(recoverAdmin(runtime, { login, password: newPassword })).rejects.toMatchObject({ name: 'RecoveryError', message: 'Staff recovery failed' });
-    expect((await fixture.query('SELECT password_hash FROM foundation.staff_web_credentials WHERE staff_id=$1', [staffId])).rows).toEqual(before);
+    try {
+      await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      // CREATE is the reuse guard: an existing name is a hard error, so a successful
+      // CREATE proves this run owns the disposable database (the flag gates the drop).
+      dbName = name;
+      dbCreated = true;
+      await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      fixture = new Client({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+      fixtures.push(fixture);
+      await fixture.connect();
+      await migrateAuthFixture(fixture, name);
+      pool = new Pool({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
+      pools.push(pool);
+      const runtime = new Pool({ ...connection, database: name, user: 'fixlevelup_runtime', password: runtimePassword });
+      pools.push(runtime);
+      ({ staffId } = await bootstrapFirstAdmin(pool, { login, password: oldPassword }));
+      spare = await spareAdmin(fixture, staffId);
+      await expect(runtime.query('SELECT * FROM foundation.staff_bootstrap_marker')).rejects.toMatchObject({ code: '42501' });
+      // Valid, active, credentialed ADMIN exists: denial cannot be due to a missing target.
+      const before = (await fixture.query('SELECT password_hash FROM foundation.staff_web_credentials WHERE staff_id=$1', [staffId])).rows;
+      await expect(recoverAdmin(runtime, { login, password: newPassword })).rejects.toMatchObject({ name: 'RecoveryError', message: 'Staff recovery failed' });
+      expect((await fixture.query('SELECT password_hash FROM foundation.staff_web_credentials WHERE staff_id=$1', [staffId])).rows).toEqual(before);
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
+    }
   }, 30000);
 
-  afterAll(async () => {
-    await Promise.all(pools.map((item) => item.end()));
-    await Promise.all(fixtures.map((item) => item.end()));
-    await admin?.end();
-  });
+  afterAll(teardown);
 
   it('changes the existing credential and version, audits without secrets, and preserves the bootstrap marker', async () => {
     const logs = [vi.spyOn(console, 'log'), vi.spyOn(console, 'warn'), vi.spyOn(console, 'error')];

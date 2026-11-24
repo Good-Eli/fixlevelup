@@ -118,8 +118,9 @@ async function importOldCoverage(compiled: string): Promise<Pick<GeoCommand, 'ru
 
 async function dropFixture(fixture: ConfigurationFixture): Promise<void> {
   await fixture.close();
-  // The shared fixture closes its pools but does not drop the database. Its
-  // migrator owns this one-off database; use that role on the maintenance DB.
+  // The shared fixture's close() both ends its pools and drops the database it
+  // created; this belt-and-braces drop is idempotent for the exact same name
+  // (strict disposable pattern + IF EXISTS) in case close() did not reach it.
   const { database } = fixture;
   const { password } = fixture.migrator.options;
   if (!/^fixlevelup_configuration_test_[a-f0-9]{24}$/.test(database) || typeof password !== 'string') {
@@ -128,7 +129,7 @@ async function dropFixture(fixture: ConfigurationFixture): Promise<void> {
   const maintenance = new Client({ ...fixture.migrator.options, password, database: 'postgres' });
   await maintenance.connect();
   try {
-    await maintenance.query(`DROP DATABASE "${database}"`);
+    await maintenance.query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`);
   } finally {
     await maintenance.end();
   }

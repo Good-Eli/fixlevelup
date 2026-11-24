@@ -121,9 +121,29 @@ live('P03-04D copy-only isolated restore', () => {
     const approvalKeys = generateKeyPairSync('ed25519');
     const authorityKeys = generateKeyPairSync('ed25519');
     const destination = `fixlevelup_file_restore_${randomBytes(12).toString('hex')}`;
+    // Set exactly when this run's CREATE DATABASE succeeded (CREATE is the reuse
+    // guard: an existing name is a hard error, so a successful CREATE proves this
+    // run owns the disposable destination — the flag plus the strict disposable-name
+    // pattern gate the teardown drop).
+    let destinationCreated = false;
     const targetOps = new Pool(restoreDbOptions(destination, 'migrator'));
     const pools = [ops, writer, nextWriter, signer, floorOps, floorRuntime, maintenance, targetOps];
     const cleanups: (() => void | Promise<void>)[] = [];
+    /** Drops exactly the destination database this run created, after every pool of
+     * this run was ended. FORCE also handles the ALLOW_CONNECTIONS false creation. */
+    const dropDestination = async (): Promise<void> => {
+      if (!destinationCreated) { return; }
+      if (!/^fixlevelup_file_restore_[a-f0-9]{24}$/.test(destination)) {
+        throw new Error('Refusing to drop a non-fixture database');
+      }
+      destinationCreated = false;
+      const dropper = new Pool(restoreDbOptions('postgres', 'maintenance'));
+      try {
+        await dropper.query(`DROP DATABASE IF EXISTS "${destination}" WITH (FORCE)`);
+      } finally {
+        await dropper.end();
+      }
+    };
     try {
       const genesis = await bootstrapFileLedgerNamespace({ mode: 'local-synthetic', ledgerOperatorPool: ops, floorOperatorPool: floorOps,
         signerPublicKey: ledgerKeys.publicKey, initialEpoch: 1n });
@@ -252,6 +272,7 @@ live('P03-04D copy-only isolated restore', () => {
         async restoreArchives(snapshot, authority) {
           await archives.restore(snapshot.dumpSha256, authority.overlaySha256, async () => {
             await maintenance.query(`CREATE DATABASE "${destination}" OWNER fixlevelup_migrator TEMPLATE template0 ALLOW_CONNECTIONS false`);
+            destinationCreated = true;
             await maintenance.query(`REVOKE ALL ON DATABASE "${destination}" FROM PUBLIC,fixlevelup_runtime`);
             await maintenance.query(`ALTER DATABASE "${destination}" ALLOW_CONNECTIONS true`);
           }, async () => {
@@ -408,8 +429,13 @@ live('P03-04D copy-only isolated restore', () => {
         pending: 'drained-before-handoff', oldWriter: 'fenced', unresolvedDebt: 'unchanged', maxReconcileBatch: 1,
         originalObjectDeletes: 0, restoredCopiesConfirmedAbsent: 2 });
     } finally {
+      // Lifecycle order: close the storages/clients this run opened, then its pools
+      // (including the maintenance pool that may still hold the destination), then
+      // drop exactly the destination database this run created. The source fixture
+      // database is dropped by its own fixture close (startFileReservationsDatabase).
       await Promise.allSettled([...cleanups.map(async close => close()), ...pools.map(async pool => pool.end()),
         sourceDb.close()]);
+      await dropDestination().catch(() => undefined);
     }
   }, 175_000);
 });

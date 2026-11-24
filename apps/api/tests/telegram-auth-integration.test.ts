@@ -57,6 +57,37 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
   let migratorAccess: { database: string; user: 'fixlevelup_migrator'; password: string } | undefined;
   let sourceSequence = 0;
   const source = () => `synthetic-source-${String(++sourceSequence)}`;
+  let dbName: string | undefined;
+  let dbCreated = false;
+  let tornDown = false;
+
+  /** Ownership proof for the teardown drop, consumed exactly once: this run's CREATE
+   * result (flag) AND the strict disposable-name pattern. */
+  const takeOwnedDatabase = (): string | undefined => {
+    if (!dbCreated) { return undefined; }
+    dbCreated = false;
+    return dbName !== undefined && /^fixlevelup_tg_auth_test_[a-f0-9]{24}$/.test(dbName) ? dbName : undefined;
+  };
+
+  /** The afterAll teardown, exactly once: this run's pools/clients down first, then
+   * the drop of exactly the database this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const ownedDatabase = takeOwnedDatabase();
+    try {
+      await Promise.all(pools.map((pool) => pool.end()));
+      await Promise.all(clients.map((client) => client.end()));
+    } finally {
+      try {
+        if (ownedDatabase !== undefined) {
+          await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        }
+      } finally {
+        await admin?.end();
+      }
+    }
+  }
 
   beforeAll(async () => {
     const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
@@ -69,24 +100,34 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
     await admin.connect();
     const database = `fixlevelup_tg_auth_test_${randomBytes(12).toString('hex')}`;
     migratorAccess = { database, user: 'fixlevelup_migrator', password: migratorPassword };
-    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    clients.push(fixture);
-    await fixture.connect();
-    await fixture.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
-    for (const migration of migrations) {
-      await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
+    try {
+      await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      // CREATE is the reuse guard: an existing name is a hard error, so a successful
+      // CREATE proves this run owns the disposable database (the flag gates the drop).
+      dbName = database;
+      dbCreated = true;
+      await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      clients.push(fixture);
+      await fixture.connect();
+      await fixture.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
+      for (const migration of migrations) {
+        await fixture.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
+      }
+      runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword });
+      pools.push(runtime);
+      // Synthetic staff rows: the link INSERT flow is outside P02-05 (migration grants
+      // only SELECT/UPDATE on links to the runtime role).
+      staffId = randomUUID();
+      await fixture.query("INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, 'TECHNICIAN', 'ACTIVE', 0)", [staffId]);
+      await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [randomUUID(), staffId, telegramUserId]);
+      service = new TelegramAuthService(runtime, { botToken, throttleSecret: randomBytes(32) });
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
     }
-    runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword });
-    pools.push(runtime);
-    // Synthetic staff rows: the link INSERT flow is outside P02-05 (migration grants
-    // only SELECT/UPDATE on links to the runtime role).
-    staffId = randomUUID();
-    await fixture.query("INSERT INTO foundation.staff (id, role, employment_state, auth_version) VALUES ($1, 'TECHNICIAN', 'ACTIVE', 0)", [staffId]);
-    await fixture.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1, $2, $3::bigint)', [randomUUID(), staffId, telegramUserId]);
-    service = new TelegramAuthService(runtime, { botToken, throttleSecret: randomBytes(32) });
   }, 30000);
 
   beforeEach(async () => {
@@ -95,11 +136,7 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
     await fixture.query('DELETE FROM foundation.web_auth_throttles');
   });
 
-  afterAll(async () => {
-    await Promise.all(pools.map((pool) => pool.end()));
-    await Promise.all(clients.map((client) => client.end()));
-    await admin?.end();
-  });
+  afterAll(teardown);
 
   it('exchanges valid initData for a TECHNICIAN session stored with the digest', async () => {
     const credential = await service.exchange(signedInitData(), source());

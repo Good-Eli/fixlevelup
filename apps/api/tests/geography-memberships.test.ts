@@ -289,6 +289,36 @@ integration('membership commands against isolated PostgreSQL', () => {
   let managerAssignmentId = '';
   let cityMembershipId = '';
   let zoneGrantId = '';
+  let maintenancePassword: string | undefined;
+  let dbName: string | undefined;
+  let dbCreated = false;
+  let tornDown = false;
+
+  /** Ownership proof for the teardown drop, consumed exactly once: this run's CREATE
+   * result (flag) AND the strict disposable-name pattern. */
+  const takeOwnedDatabase = (): string | undefined => {
+    if (!dbCreated) { return undefined; }
+    dbCreated = false;
+    return dbName !== undefined && /^fixlevelup_auth_e2e_test_[a-f0-9]{24}$/.test(dbName) ? dbName : undefined;
+  };
+
+  /** The afterAll teardown, exactly once: this run's pools down first, then the drop
+   * of exactly the database this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const ownedDatabase = takeOwnedDatabase();
+    try { await Promise.all(pools.map((pool) => pool.end())); }
+    finally {
+      if (ownedDatabase !== undefined && maintenancePassword !== undefined) {
+        const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: maintenancePassword });
+        try {
+          await admin.connect();
+          await admin.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        } finally { await admin.end().catch(() => undefined); }
+      }
+    }
+  }
   // This fixture is compared with PostgreSQL's *current* time, not with a fixed release date.
   const anchor = Date.now();
   const day = (offset: number) => new Date(anchor + offset * 86_400_000).toISOString();
@@ -414,58 +444,69 @@ integration('membership commands against isolated PostgreSQL', () => {
     const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
     const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
     if (!adminPassword || !migratorPassword || !runtimePassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    maintenancePassword = adminPassword;
     const database = `fixlevelup_auth_e2e_test_${randomBytes(12).toString('hex')}`;
     const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     try {
       await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      // CREATE is the reuse guard: an existing name is a hard error, so a successful
+      // CREATE proves this run owns the disposable database (the flag gates the drop).
+      dbName = database;
+      dbCreated = true;
       await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
     } finally { await admin.end(); }
-    const fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    await fixture.connect();
     try {
-      await fixture.query('CREATE SCHEMA IF NOT EXISTS foundation AUTHORIZATION fixlevelup_migrator');
-      await migrateAuthFixture(fixture, database);
-    } finally { await fixture.end(); }
-    migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 2 });
-    pools.push(migrator);
-    runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 2 });
-    pools.push(runtime);
-    auth = new AuthorizationService(runtime);
+      const fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      await fixture.connect();
+      try {
+        await fixture.query('CREATE SCHEMA IF NOT EXISTS foundation AUTHORIZATION fixlevelup_migrator');
+        await migrateAuthFixture(fixture, database);
+      } finally { await fixture.end(); }
+      migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 2 });
+      pools.push(migrator);
+      runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 2 });
+      pools.push(runtime);
+      auth = new AuthorizationService(runtime);
 
-    adminId = (await bootstrapFirstAdmin(migrator, { login: `geo-${randomBytes(12).toString('hex')}`,
-      password: `Synthetic-Geo-${randomBytes(12).toString('hex')}!` })).staffId;
-    managerId = await createStaff('MANAGER');
-    // Delegated geography in assigned cities only: the manager needs both the read and
-    // the manage code, and a manager can never hold GLOBAL geography.
-    await migrator.query(`INSERT INTO foundation.role_permissions (role_id, permission_code, scope_type)
-      SELECT r.id, g.code, 'CITY' FROM foundation.roles r
-      CROSS JOIN unnest(ARRAY['staff.geography.read','staff.geography.manage']) AS g(code)
-      WHERE r.role_type='SYSTEM' AND r.code='MANAGER'`);
-    technicianId = await createStaff('TECHNICIAN');
-    const linkId = randomUUID();
-    await migrator.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1,$2,$3)',
-      [linkId, technicianId, BigInt(`0x${randomBytes(5).toString('hex')}`) + 1n]);
+      adminId = (await bootstrapFirstAdmin(migrator, { login: `geo-${randomBytes(12).toString('hex')}`,
+        password: `Synthetic-Geo-${randomBytes(12).toString('hex')}!` })).staffId;
+      managerId = await createStaff('MANAGER');
+      // Delegated geography in assigned cities only: the manager needs both the read and
+      // the manage code, and a manager can never hold GLOBAL geography.
+      await migrator.query(`INSERT INTO foundation.role_permissions (role_id, permission_code, scope_type)
+        SELECT r.id, g.code, 'CITY' FROM foundation.roles r
+        CROSS JOIN unnest(ARRAY['staff.geography.read','staff.geography.manage']) AS g(code)
+        WHERE r.role_type='SYSTEM' AND r.code='MANAGER'`);
+      technicianId = await createStaff('TECHNICIAN');
+      const linkId = randomUUID();
+      await migrator.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1,$2,$3)',
+        [linkId, technicianId, BigInt(`0x${randomBytes(5).toString('hex')}`) + 1n]);
 
-    adminProof = await session(adminId, 'staff-web');
-    managerProof = await session(managerId, 'staff-web');
-    techProof = await session(technicianId, 'staff-telegram', linkId);
+      adminProof = await session(adminId, 'staff-web');
+      managerProof = await session(managerId, 'staff-web');
+      techProof = await session(technicianId, 'staff-telegram', linkId);
 
-    cityA = await createCity('city-a', 'ACTIVE');
-    cityB = await createCity('city-b', 'ACTIVE', 'Asia/Tokyo');
-    areaA = await createArea(cityA, 'zone-a');
-    await publishArea(cityA, areaA, 'Zone A');
-    areaDraftOnly = await createArea(cityA, 'zone-draft');
-    areaArchived = await createArea(cityA, 'zone-archived');
-    await publishArea(cityA, areaArchived, 'Archived zone');
-    await fencedDml((client) => client.query(
-      'UPDATE foundation.service_areas SET archived_at=statement_timestamp() WHERE id=$1', [areaArchived]));
-    areaB = await createArea(cityB, 'zone-b');
-    await publishArea(cityB, areaB, 'Zone B');
+      cityA = await createCity('city-a', 'ACTIVE');
+      cityB = await createCity('city-b', 'ACTIVE', 'Asia/Tokyo');
+      areaA = await createArea(cityA, 'zone-a');
+      await publishArea(cityA, areaA, 'Zone A');
+      areaDraftOnly = await createArea(cityA, 'zone-draft');
+      areaArchived = await createArea(cityA, 'zone-archived');
+      await publishArea(cityA, areaArchived, 'Archived zone');
+      await fencedDml((client) => client.query(
+        'UPDATE foundation.service_areas SET archived_at=statement_timestamp() WHERE id=$1', [areaArchived]));
+      areaB = await createArea(cityB, 'zone-b');
+      await publishArea(cityB, areaB, 'Zone B');
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
+    }
   }, 60000);
 
-  afterAll(async () => { await Promise.all(pools.map(pool => pool.end())); });
+  afterAll(teardown);
 
   it('administrator assigns a city and the receipt carries the subject aggregate version', async () => {
     const before = await exec(adminProof, 'adminList', { staffId: managerId });

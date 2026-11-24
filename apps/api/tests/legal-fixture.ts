@@ -72,44 +72,79 @@ export async function startLegalDatabase(): Promise<LegalFixtureDatabase> {
   // The maintenance role can only reach `postgres` and this one CREATE/GRANT block;
   // it is closed before migrations, seeds or port calls start.
   const maintenance = new Pool({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: postgresPassword, max: 1 });
+  // Set exactly when this run's CREATE DATABASE succeeded: CREATE is the reuse
+  // guard (an existing name is a hard error), so a successful CREATE proves the
+  // database is this run's own disposable artifact.
+  let databaseCreated = false;
   try {
     await maintenance.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
+    databaseCreated = true;
     await maintenance.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
     await maintenance.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
   } finally {
     await maintenance.end();
   }
   const migrator = new Pool({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword, max: 2 });
-  const actual = await migrator.query<{ db: string }>('SELECT current_database() AS db');
-  if (actual.rows[0]?.db !== name) {
-    await migrator.end();
-    throw new Error('Fixture database mismatch');
-  }
-  await migrator.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
-  for (const migration of authFixtureMigrations) {
-    await migrator.query(readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8'));
-  }
-  // The 009 deferred invariants require a live administrator with a web credential
-  // before any other staff row can commit, so the fixture uses the real bootstrap
-  // path instead of hand-inserting staff. This also issues the 012 founder grants.
-  const { staffId } = await bootstrapFirstAdmin(migrator, {
-    login: `legal-${randomBytes(6).toString('hex')}`,
-    password: randomBytes(24).toString('hex'),
-  });
   const runtime = new Pool({ ...connection, database: name, user: 'fixlevelup_runtime', password: runtimePassword, max: 4 });
-  return {
-    name,
-    migrator,
-    runtime,
-    staffId,
-    close: async () => {
-      try {
-        await runtime.end();
-      } finally {
-        await migrator.end();
-      }
-    },
+  let closed = false;
+  /** Ownership proof for the teardown drop: the `databaseCreated` flag (set exactly
+   * when this run's CREATE DATABASE succeeded — CREATE is the reuse guard, an
+   * existing name is a hard error) AND the strict disposable-name pattern. Consumes
+   * the flag, so a second call never drops anything. */
+  const takeCreatedDatabase = (): string | undefined => {
+    if (!databaseCreated) { return undefined; }
+    databaseCreated = false;
+    return /^fixlevelup_legal_test_[a-f0-9]{24}$/.test(name) ? name : undefined;
   };
+  /** Ends this run's pools first, then drops exactly the database this run created.
+   * Idempotent: the ownership flag is consumed by the first call. */
+  const dispose = async (): Promise<void> => {
+    if (closed) { return; }
+    closed = true;
+    const ownedDatabase = takeCreatedDatabase();
+    try {
+      try { await runtime.end(); } finally { await migrator.end(); }
+    } finally {
+      if (ownedDatabase !== undefined) {
+        const dropper = new Pool({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: postgresPassword, max: 1 });
+        try {
+          await dropper.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        } finally {
+          await dropper.end();
+        }
+      }
+    }
+  };
+  try {
+    const actual = await migrator.query<{ db: string }>('SELECT current_database() AS db');
+    if (actual.rows[0]?.db !== name) {
+      throw new Error('Fixture database mismatch');
+    }
+    await migrator.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
+    for (const migration of authFixtureMigrations) {
+      await migrator.query(readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8'));
+    }
+    // The 009 deferred invariants require a live administrator with a web credential
+    // before any other staff row can commit, so the fixture uses the real bootstrap
+    // path instead of hand-inserting staff. This also issues the 012 founder grants.
+    const { staffId } = await bootstrapFirstAdmin(migrator, {
+      login: `legal-${randomBytes(6).toString('hex')}`,
+      password: randomBytes(24).toString('hex'),
+    });
+    return {
+      name,
+      migrator,
+      runtime,
+      staffId,
+      close: async () => {
+        await dispose();
+      },
+    };
+  } catch (error) {
+    // Provisioning failed after CREATE: the same lifecycle cleanup runs before rethrowing.
+    await dispose().catch(() => undefined);
+    throw error;
+  }
 }
 
 /** Runs `run` inside an explicit caller transaction on one runtime client. */

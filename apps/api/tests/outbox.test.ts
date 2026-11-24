@@ -145,6 +145,29 @@ async function commandCounts(commandId: string): Promise<{ effects: number; audi
 }
 
 describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
+  // Set exactly when this run's CREATE DATABASE succeeded (below): the flag plus the
+  // strict disposable-name pattern gate the teardown drop to this run's own database.
+  let dbCreated = false;
+
+  /** Drops exactly the disposable database this run created, from the maintenance
+  * connection, after this run's clients/pools were ended. FORCE handles stragglers. */
+  async function dropFixtureDatabase(): Promise<void> {
+    if (!dbCreated) { return; }
+    if (!/^fixlevelup_p019a_worker_[a-f0-9]{12}$/.test(databaseName)) {
+      throw new Error('Refusing to drop a non-fixture database');
+    }
+    dbCreated = false;
+    const adminPassword = credential(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'), 'POSTGRES_PASSWORD');
+    const admin = new Client({ host: '127.0.0.1', port: 55432, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword,
+      connectionTimeoutMillis: 3000, statement_timeout: 3000, query_timeout: 4000 });
+    try {
+      await admin.connect();
+      await admin.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+    } finally {
+      await admin.end().catch(() => undefined);
+    }
+  }
+
   beforeAll(async () => {
     // Read ignored credentials only in memory. Never log configs, passwords, URLs or env contents.
     const adminPassword = credential(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'), 'POSTGRES_PASSWORD');
@@ -154,46 +177,66 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const admin = await connect('fixlevelup_dev', adminPassword, 'fixlevelup_dev');
     // The name is generated above from a fixed prefix and twelve hexadecimal characters.
     await admin.query(`CREATE DATABASE "${databaseName}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${databaseName}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${databaseName}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    migrator = await connect('fixlevelup_migrator', migratorPassword);
-    await migrator.query('REVOKE CREATE ON SCHEMA public FROM PUBLIC');
-    for (const migration of [
-      '20261120000100_technical_audit_outbox',
-      '20261120000200_technical_outbox_attempts',
-      '20261120000300_technical_outbox_leases',
-    ]) {
-      await migrator.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
+    // CREATE is the reuse guard: an existing name is a hard error, so a successful
+    // CREATE proves this run owns the disposable database (the flag gates the drop).
+    dbCreated = true;
+    try {
+      await admin.query(`REVOKE ALL ON DATABASE "${databaseName}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${databaseName}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      migrator = await connect('fixlevelup_migrator', migratorPassword);
+      await migrator.query('REVOKE CREATE ON SCHEMA public FROM PUBLIC');
+      for (const migration of [
+        '20261120000100_technical_audit_outbox',
+        '20261120000200_technical_outbox_attempts',
+        '20261120000300_technical_outbox_leases',
+      ]) {
+        await migrator.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
+      }
+      // Direct SQL fixtures do not run Prisma migrate; its private metadata table stays test-local.
+      await migrator.query('CREATE TABLE IF NOT EXISTS foundation._prisma_migrations(id text PRIMARY KEY)');
+      await migrator.query(`CREATE SCHEMA outbox_test;
+        REVOKE ALL ON SCHEMA outbox_test FROM PUBLIC;
+        GRANT USAGE ON SCHEMA outbox_test TO fixlevelup_runtime;
+        CREATE TABLE outbox_test.command_effects(command_id uuid PRIMARY KEY);
+        GRANT SELECT, INSERT ON outbox_test.command_effects TO fixlevelup_runtime`);
+      runtime = await connect('fixlevelup_runtime', runtimePassword);
+      contender = await connect('fixlevelup_runtime', runtimePassword);
+      config = { host: '127.0.0.1', port: 55432, database: databaseName,
+        user: 'fixlevelup_runtime', password: runtimePassword };
+      // P05-01: the stores/workers are admitted through the launch gate — a real
+      // migrator-held witness in this isolated DB pins the admission.
+      admission = await admitFixture(migrator, databaseName, 'WORKER');
+      first = new OutboxStore(config, admission.admission);
+      stores.push(first);
+      second = new OutboxStore(config, admission.admission);
+      stores.push(second);
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await Promise.allSettled([
+        ...stores.map(async (store) => { await store.close(); }),
+        ...clients.map(async (client) => { await client.end(); }),
+      ]);
+      await dropFixtureDatabase().catch(() => undefined);
+      throw error;
     }
-    // Direct SQL fixtures do not run Prisma migrate; its private metadata table stays test-local.
-    await migrator.query('CREATE TABLE IF NOT EXISTS foundation._prisma_migrations(id text PRIMARY KEY)');
-    await migrator.query(`CREATE SCHEMA outbox_test;
-      REVOKE ALL ON SCHEMA outbox_test FROM PUBLIC;
-      GRANT USAGE ON SCHEMA outbox_test TO fixlevelup_runtime;
-      CREATE TABLE outbox_test.command_effects(command_id uuid PRIMARY KEY);
-      GRANT SELECT, INSERT ON outbox_test.command_effects TO fixlevelup_runtime`);
-    runtime = await connect('fixlevelup_runtime', runtimePassword);
-    contender = await connect('fixlevelup_runtime', runtimePassword);
-    config = { host: '127.0.0.1', port: 55432, database: databaseName,
-      user: 'fixlevelup_runtime', password: runtimePassword };
-    // P05-01: the stores/workers are admitted through the launch gate — a real
-    // migrator-held witness in this isolated DB pins the admission.
-    admission = await admitFixture(migrator, databaseName, 'WORKER');
-    first = new OutboxStore(config, admission.admission);
-    stores.push(first);
-    second = new OutboxStore(config, admission.admission);
-    stores.push(second);
   }, 30_000);
 
   afterAll(async () => {
-    // Keep the isolated database for inspection; never drop or truncate it or the development DB.
+    // The isolated database created above is dropped by this run's own teardown
+    // (exactly that name, after every resource of this run was closed); the
+    // development database is never dropped or truncated.
     const stopped = await Promise.allSettled(workers.map(async (worker) => { await worker.onModuleDestroy(); }));
     const closed = await Promise.allSettled(stores.map(async (store) => { await store.close(); }));
     const released = await Promise.allSettled([admission.release()]);
     const ended = await Promise.allSettled(clients.map(async (client) => { await client.end(); }));
+    let dropError: Error | undefined;
+    try { await dropFixtureDatabase(); } catch (error) {
+      dropError = error instanceof Error ? error : new Error(String(error));
+    }
     for (const result of [...stopped, ...closed, ...released, ...ended]) {
       if (result.status === 'rejected') { throw new Error('Failed to close an isolated outbox test resource'); }
     }
+    if (dropError !== undefined) { throw dropError; }
   });
 
   it('gives one event to exactly one of two concurrent owners and completes only once', async () => {

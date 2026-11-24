@@ -29,6 +29,37 @@ integration('web authentication against isolated PostgreSQL', () => {
   let spare: string;
   let sourceSequence = 0;
   const source = () => `synthetic-source-${String(++sourceSequence)}`;
+  let dbName: string | undefined;
+  let dbCreated = false;
+  let tornDown = false;
+
+  /** Ownership proof for the teardown drop, consumed exactly once: this run's CREATE
+   * result (flag) AND the strict disposable-name pattern. */
+  const takeOwnedDatabase = (): string | undefined => {
+    if (!dbCreated) { return undefined; }
+    dbCreated = false;
+    return dbName !== undefined && /^fixlevelup_web_auth_test_[a-f0-9]{24}$/.test(dbName) ? dbName : undefined;
+  };
+
+  /** The afterAll teardown, exactly once: this run's pools/clients down first, then
+   * the drop of exactly the database this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const ownedDatabase = takeOwnedDatabase();
+    try {
+      await Promise.all(pools.map((pool) => pool.end()));
+      await Promise.all(clients.map((client) => client.end()));
+    } finally {
+      try {
+        if (ownedDatabase !== undefined) {
+          await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        }
+      } finally {
+        await admin?.end();
+      }
+    }
+  }
 
   beforeAll(async () => {
     const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
@@ -41,19 +72,29 @@ integration('web authentication against isolated PostgreSQL', () => {
     admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
     await admin.connect();
     const database = `fixlevelup_web_auth_test_${randomBytes(12).toString('hex')}`;
-    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    clients.push(fixture);
-    await fixture.connect();
-    await migrateAuthFixture(fixture, database);
-    migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword });
-    pools.push(migrator, runtime);
-    ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));
-    spare = await spareAdmin(fixture, staffId);
-    service = new WebAuthService(runtime, { throttleSecret: randomBytes(32) });
+    try {
+      await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      // CREATE is the reuse guard: an existing name is a hard error, so a successful
+      // CREATE proves this run owns the disposable database (the flag gates the drop).
+      dbName = database;
+      dbCreated = true;
+      await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      clients.push(fixture);
+      await fixture.connect();
+      await migrateAuthFixture(fixture, database);
+      migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword });
+      pools.push(migrator, runtime);
+      ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));
+      spare = await spareAdmin(fixture, staffId);
+      service = new WebAuthService(runtime, { throttleSecret: randomBytes(32) });
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
+    }
   }, 30000);
 
   beforeEach(async () => {
@@ -62,11 +103,7 @@ integration('web authentication against isolated PostgreSQL', () => {
     await fixture.query('DELETE FROM foundation.web_auth_throttles');
   });
 
-  afterAll(async () => {
-    await Promise.all(pools.map((pool) => pool.end()));
-    await Promise.all(clients.map((client) => client.end()));
-    await admin?.end();
-  });
+  afterAll(teardown);
 
   it('uses runtime grants and denies privileged staff writes', async () => {
     await expect(runtime.query('SELECT id FROM foundation.staff WHERE id = $1', [staffId])).resolves.toMatchObject({ rowCount: 1 });
