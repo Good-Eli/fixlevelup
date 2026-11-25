@@ -5,6 +5,7 @@ import { Client, Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { verifyInitData } from '../src/auth/telegram-initdata.js';
 import { TelegramAuthError, TelegramAuthService } from '../src/auth/telegram-auth.service.js';
+import { becomeOwner, dropOwnedTestDatabase, fixtureCredentials, maintenanceOpener } from './owned-test-database.js';
 
 // Explicit opt-in only: create a random database, never alter or drop the dev database.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
@@ -80,8 +81,8 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
       await Promise.all(clients.map((client) => client.end()));
     } finally {
       try {
-        if (ownedDatabase !== undefined) {
-          await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        if (ownedDatabase !== undefined && admin !== undefined) {
+          await dropOwnedTestDatabase(admin, ownedDatabase);
         }
       } finally {
         await admin?.end();
@@ -90,14 +91,10 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
   }
 
   beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
-    admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    // Lab mode reads the lab process env and the attested maintenance binding;
+    // dev mode reads the local ignored env files. Never the dev database.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
+    admin = await maintenanceOpener()();
     const database = `fixlevelup_tg_auth_test_${randomBytes(12).toString('hex')}`;
     migratorAccess = { database, user: 'fixlevelup_migrator', password: migratorPassword };
     try {
@@ -106,6 +103,8 @@ integration('telegram staff authentication against isolated PostgreSQL', () => {
       // CREATE proves this run owns the disposable database (the flag gates the drop).
       dbName = database;
       dbCreated = true;
+      // GRANT/REVOKE need the owner: in the lab the orchestrator is a NOINHERIT member.
+      await becomeOwner(admin);
       await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
       fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });

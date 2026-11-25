@@ -8,7 +8,7 @@
  * migration chain (S1 profile), plus a SEPARATE one-off disposable control
  * database in the same PostgreSQL instance — the plan §7 launcher contour:
  * the launch registry lives in `launch_control` of the control DB, owned and
- * provisioned by the migrator role, with a dedicated one-off launcher role
+ * provisioned by a dedicated control owner, with a separate launcher role
  * that has only USAGE on the schema, SELECT/INSERT and UPDATE(state,
  * consumed_at) on launch_proofs — no DELETE, no TRUNCATE, no DDL, and no
  * CONNECT for fixlevelup_runtime.
@@ -46,9 +46,10 @@
 import { generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { Client, Pool } from 'pg';
-import type { PoolClient } from 'pg';
+import type { PoolClient, QueryResult } from 'pg';
 import { AdmissionError, AdmissionGate } from '../src/infrastructure/admission/admission.js';
 import type { AdmissionBinding } from '../src/infrastructure/admission/admission.js';
 import { canonicalJson, proofDigestOf, signProof, verifyProof } from '../src/infrastructure/admission/proof.js';
@@ -57,9 +58,11 @@ import { ProofError } from '../src/infrastructure/admission/proof.js';
 import {
   consumeProof, ensureLaunchRegistry, issueProof, readRegistryState, RegistryError,
 } from '../src/infrastructure/admission/registry.js';
+import type { ControlStatement } from '../src/infrastructure/admission/registry.js';
 import { holdWitness, releaseWitness, witnessVisible, WITNESS_KEY } from '../src/infrastructure/admission/witness.js';
 import { createConfigurationFixture } from './configuration-fixture.js';
 import type { ConfigurationFixture } from './configuration-fixture.js';
+import { fixtureCredentials } from './owned-test-database.js';
 
 const proof = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? it : it.skip;
 
@@ -70,17 +73,37 @@ const publicKeyPem = keyPair.publicKey.export({ type: 'spki', format: 'pem' }).t
 const root = resolve(import.meta.dirname, '../../..');
 const pgConnection = { host: '127.0.0.1' as const, port: 55432 };
 
-/** Same credential sources as createConfigurationFixture (read-only). */
-function controlCredentials(): { admin: string; migrator: string; runtime: string } {
-  const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-  const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  const admin = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-  const migrator = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-  const runtime = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-  if (!admin || !migrator || !runtime) {
-    throw new Error('Local isolated PostgreSQL test credentials are required');
+async function controlAdminOpener(): Promise<() => Promise<Client>> {
+  const labMode = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1';
+  const user = labMode ? 'postgres' : 'fixlevelup_dev';
+  const password = labMode ? process.env['FIXLEVELUP_LAB_FIXTURE_ADMIN_PASSWORD']
+    : /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'))?.[1];
+  if (!password || !/^[a-f0-9]{64}$/.test(password)) { throw new Error('Control fixture admin credential is unavailable'); }
+  const cluster = process.env['FIXLEVELUP_CLUSTER_NAME'];
+  if (labMode) {
+    const { loadP05LabTarget } = await import('./p05-lab-target.js');
+    const maintenance = await loadP05LabTarget().openMaintenance();
+    await maintenance.end();
   }
-  return { admin, migrator, runtime };
+  return async () => {
+    const client = new Client({ ...pgConnection, database: 'postgres', user, password,
+      connectionTimeoutMillis: 3000, statement_timeout: 5000, query_timeout: 6000 });
+    try {
+      await client.connect();
+      const { rows } = await client.query<{ valid: boolean }>(`SELECT current_database() = 'postgres'
+        AND current_user = $1 AND session_user = $1
+        AND EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname=current_user AND rolsuper)
+        AND (NOT $2::boolean OR (current_setting('cluster_name') = $3
+          AND current_setting('server_version_num') = '180007'
+          AND host(inet_server_addr()) = '127.0.0.1' AND inet_server_port() = 55432)) AS valid`,
+      [user, labMode, cluster ?? null]);
+      if (rows[0]?.valid !== true) { throw new Error('Unexpected control fixture admin identity'); }
+      return client;
+    } catch {
+      await client.end().catch(() => undefined);
+      throw new Error('Unable to attest control fixture admin session');
+    }
+  };
 }
 
 interface ControlFixture {
@@ -99,6 +122,8 @@ let control: ControlFixture | undefined;
 
 beforeAll(async () => {
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') { return; }
+  const openAdmin = await controlAdminOpener();
+  await (await openAdmin()).end();
   const created = await createConfigurationFixture();
   // A failed beforeAll never reaches afterAll (vitest skips it for the
   // suite), so whatever beforeAll already created must be closed HERE:
@@ -106,7 +131,7 @@ beforeAll(async () => {
   // application database is closed the same way afterAll would.
   fixture = created;
   try {
-    control = await createControlFixture();
+    control = await createControlFixture(openAdmin);
   } catch (error) {
     fixture = undefined;
     await created.close().catch(() => undefined);
@@ -140,8 +165,7 @@ function requireControl(): ControlFixture {
  * contour). CONNECT is granted to the launcher role only; the launcher gets
  * exactly USAGE + SELECT/INSERT + UPDATE(state, consumed_at).
  */
-async function createControlFixture(): Promise<ControlFixture> {
-  const { admin: adminPassword } = controlCredentials();
+async function createControlFixture(openAdmin: () => Promise<Client>): Promise<ControlFixture> {
   const suffix = randomBytes(12).toString('hex');
   const database = `fixlevelup_p05_control_${suffix}`;
   const ownerRole = `fixlevelup_p05_ctlowner_${suffix}`;
@@ -174,8 +198,7 @@ async function createControlFixture(): Promise<ControlFixture> {
    */
   const cleanupPartialProvisioning = async (): Promise<void> => {
     await Promise.all(pools.map((pool) => pool.end().catch(() => undefined)));
-    const teardown = new Client({ ...pgConnection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await teardown.connect();
+    const teardown = await openAdmin();
     try {
       const mine = await teardown.query<{ db: string }>('SELECT current_database() AS db');
       const dbRow = databaseCreated ? (await teardown.query<{ n: number }>(
@@ -199,8 +222,7 @@ async function createControlFixture(): Promise<ControlFixture> {
   };
 
   try {
-    const admin = new Client({ ...pgConnection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    const admin = await openAdmin();
     try {
       await admin.query(`CREATE ROLE "${ownerRole}" LOGIN PASSWORD '${ownerPassword}'`);
       ownerRoleCreated = true;
@@ -216,14 +238,16 @@ async function createControlFixture(): Promise<ControlFixture> {
 
     // Dedicated control owner provisions the registry; the application
     // migrator has no CONNECT here (asserted in the isolation proofs).
-    const owner = new Pool({ ...pgConnection, database, user: ownerRole, password: ownerPassword, max: 4 });
+    const owner = new Pool({ ...pgConnection, database, user: ownerRole, password: ownerPassword,
+      max: 4, connectionTimeoutMillis: 3000, statement_timeout: 12_000 });
     pools.push(owner);
     await ensureLaunchRegistry(owner);
     await owner.query(`GRANT USAGE ON SCHEMA launch_control TO "${launcherRole}"`);
     await owner.query(`GRANT SELECT, INSERT ON launch_control.launch_proofs TO "${launcherRole}"`);
     await owner.query(`GRANT UPDATE (state, consumed_at) ON launch_control.launch_proofs TO "${launcherRole}"`);
 
-    const launcher = new Pool({ ...pgConnection, database, user: launcherRole, password: launcherPassword, max: 4 });
+    const launcher = new Pool({ ...pgConnection, database, user: launcherRole, password: launcherPassword,
+      max: 4, connectionTimeoutMillis: 3000, statement_timeout: 12_000 });
     pools.push(launcher);
 
     return {
@@ -234,8 +258,7 @@ async function createControlFixture(): Promise<ControlFixture> {
       launcher,
       async close(): Promise<void> {
         await Promise.all([owner.end(), launcher.end()]);
-        const teardown = new Client({ ...pgConnection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-        await teardown.connect();
+        const teardown = await openAdmin();
         try {
           // Verify the exact one-off names before dropping anything.
           const mine = await teardown.query<{ db: string }>('SELECT current_database() AS db');
@@ -688,7 +711,7 @@ proof('control isolation: runtime cannot connect, launcher cannot DELETE/TRUNCAT
   // CheckMyDatabase; observed live on this contour). A credential problem
   // would instead surface as 28P01, so the exact code pins the privilege
   // denial itself, not merely "connection failed".
-  const { runtime: runtimePassword, migrator: migratorPassword } = controlCredentials();
+  const { runtime: runtimePassword, migrator: migratorPassword } = fixtureCredentials();
   const runtime = new Client({ ...pgConnection, database: ctl.database, user: 'fixlevelup_runtime', password: runtimePassword });
   const refused = await runtime.connect().then(() => 'connected', (error: unknown) => pgErrorCode(error) ?? String(error));
   expect(refused).toBe('42501');
@@ -952,48 +975,107 @@ proof('admission gate: proof token expiry and signature map to typed errors', { 
 
 // --- Single-winner CAS contour (real PostgreSQL, two racing connections). ---
 
-proof('concurrent consume: exactly one winner, final state CONSUMED once', { timeout: 120_000 }, async () => {
-  const issuer = await requireControl().launcher.connect();
-  const first = await requireControl().launcher.connect();
-  const second = await requireControl().launcher.connect();
+async function issueCasSample(issuer: PoolClient) {
+  const payload = samplePayload({ consumerKind: 'WORKER' });
+  const proofDigest = proofDigestOf(payload);
+  const { issuerGeneration, launchNonce, consumerKind, instanceId, channelId } = payload;
+  const binding = { consumerKind, instanceId, channelId };
+  await issueProof(issuer, { issuerGeneration, launchNonce, proofDigest, ...binding,
+    expiresAt: new Date(payload.expiresAt) });
+  return { issuerGeneration, launchNonce, expectedDigest: proofDigest, binding };
+}
+
+proof('concurrent consume: both CAS backends wait, exactly one returns a confirmed win', { timeout: 45_000 }, async () => {
+  const { launcher } = requireControl();
+  const clients: PoolClient[] = [];
+  const acquire = async (): Promise<PoolClient> => {
+    const client = await launcher.connect();
+    clients.push(client);
+    return client;
+  };
+  let holder: PoolClient | undefined;
+  let attempts: Promise<PromiseSettledResult<boolean>[]> | undefined;
   try {
-    const payload = samplePayload({ consumerKind: 'WORKER' });
-    const digest = proofDigestOf(payload);
-    await issueProof(issuer, {
-      issuerGeneration: payload.issuerGeneration,
-      launchNonce: payload.launchNonce,
-      proofDigest: digest,
-      consumerKind: payload.consumerKind,
-      instanceId: payload.instanceId,
-      channelId: payload.channelId,
-      expiresAt: new Date(Date.parse(payload.expiresAt)),
-    });
-    const consume = (client: PoolClient): Promise<boolean> => consumeProof(client, {
-      issuerGeneration: payload.issuerGeneration,
-      launchNonce: payload.launchNonce,
-      expectedDigest: digest,
-      binding: { consumerKind: payload.consumerKind, instanceId: payload.instanceId, channelId: payload.channelId },
-    });
-    // Both racers are fired without awaiting: FOR UPDATE makes the loser wait
-    // on the winner's row lock, then its conditional UPDATE matches 0 rows.
-    const firstAttempt = consume(first);
-    const secondAttempt = consume(second);
-    const results = await Promise.all([firstAttempt, secondAttempt]);
+    const observer = await acquire();
+    const first = await acquire();
+    const second = await acquire();
+    const barrier = await acquire();
+    holder = barrier;
+    const input = await issueCasSample(observer);
+    const [firstPid, secondPid, barrierPid] = await Promise.all([backendPid(first), backendPid(second), backendPid(barrier)]);
+    await Promise.all([first, second].map((client) => client.query("SET statement_timeout = '12s'")));
+    await barrier.query('BEGIN');
+    await barrier.query(`SELECT 1 FROM launch_control.launch_proofs
+      WHERE issuer_generation = $1 AND launch_nonce = $2 FOR UPDATE`, [input.issuerGeneration, input.launchNonce]);
+    attempts = Promise.allSettled([consumeProof(first, input), consumeProof(second, input)]);
 
-    const winners = results.filter((result) => result);
-    expect(winners).toHaveLength(1);
-    expect(results).toHaveLength(2);
-    expect(results.filter((result) => !result)).toHaveLength(1);
+    const deadline = performance.now() + 5000;
+    let bothQueued = false;
+    do {
+      const { rows } = await observer.query<{ first: number[]; second: number[] }>(
+        'SELECT pg_blocking_pids($1) AS first, pg_blocking_pids($2) AS second', [firstPid, secondPid]);
+      const row = rows[0];
+      if (!row) { throw new Error('Missing blocker observation'); }
+      // One racer may wait behind the other on the tuple lock; both paths
+      // must lead to our barrier before it is released.
+      bothQueued = (row.first.includes(barrierPid) && (row.second.includes(barrierPid) || row.second.includes(firstPid)))
+        || (row.second.includes(barrierPid) && row.first.includes(secondPid));
+      if (!bothQueued) { await delay(25); }
+    } while (!bothQueued && performance.now() < deadline);
+    expect(bothQueued).toBe(true);
 
-    const state = await readRegistryState(issuer, payload.issuerGeneration, payload.launchNonce);
+    await barrier.query('ROLLBACK');
+    holder = undefined;
+    const results = await attempts;
+    expect(results).toEqual(expect.arrayContaining([
+      { status: 'fulfilled', value: true }, { status: 'fulfilled', value: false },
+    ]));
+    const state = await readRegistryState(observer, input.issuerGeneration, input.launchNonce);
     expect(state?.state).toBe('CONSUMED');
     expect(state?.consumed_at).toBeInstanceOf(Date);
-    // No second admission is possible after the single winner.
-    const replay = await consume(issuer);
-    expect(replay).toBe(false);
+    await expect(consumeProof(observer, input)).resolves.toBe(false);
   } finally {
-    issuer.release();
-    first.release();
-    second.release();
+    if (holder) {
+      // Discarding the barrier socket also releases the open transaction.
+      clients.splice(clients.indexOf(holder), 1);
+      holder.release(true);
+    }
+    await attempts;
+    for (const client of clients) { client.release(true); }
   }
 });
+
+for (const durable of [true, false]) {
+  proof(`unconfirmed CAS COMMIT denies without retry (${durable ? 'committed' : 'aborted'} backend)`, { timeout: 30_000 }, async () => {
+    const { launcher } = requireControl();
+    const observer = await launcher.connect();
+    try {
+      const actor = await launcher.connect();
+      try {
+        expect(await backendPid(actor)).not.toBe(await backendPid(observer));
+        const input = await issueCasSample(observer);
+        const statements: string[] = [];
+        const resolution = durable ? 'COMMIT' : 'ROLLBACK';
+        let observedCommand: string | undefined;
+        const query = async (text: string, values?: unknown[]): Promise<QueryResult> => {
+          statements.push(text);
+          if (text !== 'COMMIT') { return await actor.query(text, values); }
+          // Resolve the actual PostgreSQL transaction, then withhold its
+          // result from the registry caller at the driver boundary.
+          observedCommand = (await actor.query(resolution)).command;
+          throw new Error('Injected lost transaction response');
+        };
+        const uncertain: ControlStatement = { query: query as ControlStatement['query'] };
+        await expect(consumeProof(uncertain, input)).rejects.toMatchObject({ code: 'COMMIT_UNKNOWN' });
+        expect(observedCommand).toBe(resolution);
+        expect(statements).toHaveLength(5);
+        expect(statements.at(-1)).toBe('COMMIT');
+        expect(statements).not.toContain('ROLLBACK');
+        const state = await readRegistryState(observer, input.issuerGeneration, input.launchNonce);
+        expect(state?.state).toBe(durable ? 'CONSUMED' : 'ISSUED');
+        if (durable) { expect(state?.consumed_at).toBeInstanceOf(Date); }
+        else { expect(state?.consumed_at).toBeNull(); }
+      } finally { actor.release(true); }
+    } finally { observer.release(); }
+  });
+}

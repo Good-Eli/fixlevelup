@@ -1,38 +1,179 @@
+import { randomUUID } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import { startLauncher, moduleUrl, registryState } from './launcher-harness.js';
+import { Client } from 'pg';
+import { loadP05LabTarget } from './p05-lab-target.js';
+import { openVerifiedControl, verifiedControlConfig } from './admission-fixture.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 const baseEnv: NodeJS.ProcessEnv = {
-  ...process.env,
   NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0', SHUTDOWN_TIMEOUT_MS: '5000',
   DB_HOST: '127.0.0.1', DB_PORT: '55432', DB_NAME: 'fixlevelup_dev', DB_USER: 'fixlevelup_runtime',
 };
-const password = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8'))?.[1] ?? '';
-if (!password) { throw new Error('Local runtime credentials required for compiled worker integration tests'); }
+const password = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1' ? loadP05LabTarget().runtime.password : '';
 
-describe('compiled outbox worker lifecycle', () => {
+const namedLab = () => loadP05LabTarget();
+const assertRuntimeOnlyEnv = `
+  if (Object.keys(process.env).some((key) => /^(?:FIXLEVELUP_(?:LAB_ORCHESTRATOR|MIGRATOR)|LAUNCH_CONTROL_|POSTGRES_)/.test(key))) {
+    throw new Error('Privileged configuration crossed the child boundary');
+  }
+`;
+async function namedWorkerLauncher() {
+  const lab = namedLab();
+  await (await lab.openMaintenance()).end();
+  return await startLauncher('WORKER', { runtime: lab.runtime, operator: lab.migrator, artifactPaths: artifacts('worker.js') });
+}
+const artifacts = (entry: string) => [resolve(root, 'apps/api/dist/bootstrap', entry),
+  resolve(root, 'apps/api/dist/bootstrap/factories.js')];
+
+it.runIf(process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1')('compiled R admits S2 without publishing F routes or creating F rows', async () => {
+  const lab = namedLab();
+  await (await lab.openMaintenance()).end();
+  const observer = new Client(lab.migrator);
+  await observer.connect();
+  const snapshot = async () => (await observer.query<{ groups: string; anchors: string; consents: string; requests: string }>(`SELECT
+    (SELECT count(*)::text FROM foundation.form_browser_groups) AS groups,
+    (SELECT count(*)::text FROM foundation.request_sessions) AS anchors,
+    (SELECT count(*)::text FROM foundation.consent_records) AS consents,
+    (SELECT count(*)::text FROM foundation.requests) AS requests`)).rows;
+  try {
+    const before = await snapshot();
+    const launcher = await startLauncher('API', { runtime: lab.runtime, operator: lab.migrator,
+      artifactPaths: artifacts('api.js') });
+    try {
+      expect(launcher.admission.admission.binding.profile).toBe('S2');
+      const result = await launcher.launch({ timeoutMs: 60_000, env: {
+        NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0', SHUTDOWN_TIMEOUT_MS: '5000',
+        FIXLEVELUP_LAB_DATABASE: lab.runtime.database, DB_PASSWORD: lab.runtime.password,
+        WEB_AUTH_ENABLED: '1', WEB_AUTH_ORIGIN: 'https://127.0.0.1:3100',
+        WEB_AUTH_CSRF_SECRET: 'a'.repeat(64), WEB_AUTH_THROTTLE_SECRET: 'b'.repeat(64),
+      }, source: `
+        import {createApi} from ${JSON.stringify(moduleUrl('bootstrap/factories.js'))};
+        import {SafeLogger} from ${JSON.stringify(moduleUrl('runtime/safe-logger.js'))};
+        import {loadConfig} from ${JSON.stringify(moduleUrl('runtime/config.js'))};
+        import {loadWebAuthConfig} from ${JSON.stringify(moduleUrl('auth/web-auth.config.js'))};
+        import {loadRuntimeAdmission} from ${JSON.stringify(moduleUrl('infrastructure/admission/runtime-admission.js'))};
+        import {admitProcess} from ${JSON.stringify(moduleUrl('infrastructure/admission/process-admission.js'))};
+        ${assertRuntimeOnlyEnv}
+        const database = { host: '127.0.0.1', port: 55432, user: 'fixlevelup_runtime',
+          database: process.env.FIXLEVELUP_LAB_DATABASE, password: process.env.DB_PASSWORD };
+        const admission = loadRuntimeAdmission(process.env, {database, requiredConsumer: 'API'});
+        const authorization = await admitProcess(admission, { database, approvalTimeoutMs: 10000 });
+        const config = loadConfig(process.env);
+        const logger = new SafeLogger('api');
+        const app = await createApi(config, logger, database, loadWebAuthConfig(process.env), undefined, authorization);
+        const { registerShutdown } = await import(${JSON.stringify(moduleUrl('runtime/lifecycle.js'))});
+        registerShutdown(app, config, logger);
+        try {
+          const base = await app.getUrl();
+          const check = async (method, path) => {
+            const response = await fetch(base + path, {method});
+            await response.arrayBuffer();
+            return response.status;
+          };
+          const ready = await check('GET', '/health/ready');
+          const staff = await check('GET', '/api/v1/staff/self');
+          const routes = ['form-session/browser', 'form-sessions', 'form-session/csrf', 'form-session/revoke',
+            'form-session/consents', 'coverage/check', 'legal-documents/POLICY'];
+          const statuses = [];
+          for (const route of routes) statuses.push(await check(route.startsWith('legal-documents/') ? 'GET' : 'POST', '/api/v1/public/' + route));
+          console.log('R_PROBE:' + JSON.stringify({ready, staff, statuses}));
+        } finally { process.emit('SIGTERM'); }
+      ` });
+      expect(result.status).toBe(0);
+      expect(result.acked).toBe(true);
+      expect(result.stdout).toContain('"event":"shutdown_completed"');
+      expect(result.stdout).toContain('R_PROBE:' + JSON.stringify({ ready: 200, staff: 401, statuses: Array(7).fill(404) }));
+      expect(await snapshot()).toEqual(before);
+    } finally { await launcher.close(); }
+  } finally { await observer.end(); }
+}, 90_000);
+
+const namedWorkerStartup = `
+  import {createWorker} from ${JSON.stringify(moduleUrl('bootstrap/factories.js'))};
+  import {SafeLogger} from ${JSON.stringify(moduleUrl('runtime/safe-logger.js'))};
+  import {loadConfig} from ${JSON.stringify(moduleUrl('runtime/config.js'))};
+  import {registerShutdown} from ${JSON.stringify(moduleUrl('runtime/lifecycle.js'))};
+  import {loadRuntimeAdmission} from ${JSON.stringify(moduleUrl('infrastructure/admission/runtime-admission.js'))};
+  import {admitProcess} from ${JSON.stringify(moduleUrl('infrastructure/admission/process-admission.js'))};
+  ${assertRuntimeOnlyEnv}
+  const logger = new SafeLogger('worker');
+  const config = loadConfig(process.env);
+  const database = {host: '127.0.0.1', port: 55432, user: 'fixlevelup_runtime',
+    database: process.env.FIXLEVELUP_LAB_DATABASE, password: process.env.DB_PASSWORD};
+  const admission = loadRuntimeAdmission(process.env, {database, requiredConsumer: 'WORKER'});
+  let authorization;
+  try {
+    authorization = await admitProcess(admission, { database, approvalTimeoutMs: 10000 });
+  } catch {
+    logger.event('admission_denied');
+    process.exit(1);
+  }
+  const app = await createWorker(logger, database, authorization);
+  registerShutdown(app, config, logger);
+  logger.event('started');
+`;
+
+describe.runIf(process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1')('compiled outbox worker lifecycle', () => {
   it('uses the real runtime database and closes worker pools and timers on SIGTERM without exposing credentials', async () => {
-    // P05-01 §7 (round 6): the child is the REAL compiled worker entrypoint,
-    // spawned with the private IPC channel. The parent acts as the launcher:
+    // This child uses the compiled worker factory on a named lab target,
+    // not the dev-only environment loader. The parent owns the real private IPC:
     // holds the per-instance witness, issues the one-time proof row, and
     // answers the child's handshake with the production decideLaunch(). The
     // child only reaches its tick after the single approval + ack.
-    const launcher = await startLauncher('WORKER');
+    const launcher = await namedWorkerLauncher();
+    const { binding } = launcher.admission.admission;
+    const event = randomUUID();
+    const observer = new Client(namedLab().migrator);
+    const controlConfig = verifiedControlConfig(binding.database);
+    const control = await openVerifiedControl(controlConfig);
+    // pg_stat_activity can retain the snapshot of the transaction holding the
+    // barrier. Sample the wait from a third, autocommit control connection.
+    const monitor = await openVerifiedControl(controlConfig);
+    let pending: ReturnType<typeof launcher.launch> | undefined;
+    let locked = false;
     let result;
     try {
-      result = await launcher.launch({
+      await observer.connect();
+      await observer.query(`INSERT INTO foundation.outbox_events(id,event_id,event_type,payload) VALUES ($1,$2,'P05_TEST_PENDING',$3::jsonb)`,
+        [event, randomUUID(), JSON.stringify({ synthetic: true })]);
+      const row = async () => (await observer.query<{ encoded: string }>(
+        'SELECT to_jsonb(e)::text AS encoded FROM foundation.outbox_events e WHERE id=$1', [event])).rows[0]?.encoded;
+      const original = await row();
+      expect(original).toBeDefined();
+      const holderPid = (await control.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid;
+      await control.query('BEGIN');
+      locked = true;
+      await control.query('SELECT 1 FROM launch_control.launch_proofs WHERE issuer_generation=$1 AND launch_nonce=$2 FOR UPDATE',
+        [binding.expected.issuerGeneration, binding.expected.launchNonce]);
+      let repeated = false;
+      pending = launcher.launch({
+        repeatFirstHandshake: () => { repeated = true; },
         timeoutMs: 20_000,
-        env: { ...baseEnv, DB_PASSWORD: password, LAUNCH_APPROVAL_TIMEOUT_MS: '10000' },
+        env: { ...baseEnv, FIXLEVELUP_LAB_DATABASE: namedLab().runtime.database, DB_PASSWORD: password, LAUNCH_APPROVAL_TIMEOUT_MS: '10000' },
         source: `
-        await import(${JSON.stringify(moduleUrl('bootstrap/worker.js'))});
-        setTimeout(()=>{process.emit('SIGTERM');process.emit('SIGINT');},600);
+        ${namedWorkerStartup}
+        const { OutboxWorker } = await import(${JSON.stringify(moduleUrl('infrastructure/outbox/outbox-worker.js'))});
+        await app.get(OutboxWorker).runOnce();
+        process.emit('SIGTERM');process.emit('SIGINT');
         `,
       });
+      void pending.catch(() => undefined);
+      await expect.poll(async () => repeated && (await monitor.query<{ waiting: boolean }>(`SELECT EXISTS(
+        SELECT FROM pg_stat_activity WHERE datname=current_database() AND $1::int=ANY(pg_blocking_pids(pid))) AS waiting`, [holderPid])).rows[0]?.waiting,
+      { timeout: 7_000, interval: 25 }).toBe(true);
+      await control.query('ROLLBACK');
+      locked = false;
+      result = await pending;
+      expect(await row()).toBe(original);
+      expect((await registryState(binding.expected.issuerGeneration, binding.expected.launchNonce))?.state).toBe('CONSUMED');
     } finally {
-      await launcher.close();
+      if (locked) { await control.query('ROLLBACK'); }
+      await Promise.allSettled([pending]);
+      try { await launcher.close(); } finally { await Promise.all([control.end(), monitor.end(), observer.end()]); }
     }
     expect(result.status).toBe(0);
     expect(result.stderr).toBe('');
@@ -51,14 +192,14 @@ describe('compiled outbox worker lifecycle', () => {
     // The launcher's trusted binding is corrupted: the production
     // decideLaunch refuses the GENUINE compiled child at the BINDING gate —
     // before any witness check, CAS or approval.
-    const launcher = await startLauncher('WORKER');
+    const launcher = await namedWorkerLauncher();
     let result;
     try {
       result = await launcher.launch({
         timeoutMs: 20_000, corruptBinding: true,
-        env: { ...baseEnv, DB_PASSWORD: password, LAUNCH_APPROVAL_TIMEOUT_MS: '10000' },
+        env: { ...baseEnv, FIXLEVELUP_LAB_DATABASE: namedLab().runtime.database, DB_PASSWORD: password, LAUNCH_APPROVAL_TIMEOUT_MS: '10000' },
         source: `
-        await import(${JSON.stringify(moduleUrl('bootstrap/worker.js'))});
+        ${namedWorkerStartup}
         setTimeout(()=>{process.emit('SIGTERM');},600);
         `,
       });
@@ -82,7 +223,7 @@ describe('compiled outbox worker lifecycle', () => {
   it('rejects missing database configuration in the compiled worker entrypoint without starting a worker', () => {
     const result = spawnSync(process.execPath, ['--input-type=module', '--eval', `
       await import(${JSON.stringify(moduleUrl('bootstrap/worker.js'))});
-    `], { cwd: root, encoding: 'utf8', timeout: 10_000, env: { ...baseEnv, DB_PASSWORD: '' } });
+    `], { cwd: root, encoding: 'utf8', timeout: 30_000, env: { ...baseEnv, DB_PASSWORD: '' } });
     expect(result.status).toBe(1);
     expect(result.stdout).toContain('"event":"startup_failed"');
     expect(result.stderr).toBe('');
@@ -108,18 +249,18 @@ describe('compiled outbox worker lifecycle', () => {
     // issued for this (or any) admission. The offline admission itself is
     // GENUINE (a real signed proof loaded through the production loader), so
     // the refusal is attributable to the forged marker alone.
-    const launcher = await startLauncher('WORKER');
+    const launcher = await namedWorkerLauncher();
     let result;
     try {
       result = await launcher.launch({
         timeoutMs: 15_000,
-        env: { ...baseEnv, DB_PASSWORD: password, LAUNCH_APPROVAL_TIMEOUT_MS: '10000' },
+        env: { ...baseEnv, FIXLEVELUP_LAB_DATABASE: namedLab().runtime.database, DB_PASSWORD: password, LAUNCH_APPROVAL_TIMEOUT_MS: '10000' },
         source: `
         import {createWorker} from ${JSON.stringify(moduleUrl('bootstrap/factories.js'))};
         import {SafeLogger} from ${JSON.stringify(moduleUrl('runtime/safe-logger.js'))};
         import {loadRuntimeAdmission} from ${JSON.stringify(moduleUrl('infrastructure/admission/runtime-admission.js'))};
-        import {loadDatabaseConfig} from ${JSON.stringify(moduleUrl('infrastructure/database/runtime-database.js'))};
-        const database = loadDatabaseConfig(process.env);
+        const database = {host: '127.0.0.1', port: 55432, user: 'fixlevelup_runtime',
+          database: process.env.FIXLEVELUP_LAB_DATABASE, password: process.env.DB_PASSWORD};
         const offline = loadRuntimeAdmission(process.env, { database, requiredConsumer: 'WORKER' });
         const forged = { admission: offline, completed: { __p05ProcessAdmissionCompleted: Symbol() } };
         try {

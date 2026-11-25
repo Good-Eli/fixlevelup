@@ -6,6 +6,9 @@
  * the migrator, the real migration chain applied by `migrateAuthFixture`, and all
  * writes of the port under test executed through the real `fixlevelup_runtime`
  * role. Nothing here touches the dev database and no production fake is used.
+ * The database lifecycle, credentials and maintenance binding come from
+ * `owned-test-database.ts`: dev reads the local ignored env files, synthetic lab
+ * mode reads only the lab process env and the attested lab maintenance binding.
  *
  * The fixture also builds the *synthetic* staff/city rows the ports need. Those
  * rows are written by the migration owner exactly as reviewed data would be, never
@@ -18,7 +21,8 @@ import { Client, Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { describe } from 'vitest';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
-import { authFixtureMigrations, migrateAuthFixture } from './auth-db-fixture.js';
+import { authFixtureMigrations, installPinnedMigrationHistory, migrateAuthFixture } from './auth-db-fixture.js';
+import { fixtureCredentials, maintenanceOpener, OwnedTestDatabase } from './owned-test-database.js';
 
 export const configurationIntegration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1'
   ? describe : describe.skip;
@@ -40,16 +44,18 @@ export interface ConfigurationFixture {
   close(): Promise<void>;
 }
 
-function credentials(): { admin: string; migrator: string; runtime: string } {
-  const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-  const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  const admin = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-  const migrator = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-  const runtime = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-  if (!admin || !migrator || !runtime) {
-    throw new Error('Local isolated PostgreSQL test credentials are required');
+/**
+ * Connected maintenance client on the `postgres` database, for lifecycle proofs
+ * that must inspect `pg_database`/`pg_stat_activity` around a fixture whose
+ * provisioning is expected to fail. Uses the same opener as the fixture itself:
+ * dev role on `postgres`, or the attested lab binding in synthetic mode. The
+ * caller always closes it.
+ */
+export async function openConfigurationMaintenanceClient(): Promise<Client> {
+  if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') {
+    throw new Error('Configuration fixture requires FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1');
   }
-  return { admin, migrator, runtime };
+  return await maintenanceOpener()();
 }
 
 /**
@@ -64,7 +70,7 @@ export async function createConfigurationFixture(options: { readonly capBefore?:
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') {
     throw new Error('Configuration fixture requires FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1');
   }
-  const { admin: adminPassword, migrator: migratorPassword, runtime: runtimePassword } = credentials();
+  const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
   const capIndex = options.capBefore === undefined ? -1 : authFixtureMigrations.indexOf(options.capBefore);
   if (options.capBefore !== undefined && capIndex < 0) { throw new Error(`Unknown cap migration: ${options.capBefore}`); }
   const chain = capIndex >= 0 ? authFixtureMigrations.slice(0, capIndex) : null;
@@ -72,88 +78,62 @@ export async function createConfigurationFixture(options: { readonly capBefore?:
   if (!/^fixlevelup_configuration_test_[a-f0-9]{24}$/.test(database)) {
     throw new Error('Refusing non-isolated configuration fixture');
   }
-  const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-  await admin.connect();
-  // Set exactly when this run's CREATE DATABASE succeeded: CREATE is the reuse
-  // guard (an existing name is a hard error), so a successful CREATE proves the
-  // database is this run's own disposable artifact.
-  let databaseCreated = false;
-  try {
-    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    databaseCreated = true;
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-  } finally {
-    await admin.end();
-  }
-  const fixtureClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-  await fixtureClient.connect();
-  try {
-    if (chain) {
-      // Same isolation guard as migrateAuthFixture, applied to the capped chain.
-      // (The opt-in env was checked by the caller above; here only the disposable
-      // name pattern and the actual connection identity are re-proved.)
-      if (!/^fixlevelup_(bootstrap|recovery|web_auth|auth_e2e|legal|configuration)_test_[a-f0-9]{24}$/.test(database)
-        || (await fixtureClient.query<{ db: string }>('SELECT current_database() AS db')).rows[0]?.db !== database) {
-        throw new Error('Refusing non-isolated capped fixture');
-      }
-      for (const migration of chain) {
-        await fixtureClient.query(readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8'));
-      }
-    } else {
-      await migrateAuthFixture(fixtureClient, database);
-    }
-  } finally {
-    await fixtureClient.end();
-  }
-  const migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 4 });
-  const runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 4 });
-  let closed = false;
-  /**
-   * Ownership proof for the teardown drop: the `databaseCreated` flag (set exactly
-   * when this run's CREATE DATABASE succeeded — CREATE is the reuse guard, an
-   * existing name is a hard error) AND the strict disposable-name pattern. Consumes
-   * the flag, so a second call never drops anything.
-   */
-  const takeCreatedDatabase = (): string | undefined => {
-    if (!databaseCreated) { return undefined; }
-    databaseCreated = false;
-    return /^fixlevelup_configuration_test_[a-f0-9]{24}$/.test(database) ? database : undefined;
+  // Owned lifecycle: CREATE + the REVOKE/GRANT block on `postgres`, then exactly
+  // this run's database is dropped on any later failure (owned-test-database.ts).
+  const owned = await OwnedTestDatabase.create({
+    name: database,
+    pattern: /^fixlevelup_configuration_test_[a-f0-9]{24}$/,
+    prepare: async (maintenance) => {
+      await maintenance.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await maintenance.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+    },
+  });
+  let migrator: Pool | undefined;
+  let runtime: Pool | undefined;
+  const closeOwnResources = async (): Promise<void> => {
+    const pools = [migrator, runtime].filter((pool): pool is Pool => pool !== undefined);
+    if (pools.length > 0) { await Promise.all(pools.map((pool) => pool.end())); }
   };
-  /** Ends this run's pools first, then drops exactly the database this run created.
-   * Idempotent: the ownership flag is consumed by the first call. */
-  const dispose = async (): Promise<void> => {
-    if (closed) { return; }
-    closed = true;
-    const ownedDatabase = takeCreatedDatabase();
+  try {
+    const fixtureClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
     try {
-      await Promise.all([migrator.end(), runtime.end()]);
-    } finally {
-      if (ownedDatabase !== undefined) {
-        const maintenance = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-        try {
-          await maintenance.connect();
-          await maintenance.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
-        } finally {
-          await maintenance.end().catch(() => undefined);
+      await fixtureClient.connect();
+      if (chain) {
+        // Same isolation guard as migrateAuthFixture, applied to the capped chain.
+        // (The opt-in env was checked by the caller above; here only the disposable
+        // name pattern and the actual connection identity are re-proved.)
+        if (!/^fixlevelup_(bootstrap|recovery|web_auth|auth_e2e|legal|configuration)_test_[a-f0-9]{24}$/.test(database)
+          || (await fixtureClient.query<{ db: string }>('SELECT current_database() AS db')).rows[0]?.db !== database) {
+          throw new Error('Refusing non-isolated capped fixture');
         }
+        for (const migration of chain) {
+          await fixtureClient.query(readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8'));
+        }
+        await installPinnedMigrationHistory(fixtureClient, chain);
+      } else {
+        await migrateAuthFixture(fixtureClient, database);
+        await installPinnedMigrationHistory(fixtureClient, authFixtureMigrations);
       }
+    } finally {
+      await fixtureClient.end().catch(() => undefined);
     }
-  };
-  try {
-    const reviewer = (await bootstrapFirstAdmin(migrator, {
+    const migratorPool = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 4 });
+    migrator = migratorPool;
+    const runtimePool = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 4 });
+    runtime = runtimePool;
+    const reviewer = (await bootstrapFirstAdmin(migratorPool, {
       login: `config-${randomBytes(12).toString('hex')}`,
       password: `Synthetic-Config-${randomBytes(12).toString('hex')}!`,
     })).staffId;
-    const secondReviewer = await createSecondStaff(migrator);
+    const secondReviewer = await createSecondStaff(migratorPool);
     return {
       database,
-      migrator,
-      runtime,
+      migrator: migratorPool,
+      runtime: runtimePool,
       reviewer,
       secondReviewer,
       async inTransaction<T>(run: (client: Client) => Promise<T>): Promise<T> {
-        const client = await runtime.connect();
+        const client = await runtimePool.connect();
         try {
           await client.query('BEGIN');
           const result = await run(client);
@@ -167,13 +147,14 @@ export async function createConfigurationFixture(options: { readonly capBefore?:
         }
       },
       async close(): Promise<void> {
-        await dispose();
+        // Ends this run's pools first, then drops exactly this run's database.
+        await owned.dispose(closeOwnResources);
       },
     };
   } catch (error) {
-    // Provisioning failed after CREATE: the same lifecycle cleanup runs before rethrowing.
-    await dispose().catch(() => undefined);
-    throw error;
+    // Provisioning failed after CREATE: close this run's pools, drop exactly this
+    // run's database, and surface a teardown failure instead of swallowing it.
+    throw await owned.failure(error, closeOwnResources);
   }
 }
 

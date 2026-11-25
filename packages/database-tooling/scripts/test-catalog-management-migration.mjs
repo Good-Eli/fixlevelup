@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { setTimeout as delay } from 'node:timers/promises';
 import { baseTables, migrationHistory, snapshot } from './test-catalog-fixed-prices-migration.mjs';
 import { syntheticVerifier } from './test-rbac-migration.mjs';
+import { adminIdentity } from './migration-local.mjs';
 
 const migration = '20261122000700_catalog_management';
 const pricingSha = 'faccb0d44f3526c43e0131340446b2a12671435f11877fa24786ff52a56bee09';
@@ -400,8 +401,13 @@ export async function proveCatalogManagementIssuer(admin, passwords, migrations)
   // prefix of the chain, not to the live repository length.
   assert.equal(migrations.length >= 21 ? migrations[20] : migrations.at(-1), migration);
   assert.equal(migrations.indexOf(migration), 20);
+  // Exact admin identity for the active mode: the legacy local dev superuser on
+  // its own database, or the scoped lab orchestrator on the `postgres` control
+  // database. Only the expected identity is parametrized — the assertion itself
+  // stays an exact deepEqual on database, role and PostgreSQL version, so a
+  // wrong admin target still fails closed.
   assert.deepEqual(await one(admin, 'SELECT current_database() AS db,current_user AS role,current_setting(\'server_version_num\') AS pg'),
-    {db:'fixlevelup_dev',role:'fixlevelup_dev',pg:'180007'}); // only database provisioning uses the admin connection; all migration/data SQL runs in isolated DBs
+    adminIdentity()); // only database provisioning uses the admin connection; all migration/data SQL runs in isolated DBs
   const requireApi = createRequire(new URL('../../../apps/api/package.json',import.meta.url));
   const { Client } = requireApi('pg');
   for (const prefix of ['configuration_test','p04_browser_test']) {
@@ -409,7 +415,6 @@ export async function proveCatalogManagementIssuer(admin, passwords, migrations)
     assert.match(name,allowedFixture);
     assert.deepEqual(await rows(admin,'SELECT datname FROM pg_database WHERE datname=$1',[name]),[]);
     await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC; GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator,fixlevelup_runtime`);
     const connect = role => {
       assert.match(passwords[role] ?? '',/^[a-f0-9]{64}$/);
       return new Client({host:'127.0.0.1',port:55432,database:name,user:role,password:passwords[role],connectionTimeoutMillis:5000,statement_timeout:10000});
@@ -418,6 +423,7 @@ export async function proveCatalogManagementIssuer(admin, passwords, migrations)
     try {
       await owner.connect();
       assert.equal(await isolated(owner,'fixlevelup_migrator',allowedFixture),name);
+      await owner.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC; GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_runtime`);
       // The issuer proof deploys the EXACT capped 021 chain into its fixture
       // databases: a later slice's migrations must never silently enter this
       // proof's schema profile.

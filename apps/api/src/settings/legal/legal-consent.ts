@@ -22,7 +22,11 @@
  * ## Lock order
  *
  * Every write and every consumption takes the anchor row `FOR UPDATE` first and
- * the document row second, in that order and never the reverse. Migration 013's
+ * the document row second, in that order and never the reverse. The document lock
+ * is a single-table statement that locks exactly one `legal_documents` row; the
+ * current revision and `legal_basis` are read in a *separate* statement issued
+ * only after that lock, so a concurrent publish that committed during the lock
+ * wait is observed instead of being hidden by a pre-wait snapshot. Migration 013's
  * `consent_records_guard` re-takes the same two locks in the same order, so the
  * ordering holds even for a caller that bypasses these ports.
  *
@@ -34,6 +38,8 @@
  * revoke state. Anything else is a mismatch, not a second event. The unique index
  * is also the concurrency primitive: two simultaneous retries race on it, the
  * loser re-reads the winner's row and applies exactly the same replay checks.
+ * P05-02 binds its mandatory `Idempotency-Key` to this `evidence_ref`, so the
+ * protocol-level key and the legal evidence identity are the same value.
  */
 import { randomUUID } from 'node:crypto';
 import { LegalPortError } from './legal-contract.js';
@@ -86,35 +92,58 @@ function receipt(row: ConsentRow, replayed: boolean): ConsentReceipt {
 }
 
 /**
- * Locks the purpose's CONSENT_FORM document (step 2 of the lock order) and returns
- * the current immutable revision that a GIVEN must name.
+ * Locks exactly one `legal_documents` row: step 2 of the mandated lock order.
  *
- * The kind predicate is part of the SQL when the caller does not name a document:
- * a purpose that has both a POLICY and a CONSENT_FORM would otherwise resolve to
- * whichever row the planner returned first. An explicitly named document is
- * locked by id and then kind-checked, so naming a POLICY is a precise
- * `KIND_NOT_CONSENT_FORM` refusal instead of a silent lookup miss.
+ * The statement is deliberately single-table and returns no revision data. A
+ * joined projection (`current_version_id`, the version's `legal_basis`) inside the
+ * locking statement would be evaluated from a snapshot taken *before* the lock
+ * wait, so a concurrent publish that committed meanwhile could be missed and an
+ * acceptance of superseded text recorded as current. `FOR UPDATE` on the unique
+ * primary-key / `(purpose,kind)` predicate locks one row and nothing else.
  */
-async function lockConsentForm(
+async function lockConsentDocument(
   client: LegalSqlClient, purpose: LegalPurpose, documentId: string | null,
-): Promise<{ documentId: string; currentVersionId: string; legalBasis: string }> {
+): Promise<string> {
   const result = documentId === null
-    ? await guard(() => client.query<ConsentFormDocument>(
-      `SELECT d.id,d.purpose,d.kind,d.row_version,d.current_version_id,v.legal_basis
-       FROM foundation.legal_documents d
-       LEFT JOIN foundation.legal_document_versions v ON v.id=d.current_version_id AND v.document_id=d.id
-       WHERE d.purpose=$1 AND d.kind=$2
-       FOR UPDATE OF d`,
+    ? await guard(() => client.query<{ id: string }>(
+      `SELECT id FROM foundation.legal_documents
+       WHERE purpose=$1 AND kind=$2
+       FOR UPDATE`,
       [purposeValue(purpose), CONSENT_FORM_KIND],
     ))
-    : await guard(() => client.query<ConsentFormDocument>(
-      `SELECT d.id,d.purpose,d.kind,d.row_version,d.current_version_id,v.legal_basis
-       FROM foundation.legal_documents d
-       LEFT JOIN foundation.legal_document_versions v ON v.id=d.current_version_id AND v.document_id=d.id
-       WHERE d.id=$1 AND d.purpose=$2
-       FOR UPDATE OF d`,
+    : await guard(() => client.query<{ id: string }>(
+      `SELECT id FROM foundation.legal_documents
+       WHERE id=$1 AND purpose=$2
+       FOR UPDATE`,
       [documentId, purposeValue(purpose)],
     ));
+  const row = result.rows[0];
+  if (!row) {
+    throw new LegalPortError('NOT_FOUND');
+  }
+  return row.id;
+}
+
+/**
+ * Reads the *locked* document's current revision and legal basis.
+ *
+ * This must be a separate statement issued after `lockConsentDocument` in the
+ * same transaction: only then is the pointer guaranteed not to move under a
+ * concurrent publish, and only then does `legal_basis` describe the exact revision
+ * the event is about to name. The kind and publication checks live here as well,
+ * so an explicitly named POLICY is still a precise `KIND_NOT_CONSENT_FORM`
+ * refusal instead of a silent lookup miss.
+ */
+async function readCurrentConsentForm(
+  client: LegalSqlClient, documentId: string,
+): Promise<{ documentId: string; currentVersionId: string; legalBasis: string }> {
+  const result = await guard(() => client.query<ConsentFormDocument>(
+    `SELECT d.id,d.purpose,d.kind,d.row_version,d.current_version_id,v.legal_basis
+     FROM foundation.legal_documents d
+     LEFT JOIN foundation.legal_document_versions v ON v.id=d.current_version_id AND v.document_id=d.id
+     WHERE d.id=$1`,
+    [documentId],
+  ));
   const row = result.rows[0];
   if (!row) {
     throw new LegalPortError('NOT_FOUND');
@@ -126,6 +155,20 @@ async function lockConsentForm(
     throw new LegalPortError('DOCUMENT_NOT_PUBLISHED');
   }
   return { documentId: row.id, currentVersionId: row.current_version_id, legalBasis: row.legal_basis };
+}
+
+/**
+ * Locks the purpose's CONSENT_FORM document (step 2 of the lock order) and returns
+ * the current immutable revision that a GIVEN must name: lock first, then read in
+ * a separate statement. The kind predicate is part of the locking statement when
+ * the caller does not name a document, so a purpose that has both a POLICY and a
+ * CONSENT_FORM cannot resolve to whichever row the planner returned first.
+ */
+async function lockConsentForm(
+  client: LegalSqlClient, purpose: LegalPurpose, documentId: string | null,
+): Promise<{ documentId: string; currentVersionId: string; legalBasis: string }> {
+  const lockedId = await lockConsentDocument(client, purpose, documentId);
+  return await readCurrentConsentForm(client, lockedId);
 }
 
 /** A later REVOKED event that names this exact GIVEN event, if any. */
@@ -204,7 +247,8 @@ async function replayGiven(
  */
 export async function recordConsentGiven(client: LegalSqlClient, input: unknown): Promise<ConsentReceipt> {
   const parsed = consentGivenInput(input);
-  // Lock order: anchor first, then document.
+  // Lock order: anchor first, then exactly one document row, then (separately)
+  // the current revision and legal basis of that locked document.
   const anchor = await requireLiveAnchor(client, parsed.session);
   const form = await lockConsentForm(client, parsed.purpose, parsed.documentId);
   // The document lock may have waited past the anchor's expiry; re-check the
@@ -220,6 +264,10 @@ export async function recordConsentGiven(client: LegalSqlClient, input: unknown)
   if (parsed.documentVersionId !== form.currentVersionId) {
     throw new LegalPortError('DOCUMENT_NOT_CURRENT');
   }
+  // The evidence read above is a plain SELECT, but it can still wait on a
+  // relation lock; the decision point is here, so the database clock is sampled
+  // once more before the event is written.
+  await assertAnchorLiveAfterLock(client, anchor);
 
   const inserted = await guard(() => client.query<ConsentRow>(
     `INSERT INTO foundation.consent_records

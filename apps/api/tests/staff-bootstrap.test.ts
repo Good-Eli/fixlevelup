@@ -1,11 +1,11 @@
 import { argon2, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { insertWebStaff, migrateAuthFixture, reassignFixture, spareAdmin } from './auth-db-fixture.js';
+import { becomeOwner, dropOwnedTestDatabase, fixtureCredentials, maintenanceOpener, releaseOwner } from './owned-test-database.js';
 
 // Opt in only on the documented local development PostgreSQL instance. Each run
 // creates three empty, randomly named databases; it never writes to dev tables.
@@ -96,22 +96,18 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
     } finally {
       try {
         for (const name of owned) {
-          await admin?.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+          if (admin !== undefined) { await dropOwnedTestDatabase(admin, name); }
         }
       } finally { await admin?.end(); }
     }
   }
 
   beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    // Lab mode reads the lab process env and the attested maintenance binding;
+    // dev mode reads the local ignored env files. Never the dev database.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
     const connection = { host: '127.0.0.1', port: 55432 };
-    admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    admin = await maintenanceOpener()();
     try {
       for (let i = 0; i < 3; i++) {
         // The name consists solely of a fixed prefix and cryptographic random hex.
@@ -120,8 +116,12 @@ integration('first-admin bootstrap against isolated PostgreSQL databases', () =>
         // CREATE is the reuse guard: an existing name is a hard error, so a successful
         // CREATE proves this run owns the disposable database (the name gates the drop).
         createdNames.push(name);
+        // GRANT/REVOKE need the owner: in the lab the orchestrator is a NOINHERIT member.
+        await becomeOwner(admin);
         await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
         await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_runtime`);
+        // Back to the orchestrator: the next loop iteration needs CREATEDB again.
+        await releaseOwner(admin);
         const fixture = new Client({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
         fixtures.push(fixture);
         await fixture.connect();

@@ -1172,6 +1172,124 @@ legalIntegration('P03-03 legal documents and consent ports on real PostgreSQL ru
     expect(original.rows[0]).toMatchObject({ action: 'GIVEN', supersedes_id: null });
   }, 60_000);
 
+  it('locks exactly one document row and reads the current revision only after that lock', async () => {
+    // MUST 2 regression: the document lock is a single-table `FOR UPDATE` on one
+    // `legal_documents` row, and `current_version_id`/`legal_basis` are read in a
+    // *separate* statement issued after the lock. Proof by outcome: a publish is
+    // queued on the same row *ahead* of the GIVEN, so it commits during the GIVEN's
+    // lock wait and moves the pointer. If the revision were read before the wait
+    // (joined into the locking statement), the GIVEN would accept the old text;
+    // reading after the lock must refuse it as DOCUMENT_NOT_CURRENT.
+    const form = await publishNext('MARKETING', 'CONSENT_FORM');
+    const anchor = await newAnchor();
+    const blocker = await db.runtime.connect();
+    const publisher = await db.runtime.connect();
+    const giver = await db.runtime.connect();
+    let published: string;
+    let given: string;
+    try {
+      // 1. A third session holds the document row, so both waiters below block.
+      await blocker.query('BEGIN');
+      await blocker.query('SELECT id FROM foundation.legal_documents WHERE id=$1 FOR UPDATE', [form.documentId]);
+      const blockerPid = (await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid;
+      if (!blockerPid) {
+        throw new Error('Missing blocker backend pid');
+      }
+
+      // 2. The publish joins the lock queue FIRST: PostgreSQL grants the row lock
+      //    in queue order, so the pointer moves before the GIVEN is let through.
+      await beginLegalTransaction(publisher);
+      const publisherPid = (await publisher.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid;
+      if (!publisherPid) {
+        throw new Error('Missing publisher backend pid');
+      }
+      const publishedOutcome = publishLegalDocumentVersion(publisher, {
+        documentId: form.documentId,
+        expectedVersion: form.version,
+        title: 'Concurrent republish during the document-lock wait',
+        body: `Republished during lock wait ${randomUUID()}`,
+        legalBasis: 'Synthetic republished basis',
+        sourceRef: 'synthetic-source',
+        reviewedBy: db.staffId,
+      }).then(
+        () => 'OK',
+        (error: unknown) => error instanceof LegalPortError ? error.code : 'UNEXPECTED',
+      );
+
+      // 3. The GIVEN joins the same queue SECOND and names the OLD revision.
+      await beginLegalTransaction(giver);
+      const giverPid = (await giver.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid;
+      if (!giverPid) {
+        throw new Error('Missing giver backend pid');
+      }
+      const givenOutcome = recordConsentGiven(giver, {
+        session: proof(anchor), purpose: 'MARKETING', documentVersionId: form.versionId,
+        evidenceRef: randomUUID(), accepted: true,
+      }).then(
+        () => 'OK',
+        (error: unknown) => error instanceof LegalPortError ? error.code : 'UNEXPECTED',
+      );
+
+      // 4. Both waiters must really be blocked (not sleeping): the publisher is
+      //    blocked by the blocker, the GIVEN is queued behind the publisher.
+      const blockersOf = async (pid: number): Promise<number[]> => {
+        const wait = await db.migrator.query<{ pids: number[] }>('SELECT pg_blocking_pids($1) AS pids', [pid]);
+        return wait.rows[0]?.pids ?? [];
+      };
+      const deadline = Date.now() + 5_000;
+      let queued = false;
+      while (Date.now() < deadline) {
+        if ((await blockersOf(publisherPid)).includes(blockerPid) && (await blockersOf(giverPid)).length > 0) {
+          queued = true;
+          break;
+        }
+        await delay(25);
+      }
+      expect(queued).toBe(true);
+
+      // The document lock is a single-row `FOR UPDATE` on `legal_documents` only:
+      // the waiting GIVEN queues one tuple lock on that table and none on the
+      // immutable revision table (a joined locking read would queue there too).
+      const queuedLocks = await db.migrator.query<{ table: string }>(
+        `SELECT c.relname AS table FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+         WHERE l.pid=$1 AND l.locktype='tuple'`, [giverPid]);
+      expect(queuedLocks.rows.filter((row) => row.table === 'legal_documents')).toHaveLength(1);
+      expect(queuedLocks.rows.filter((row) => row.table === 'legal_document_versions')).toHaveLength(0);
+
+      // 5. Release the blocker. The publisher finishes its statements while still
+      //    holding the row lock, then COMMITs and releases it; only then can the
+      //    GIVEN acquire the lock and read the document state.
+      await blocker.query('ROLLBACK');
+      published = await publishedOutcome;
+      await publisher.query('COMMIT');
+      given = await givenOutcome;
+    } finally {
+      // Every connection is rolled back before release: a client returned to the
+      // pool with an open transaction would keep its row locks and stall the suite.
+      for (const client of [giver, publisher, blocker]) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          // The transaction may already be committed or rolled back.
+        }
+      }
+      giver.release();
+      publisher.release();
+      blocker.release();
+    }
+
+    // The publish won the wait and moved the pointer.
+    expect(published).toBe('OK');
+    // The GIVEN naming the superseded revision is refused after the lock, so the
+    // revision/legal-basis read provably happened *after* the wait.
+    expect(given).toBe('DOCUMENT_NOT_CURRENT');
+    expect(await evidenceCount(anchor.sessionId)).toBe(0);
+    // The stored revision is the publisher's, and the old one is no longer current.
+    const pointer = await db.migrator.query<{ current_version_id: string }>(
+      'SELECT current_version_id FROM foundation.legal_documents WHERE id=$1', [form.documentId]);
+    expect(pointer.rows[0]?.current_version_id).not.toBe(form.versionId);
+  }, 60_000);
+
   it.each(['current GRANTED', 'GIVEN replay', 'REVOKED replay'] as const)(
     'refuses %s when the evidence SELECT waits across anchor expiry',
     async (path) => {

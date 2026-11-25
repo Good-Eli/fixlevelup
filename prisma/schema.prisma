@@ -793,6 +793,7 @@ model RequestSession {
   consents            ConsentRecord[]
   fileUploadIntents   FileUploadIntent[] @relation("FileUploadIntentSession")
   requestEvents       RequestEvent[]
+  formGroupMembership FormSessionGroupMembership?
 
   @@map("request_sessions")
   @@schema("foundation")
@@ -1839,5 +1840,64 @@ model RequestEvent {
   @@unique([principal, operation, idempotencyKey], map: "request_events_principal_operation_key_key")
   @@index([requestId, createdAt], map: "request_events_request_idx")
   @@map("request_events")
+  @@schema("foundation")
+}
+
+// P05-02 opaque browser group: a server-side hash of an opaque grouping secret
+// plus a trusted expiry window. Not an F-session and not an identity; no PII,
+// no revoke. Expiry is decided by comparing the stored timestamps with the
+// database clock, so the row always stays: UPDATE and DELETE are refused by the
+// form_browser_groups_guard trigger (23514), which also pins created_at to the
+// database clock on every INSERT. Expired groups are never deleted either:
+// form session group memberships outlive as history and reference them.
+model FormBrowserGroup {
+  id          String   @id @db.Uuid
+  secretHash  String   @unique(map: "form_browser_groups_secret_hash_key") @map("secret_hash") @db.VarChar(64)
+  createdAt   DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  expiresAt   DateTime @map("expires_at") @db.Timestamptz(6)
+  memberships FormSessionGroupMembership[]
+
+  @@map("form_browser_groups")
+  @@schema("foundation")
+}
+
+// P05-02 form session group membership (S2): the thin 1:1 mapping of a
+// request_sessions.id issued through the F protocol to its browser group.
+// session_id is both the primary key and the P03 anchor reference — there is
+// no second anchor id, no second secret hash and no own expiry, revoke or
+// intake pair here; the anchor secret, expiry and provenance keep living in
+// request_sessions (013), so the same F token keeps authorizing
+// reserveFileUpload (014) and consent_records (013). The
+// form_session_group_memberships_guard trigger (23514) requires the browser
+// group and a live (unrevoked, unexpired) request session to exist, pins the
+// anchor expiry to the group expiry and pins created_at to the database clock
+// on INSERT; UPDATE and DELETE are refused.
+model FormSessionGroupMembership {
+  sessionId String   @id @map("session_id") @db.Uuid
+  groupId   String   @map("group_id") @db.Uuid
+  createdAt DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  group     FormBrowserGroup @relation(fields: [groupId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  session   RequestSession   @relation(fields: [sessionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([groupId], map: "form_session_group_memberships_group_id_idx")
+  @@map("form_session_group_memberships")
+  @@schema("foundation")
+}
+
+// P05-02 bounded fixed-window throttle counters for the form session issuance
+// paths. A bucket is a keyed counter, not a policy and not PII. Identity and
+// window columns are immutable, hit_count can only grow or stay (the
+// form_throttle_buckets_guard trigger refuses a decrease and any DELETE); a new
+// window is a new row keyed by UNIQUE(kind,key_hash,window_started_at).
+model FormThrottleBucket {
+  id              String   @id @db.Uuid
+  kind            String   @db.VarChar(16)
+  keyHash         String   @map("key_hash") @db.VarChar(64)
+  windowStartedAt DateTime @map("window_started_at") @db.Timestamptz(6)
+  windowSeconds   Int      @map("window_seconds")
+  hitCount        Int      @map("hit_count")
+
+  @@unique([kind, keyHash, windowStartedAt], map: "form_throttle_buckets_kind_key_hash_window_started_at_key")
+  @@map("form_throttle_buckets")
   @@schema("foundation")
 }

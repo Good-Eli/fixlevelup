@@ -3,8 +3,7 @@ import type { OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { ConfigurationError } from '../../runtime/config.js';
 import { RuntimeDatabase } from '../database/runtime-database.js';
 import type { DatabaseConfig } from '../database/runtime-database.js';
-import type { RuntimeAdmission } from '../admission/runtime-admission.js';
-import { validateAuthorization } from '../admission/process-admission.js';
+import { requireRuntimeAuthorization } from '../admission/pool-guard.js';
 import type { ProcessAuthorization } from '../admission/process-admission.js';
 import { SafeLogger } from '../../runtime/safe-logger.js';
 import { OutboxStore } from './outbox-store.js';
@@ -32,9 +31,9 @@ export class OutboxWorker implements OnApplicationBootstrap, OnModuleDestroy {
       // process admission (launcher-approved); the branded authorization
       // cannot be produced from an offline loader output.
       if (!authorization) { throw new ConfigurationError(['LAUNCH_PROOF_TOKEN']); }
-      const admission: RuntimeAdmission = validateAuthorization(authorization);
-      this.database = new RuntimeDatabase(config, false, admission);
-      this.store = new OutboxStore(config, admission);
+      requireRuntimeAuthorization(authorization, 'WORKER', config);
+      this.database = new RuntimeDatabase(config, false, authorization, 'WORKER');
+      this.store = new OutboxStore(config, authorization);
     }
   }
 
@@ -64,7 +63,7 @@ export class OutboxWorker implements OnApplicationBootstrap, OnModuleDestroy {
     if (!lease) { return; }
     // Shutdown can race the claim commit. Leave that lease to expire; never
     // execute a new handler after closing starts or mark it successful.
-    if (this.isClosing()) { return; }
+    if (this.isClosing() || !await this.database.ready() || this.isClosing()) { return; }
     const handler = this.handlers.get(lease.eventType);
     if (!handler) { return; }
     try {

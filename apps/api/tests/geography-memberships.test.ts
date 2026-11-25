@@ -1,7 +1,5 @@
 import 'reflect-metadata';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { BadRequestException, ForbiddenException, HttpException, NotFoundException } from '@nestjs/common';
 import { Client, Pool } from 'pg';
 import type { PoolClient } from 'pg';
@@ -17,6 +15,7 @@ import {
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { DUMMY_PASSWORD_HASH } from '../src/staff/password.js';
 import { migrateAuthFixture } from './auth-db-fixture.js';
+import { becomeOwner, dropOwnedTestDatabase, fixtureCredentials, maintenanceOpener } from './owned-test-database.js';
 
 const CITY = '11111111-1111-4111-8111-111111111111';
 const OTHER_CITY = '22222222-2222-4222-8222-222222222222';
@@ -258,7 +257,6 @@ describe('grant interval parsing', () => {
 
 // Explicit opt-in only: creates a random isolated database and never touches the dev database.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
-const root = resolve(import.meta.dirname, '../../..');
 const connection = { host: '127.0.0.1' as const, port: 55432 };
 
 /**
@@ -289,7 +287,7 @@ integration('membership commands against isolated PostgreSQL', () => {
   let managerAssignmentId = '';
   let cityMembershipId = '';
   let zoneGrantId = '';
-  let maintenancePassword: string | undefined;
+  let maintenance: Client | undefined;
   let dbName: string | undefined;
   let dbCreated = false;
   let tornDown = false;
@@ -310,13 +308,11 @@ integration('membership commands against isolated PostgreSQL', () => {
     const ownedDatabase = takeOwnedDatabase();
     try { await Promise.all(pools.map((pool) => pool.end())); }
     finally {
-      if (ownedDatabase !== undefined && maintenancePassword !== undefined) {
-        const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: maintenancePassword });
-        try {
-          await admin.connect();
-          await admin.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
-        } finally { await admin.end().catch(() => undefined); }
-      }
+      try {
+        if (ownedDatabase !== undefined && maintenance !== undefined) {
+          await dropOwnedTestDatabase(maintenance, ownedDatabase);
+        }
+      } finally { await maintenance?.end().catch(() => undefined); }
     }
   }
   // This fixture is compared with PostgreSQL's *current* time, not with a fixed release date.
@@ -438,26 +434,22 @@ integration('membership commands against isolated PostgreSQL', () => {
   };
 
   beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-    if (!adminPassword || !migratorPassword || !runtimePassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
-    maintenancePassword = adminPassword;
+    // Lab mode reads the lab process env and the attested maintenance binding;
+    // dev mode reads the local ignored env files. Never the dev database.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
+    maintenance = await maintenanceOpener()();
+    const admin = maintenance;
     const database = `fixlevelup_auth_e2e_test_${randomBytes(12).toString('hex')}`;
-    const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
     try {
       await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
       // CREATE is the reuse guard: an existing name is a hard error, so a successful
       // CREATE proves this run owns the disposable database (the flag gates the drop).
       dbName = database;
       dbCreated = true;
+      // GRANT/REVOKE need the owner: in the lab the orchestrator is a NOINHERIT member.
+      await becomeOwner(admin);
       await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    } finally { await admin.end(); }
-    try {
       const fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
       await fixture.connect();
       try {

@@ -6,7 +6,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RuntimeDatabase } from '../src/infrastructure/database/runtime-database.js';
 import { authFixtureMigrations as migrations } from './auth-db-fixture.js';
 import { admitFixture } from './admission-fixture.js';
-import type { AdmissionHandle } from './admission-fixture.js';
+import type { AdmittedHandle } from './admission-fixture.js';
+import { LegacyReadinessProbes } from '../src/infrastructure/database/legacy-readiness.js';
+import { loadP05LabTarget } from './p05-lab-target.js';
+import { pinFreshFileDatabase, syntheticLabMode } from './owned-test-database.js';
 
 // Explicit opt-in: preserve the random fixture database and never modify the dev schema.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
@@ -15,7 +18,8 @@ const root = resolve(import.meta.dirname, '../../..');
 integration('web auth readiness against isolated PostgreSQL', () => {
   let admin: Client | undefined;
   let fixture: Client | undefined;
-  let admission: AdmissionHandle | undefined;
+  let admission: AdmittedHandle | undefined;
+  let metadata: Client | undefined;
   let db: RuntimeDatabase | undefined;
   let authReady: () => Promise<boolean>;
   let dbName: string | undefined;
@@ -37,27 +41,41 @@ integration('web auth readiness against isolated PostgreSQL', () => {
     tornDown = true;
     const ownedDatabase = takeOwnedDatabase();
     try { await db?.onModuleDestroy(); }
-    finally { await admission?.release(); }
+    finally {
+      try { await admission?.release(); }
+      finally { await metadata?.end(); }
+    }
     try { await fixture?.end(); }
     finally {
       try {
-        if (ownedDatabase !== undefined) {
-          await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        if (ownedDatabase !== undefined && admin !== undefined) {
+          if (syntheticLabMode()) {
+            await admin.query('SET ROLE fixlevelup_migrator');
+            const dispose = await pinFreshFileDatabase(admin, ownedDatabase);
+            await dispose(admin);
+          } else {
+            await admin.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+          }
         }
       } finally { await admin?.end(); }
     }
   }
 
   beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
-    const connection = { host: '127.0.0.1' as const, port: 55432 };
-    admin = new Client({ ...connection, database: 'fixlevelup_dev', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    const lab = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1' ? loadP05LabTarget() : undefined;
+    const runtimeEnv = lab ? '' : readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
+    const runtimePassword = lab?.runtime.password ?? /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
+    const migratorPassword = lab?.migrator.password ?? /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
+    if (!runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    const connection = { host: '127.0.0.1' as const, port: 55432, ...(lab ? { application_name: lab.applicationName } : {}) };
+    if (lab) { admin = await lab.openMaintenance(); }
+    else {
+      const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
+      const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
+      if (!adminPassword) { throw new Error('Local isolated PostgreSQL maintenance credentials are required'); }
+      admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
+      await admin.connect();
+    }
     const database = `fixlevelup_auth_readiness_test_${randomBytes(12).toString('hex')}`;
     try {
       await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
@@ -65,6 +83,7 @@ integration('web auth readiness against isolated PostgreSQL', () => {
       // CREATE proves this run owns the disposable database (the flag gates the drop).
       dbName = database;
       dbCreated = true;
+      if (lab) { await admin.query('SET ROLE fixlevelup_migrator'); }
       await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
       fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
@@ -78,9 +97,13 @@ integration('web auth readiness against isolated PostgreSQL', () => {
       // Invoke the auth-specific probe directly: the surrounding probe has its own DB identity checks.
       // P05-01: the pool is admitted through the launch gate (migrator-held witness).
       admission = await admitFixture(fixture, database, 'TEST');
-      db = new RuntimeDatabase({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword }, true, admission.admission);
-      const internal = db as unknown as { authReady: () => Promise<boolean> };
-      authReady = () => internal.authReady();
+      const target = { ...connection, database, user: 'fixlevelup_runtime' as const, password: runtimePassword };
+      db = new RuntimeDatabase(target, true, admission.authorization, 'TEST');
+      const reader = new Client({ ...target, options: '-c default_transaction_read_only=on' });
+      metadata = reader;
+      await reader.connect();
+      const probes = new LegacyReadinessProbes(reader, database, true);
+      authReady = () => probes.ready().catch(() => false);
     } catch (error) {
       // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
       await teardown().catch(() => undefined);

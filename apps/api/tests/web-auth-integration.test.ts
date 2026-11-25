@@ -1,16 +1,14 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { WebAuthService } from '../src/auth/web-auth.service.js';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { recoverAdmin } from '../src/staff/recovery.js';
 import { inFixtureTransaction, insertWebStaff, migrateAuthFixture, reassignFixture, spareAdmin } from './auth-db-fixture.js';
+import { becomeOwner, dropOwnedTestDatabase, fixtureCredentials, maintenanceOpener } from './owned-test-database.js';
 
 // Explicit opt-in only: create a random database, never alter or drop the dev database.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
-const root = resolve(import.meta.dirname, '../../..');
 const oldPassword = 'Synthetic-Web-Old-Password-2026!';
 const newPassword = 'Synthetic-Web-New-Password-2026!';
 const recoveredPassword = 'Synthetic-Web-Recovered-Password-2026!';
@@ -52,8 +50,8 @@ integration('web authentication against isolated PostgreSQL', () => {
       await Promise.all(clients.map((client) => client.end()));
     } finally {
       try {
-        if (ownedDatabase !== undefined) {
-          await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        if (ownedDatabase !== undefined && admin !== undefined) {
+          await dropOwnedTestDatabase(admin, ownedDatabase);
         }
       } finally {
         await admin?.end();
@@ -62,15 +60,11 @@ integration('web authentication against isolated PostgreSQL', () => {
   }
 
   beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    // Lab mode reads the lab process env and the attested maintenance binding;
+    // dev mode reads the local ignored env files. Never the dev database.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
     const connection = { host: '127.0.0.1', port: 55432 };
-    admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    admin = await maintenanceOpener()();
     const database = `fixlevelup_web_auth_test_${randomBytes(12).toString('hex')}`;
     try {
       await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
@@ -78,6 +72,8 @@ integration('web authentication against isolated PostgreSQL', () => {
       // CREATE proves this run owns the disposable database (the flag gates the drop).
       dbName = database;
       dbCreated = true;
+      // GRANT/REVOKE need the owner: in the lab the orchestrator is a NOINHERIT member.
+      await becomeOwner(admin);
       await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
       fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });

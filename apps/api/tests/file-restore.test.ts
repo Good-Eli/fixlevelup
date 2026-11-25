@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3ServiceException } from '@aws-sdk/client-s3';
 import { Client, Pool } from 'pg';
 import { describe, expect, it, vi } from 'vitest';
-import { freshGarageBucket, newArchives, restoreDbOptions } from '../../../infra/file-restore/resources.mjs';
+import { freshGarageBucket, newArchives, restoreDbOptions, restoreReviewedExpressions } from '../../../infra/file-restore/resources.mjs';
 import { closeReadyStream, createFileReadBudget, openReadyStream, readReadyChunk, readReadyMetadata } from '../src/files/file-access/index.js';
 import { bootstrapFileLedgerNamespace, createFileLedgerVerifier, createPgFileLedger, createPgFloorStore } from '../src/files/file-ledger/index.js';
 import type { FileLedgerVerifier, LedgerHead } from '../src/files/file-ledger/contract.js';
@@ -17,30 +17,32 @@ import { drainFencedFileDecisions, reconcileFileDeletion } from '../src/files/fi
 import { makeFilePrivacyGrant, makeHoldGrant } from '../src/files/file-privacy/grants.js';
 import { changeFileHold, planRetention } from '../src/files/file-privacy/retention.js';
 import type { RetentionPolicy } from '../src/files/file-privacy/contract.js';
-import type { RestoreContext, RestoreLimits, SnapshotManifest } from '../src/files/file-restore/contract.js';
+import type { RestoreContext, RestoreGateReceipt, RestoreLimits, SnapshotManifest } from '../src/files/file-restore/contract.js';
 import { AUTHORITY_TABLES, readAuthorityInventory, readRestoreInventory } from '../src/files/file-restore/inventory.js';
-import { assertP05AbsentAfterDrain } from '../src/files/file-restore/p05-inventory.js';
+import { observeFencedSource } from '../src/files/file-restore/p05-source-fence.js';
 import { createRestoreObjectIO } from '../src/files/file-restore/objects.js';
 import { readSnapshot, sha256, signApproval, signAuthority, signSnapshot } from '../src/files/file-restore/records.js';
 import { createRestoredReadyStorage, rescrubFileRestore } from '../src/files/file-restore/rescrub.js';
+import { verifyClosedBase } from '../src/infrastructure/database/closed-profile-base.js';
+import { readP05Metadata } from '../src/infrastructure/database/p05-profile-catalog.js';
 import { createS3Client, validateConfig, type PrivateQuarantineStorageConfig } from '../src/files/storage/config.js';
 import { createPrivateQuarantineStorage } from '../src/files/storage/index.js';
-import { authFixtureMigrations } from './auth-db-fixture.js';
-import { accessPolicy, faultEvidence, png, processingPolicy, provision, uploadPolicy } from './file-lifecycle-fixture.js';
+import { authFixtureMigrations, installPinnedMigrationHistory } from './auth-db-fixture.js';
+import { accessPolicy, faultEvidence, png, processingPolicy, provision, uploadPolicy, withQueryHook } from './file-lifecycle-fixture.js';
 import { revokeConsent, startFileReservationsDatabase } from './file-reservations-fixture.js';
 import { inRuntimeTransaction } from './legal-fixture.js';
 import type { FileReservationsFixture } from './file-reservations-fixture.js';
+import { pinFreshFileDatabase } from './owned-test-database.js';
 import { TECHNICAL_TIMEOUTS } from './file-storage-fixture.js';
 
 const enabled = process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1';
 const live = enabled ? describe : describe.skip;
-const sig = AbortSignal.timeout(170_000);
 const limits: RestoreLimits = { maxObjects: 80, maxIntents: 20, maxObjectBytes: 65_536, maxTotalObjectBytes: 524_288,
   maxManifestBytes: 524_288, maxDumpBytes: 8_388_608 };
 const proofLimits = { maxItems: 80, maxProofEvents: 80 };
 const expiry = () => new Date(Date.now() + 300_000);
-const policy: RetentionPolicy = { mode: 'local-synthetic', versionId: randomUUID(), expiresAt: expiry(), rawBoundMs: 1,
-  readyMs: 1, quarantinedMs: 1, orphanMs: 1, maxBatch: 16, maxItemsPerIntent: 16, claimMs: 15_000 };
+const restorePolicy = (): RetentionPolicy => ({ mode: 'local-synthetic', versionId: randomUUID(), expiresAt: expiry(), rawBoundMs: 1,
+  readyMs: 1, quarantinedMs: 1, orphanMs: 1, maxBatch: 16, maxItemsPerIntent: 16, claimMs: 15_000 });
 
 function ledgerPool(role: string): Pool {
   const keyName = `${role.toUpperCase()}_PASSWORD`;
@@ -59,7 +61,7 @@ const storageConfig = (target: ReturnType<typeof freshGarageBucket>, write: bool
 /** Install an exact synthetic published tuple, not a claim that these bytes passed a real engine.
  * The separate C suite owns that proof; this suite proves old published bytes survive a real restore. */
 async function published(db: FileReservationsFixture, config: PrivateQuarantineStorageConfig,
-  storage: ReturnType<typeof createPrivateQuarantineStorage>) {
+  storage: ReturnType<typeof createPrivateQuarantineStorage>, sig: AbortSignal) {
   const reserved = await provision(db, storage);
   const served = new Uint8Array(png);
   const digest = sha256(served);
@@ -100,8 +102,76 @@ async function published(db: FileReservationsFixture, config: PrivateQuarantineS
 
 const expectCode = async (run: Promise<unknown>, code: string): Promise<void> => { await expect(run).rejects.toMatchObject({ code }); };
 
+type Completion = 'confirmed' | 'committed-unacknowledged' | 'aborted-unacknowledged';
+
+async function finishRestoreRun(failures: unknown[], releases: readonly (() => void | Promise<void>)[]): Promise<void> {
+  for (const release of releases) {
+    try { await release(); } catch (error) { failures.push(error); }
+  }
+  if (failures.length === 1) { throw failures[0]; }
+  if (failures.length > 1) { throw new AggregateError(failures, 'Restore scenario or cleanup failed'); }
+}
+
+// Redacted diagnostics for a real source/destination mismatch, no row values.
+async function schemaMeasurement(connection: Pick<Client, 'query'>) {
+  return { legacy: await verifyClosedBase(connection), S1: await readP05Metadata(connection, 'S1'),
+    S2: await readP05Metadata(connection, 'S2') };
+}
+
+/** Only the target's terminal COMMIT is faulted. A real PG transaction is
+ * committed or aborted and the driver adapter hides the reply. An independent
+ * backend observes the result, but never supplies a receipt to the installer. */
+async function checkUncertainCompletion(ctx: RestoreContext, manifest: ReturnType<typeof signSnapshot>,
+  mode: Exclude<Completion, 'confirmed'>, sig: AbortSignal): Promise<void> {
+  const observer = new Client(restoreDbOptions(ctx.destinationDatabase, 'migrator'));
+  let checkedOutPid = 0;
+  let casCount = 0;
+  let commits = 0;
+  let rollbacks = 0;
+  let issued: RestoreGateReceipt | undefined;
+  let before: unknown;
+  let hiddenCommand: unknown;
+  const state = async () => (await observer.query<{ mode: string; epoch: string; connect: boolean; independent: boolean }>(
+    `SELECT mode,epoch::text,has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT') AS connect,
+      pg_backend_pid()<>$1 AS independent FROM foundation.file_runtime_epochs WHERE singleton`, [checkedOutPid])).rows;
+  const controlled = withQueryHook(ctx.targetOperatorPool, sql => /^(UPDATE foundation\.file_runtime_epochs|COMMIT$|ROLLBACK$)/u.test(sql),
+    async (sql, client, send) => {
+      if (sql.startsWith('UPDATE')) { casCount++; return send(); }
+      if (sql === 'ROLLBACK') { rollbacks++; return send(); }
+      commits++;
+      checkedOutPid = (await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]?.pid ?? 0;
+      await observer.connect();
+      before = await state();
+      // Do not inject a fake CommandComplete: record the real command tag,
+      // conceal it only from restore, and assert it outside the error boundary.
+      const reply: unknown = mode === 'committed-unacknowledged' ? await send() : await client.query('ROLLBACK');
+      hiddenCommand = typeof reply === 'object' && reply !== null && 'command' in reply ? reply.command : undefined;
+      throw new Error('Synthetic lost target completion');
+    });
+  const faulted = { ...ctx, targetOperatorPool: controlled };
+  try {
+    await expectCode(rescrubFileRestore(faulted, manifest, sig).then(result => { issued = result; }), 'RESTORE_COMMIT_UNKNOWN');
+    expect(issued).toBeUndefined();
+    expect(checkedOutPid).toBeGreaterThan(0);
+    expect(before).toEqual([{ mode: 'RESTORE_CLOSED', epoch: String(ctx.oldScope.writerEpoch), connect: false, independent: true }]);
+    expect([casCount, commits, rollbacks]).toEqual([1, 1, 0]);
+    expect(ctx.targetOperatorPool.totalCount).toBe(0);
+    const didCommit = mode === 'committed-unacknowledged';
+    expect(hiddenCommand).toBe(didCommit ? 'COMMIT' : 'ROLLBACK');
+    expect(await state()).toEqual([{ mode: didCommit ? 'ACTIVE' : 'RESTORE_CLOSED',
+      epoch: String(didCommit ? ctx.nextEpoch : ctx.oldScope.writerEpoch), connect: false, independent: true }]);
+    const restore = vi.fn(ctx.restoreArchives);
+    await expectCode(rescrubFileRestore(faulted, manifest, sig), 'RESTORE_INPUT');
+    await expectCode(rescrubFileRestore({ ...faulted, restoreArchives: restore }, manifest, sig), 'RESTORE_CLOSED');
+    expect(restore).not.toHaveBeenCalled();
+    expect([casCount, commits, rollbacks]).toEqual([1, 1, 0]);
+  } finally { await observer.end(); }
+}
+
 live('P03-04D copy-only isolated restore', () => {
-  it('uses real old archives, Garage copy, authoritative fenced overlay, pending drain and independent anchored ledger', async () => {
+  it.each(['confirmed', 'committed-unacknowledged', 'aborted-unacknowledged'] as const)('uses real archives, Garage copy, fenced overlay and independent ledger: %s', async mode => {
+    const sig = AbortSignal.timeout(170_000);
+    const policy = restorePolicy();
     expect(process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS']).toBe('1');
     expect(process.env['FIXLEVELUP_STORAGE_S3_TESTS']).toBe('1');
     const schemaVersion = authFixtureMigrations.at(-1) ?? '';
@@ -109,10 +179,11 @@ live('P03-04D copy-only isolated restore', () => {
     expect(authFixtureMigrations[18]).toBe('20261122000500_catalog_fixed_prices');
     expect(authFixtureMigrations[19]).toBe('20261122000600_pricing_rules_ranges');
     expect(authFixtureMigrations[20]).toBe('20261122000700_catalog_management');
-    // The restore contour now runs on the S1 profile (022 request intake);
-    // its source-side P05 fact is SCHEMA-verified through the new callback.
-    expect(schemaVersion).toBe('20261123000100_request_intake_foundation');
-    const sourceDb = await startFileReservationsDatabase();
+    expect(authFixtureMigrations[21]).toBe('20261123000100_request_intake_foundation');
+    // The restore contour now runs on the S2 profile (023 form session
+    // foundation over the 022 request intake); its source-side P05 fact is
+    // SCHEMA-verified through the new callback.
+    expect(schemaVersion).toBe('20261124000100_form_session_foundation');
     const [ops, writer, nextWriter, signer, floorOps, floorRuntime] = [ledgerPool('file_ledger_operator'), ledgerPool('file_ledger_writer'),
       ledgerPool('file_ledger_writer_next'), ledgerPool('file_ledger_signer'), ledgerPool('file_floor_operator'), ledgerPool('file_floor_verifier')] as const;
     const maintenance = new Pool(restoreDbOptions('postgres', 'maintenance'));
@@ -126,11 +197,12 @@ live('P03-04D copy-only isolated restore', () => {
     // run owns the disposable destination — the flag plus the strict disposable-name
     // pattern gate the teardown drop).
     let destinationCreated = false;
-    const targetOps = new Pool(restoreDbOptions(destination, 'migrator'));
+    let disposeDestination: Awaited<ReturnType<typeof pinFreshFileDatabase>> | undefined;
+    const targetOps = new Pool({ ...restoreDbOptions(destination, 'migrator'), max: 1 });
     const pools = [ops, writer, nextWriter, signer, floorOps, floorRuntime, maintenance, targetOps];
     const cleanups: (() => void | Promise<void>)[] = [];
     /** Drops exactly the destination database this run created, after every pool of
-     * this run was ended. FORCE also handles the ALLOW_CONNECTIONS false creation. */
+     * this run was ended. A busy target is retained and reported, never FORCE-dropped. */
     const dropDestination = async (): Promise<void> => {
       if (!destinationCreated) { return; }
       if (!/^fixlevelup_file_restore_[a-f0-9]{24}$/.test(destination)) {
@@ -139,11 +211,14 @@ live('P03-04D copy-only isolated restore', () => {
       destinationCreated = false;
       const dropper = new Pool(restoreDbOptions('postgres', 'maintenance'));
       try {
-        await dropper.query(`DROP DATABASE IF EXISTS "${destination}" WITH (FORCE)`);
+        if (!disposeDestination) { throw new Error('Missing fresh restore target identity'); }
+        await disposeDestination(dropper);
       } finally {
         await dropper.end();
       }
     };
+    const failures: unknown[] = [];
+    const sourceDb = await startFileReservationsDatabase();
     try {
       const genesis = await bootstrapFileLedgerNamespace({ mode: 'local-synthetic', ledgerOperatorPool: ops, floorOperatorPool: floorOps,
         signerPublicKey: ledgerKeys.publicKey, initialEpoch: 1n });
@@ -161,11 +236,15 @@ live('P03-04D copy-only isolated restore', () => {
       const staleVerifier: FileLedgerVerifier = createFileLedgerVerifier({ ledger: {
         getEvents: (s, from, to) => ledger.getEvents(s, from, to), getHead: (_scope, nonce) => ledger.getHead(scope, nonce),
       }, floor, signerPublicKey: ledgerKeys.publicKey, limits: proofLimits });
+      await installPinnedMigrationHistory(sourceDb.migrator);
       await sourceDb.migrator.query(`INSERT INTO foundation.file_runtime_epochs (singleton,namespace_id,epoch,mode) VALUES (true,$1,1,'ACTIVE')`, [namespace]);
       const sourceTarget = freshGarageBucket(namespace);
       const fresh = freshGarageBucket();
       const sourceConfig = storageConfig(sourceTarget, true);
       const sourceStorage = createPrivateQuarantineStorage(sourceConfig);
+      let sourceClosing: Promise<void> | undefined;
+      const closeSourceStorage = () => (sourceClosing ??= sourceStorage.close());
+      cleanups.push(closeSourceStorage);
       const readyStorage = createPrivateQuarantineStorage(storageConfig(fresh, false));
       const reader = createS3Client(validateConfig(storageConfig(fresh, false)));
       const sourceReader = createS3Client(validateConfig(storageConfig(sourceTarget, false)));
@@ -173,11 +252,11 @@ live('P03-04D copy-only isolated restore', () => {
       cleanups.push(() => { sourceReader.destroy(); }, () => writerStorage.close());
       const io = createRestoreObjectIO({ source: storageConfig(sourceTarget, false), destination: storageConfig(fresh, true),
         maxObjectBytes: limits.maxObjectBytes });
-      cleanups.push(() => sourceStorage.close(), () => readyStorage.close(), () => { reader.destroy(); io.close(); });
-      const survivor = await published(sourceDb, sourceConfig, sourceStorage);
-      const held = await published(sourceDb, sourceConfig, sourceStorage);
-      const retired = await published(sourceDb, sourceConfig, sourceStorage);
-      const withdrawn = await published(sourceDb, sourceConfig, sourceStorage);
+      cleanups.push(() => readyStorage.close(), () => { reader.destroy(); io.close(); });
+      const survivor = await published(sourceDb, sourceConfig, sourceStorage, sig);
+      const held = await published(sourceDb, sourceConfig, sourceStorage, sig);
+      const retired = await published(sourceDb, sourceConfig, sourceStorage, sig);
+      const withdrawn = await published(sourceDb, sourceConfig, sourceStorage, sig);
       const quarantined = await provision(sourceDb, sourceStorage); // Real B binding, never processed or published.
       // Real commit-before-byte history for an unbound, already dispatched orphan. Its UNKNOWN remains charged.
       const orphan = randomUUID();
@@ -219,25 +298,29 @@ live('P03-04D copy-only isolated restore', () => {
       const retention = await planRetention({ ...sourcePrivacy, grant: operator('RETENTION'), scope }, sig);
       expect(retention.advanced).toBe(1);
       await expectCode(Promise.resolve().then(() => readAuthorityInventory(sourceDb.migrator, limits)), 'RESTORE_AUTHORITY');
-      const budget = createFileReadBudget({ mode: 'local-synthetic', namespace, singleProcess: true, maxBufferedBytes: 2_200_000,
-        maxActiveStreams: 2, maxLiveOperationsPerOwner: 4 });
-      const sourceAccess = { pool: sourceDb.runtime, epoch, storage: sourceStorage,
-        policy: accessPolicy({ maxBufferedBytes: 2_200_000 }), budget };
-      const oldTicket = await openReadyStream(sourceAccess, { ...survivor.file, signal: sig });
-      expect((await readReadyChunk(oldTicket)).kind).toBe('CHUNK');
-      const broker = createSyntheticDeleteBroker({ mode: 'local-synthetic', namespace, epoch: epoch.epoch, targets: [sourceConfig] });
+      // The historical read-ticket smoke needs one serving namespace per process.
+      // The two independent COMMIT probes never serve a file or allocate a read budget.
+      const sourceAccess = mode === 'confirmed' ? { pool: sourceDb.runtime, epoch, storage: sourceStorage,
+        policy: accessPolicy({ maxBufferedBytes: 2_200_000 }),
+        budget: createFileReadBudget({ mode: 'local-synthetic', namespace, singleProcess: true, maxBufferedBytes: 2_200_000,
+          maxActiveStreams: 2, maxLiveOperationsPerOwner: 4 }) } : undefined;
+      const oldTicket = sourceAccess ? await openReadyStream(sourceAccess, { ...survivor.file, signal: sig }) : undefined;
+      if (oldTicket) { expect((await readReadyChunk(oldTicket)).kind).toBe('CHUNK'); }
+      const broker = mode === 'confirmed'
+        ? createSyntheticDeleteBroker({ mode: 'local-synthetic', namespace, epoch: epoch.epoch, targets: [sourceConfig] }) : undefined;
       await sourceDb.migrator.query(`UPDATE foundation.file_runtime_epochs SET mode='FENCED' WHERE singleton AND namespace_id=$1 AND epoch=1 AND mode='ACTIVE'`, [namespace]);
-      await revokeDeleteBroker(broker);
-      await expectCode(Promise.resolve().then(() => requireDeleteBroker(broker, namespace, epoch.epoch)), 'NOT_CONFIGURED');
-      await expect(readReadyChunk(oldTicket)).rejects.toBeDefined();
-      await closeReadyStream(oldTicket);
-      await expectCode(readReadyMetadata(sourceAccess, survivor.file), 'NOT_CONFIGURED');
+      if (broker && oldTicket && sourceAccess) {
+        await revokeDeleteBroker(broker);
+        await expectCode(Promise.resolve().then(() => requireDeleteBroker(broker, namespace, epoch.epoch)), 'NOT_CONFIGURED');
+        await expect(readReadyChunk(oldTicket)).rejects.toBeDefined();
+        await closeReadyStream(oldTicket);
+        await expectCode(readReadyMetadata(sourceAccess, survivor.file), 'NOT_CONFIGURED');
+      }
       expect((await drainFencedFileDecisions({ ...sourcePrivacy, grant: operator('SOURCE_DRAIN'), scope, ledger, verifier }, sig)).advanced).toBe(1);
       const fenceRow = await maintenance.query(`REVOKE CONNECT ON DATABASE "${sourceDb.database}" FROM fixlevelup_runtime`);
       expect(fenceRow.command).toBe('REVOKE');
       // Only this fixture's runtime service is shut down; the dev DB/roles and other fixtures are not touched.
-      await sourceDb.runtime.end();
-      await sourceStorage.close();
+      await closeSourceStorage();
       const oldRuntime = new Client(restoreDbOptions(sourceDb.database, 'runtime'));
       try { await expect(oldRuntime.connect()).rejects.toMatchObject({ code: '42501' }); }
       finally { await oldRuntime.end(); }
@@ -245,39 +328,60 @@ live('P03-04D copy-only isolated restore', () => {
       expect(head.seq).toBe(1n);
       const inventorySha256 = await readAuthorityInventory(sourceDb.migrator, limits);
       const overlaySha256 = archives.overlay();
+      const sourceObserver = new Client({ ...restoreDbOptions(sourceDb.database, 'migrator'),
+        options: '-c default_transaction_read_only=on' });
+      cleanups.push(async () => { await sourceObserver.end(); });
+      await sourceObserver.connect();
+      const sourceOid = (await sourceObserver.query<{ oid: string }>(
+        'SELECT oid::text AS oid FROM pg_database WHERE datname=current_database()',
+      )).rows[0]?.oid;
+      const sourceDatabaseOid = Number(sourceOid);
+      if (!Number.isSafeInteger(sourceDatabaseOid) || sourceDatabaseOid <= 0) { throw new Error('Missing pinned source database OID'); }
+      const sourcePin = { database: sourceDb.database, databaseOid: sourceDatabaseOid, scope, profile: 'S2' as const,
+        manifestSha256: authHash, challenge: randomBytes(32).toString('hex') };
+      // The restore core independently checks the hard fence and compares the
+      // inventory digest before trusting this manifest/challenge-bound signature.
+      const authorityNonces: string[] = [];
       const currentAuthority: RestoreContext['currentAuthority'] = async ({ challenge, manifestSha256 }) => {
-        const row = (await sourceDb.migrator.query<{ db: string; mode: string; epoch: string; runtime_open: boolean; live_runtime: boolean }>(`SELECT
-          current_database() AS db,mode,epoch::text,has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT') AS runtime_open,
-          EXISTS(SELECT 1 FROM pg_stat_activity a WHERE a.datname=current_database() AND a.usename='fixlevelup_runtime') AS live_runtime
-          FROM foundation.file_runtime_epochs WHERE singleton AND namespace_id=$1`, [namespace])).rows[0];
-        if (manifestSha256 !== authHash || row?.db !== sourceDb.database || row.mode !== 'FENCED' || row.epoch !== '1' || row.runtime_open
-          || row.live_runtime || await readAuthorityInventory(sourceDb.migrator, limits) !== inventorySha256) {throw new Error('Current authority is not fenced');}
+        if (manifestSha256 !== authHash || await readAuthorityInventory(sourceObserver, limits) !== inventorySha256) {
+          throw new Error('Current authority is not fenced');
+        }
+        authorityNonces.push(challenge);
         return signAuthority({ challenge, manifestSha256, overlaySha256, inventorySha256, head }, authorityKeys.privateKey);
       };
-      // §5.3 synthetic operator bridge: the fixture source is the full S1 chain,
-      // so the proven post-drain fact is P05_EMPTY_AFTER_DRAIN. Nonces are fresh
-      // per handoff (captured for the challenge-distinction check below).
-      const p05Nonces: string[] = [];
-      const readP05SourceState: RestoreContext['readP05SourceState'] = async ({ challenge, manifestSha256 }) => {
-        if (manifestSha256 !== authHash) {throw new Error('Unknown manifest');}
-        if (p05Nonces.includes(challenge)) {throw new Error('Challenge reuse');}
-        p05Nonces.push(challenge);
-        const fact = await assertP05AbsentAfterDrain(sourceDb.migrator);
-        return { fact, profile: 'S1', nonce: randomUUID() };
-      };
+      const heldSession = new Client(restoreDbOptions(sourceDb.database, 'migrator'));
+      await heldSession.connect();
+      try {
+        await sourceDb.drainPools();
+        await maintenance.query(`ALTER DATABASE "${sourceDb.database}" ALLOW_CONNECTIONS false`);
+        const rejectedObserver = new Client(restoreDbOptions(sourceDb.database, 'migrator'));
+        try { await expect(rejectedObserver.connect()).rejects.toMatchObject({ code: '55000' }); }
+        finally { await rejectedObserver.end(); }
+        await expectCode(observeFencedSource(sourceObserver, sourcePin, limits), 'RESTORE_AUTHORITY');
+      } finally { await heldSession.end(); }
+      await expect(observeFencedSource(sourceObserver, sourcePin, limits)).resolves.toMatchObject({ profile: 'S2',
+        fact: 'P05_EMPTY_AFTER_DRAIN', nonce: sourcePin.challenge, manifestSha256: authHash, inventorySha256 });
+      const sourceSchema = await schemaMeasurement(sourceObserver);
       const ctx: RestoreContext = {
         mode: 'local-synthetic', schemaVersion, sourceDatabase: sourceDb.database, destinationDatabase: destination, oldScope: scope,
         nextEpoch: nextScope.writerEpoch, limits, targetOperatorPool: targetOps, snapshotKey: snapshotKeys.publicKey,
-        approvalKey: approvalKeys.publicKey, authorityKey: authorityKeys.publicKey, verifier, currentAuthority, readP05SourceState,
+        approvalKey: approvalKeys.publicKey, authorityKey: authorityKeys.publicKey, verifier, currentAuthority,
+        sourceObserver, sourceDatabaseOid,
         async restoreArchives(snapshot, authority) {
           await archives.restore(snapshot.dumpSha256, authority.overlaySha256, async () => {
             await maintenance.query(`CREATE DATABASE "${destination}" OWNER fixlevelup_migrator TEMPLATE template0 ALLOW_CONNECTIONS false`);
             destinationCreated = true;
+            disposeDestination = await pinFreshFileDatabase(maintenance, destination);
             await maintenance.query(`REVOKE ALL ON DATABASE "${destination}" FROM PUBLIC,fixlevelup_runtime`);
             await maintenance.query(`ALTER DATABASE "${destination}" ALLOW_CONNECTIONS true`);
           }, async () => {
-            await targetOps.query(`INSERT INTO foundation.file_runtime_epochs (singleton,namespace_id,epoch,mode)
-              VALUES (true,$1,$2,'RESTORE_CLOSED')`, [namespace, epoch.epoch.toString()]);
+            const restored = await targetOps.connect();
+            try {
+              await restoreReviewedExpressions(sourceObserver, restored, snapshot.destinationDatabase);
+              expect(await schemaMeasurement(restored)).toEqual(sourceSchema);
+              await restored.query(`INSERT INTO foundation.file_runtime_epochs (singleton,namespace_id,epoch,mode)
+                VALUES (true,$1,$2,'RESTORE_CLOSED')`, [namespace, epoch.epoch.toString()]);
+            } finally { restored.release(); }
           });
         },
         openBackupObject: (item) => Promise.resolve(archives.object(item, limits.maxObjectBytes)),
@@ -289,7 +393,20 @@ live('P03-04D copy-only isolated restore', () => {
           return signApproval(binding, approvalKeys.privateKey);
         },
       };
+      if (mode !== 'confirmed') {
+        await checkUncertainCompletion(ctx, manifest, mode, sig);
+        expect(authorityNonces).toHaveLength(2);
+        archives.evidence({ terminalCompletion: mode, receipt: false, runtimeConnect: false, automaticRetry: false });
+        return;
+      }
+      if (!sourceAccess) { throw new Error('Missing confirmed serving namespace'); }
       await expectCode(rescrubFileRestore({ ...ctx }, { ...manifest, payload: manifest.payload + ' ' }, sig), 'RESTORE_INPUT');
+      const noAuthority = vi.fn(currentAuthority);
+      const noObject = vi.fn(ctx.openBackupObject);
+      await expectCode(rescrubFileRestore({ ...ctx, sourceDatabaseOid: sourceDatabaseOid + 1,
+        currentAuthority: noAuthority, openBackupObject: noObject }, manifest, sig), 'RESTORE_AUTHORITY');
+      expect(noAuthority).not.toHaveBeenCalled();
+      expect(noObject).not.toHaveBeenCalled();
       await expectCode(rescrubFileRestore({ ...ctx, currentAuthority: () => Promise.reject(new Error('Unavailable source')) }, manifest, sig), 'RESTORE_AUTHORITY');
       await expectCode(rescrubFileRestore({ ...ctx, verifier: staleVerifier }, manifest, sig), 'RESTORE_LEDGER');
       const missingFloor = createFileLedgerVerifier({ ledger, floor: {
@@ -301,11 +418,11 @@ live('P03-04D copy-only isolated restore', () => {
         altered[0] = (altered[0] ?? 0) ^ 1;
         return Promise.resolve(altered);
       } }, manifest, sig), 'RESTORE_OBJECT');
+      authorityNonces.length = 0;
       const receipt = await rescrubFileRestore(ctx, manifest, sig);
       expect(receipt).toMatchObject({ mode: 'ACTIVE', epoch: { namespace, epoch: 2n }, copied: 7, tombstoned: 3, unresolved: 0 });
-      // §5.3: the two activation handoffs each presented a FRESH challenge nonce.
-      expect(p05Nonces).toHaveLength(2);
-      expect(new Set(p05Nonces).size).toBe(2);
+      expect(authorityNonces).toHaveLength(2);
+      expect(new Set(authorityNonces).size).toBe(2);
       // The physical dump/restore must carry 018, not just claim its name in the manifest.
       // The synthetic founder was commissioned, but no management commands ran.
       expect((await targetOps.query(sourceRowsSql)).rows).toEqual(originalFounderSources);
@@ -428,14 +545,11 @@ live('P03-04D copy-only isolated restore', () => {
         survivor: 'ready-stream-exact-bytes', revoked: 'denied', hold: 'post-backup-current-open-protected',
         pending: 'drained-before-handoff', oldWriter: 'fenced', unresolvedDebt: 'unchanged', maxReconcileBatch: 1,
         originalObjectDeletes: 0, restoredCopiesConfirmedAbsent: 2 });
-    } finally {
-      // Lifecycle order: close the storages/clients this run opened, then its pools
-      // (including the maintenance pool that may still hold the destination), then
-      // drop exactly the destination database this run created. The source fixture
-      // database is dropped by its own fixture close (startFileReservationsDatabase).
-      await Promise.allSettled([...cleanups.map(async close => close()), ...pools.map(async pool => pool.end()),
-        sourceDb.close()]);
-      await dropDestination().catch(() => undefined);
+    } catch (error) { failures.push(error); }
+    finally {
+      // End the source observer before disposing the fenced source. Each owned
+      // target has a distinct random name, checked by its successful CREATE.
+      await finishRestoreRun(failures, [...cleanups.reverse(), ...pools.map(pool => () => pool.end()), () => sourceDb.close(), dropDestination]);
     }
   }, 175_000);
 });

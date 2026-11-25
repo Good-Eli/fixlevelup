@@ -6,8 +6,6 @@ import { registerShutdown } from '../runtime/lifecycle.js';
 import { loadDatabaseConfig } from '../infrastructure/database/runtime-database.js';
 import { loadRuntimeAdmission } from '../infrastructure/admission/runtime-admission.js';
 import { admitProcess, ProcessAdmissionError } from '../infrastructure/admission/process-admission.js';
-import type { LauncherChannel } from '../infrastructure/admission/process-admission.js';
-import { physicalProfileVerifier } from '../infrastructure/admission/physical-profile.js';
 
 const logger = new SafeLogger('worker');
 /** Sentinel: the admission stage already logged its own typed event. */
@@ -32,9 +30,6 @@ try {
   try {
     authorization = await admitProcess(admission, {
       database,
-      channel: (typeof process.send === 'function'
-        ? process as unknown as LauncherChannel : undefined),
-      verifyProfile: physicalProfileVerifier(database),
       approvalTimeoutMs: Number(process.env['LAUNCH_APPROVAL_TIMEOUT_MS'] ?? 10_000),
     });
   } catch (error) {
@@ -48,6 +43,6 @@ try {
   if (error !== STAGE_DONE) { logger.event('startup_failed'); }
   // An unadmitted process must terminate now: the open IPC handle would keep
   // the event loop alive otherwise.
-  if (typeof process.disconnect === 'function') { process.disconnect(); }
+  if (process.connected && typeof process.disconnect === 'function') { process.disconnect(); }
   process.exit(1);
 }

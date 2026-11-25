@@ -12,16 +12,14 @@
  */
 import { createServer } from 'node:net';
 import type { Server, Socket } from 'node:net';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { Client } = require('pg') as typeof import('pg');
 
-const root = resolve(import.meta.dirname, '../../..');
-const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'))?.[1] ?? '';
+// The loopback protocol fixture never authenticates a database account.
+const wireIdentity = { database: 'wire_test', user: 'wire_client', password: 'synthetic-wire-only', ssl: false } as const;
 
 /** Minimal PG wire server: full startup handshake, then black-hole. */
 function stallAfterHandshake(): Promise<{ server: Server; port: number }> {
@@ -63,7 +61,7 @@ it('query_timeout fires on an established session whose server never answers (cl
   try {
     // 1. PROOF of established session: connect() resolves (the handshake
     //    completed — ReadyForQuery was delivered).
-    const client = new Client({ host: '127.0.0.1', port, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword,
+    const client = new Client({ host: '127.0.0.1', port, ...wireIdentity,
       connectionTimeoutMillis: 5_000, query_timeout: 400 });
     await client.connect();
     // 2. The stalled query: only the CLIENT read timer can unblock it.
@@ -95,7 +93,7 @@ it('the admission gate fails closed when the registry stalls an established sess
   const instanceId = randomUUID();
   const gate = new AdmissionGate({
     binding: {
-      database: 'postgres', databaseOid: 5, role: 'fixlevelup_dev', schema: 'public',
+      database: wireIdentity.database, databaseOid: 5, role: wireIdentity.user, schema: 'public',
       witnessKey: witnessKeyForInstance(instanceId), profile: 'S1',
       witnessHolderPid: 4_000_000,
       expected: { endpoint: `127.0.0.1:${String(port)}`, issuerGeneration: 1, launchNonce: randomUUID(),
@@ -104,7 +102,7 @@ it('the admission gate fails closed when the registry stalls an established sess
     },
     publicKeyPem: '',
   });
-  const client = new Client({ host: '127.0.0.1', port, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword,
+  const client = new Client({ host: '127.0.0.1', port, ...wireIdentity,
     connectionTimeoutMillis: 5_000, query_timeout: 400 });
   try {
     await client.connect();

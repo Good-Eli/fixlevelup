@@ -6,8 +6,9 @@
  * name that is not a freshly created `fixlevelup_legal_test_<24 random hex>`.
  * The suffix is cryptographically random, so a run can never reuse a previous
  * database: `CREATE DATABASE` failing on an existing name is a hard error, not a
- * silent reuse of stale rows. Nothing here touches the working dev database and
- * nothing deletes a database.
+ * silent reuse of stale rows. Nothing here touches the working dev database; the
+ * only database this fixture deletes is the one it created itself (owned
+ * lifecycle in owned-test-database.ts), also when provisioning fails midway.
  *
  * The migration chain is the shared `authFixtureMigrations` list, so this fixture
  * follows the real chain (including `013_settings_legal_references`) without a
@@ -23,6 +24,7 @@ import { describe } from 'vitest';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { beginLegalTransaction } from '../src/settings/legal/legal-tx.js';
 import { authFixtureMigrations } from './auth-db-fixture.js';
+import { OwnedTestDatabase, fixtureCredentials } from './owned-test-database.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 const migrationRoot = resolve(root, 'prisma/migrations');
@@ -36,14 +38,6 @@ export const legalIntegration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TE
 if (!authFixtureMigrations.includes(LEGAL_MIGRATION)) {
   // Fail loudly instead of silently proving the ports against an older schema.
   throw new Error('Legal fixture requires the 013 settings/legal migration in the shared chain');
-}
-
-function secret(env: string, name: string): string {
-  const match = new RegExp(`^${name}=([a-f0-9]{64})$`, 'm').exec(env);
-  if (!match?.[1]) {
-    throw new Error(`Missing local test credential: ${name}`);
-  }
-  return match[1];
 }
 
 export interface LegalFixtureDatabase {
@@ -63,58 +57,23 @@ export async function startLegalDatabase(): Promise<LegalFixtureDatabase> {
   if (!/^fixlevelup_legal_test_[a-f0-9]{24}$/.test(name)) {
     throw new Error('Invalid legal fixture database name');
   }
-  const postgresEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-  const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  const postgresPassword = secret(postgresEnv, 'POSTGRES_PASSWORD');
-  const runtimePassword = secret(runtimeEnv, 'FIXLEVELUP_RUNTIME_PASSWORD');
-  const migratorPassword = secret(runtimeEnv, 'FIXLEVELUP_MIGRATOR_PASSWORD');
+  // Credentials follow the shared fixture policy: lab mode reads only the lab
+  // process env (never the dev `.env` files, no partial-env fallback).
+  const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
 
-  // The maintenance role can only reach `postgres` and this one CREATE/GRANT block;
-  // it is closed before migrations, seeds or port calls start.
-  const maintenance = new Pool({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: postgresPassword, max: 1 });
-  // Set exactly when this run's CREATE DATABASE succeeded: CREATE is the reuse
-  // guard (an existing name is a hard error), so a successful CREATE proves the
-  // database is this run's own disposable artifact.
-  let databaseCreated = false;
-  try {
-    await maintenance.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    databaseCreated = true;
-    await maintenance.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
-    await maintenance.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
-  } finally {
-    await maintenance.end();
-  }
+  // Owned lifecycle: the maintenance role only reaches `postgres` for this one
+  // CREATE/REVOKE/GRANT block, and any failure from here to the returned fixture
+  // drops exactly this run's database (see owned-test-database.ts).
+  const owned = await OwnedTestDatabase.create({
+    name,
+    pattern: /^fixlevelup_legal_test_[a-f0-9]{24}$/,
+    prepare: async (maintenance) => {
+      await maintenance.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+      await maintenance.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
+    },
+  });
   const migrator = new Pool({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword, max: 2 });
   const runtime = new Pool({ ...connection, database: name, user: 'fixlevelup_runtime', password: runtimePassword, max: 4 });
-  let closed = false;
-  /** Ownership proof for the teardown drop: the `databaseCreated` flag (set exactly
-   * when this run's CREATE DATABASE succeeded — CREATE is the reuse guard, an
-   * existing name is a hard error) AND the strict disposable-name pattern. Consumes
-   * the flag, so a second call never drops anything. */
-  const takeCreatedDatabase = (): string | undefined => {
-    if (!databaseCreated) { return undefined; }
-    databaseCreated = false;
-    return /^fixlevelup_legal_test_[a-f0-9]{24}$/.test(name) ? name : undefined;
-  };
-  /** Ends this run's pools first, then drops exactly the database this run created.
-   * Idempotent: the ownership flag is consumed by the first call. */
-  const dispose = async (): Promise<void> => {
-    if (closed) { return; }
-    closed = true;
-    const ownedDatabase = takeCreatedDatabase();
-    try {
-      try { await runtime.end(); } finally { await migrator.end(); }
-    } finally {
-      if (ownedDatabase !== undefined) {
-        const dropper = new Pool({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: postgresPassword, max: 1 });
-        try {
-          await dropper.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
-        } finally {
-          await dropper.end();
-        }
-      }
-    }
-  };
   try {
     const actual = await migrator.query<{ db: string }>('SELECT current_database() AS db');
     if (actual.rows[0]?.db !== name) {
@@ -137,13 +96,15 @@ export async function startLegalDatabase(): Promise<LegalFixtureDatabase> {
       runtime,
       staffId,
       close: async () => {
-        await dispose();
+        // Ends this run's pools first, then drops exactly this run's database.
+        await owned.dispose(async () => { try { await runtime.end(); } finally { await migrator.end(); } });
       },
     };
   } catch (error) {
-    // Provisioning failed after CREATE: the same lifecycle cleanup runs before rethrowing.
-    await dispose().catch(() => undefined);
-    throw error;
+    // Provisioning failed after CREATE: close the pools this run opened, drop
+    // exactly this run's database, and surface a teardown failure instead of
+    // swallowing it (AggregateError carries both errors).
+    throw await owned.failure(error, async () => { try { await runtime.end(); } finally { await migrator.end(); } });
   }
 }
 

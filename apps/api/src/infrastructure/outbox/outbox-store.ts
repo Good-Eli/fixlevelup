@@ -1,7 +1,7 @@
 import type { DatabaseConfig } from '../database/runtime-database.js';
 import { admittedPool } from '../admission/pool-guard.js';
 import type { GuardedPool } from '../admission/pool-guard.js';
-import type { RuntimeAdmission } from '../admission/runtime-admission.js';
+import type { ProcessAuthorization } from '../admission/process-admission.js';
 
 export interface OutboxLease {
   readonly id: string;
@@ -24,9 +24,9 @@ export class OutboxStore {
   private readonly pool: GuardedPool;
   private closing = false;
 
-  constructor(config: DatabaseConfig, admission: RuntimeAdmission) {
+  constructor(config: DatabaseConfig, authorization: ProcessAuthorization, kind: 'WORKER' | 'TEST' = 'WORKER') {
     // P05-01 §7: this pool is admitted per checkout by the launch gate.
-    this.pool = admittedPool({ gate: admission.gate }, { ...config, max: 2, connectionTimeoutMillis: 1000,
+    this.pool = admittedPool({ authorization, kind }, config, { max: 2, connectionTimeoutMillis: 1000,
       query_timeout: 2000, statement_timeout: 1000, idleTimeoutMillis: 1000,
       options: '-c lock_timeout=1000', application_name: 'fixlevelup-outbox-runtime' });
     this.pool.on('error', () => { /* driver errors may contain credentials */ });

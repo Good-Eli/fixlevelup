@@ -1,29 +1,18 @@
-/**
- * Real launcher→child IPC harness for compiled-process tests (P05-01 §7,
- * audit round 6 MUST 5): spawns a compiled child with the Node IPC channel,
- * acts as the LAUNCHER side, and proves the child only starts after the
- * single approval.
- *
- * The parent process is the launcher: it holds the witness, provisions the
- * one-time registry row, and answers the child's handshake with the real
- * decideLaunch() — the same code the production launcher runs. Every
- * decision (approve or reject) passes through it; tests may corrupt the
- * launcher's trusted binding to exercise the BINDING gate on a genuine
- * compiled child.
- */
+/** Compiled-child IPC harness for the attested lab and its external control registry. */
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Client } from 'pg';
 import type { ChildProcess } from 'node:child_process';
-import { admitFixture } from './admission-fixture.js';
-import type { AdmittedHandle } from './admission-fixture.js';
-import { ensureLaunchRegistry, issueProof, readRegistryState } from '../src/infrastructure/admission/registry.js';
-import { decideLaunch } from '../src/infrastructure/admission/launcher.js';
+import { issueVerifiedLaunch, openVerifiedControl, verifiedControlConfig } from './admission-fixture.js';
+import type { AdmissionHandle } from './admission-fixture.js';
+import { readRegistryState } from '../src/infrastructure/admission/registry.js';
+import type { DatabaseConfig } from '../src/infrastructure/database/runtime-database.js';
+import { superviseLaunch } from '../src/infrastructure/admission/launcher.js';
+import type { LaunchSupervisor } from '../src/infrastructure/admission/launcher.js';
 import { witnessKeyForInstance } from '../src/infrastructure/admission/runtime-admission.js';
-import type { ChildHandshake } from '../src/infrastructure/admission/process-admission.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 export const moduleUrl = (path: string): string => pathToFileURL(resolve(root, 'apps/api/dist', path)).href;
@@ -49,50 +38,91 @@ export interface LaunchOptions {
   /** Corrupts the launcher's trusted binding: the production decideLaunch
    * must refuse the genuine child at the BINDING gate (no DB access). */
   readonly corruptBinding?: boolean;
+  /** Re-deliver only the genuine frame received on this child’s own channel. */
+  readonly repeatFirstHandshake?: () => void;
 }
 
 export interface LauncherHandle {
-  readonly admission: AdmittedHandle;
+  readonly admission: AdmissionHandle;
   launch(options: LaunchOptions): Promise<LaunchOutcome>;
   close(): Promise<void>;
 }
 
-function migratorPassword(): string {
-  const tooling = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  const password = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(tooling)?.[1];
-  if (!password) { throw new Error('Local migrator credentials required for the launcher harness'); }
-  return password;
+type LauncherTarget = {
+  readonly runtime: DatabaseConfig;
+  readonly operator: { readonly host: string; readonly port: number; readonly database: string;
+    readonly user: string; readonly password: string };
+  readonly artifactPaths: readonly string[];
+  readonly expectedMigrations?: readonly string[];
+};
+
+const CHILD_ENV = ['NODE_ENV', 'APP_HOST', 'APP_PORT', 'SHUTDOWN_TIMEOUT_MS', 'LAUNCH_APPROVAL_TIMEOUT_MS',
+  'WEB_AUTH_ENABLED', 'WEB_AUTH_ORIGIN', 'WEB_AUTH_CSRF_SECRET', 'WEB_AUTH_THROTTLE_SECRET'] as const;
+
+function artifactDigestOf(paths: readonly string[]): string {
+  if (paths.length === 0) { throw new Error('No compiled launch artifact was pinned'); }
+  const dist = resolve(root, 'apps/api/dist');
+  if (!lstatSync(dist).isDirectory() || relative(realpathSync(root), realpathSync(dist)) !== relative(root, dist)) {
+    throw new Error('Invalid compiled launch artifact root');
+  }
+  const files: string[] = [];
+  function collect(dir: string): void {
+    for (const name of readdirSync(dir)) {
+      const path = resolve(dir, name);
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) { throw new Error('Linked compiled launch artifact'); }
+      if (stat.isDirectory()) { collect(path); }
+      else if (stat.isFile() && /\.(?:js|mjs|cjs|json)$/.test(name)) { files.push(relative(dist, path)); }
+    }
+  }
+  collect(dist);
+  for (const path of paths) {
+    const entry = relative(dist, path);
+    if (!isAbsolute(path) || isAbsolute(entry) || !files.includes(entry)) {
+      throw new Error('Launch entry is outside the compiled artifact');
+    }
+  }
+  const digest = createHash('sha256').update('fixlevelup/api-dist/v1\0');
+  for (const entry of files.sort()) {
+    const name = Buffer.from(entry.split(sep).join('/'), 'utf8');
+    const bytes = readFileSync(resolve(dist, entry));
+    digest.update(`${String(name.byteLength)}:${String(bytes.byteLength)}:`).update(name).update(bytes);
+  }
+  return digest.digest('hex');
 }
 
-/**
- * Starts a real launcher for the dev database: holds the witness (per-instance
- * key), provisions launch_control on the SAME instance (isolated equivalent
- * of the control DB; its separate ownership/role isolation is proven in
- * requests-admission.test.ts), and issues the one-time row for the compiled
- * child's proof.
- */
-export async function startLauncher(consumerKind: 'API' | 'WORKER', database = 'fixlevelup_dev'): Promise<LauncherHandle> {
-  const password = (() => {
-    const source = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    return /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(source)?.[1] ?? '';
+/** Starts an explicitly targeted isolated launch; no dev or control-owner fallback. */
+export async function startLauncher(consumerKind: 'API' | 'WORKER', target: LauncherTarget): Promise<LauncherHandle> {
+  const { runtime, operator } = target;
+  const { database } = runtime;
+  if (!/^fixlevelup_p05_[a-z0-9_]{1,48}$/.test(database) || database !== operator.database
+    || operator.host !== runtime.host || operator.port !== runtime.port || operator.user !== 'fixlevelup_migrator') {
+    throw new Error('Invalid isolated compiled launcher target');
+  }
+  const control = verifiedControlConfig(database);
+  const paths = [...target.artifactPaths];
+  const artifactDigest = artifactDigestOf(paths);
+  const holder = new Client({ ...operator, connectionTimeoutMillis: 3000, statement_timeout: 3000, query_timeout: 4000 });
+  const admission = await (async () => {
+    try {
+      await holder.connect();
+      return await issueVerifiedLaunch(holder, runtime, { consumerKind, artifactDigest,
+        ...(target.expectedMigrations === undefined ? {} : { expectedMigrations: target.expectedMigrations }) });
+    } catch (error) {
+      await holder.end().catch(() => undefined);
+      throw error;
+    }
   })();
-  const holder = new Client({ host: '127.0.0.1', port: 55432, database, user: 'fixlevelup_runtime', password });
-  await holder.connect();
-  const admission = await admitFixture(holder, database, consumerKind);
-  const control = new Client({ host: '127.0.0.1', port: 55432, database, user: 'fixlevelup_migrator', password: migratorPassword() });
-  await control.connect();
-  await ensureLaunchRegistry(control);
   const generation = Number(admission.env['LAUNCH_ISSUER_GENERATION']);
   const nonce = String(admission.env['LAUNCH_NONCE']);
   const instanceId = String(admission.env['LAUNCH_INSTANCE_ID']);
   const channelId = String(admission.env['LAUNCH_CHANNEL_ID']);
-  await issueProof(control, { issuerGeneration: generation, launchNonce: nonce, proofDigest: admission.admission.proofDigest,
-    consumerKind, instanceId, channelId, expiresAt: new Date(Date.now() + 300_000) });
-  const launcherDeps = { app: { host: '127.0.0.1', port: 55432, database, user: 'fixlevelup_migrator', password: migratorPassword() },
-    control: { host: '127.0.0.1', port: 55432, database, user: 'fixlevelup_migrator', password: migratorPassword() },
-    witnessKeyOf: witnessKeyForInstance, ackTimeoutMs: 5_000 };
+  const launcherDeps = { app: operator, control, witnessKeyOf: witnessKeyForInstance, ackTimeoutMs: 5_000 };
+  const { binding } = admission.admission;
   const expected = { instanceId, launchNonce: nonce, consumerKind, proofDigest: admission.admission.proofDigest,
-    issuerGeneration: generation, witnessHolderPid: admission.admission.binding.witnessHolderPid, channelId };
+    issuerGeneration: generation, witnessHolderPid: binding.witnessHolderPid, channelId,
+    database, databaseOid: binding.databaseOid, role: binding.role, profile: binding.profile };
+  let supervisor: LaunchSupervisor | undefined;
   return {
     admission,
     launch: (options) => new Promise<LaunchOutcome>((resolveLaunch) => {
@@ -101,66 +131,60 @@ export async function startLauncher(consumerKind: 'API' | 'WORKER', database = '
       const trusted = options.corruptBinding === true
         ? { ...expected, launchNonce: randomUUID() }
         : expected;
+      if (artifactDigestOf(paths) !== artifactDigest) { throw new Error('Pinned launch artifacts changed'); }
+      const env: NodeJS.ProcessEnv = {
+        ...admission.env, FIXLEVELUP_LAB_DATABASE: database,
+        DB_HOST: runtime.host, DB_PORT: String(runtime.port), DB_NAME: database,
+        DB_USER: runtime.user, DB_PASSWORD: runtime.password,
+      };
+      for (const name of CHILD_ENV) {
+        const value = options.env[name];
+        if (value !== undefined) { env[name] = value; }
+      }
       const child: ChildProcess = spawn(process.execPath, ['--input-type=module', '--eval', options.source], {
-        cwd: root, env: { ...options.env, ...admission.env }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], timeout: options.timeoutMs,
+        cwd: root, env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], timeout: options.timeoutMs,
       });
       let stdout = '';
       let stderr = '';
       let approvals = 0;
       let rejects = 0;
-      let acked = false;
-      let decision: string | undefined;
-      let ackResolver: ((acked: boolean) => void) | undefined;
-      // The in-flight launcher decision: on child exit the harness waits for
-      // it to settle before reporting, so an ack deadline still pending when
-      // the child dies is reported as its real outcome (never 'no-handshake').
-      let inFlight: Promise<void> = Promise.resolve();
       child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
       child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
-      child.on('message', (message: unknown) => {
-        if (message === null || typeof message !== 'object' || !('type' in message)) { return; }
-        const typed = message as Record<string, unknown>;
-        if (typed['type'] === 'p05/launch/active') {
-          // The activation ack is only counted when bound to THIS instance.
-          acked = typed['instanceId'] === expected.instanceId;
-          ackResolver?.(acked);
-          return;
-        }
-        if (typed['type'] !== 'p05/launch/handshake') { return; }
-        // Every decision goes through the production decideLaunch: the
-        // trusted-binding gate, witness gate, CAS, post-COMMIT checks and the
-        // launcher's own ack deadline all run for the real compiled child.
-        inFlight = decideLaunch(launcherDeps, trusted, message as ChildHandshake,
-          (iid, n) => { approvals += 1; child.send({ type: 'p05/launch/approve', instanceId: iid, launchNonce: n }); },
-          (iid) => { rejects += 1; child.send({ type: 'p05/launch/reject', instanceId: iid }); },
-          () => new Promise<boolean>((resolveAck) => {
-            if (acked) { resolveAck(true); return; }
-            ackResolver = resolveAck;
-          }),
-        ).then((d) => { decision = d.approved ? `approved:${d.acked ? 'acked' : 'unacked'}` : `rejected:${d.reason}`; },
-          () => { decision = 'launcher-error'; });
+      child.on('error', () => undefined); // also handles a synchronous spawn refusal
+      const supervised = superviseLaunch(launcherDeps, trusted, child, {
+        startupTimeoutMs: options.timeoutMs, drainTimeoutMs: 5_000,
+        onSend: ({ type }) => {
+          if (type === 'p05/launch/approve') { approvals += 1; }
+          if (type === 'p05/launch/reject') { rejects += 1; }
+        },
       });
-      child.on('exit', (code) => {
-        void inFlight.then(() => {
-          resolveLaunch({ status: code, stdout, stderr, approvals, rejects, acked, exitCode: code,
-            decision: decision ?? 'no-handshake' });
+      supervisor = supervised;
+      if (options.repeatFirstHandshake) {
+        let repeated = false;
+        child.on('message', (message: unknown) => {
+          if (repeated || typeof message !== 'object' || message === null || !('type' in message) || message.type !== 'p05/launch/handshake') { return; }
+          repeated = true;
+          child.emit('message', message);
+          options.repeatFirstHandshake?.();
         });
+      }
+      void Promise.all([supervised.activation, supervised.closed]).then(([result]) => {
+        const code = child.exitCode;
+        resolveLaunch({ status: code, stdout, stderr, approvals, rejects, acked: result.approved, exitCode: code,
+          decision: result.approved ? 'approved:acked' : `rejected:${result.reason}` });
       });
-      child.on('error', () => { resolveLaunch({ status: null, stdout, stderr, approvals, rejects, acked, exitCode: null,
-        decision: decision ?? 'spawn-error' }); });
     }),
     close: async () => {
+      await supervisor?.stop();
       await admission.release();
-      await control.end().catch(() => undefined);
       await holder.end().catch(() => undefined);
     },
   };
 }
 
 /** Exposed for the test's registry-state assertions. */
-export async function registryState(generation: number, nonce: string, database = 'fixlevelup_dev') {
-  const client = new Client({ host: '127.0.0.1', port: 55432, database, user: 'fixlevelup_migrator', password: migratorPassword() });
-  await client.connect();
+export async function registryState(generation: number, nonce: string) {
+  const client = await openVerifiedControl(verifiedControlConfig(process.env['FIXLEVELUP_LAB_DATABASE'] ?? ''));
   try { return await readRegistryState(client, generation, nonce); }
   finally { await client.end().catch(() => undefined); }
 }

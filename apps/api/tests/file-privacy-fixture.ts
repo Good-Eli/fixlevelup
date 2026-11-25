@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Pool } from 'pg';
+import { labGarageCli } from '../../../infra/file-restore/resources.mjs';
 import {
   bootstrapFileLedgerNamespace, createFileLedgerVerifier, createPgFileLedger, createPgFloorStore,
 } from '../src/files/file-ledger/index.js';
@@ -270,7 +271,12 @@ export async function rejectOutbox(db: FileReservationsFixture, intentId: string
     CREATE TRIGGER ${name} BEFORE INSERT ON foundation.outbox_events FOR EACH ROW EXECUTE FUNCTION foundation.${name}('${intentId}','${operationId ?? ''}')`);
 }
 
+/** Lab mode (P05-02 S4): the real Garage CLI at the pinned path and config.
+ * Dev mode keeps the historical Docker-exec path unchanged. */
 function garage(...args: string[]): string {
+  if (process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
+    return labGarageCli('privacy-garage', ...args);
+  }
   try {
     return execFileSync('docker', ['exec','fixlevelup-dev-s3','/garage', ...args], {
       encoding: 'utf8', timeout: 15_000, stdio: ['ignore','pipe','pipe'], windowsHide: true,

@@ -34,10 +34,25 @@ export interface RuntimeAdmission {
   readonly payload: LaunchProofPayload;
 }
 
+// Identity of the immutable bundle returned only after the signed token and
+// trusted expectations have been checked. A structural copy is not a proof.
+const verifiedBundles = new WeakSet<RuntimeAdmission>();
+export function isVerifiedRuntimeAdmission(value: RuntimeAdmission): boolean {
+  return verifiedBundles.has(value);
+}
+
+/** Match application configuration against the verified endpoint, role and database. */
+export function matchesRuntimeTarget(admission: RuntimeAdmission,
+  target: Pick<DatabaseConfig, 'host' | 'port' | 'database' | 'user'>): boolean {
+  const binding = admission.binding;
+  return binding.database === target.database && binding.role === target.user
+    && binding.expected.endpoint === `${target.host}:${String(target.port)}`;
+}
+
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const digestPattern = /^[0-9a-f]{64}$/;
 const consumerKinds: readonly ConsumerKind[] = ['API', 'WORKER', 'TEST'];
-const profiles: readonly ProofProfile[] = ['S0', 'S1'];
+const profiles: readonly ProofProfile[] = ['S0', 'S1', 'S2'];
 
 /** Deterministic per-instance witness objectId inside the 557001 namespace
  * (positive 31-bit, collision-safe for the isolated contour). */
@@ -161,5 +176,15 @@ export function loadRuntimeAdmission(env: NodeJS.ProcessEnv, deps: { database: D
   // The registry digest is DERIVED from the verified canonical payload — the
   // binding of the one-time consumption to the exact signed token (round-5
   // audit MUST 2: no separately supplied digest can name another row).
-  return { gate, binding, payload, proofDigest: proofDigestOf(payload) };
+  const proofDigest = proofDigestOf(payload);
+  Object.freeze(binding.expected);
+  Object.freeze(binding.witnessKey);
+  Object.freeze(binding);
+  Object.freeze(payload.targetIdentity);
+  Object.freeze(payload.witness);
+  Object.freeze(payload);
+  Object.freeze(gate);
+  const verified = Object.freeze({ gate, binding, payload, proofDigest });
+  verifiedBundles.add(verified);
+  return verified;
 }

@@ -11,10 +11,13 @@
  *   suffix means a run never reuses a previous database, and the existing
  *   `fixlevelup_(...|legal)_test_...` guard in `auth-db-fixture.ts` already accepts
  *   it, so no extra allowlist entry is needed;
- * - the maintenance role only reaches `postgres` and one CREATE/GRANT block;
+ * - the maintenance role only reaches `postgres` and one CREATE/GRANT block
+ *   (owned lifecycle in owned-test-database.ts, which also drops this run's own
+ *   database when provisioning fails midway);
  *   migrations run as the migrator role, the ports under test run as the real
  *   `fixlevelup_runtime` role;
- * - nothing deletes a database, drops rows or touches the working dev database.
+ * - nothing drops rows or touches the working dev database; the only database
+ *   this fixture deletes is the one it created itself.
  *
  * The migration chain is the shared `authFixtureMigrations` list (the file-proof
  * task adds migration 014 to it). This fixture requires 014 to be present and
@@ -23,12 +26,10 @@
  *
  * All synthetic rows (reviewed staff, city, legal documents, consent evidence) are
  * written by the migration owner, never by the port under test, so a port cannot
- * authorize itself. Credentials are read from the local ignored env files and are
- * never printed.
+ * authorize itself. Credentials come from the shared fixture policy (lab process
+ * env in lab mode, local ignored env files otherwise) and are never printed.
  */
 import { randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { describe } from 'vitest';
@@ -38,8 +39,8 @@ import {
   publishLegalDocumentVersion, recordConsentGiven, recordConsentRevoked,
 } from '../src/settings/legal/index.js';
 import { authFixtureMigrations, migrateAuthFixture } from './auth-db-fixture.js';
+import { OwnedTestDatabase, fixtureCredentials } from './owned-test-database.js';
 
-const root = resolve(import.meta.dirname, '../../..');
 const FILE_RESERVATIONS_MIGRATION = '20261121000500_file_upload_reservations';
 const connection = { host: '127.0.0.1' as const, port: 55432 };
 
@@ -50,24 +51,6 @@ export const fileReservationsIntegration =
 if (!authFixtureMigrations.includes(FILE_RESERVATIONS_MIGRATION)) {
   // Fail loudly instead of silently proving the ports against a schema without 014.
   throw new Error('File reservation fixture requires migration 014 in the shared auth fixture chain');
-}
-
-function secret(env: string, name: string): string {
-  const match = new RegExp(`^${name}=([a-f0-9]{64})$`, 'm').exec(env);
-  if (!match?.[1]) {
-    throw new Error(`Missing local isolated test credential: ${name}`);
-  }
-  return match[1];
-}
-
-function credentials(): { admin: string; migrator: string; runtime: string } {
-  const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-  const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  return {
-    admin: secret(adminEnv, 'POSTGRES_PASSWORD'),
-    migrator: secret(toolingEnv, 'FIXLEVELUP_MIGRATOR_PASSWORD'),
-    runtime: secret(toolingEnv, 'FIXLEVELUP_RUNTIME_PASSWORD'),
-  };
 }
 
 export interface FixtureCity {
@@ -84,6 +67,8 @@ export interface FileReservationsFixture {
   readonly city: FixtureCity;
   /** Runs `run` inside one explicit runtime transaction, rolling back on failure. */
   inTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T>;
+  /** End both application pools once; the operator may keep the closed database for a restore handoff. */
+  drainPools(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -92,59 +77,35 @@ export async function startFileReservationsDatabase(): Promise<FileReservationsF
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') {
     throw new Error('File reservation fixture requires FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1');
   }
-  const { admin: adminPassword, migrator: migratorPassword, runtime: runtimePassword } = credentials();
+  // Credentials follow the shared fixture policy: lab mode reads only the lab
+  // process env (never the dev `.env` files, no partial-env fallback).
+  const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
   // The existing auth fixture guard already accepts this prefix; the random suffix
   // makes CREATE DATABASE the reuse check (an existing name is a hard error).
   const database = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
   if (!/^fixlevelup_legal_test_[a-f0-9]{24}$/.test(database)) {
     throw new Error('Invalid file reservation fixture database name');
   }
-  const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-  await admin.connect();
-  // Set exactly when this run's CREATE DATABASE succeeded: CREATE is the reuse
-  // guard (an existing name is a hard error), so a successful CREATE proves the
-  // database is this run's own disposable artifact.
-  let databaseCreated = false;
-  try {
-    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    databaseCreated = true;
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-  } finally {
-    await admin.end();
-  }
+  // Owned lifecycle: the maintenance role only reaches `postgres` for this one
+  // CREATE/REVOKE/GRANT block, and any failure from here to the returned fixture
+  // drops exactly this run's database (see owned-test-database.ts).
+  const owned = await OwnedTestDatabase.create({
+    name: database,
+    gracefulFileDrop: true,
+    pattern: /^fixlevelup_legal_test_[a-f0-9]{24}$/,
+    prepare: async (maintenance) => {
+      await maintenance.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await maintenance.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+    },
+  });
   const migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 4 });
   const runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 6 });
-  let closed = false;
-  /** Ownership proof for the teardown drop: the `databaseCreated` flag (set exactly
-   * when this run's CREATE DATABASE succeeded — CREATE is the reuse guard, an
-   * existing name is a hard error) AND the strict disposable-name pattern. Consumes
-   * the flag, so a second call never drops anything. */
-  const takeCreatedDatabase = (): string | undefined => {
-    if (!databaseCreated) { return undefined; }
-    databaseCreated = false;
-    return /^fixlevelup_legal_test_[a-f0-9]{24}$/.test(database) ? database : undefined;
-  };
-  /** Ends this run's pools first, then drops exactly the database this run created.
-   * Idempotent: the ownership flag is consumed by the first call. */
-  const dispose = async (): Promise<void> => {
-    if (closed) { return; }
-    closed = true;
-    const ownedDatabase = takeCreatedDatabase();
-    try {
-      await Promise.all([runtime.end(), migrator.end()]);
-    } finally {
-      if (ownedDatabase !== undefined) {
-        const maintenance = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-        try {
-          await maintenance.connect();
-          await maintenance.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
-        } finally {
-          await maintenance.end().catch(() => undefined);
-        }
-      }
-    }
-  };
+  let drained: Promise<void> | undefined;
+  const drainPools = (): Promise<void> => (drained ??= (async () => {
+    const results = await Promise.allSettled([runtime.end(), migrator.end()]);
+    const errors = results.filter(result => result.status === 'rejected').map(result => result.reason as unknown);
+    if (errors.length) { throw new AggregateError(errors, 'File reservation fixture pool drain failed'); }
+  })());
   try {
     const migrationClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
     await migrationClient.connect();
@@ -178,14 +139,17 @@ export async function startFileReservationsDatabase(): Promise<FileReservationsF
           client.release();
         }
       },
+      drainPools,
       async close(): Promise<void> {
-        await dispose();
+        // Ends this run's pools first, then drops exactly this run's database.
+        await owned.dispose(drainPools);
       },
     };
   } catch (error) {
-    // Provisioning failed after CREATE: the same lifecycle cleanup runs before rethrowing.
-    await dispose().catch(() => undefined);
-    throw error;
+    // Provisioning failed after CREATE: close this run's pools, drop exactly this
+    // run's database, and surface a teardown failure instead of swallowing it
+    // (AggregateError carries both errors).
+    throw await owned.failure(error, drainPools);
   }
 }
 

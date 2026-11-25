@@ -1,6 +1,4 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -8,6 +6,7 @@ import { CityContextError, readSingleCityContext, SINGLE_CITY_CONTEXT_SQL } from
 import type { CityContextReader } from '../src/settings/geography/city-context.js';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { migrateAuthFixture } from './auth-db-fixture.js';
+import { becomeOwner, dropOwnedTestDatabase, fixtureCredentials, maintenanceOpener } from './owned-test-database.js';
 
 const incomplete = { code: 'CONFIGURATION_INCOMPLETE' };
 
@@ -50,7 +49,6 @@ describe('single city context read port', () => {
 
 // Explicit opt-in only: creates a random isolated database and never touches the dev database.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
-const root = resolve(import.meta.dirname, '../../..');
 const connection = { host: '127.0.0.1' as const, port: 55432 };
 
 integration('single city context against isolated PostgreSQL', () => {
@@ -58,7 +56,7 @@ integration('single city context against isolated PostgreSQL', () => {
   let migrator: Pool;
   let runtime: Pool;
   let reviewer: string;
-  let maintenancePassword: string | undefined;
+  let maintenance: Client | undefined;
   let dbName: string | undefined;
   let dbCreated = false;
   let tornDown = false;
@@ -79,39 +77,33 @@ integration('single city context against isolated PostgreSQL', () => {
     const ownedDatabase = takeOwnedDatabase();
     try { await Promise.all(pools.map((pool) => pool.end())); }
     finally {
-      if (ownedDatabase !== undefined && maintenancePassword !== undefined) {
-        const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: maintenancePassword });
-        try {
-          await admin.connect();
-          await admin.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
-        } finally { await admin.end().catch(() => undefined); }
-      }
+      try {
+        if (ownedDatabase !== undefined && maintenance !== undefined) {
+          await dropOwnedTestDatabase(maintenance, ownedDatabase);
+        }
+      } finally { await maintenance?.end().catch(() => undefined); }
     }
   }
 
   beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-    if (!adminPassword || !migratorPassword || !runtimePassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
-    maintenancePassword = adminPassword;
+    // Lab mode reads the lab process env and the attested maintenance binding;
+    // dev mode reads the local ignored env files. Never the dev database.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
+    maintenance = await maintenanceOpener()();
+    const admin = maintenance;
     // Same isolated fixture contract as the existing auth integration suites: a fresh
     // random database owned by the migrator, never the dev database.
     const database = `fixlevelup_auth_e2e_test_${randomBytes(12).toString('hex')}`;
-    const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
     try {
       await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
       // CREATE is the reuse guard: an existing name is a hard error, so a successful
       // CREATE proves this run owns the disposable database (the flag gates the drop).
       dbName = database;
       dbCreated = true;
+      // GRANT/REVOKE need the owner: in the lab the orchestrator is a NOINHERIT member.
+      await becomeOwner(admin);
       await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    } finally { await admin.end(); }
-    try {
       const fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
       await fixture.connect();
       try { await migrateAuthFixture(fixture, database); } finally { await fixture.end(); }

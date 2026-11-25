@@ -7,7 +7,8 @@ import { syntheticAdmission } from './admission-fixture.js';
 const root = resolve(import.meta.dirname, '../../..');
 const moduleUrl = (path: string): string => pathToFileURL(resolve(root, 'apps/api/dist', path)).href;
 const env = {
-  ...process.env,
+  // A release smoke child receives no operator, ledger, storage or control credential.
+  ...(process.env['SystemRoot'] ? { SystemRoot: process.env['SystemRoot'] } : {}),
   NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0', SHUTDOWN_TIMEOUT_MS: '5000',
   DB_HOST: '127.0.0.1', DB_PORT: '55432', DB_NAME: 'fixlevelup_dev', DB_USER: 'fixlevelup_runtime',
   DB_PASSWORD: 'synthetic-runtime-password-placeholder',

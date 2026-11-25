@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { Client } from 'pg';
@@ -24,6 +24,7 @@ const expectedSteps = [
   '20261122000600_pricing_rules_ranges',
   '20261122000700_catalog_management',
   '20261123000100_request_intake_foundation',
+  '20261124000100_form_session_foundation',
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })
@@ -45,6 +46,109 @@ export async function migrateAuthFixture(db: Client, database: string): Promise<
   for (const migration of authFixtureMigrations) {
     await db.query(readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8'));
   }
+}
+
+/** SHA-256 of the migration script with the newline form normalized, so the
+ * pinned manifest does not depend on the checkout's CRLF/LF representation. */
+function migrationChecksum(migration: string): string {
+  const sql = readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8').replaceAll('\r\n', '\n');
+  return createHash('sha256').update(sql, 'utf8').digest('hex');
+}
+
+interface ManifestEntry {
+  readonly name: string;
+  readonly checksum: string;
+}
+
+/** Stable SHA-256 of the ordered `name:checksum` manifest. */
+function manifestDigest(entries: readonly ManifestEntry[]): string {
+  return createHash('sha256')
+    .update(entries.map((entry) => `${entry.name}:${entry.checksum}`).join('\n'), 'utf8')
+    .digest('hex');
+}
+
+/**
+ * Writes the REAL Prisma migration history into `foundation._prisma_migrations`
+ * (the exact table shape Prisma uses) for the pinned chain, with one completed,
+ * non-rolled-back record per migration and the exact SHA-256 of the migration
+ * script as the checksum. The table is (re)created and fully repopulated, so
+ * the fixture history is exactly the manifest — never an accumulation of runs.
+ * The returned digest is the same value `verifyOperatorMigrationHistory`
+ * recomputes from the database rows.
+ */
+export async function installPinnedMigrationHistory(
+  db: Pick<Client, 'query'>,
+  migrations: readonly string[] = authFixtureMigrations,
+): Promise<{ readonly historyManifestDigest: string }> {
+  await db.query(`CREATE TABLE IF NOT EXISTS foundation._prisma_migrations (
+    id text PRIMARY KEY,
+    checksum varchar(64) NOT NULL,
+    finished_at timestamptz,
+    migration_name varchar(255) NOT NULL,
+    logs text,
+    rolled_back_at timestamptz,
+    started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    applied_steps_count integer NOT NULL DEFAULT 1
+  )`);
+  const entries = migrations.map((name) => ({ name, checksum: migrationChecksum(name) }));
+  await db.query('DELETE FROM foundation._prisma_migrations');
+  for (const entry of entries) {
+    await db.query(`INSERT INTO foundation._prisma_migrations
+      (id, checksum, finished_at, migration_name, rolled_back_at, applied_steps_count)
+      VALUES ($1, $2, clock_timestamp(), $3, NULL, 1)`, [randomUUID(), entry.checksum, entry.name]);
+  }
+  return { historyManifestDigest: manifestDigest(entries) };
+}
+
+interface MigrationHistoryRow {
+  readonly migration_name: string;
+  readonly checksum: string;
+  readonly finished_at: Date | null;
+  readonly rolled_back_at: Date | null;
+  readonly applied_steps_count: number;
+}
+
+/**
+ * Operator-contour preflight (docs/P05-PLAN.md §7 item 1): reads the REAL
+ * migration history and refuses on any deviation — a missing migration, an
+ * extra/unknown row, a NULL `finished_at`, a rolled-back record, an applied
+ * steps count other than 1, or a checksum that is not the exact SHA-256 of the
+ * pinned migration script. Every failure returns `ok: false` with an empty
+ * digest; the digest is only produced for a fully verified history.
+ */
+export async function verifyOperatorMigrationHistory(
+  db: Pick<Client, 'query'>,
+  expectedMigrations: readonly string[] = authFixtureMigrations,
+): Promise<{ readonly ok: boolean; readonly historyManifestDigest: string }> {
+  const failed = { ok: false, historyManifestDigest: '' } as const;
+  let rows: readonly MigrationHistoryRow[];
+  try {
+    const result = await db.query<MigrationHistoryRow>(
+      `SELECT migration_name, checksum, finished_at, rolled_back_at, applied_steps_count
+         FROM foundation._prisma_migrations
+         ORDER BY migration_name ASC`);
+    rows = result.rows;
+  } catch {
+    // An absent/unreadable history table is a failed preflight, never a success.
+    return failed;
+  }
+  if (rows.length !== expectedMigrations.length) { return failed; }
+  const entries: ManifestEntry[] = [];
+  for (const [index, expected] of expectedMigrations.entries()) {
+    const row = rows[index];
+    if (row === undefined
+      || row.migration_name !== expected
+      || !(row.finished_at instanceof Date)
+      || row.rolled_back_at !== null
+      || row.applied_steps_count !== 1) {
+      return failed;
+    }
+    let checksum: string;
+    try { checksum = migrationChecksum(expected); } catch { return failed; }
+    if (row.checksum !== checksum) { return failed; }
+    entries.push({ name: expected, checksum });
+  }
+  return { ok: true, historyManifestDigest: manifestDigest(entries) };
 }
 
 export async function inFixtureTransaction<T>(db: Client, run: () => Promise<T>): Promise<T> {

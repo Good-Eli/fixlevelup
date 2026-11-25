@@ -24,27 +24,31 @@ import { Pool } from 'pg';
 import { AdmissionRequiredError, admittedPool } from '../src/infrastructure/admission/pool-guard.js';
 import { loadRuntimeAdmission, witnessKeyForInstance } from '../src/infrastructure/admission/runtime-admission.js';
 import { admitProcess, validateAuthorization, ProcessAdmissionError } from '../src/infrastructure/admission/process-admission.js';
-import type { LauncherChannel } from '../src/infrastructure/admission/process-admission.js';
 import { physicalProfileVerifier } from '../src/infrastructure/admission/physical-profile.js';
 import { createApi, createWorker } from '../src/bootstrap/factories.js';
 import { ConfigurationError, loadConfig } from '../src/runtime/config.js';
 import { RuntimeDatabase } from '../src/infrastructure/database/runtime-database.js';
 import type { DatabaseConfig } from '../src/infrastructure/database/runtime-database.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
-import { admitFixture, syntheticAdmission } from './admission-fixture.js';
-import type { AdmissionHandle } from './admission-fixture.js';
+import { admitFixture, holdFixtureWitness, openVerifiedControl, syntheticAdmission, verifiedControlConfig } from './admission-fixture.js';
+import { testLaunchChannel, withTestLaunchChannel } from './admission-transport-fixture.js';
+import type { LauncherChannel } from '../src/infrastructure/admission/private-launch-channel.js';
+import type { AdmittedHandle } from './admission-fixture.js';
 import { createConfigurationFixture } from './configuration-fixture.js';
 import type { ConfigurationFixture } from './configuration-fixture.js';
 
 const proof = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? it : it.skip;
+// The three launcher-side proofs below issue a proof into the separate control
+// database and therefore need the provisioned P05 lab contour (same gate as
+// runtime-database.test.ts). Without it they must SKIP, not fail: the control
+// credentials are validated before any history is read, so an unlabelled run
+// would report a configuration error instead of the proof's own subject.
+const labEnabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1';
+const labProof = labEnabled ? proof : it.skip;
 const root = resolve(import.meta.dirname, '../../..');
-const connection = { host: '127.0.0.1' as const, port: 55432 };
 
 function runtimePassword(): string {
-  const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  const password = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-  if (!password) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
-  return password;
+  return wiringPassword('FIXLEVELUP_RUNTIME_PASSWORD');
 }
 
 function databaseConfig(database: string): DatabaseConfig {
@@ -138,7 +142,7 @@ it('createApi and createWorker refuse database consumers without admission', asy
 // --- Real PostgreSQL part: GuardedPool semantics and Prisma compatibility. ---
 
 let fixture: ConfigurationFixture | undefined;
-let handle: AdmissionHandle | undefined;
+let handle: AdmittedHandle | undefined;
 
 beforeAll(async () => {
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') { return; }
@@ -156,10 +160,8 @@ proof('wiring: guarded pool admits with the witness, serves Prisma readiness, fa
   const current = requireFixture();
   await current.migrator.query('CREATE TABLE IF NOT EXISTS foundation._prisma_migrations (id text PRIMARY KEY)');
   handle = await admitFixture(current.migrator, current.database, 'TEST');
-  // The operator env contour → loader → gate is the exact production chain.
-  const loaded = loadRuntimeAdmission(handle.env, { database: databaseConfig(current.database) });
-  const pool = admittedPool({ gate: loaded.gate }, { ...connection, database: current.database,
-    user: 'fixlevelup_runtime', password: runtimePassword(), max: 2 });
+  const target = databaseConfig(current.database);
+  const pool = admittedPool({ authorization: handle.authorization, kind: 'TEST' }, target, { max: 2 });
   // Proxy over a real pg.Pool: Prisma's instanceof check keeps holding.
   expect(pool instanceof Pool).toBe(true);
   const single = await pool.query<{ ok: number }>('SELECT 1 AS ok');
@@ -168,7 +170,7 @@ proof('wiring: guarded pool admits with the witness, serves Prisma readiness, fa
   const kept = await pool.connect();
   try {
     // Prisma compatibility: the whole RuntimeDatabase probe runs through the guard.
-    const database = new RuntimeDatabase(databaseConfig(current.database), true, handle.admission);
+    const database = new RuntimeDatabase(target, true, handle.authorization, 'TEST');
     try {
       expect(await database.ready()).toBe(true);
     } finally {
@@ -188,27 +190,30 @@ proof('wiring: guarded pool admits with the witness, serves Prisma readiness, fa
   expect(denied).toBe('ADMISSION_REQUIRED/WITNESS_MISSING');
   const deniedQuery = await pool.query('SELECT 1').then(() => 'resolved', (error: unknown) =>
     error instanceof AdmissionRequiredError ? `${error.code}/${error.reason ?? 'none'}` : 'other');
-  expect(deniedQuery).toBe('ADMISSION_REQUIRED/WITNESS_MISSING');
+  // D4 permanently revokes this admission after the first proved witness loss.
+  expect(deniedQuery).toBe('ADMISSION_REQUIRED/none');
   await pool.end();
 });
 
-proof('process handshake (launcher protocol): witness-gated one-time CAS, single approval, replay/dead-witness refusals; physical profile gates admission', { timeout: 180_000 }, async () => {
+labProof('process handshake (simulated IPC, real DB): witness-gated one-time CAS, single approval, replay/dead-witness refusals; physical profile gates admission', { timeout: 180_000 }, async () => {
   const current = requireFixture();
   await current.migrator.query('CREATE TABLE IF NOT EXISTS foundation._prisma_migrations (id text PRIMARY KEY)');
+  // Resolve the control contour BEFORE taking a witness: a bad control
+  // configuration must not leak a held witness into the rest of the file.
+  const control = verifiedControlConfig(current.database);
   const admitted = await admitFixture(current.migrator, current.database, 'WORKER');
-  const { Client } = await import('pg');
-  const owner = new Client({ ...connection, database: current.database, user: 'fixlevelup_migrator',
-    password: migratorPassword() });
-  await owner.connect();
+  const owner = await openVerifiedControl(control).catch(async (error: unknown) => {
+    await admitted.release();
+    throw error;
+  });
   try {
     const loaded = loadRuntimeAdmission(admitted.env, { database: databaseConfig(current.database), requiredConsumer: 'WORKER' });
     // An API-only entrypoint must refuse a WORKER proof (consumer-kind binding).
     expect(() => loadRuntimeAdmission(admitted.env, { database: databaseConfig(current.database), requiredConsumer: 'API' }))
       .toThrow(ConfigurationError);
-    const { ensureLaunchRegistry, issueProof, readRegistryState } = await import('../src/infrastructure/admission/registry.js');
+    const { issueProof, readRegistryState } = await import('../src/infrastructure/admission/registry.js');
     const { decideLaunch } = await import('../src/infrastructure/admission/launcher.js');
     const { witnessKeyForInstance } = await import('../src/infrastructure/admission/runtime-admission.js');
-    await ensureLaunchRegistry(owner);
     const instanceId = String(admitted.env['LAUNCH_INSTANCE_ID']);
     const channelId = String(admitted.env['LAUNCH_CHANNEL_ID']);
     const generation = Number(admitted.env['LAUNCH_ISSUER_GENERATION']);
@@ -216,8 +221,6 @@ proof('process handshake (launcher protocol): witness-gated one-time CAS, single
     const proofDigest = loaded.proofDigest;
     await issueProof(owner, { issuerGeneration: generation, launchNonce: nonce, proofDigest,
       consumerKind: 'WORKER', instanceId, channelId, expiresAt: new Date(Date.now() + 120_000) });
-    const control = { host: '127.0.0.1', port: 55432, database: current.database,
-      user: 'fixlevelup_migrator', password: migratorPassword() };
     const launcherDeps = { app: { host: '127.0.0.1', port: 55432, database: current.database,
       user: 'fixlevelup_migrator', password: migratorPassword() }, control,
       witnessKeyOf: witnessKeyForInstance, ackTimeoutMs: 3_000 };
@@ -230,70 +233,61 @@ proof('process handshake (launcher protocol): witness-gated one-time CAS, single
     interface ChannelPair {
       readonly child: LauncherChannel;
       readonly handshake: Promise<Record<string, unknown>>;
-      readonly ack: Promise<boolean>;
+      readonly ack: Promise<unknown>;
+      readonly receipt: Promise<unknown>;
       deliver(message: unknown): void;
     }
     const childChannel = (): ChannelPair => {
-      const listeners: Array<(message: unknown) => void> = [];
       let resolveHandshake: (message: Record<string, unknown>) => void = () => undefined;
-      let resolveAck: (acked: boolean) => void = () => undefined;
+      let resolveAck: (message: unknown) => void = () => undefined;
+      let resolveReceipt: (message: unknown) => void = () => undefined;
       const handshake = new Promise<Record<string, unknown>>((resolve) => { resolveHandshake = resolve; });
-      const ack = new Promise<boolean>((resolve) => { resolveAck = resolve; });
-      const pair: ChannelPair = {
-        child: {
-          send: (message: unknown) => {
-            // Child→launcher messages flow to the launcher via the same
-            // listeners; handshake and activation ack are also captured.
-            for (const l of listeners) { l(message); }
-            if (message !== null && typeof message === 'object') {
-              const type = (message as Record<string, unknown>)['type'];
-              if (type === 'p05/launch/handshake') { resolveHandshake(message as Record<string, unknown>); }
-              if (type === 'p05/launch/active') { resolveAck(true); }
-            }
-            return true;
-          },
-          on: (_: 'message', listener: (message: unknown) => void) => { listeners.push(listener); return pair.child; },
-        },
-        handshake,
-        ack,
-        deliver: (message: unknown) => { for (const l of listeners) { l(message); } },
-      };
-      return pair;
+      const ack = new Promise<unknown>((resolve) => { resolveAck = resolve; });
+      const receipt = new Promise<unknown>((resolve) => { resolveReceipt = resolve; });
+      const wire = testLaunchChannel((message) => {
+        if (!('type' in message)) { return; }
+        if (message.type === 'p05/launch/handshake') { resolveHandshake(message); }
+        if (message.type === 'p05/launch/active') { resolveAck(message); }
+        if (message.type === 'p05/launch/activated') { resolveReceipt(message); }
+      });
+      return { child: wire.channel, handshake, ack, receipt, deliver: (message) => { wire.deliver(message); } };
     };
-    let active: ChannelPair | undefined;
-    const sendApprove = (iid: string, launchNonce: string): void => {
-      approvals.push(iid);
-      active?.deliver({ type: 'p05/launch/approve', instanceId: iid, launchNonce });
+    const runAdmission = (pair: ChannelPair): Promise<string> => withTestLaunchChannel(pair.child,
+      () => admitProcess(loaded, { database: databaseConfig(current.database), approvalTimeoutMs: 5_000 }))
+      .then(() => 'admitted', (error: unknown) => error instanceof ProcessAdmissionError ? error.kind : 'other');
+    const runChild = async (pair: ChannelPair) => {
+      const outcome = runAdmission(pair);
+      await Promise.race([pair.handshake, outcome.then((state) => { throw new Error(`Child refused before handshake: ${state}`); })]);
+      return { outcome };
     };
-    const sendReject = (iid: string): void => {
-      rejects.push(iid);
-      active?.deliver({ type: 'p05/launch/reject', instanceId: iid });
-    };
-    const falseProfile = (): Promise<boolean> => Promise.resolve(false);
-    const trueProfile = (): Promise<boolean> => Promise.resolve(true);
-    const depsFor = (channel: LauncherChannel, profileOk = true) => ({ database: databaseConfig(current.database),
-      channel, verifyProfile: profileOk ? trueProfile : falseProfile, approvalTimeoutMs: 2_000 });
-    const runChild = async (pair: ChannelPair, profileOk = true): Promise<{ outcome: Promise<string>; handshake: Record<string, unknown> }> => {
-      active = pair;
-      const outcome = admitProcess(loaded, depsFor(pair.child, profileOk)).then(() => 'admitted',
-        (error: unknown) => error instanceof ProcessAdmissionError ? error.kind : 'other');
-      return { outcome, handshake: await pair.handshake };
-    };
-
     // The launcher's OWN trusted expectations for the issued proof (never
     // derived from the child's self-reported handshake).
     const expected = { instanceId, launchNonce: nonce, consumerKind: 'WORKER' as const, proofDigest,
-      issuerGeneration: generation, witnessHolderPid: loaded.binding.witnessHolderPid, channelId };
-    // Feed a pair's handshake to the launcher's decideLaunch and await the
-    // decision (its bounded ack wait uses the pair's own ack promise).
-    const launch = (pair: ChannelPair): Promise<Awaited<ReturnType<typeof decideLaunch>>> =>
-      pair.handshake.then((handshake) => decideLaunch(launcherDeps, expected,
-        handshake as unknown as Parameters<typeof decideLaunch>[2], sendApprove, sendReject, () => pair.ack));
+      issuerGeneration: generation, witnessHolderPid: loaded.binding.witnessHolderPid, channelId,
+      database: loaded.binding.database, databaseOid: loaded.binding.databaseOid,
+      role: loaded.binding.role, profile: loaded.binding.profile };
+    const launch = async (pair: ChannelPair, override?: Record<string, unknown>) => {
+      const decision = await decideLaunch(launcherDeps, expected, override ?? await pair.handshake, process.pid, {
+        live: () => true,
+        send: (message) => {
+          if (message.type === 'p05/launch/approve') { approvals.push(message.instanceId); }
+          pair.deliver(message);
+          return Promise.resolve(true);
+        },
+        ack: pair.ack,
+        receipt: pair.receipt,
+      });
+      if (!decision.approved) {
+        rejects.push(expected.instanceId);
+        pair.deliver({ ...expected, pid: process.pid, type: 'p05/launch/reject' });
+      }
+      return decision;
+    };
 
     // 1. A drifted physical profile refuses BEFORE any handshake/consumption.
-    const drifted = await admitProcess(loaded, depsFor(childChannel().child, false)).then(() => 'admitted',
-      (error: unknown) => error instanceof ProcessAdmissionError ? error.kind : 'other');
-    expect(drifted).toBe('ADMISSION_DENIED');
+    await current.migrator.query('ALTER TABLE foundation.requests DISABLE TRIGGER requests_guard');
+    try { expect(await runAdmission(childChannel())).toBe('ADMISSION_DENIED'); }
+    finally { await current.migrator.query('ALTER TABLE foundation.requests ENABLE TRIGGER requests_guard'); }
     expect((await readRegistryState(owner, generation, nonce))?.state).toBe('ISSUED');
 
     // 2. The winner: correct profile, launcher decides, single approval, acked.
@@ -311,8 +305,7 @@ proof('process handshake (launcher protocol): witness-gated one-time CAS, single
     const forgedPair = childChannel();
     const forged = await runChild(forgedPair);
     const forgedHandshake = { ...await forgedPair.handshake, instanceId: randomUUID() } as Record<string, unknown>;
-    const forgedDecision = await decideLaunch(launcherDeps, expected,
-      forgedHandshake as unknown as Parameters<typeof decideLaunch>[2], sendApprove, sendReject, () => Promise.resolve(true));
+    const forgedDecision = await launch(forgedPair, forgedHandshake);
     expect(forgedDecision.approved).toBe(false);
     expect((forgedDecision as { reason: string }).reason).toBe('BINDING');
     expect(await forged.outcome).toBe('ADMISSION_DENIED');
@@ -334,9 +327,7 @@ proof('process handshake (launcher protocol): witness-gated one-time CAS, single
       consumerKind: 'WORKER', instanceId, channelId, expiresAt: new Date(Date.now() + 120_000) });
     await admitted.release();
     const deadPair = childChannel();
-    active = deadPair;
-    const deadOutcome = admitProcess(loaded, depsFor(deadPair.child)).then(() => 'admitted',
-      (error: unknown) => error instanceof ProcessAdmissionError ? error.kind : 'other');
+    const deadOutcome = runAdmission(deadPair);
     const deadHandshake = await Promise.race([deadPair.handshake, deadOutcome.then((outcome) => outcome)]);
     // The child refused at live verification — the outcome IS the verdict.
     expect(deadHandshake).toBe('ADMISSION_DENIED');
@@ -359,6 +350,14 @@ proof('authorization identity binding: a marker paired with a DIFFERENT admissio
   try {
     const a1 = first.authorization;
     const a2 = second.authorization;
+    // Even a byte-for-byte structural copy cannot start a handshake: only the
+    // immutable object returned by signature verification is eligible.
+    let sent = false;
+    const channel = testLaunchChannel(() => { sent = true; }).channel;
+    await expect(withTestLaunchChannel(channel, () => admitProcess({ ...first.admission }, {
+      database: databaseConfig(current.database), approvalTimeoutMs: 100,
+    }))).rejects.toMatchObject({ kind: 'ADMISSION_DENIED' });
+    expect(sent).toBe(false);
     // The genuine pairing validates.
     expect(() => validateAuthorization(a1)).not.toThrow();
     expect(() => validateAuthorization(a2)).not.toThrow();
@@ -380,53 +379,75 @@ proof('authorization identity binding: a marker paired with a DIFFERENT admissio
   }
 });
 
-proof('physical profile: the production classifier is exact and positive on a real 022 database (r7 MUST 3)', { timeout: 120_000 }, async () => {
+proof('physical profile: the production classifier is exact and positive on a real 023 database (r7 MUST 3)', { timeout: 180_000 }, async () => {
   const current = requireFixture();
-  // The fixture chain IS 022 (S1): the real classifier must admit an S1
-  // proof and refuse an S0 proof against the same physical database.
-  const s1 = await admitFixture(current.migrator, current.database, 'TEST');
-  // A separately SIGNED S0 proof (same witness machinery, S0 profile) for the
-  // same database — used to prove S0 never admits an S1 database.
-  const s0handle = await admitFixture(current.migrator, current.database, 'TEST', 'public', 'S0');
+  // The fixture chain IS 023 (S2): the real classifier must admit an S2 proof
+  // and refuse BOTH earlier profiles against the same physical database.
+  const s2 = await admitFixture(current.migrator, current.database, 'TEST');
+  expect(s2.admission.binding.profile).toBe('S2');
+  // Separately SIGNED S1/S0 proofs (same witness machinery) for the same
+  // database — used to prove neither earlier profile admits an S2 database.
+  const s1handle = await holdFixtureWitness(current.migrator, current.database, 'TEST', 'public', 'S1');
+  const s0handle = await holdFixtureWitness(current.migrator, current.database, 'TEST', 'public', 'S0');
   try {
     const verifier = physicalProfileVerifier(databaseConfig(current.database));
-    expect(await verifier(s1.admission)).toBe(true);
+    expect(await verifier(s2.admission)).toBe(true);
+    const s1 = loadRuntimeAdmission(s1handle.env, { database: databaseConfig(current.database) });
+    expect(s1.binding.profile).toBe('S1');
+    expect(await verifier(s1)).toBe(false);
     const s0 = loadRuntimeAdmission(s0handle.env, { database: databaseConfig(current.database) });
     expect(s0.binding.profile).toBe('S0');
     expect(await verifier(s0)).toBe(false);
-    // A damaged 022 is NEITHER profile: disable one guard trigger; the S1
-    // fingerprint is false AND the positive absence probe is also false
-    // (tables still exist), so both S1 and S0 are refused.
+    // A damaged 022 is NEITHER profile: disable one 022 guard trigger; the S2
+    // fingerprint is false (it embeds the 022 fingerprint) AND the positive
+    // absence probes are also false (tables still exist), so S2, S1 and S0 are
+    // all refused — a later profile never downgrades to an earlier one.
     await current.migrator.query('ALTER TABLE foundation.requests DISABLE TRIGGER requests_guard');
     try {
-      expect(await verifier(s1.admission)).toBe(false);
+      expect(await verifier(s2.admission)).toBe(false);
+      expect(await verifier(s1)).toBe(false);
       expect(await verifier(s0)).toBe(false);
     } finally {
       await current.migrator.query('ALTER TABLE foundation.requests ENABLE TRIGGER requests_guard');
     }
-    // Restored: S1 is exact again; S0 stays refused because the tables exist.
-    // Exactness in both directions.
-    expect(await verifier(s1.admission)).toBe(true);
+    // A damaged 023 is NEITHER profile either: disabling one 023 guard trigger
+    // breaks the S2 fingerprint while the 023 tables still exist, so S1's
+    // positive 023-absence probe stays false — a damaged S2 NEVER rolls back
+    // to S1. S0 stays refused for the same reason.
+    await current.migrator.query('ALTER TABLE foundation.form_browser_groups DISABLE TRIGGER form_browser_groups_guard');
+    try {
+      expect(await verifier(s2.admission)).toBe(false);
+      expect(await verifier(s1)).toBe(false);
+      expect(await verifier(s0)).toBe(false);
+    } finally {
+      await current.migrator.query('ALTER TABLE foundation.form_browser_groups ENABLE TRIGGER form_browser_groups_guard');
+    }
+    // Restored: S2 is exact again; S1 and S0 stay refused because the 023
+    // tables exist. Exactness in both directions.
+    expect(await verifier(s2.admission)).toBe(true);
+    expect(await verifier(s1)).toBe(false);
     expect(await verifier(s0)).toBe(false);
   } finally {
-    await s1.release();
+    await s2.release();
+    await s1handle.release();
     await s0handle.release();
   }
 });
 
-proof('launcher ack deadline: a silent child after approval is a failed launch (r7 MUST 2)', { timeout: 120_000 }, async () => {
+labProof('launcher ack deadline: simulated delivery loss after real CAS denies activation', { timeout: 120_000 }, async () => {
   const current = requireFixture();
   await current.migrator.query('CREATE TABLE IF NOT EXISTS foundation._prisma_migrations (id text PRIMARY KEY)');
+  // Control contour first: see the process-handshake proof above.
+  const control = verifiedControlConfig(current.database);
   const admitted = await admitFixture(current.migrator, current.database, 'WORKER');
-  const { Client } = await import('pg');
-  const owner = new Client({ ...connection, database: current.database, user: 'fixlevelup_migrator',
-    password: migratorPassword() });
-  await owner.connect();
+  const owner = await openVerifiedControl(control).catch(async (error: unknown) => {
+    await admitted.release();
+    throw error;
+  });
   try {
     const loaded = loadRuntimeAdmission(admitted.env, { database: databaseConfig(current.database), requiredConsumer: 'WORKER' });
-    const { ensureLaunchRegistry, issueProof, readRegistryState } = await import('../src/infrastructure/admission/registry.js');
+    const { issueProof, readRegistryState } = await import('../src/infrastructure/admission/registry.js');
     const { decideLaunch } = await import('../src/infrastructure/admission/launcher.js');
-    await ensureLaunchRegistry(owner);
     const instanceId = String(admitted.env['LAUNCH_INSTANCE_ID']);
     const channelId = String(admitted.env['LAUNCH_CHANNEL_ID']);
     const generation = Number(admitted.env['LAUNCH_ISSUER_GENERATION']);
@@ -436,66 +457,53 @@ proof('launcher ack deadline: a silent child after approval is a failed launch (
       consumerKind: 'WORKER', instanceId, channelId, expiresAt: new Date(Date.now() + 120_000) });
     const launcherDeps = { app: { host: '127.0.0.1', port: 55432, database: current.database,
       user: 'fixlevelup_migrator', password: migratorPassword() },
-      control: { host: '127.0.0.1', port: 55432, database: current.database,
-        user: 'fixlevelup_migrator', password: migratorPassword() },
+      control,
       witnessKeyOf: witnessKeyForInstance, ackTimeoutMs: 500 };
     // In-memory child that hands over a VALID handshake but never acks.
-    const listeners: Array<(message: unknown) => void> = [];
-    const child: LauncherChannel = {
-      send: () => true,
-      on: (_: 'message', listener: (message: unknown) => void) => { listeners.push(listener); return child; },
-    };
-    const deps = { database: databaseConfig(current.database), channel: child,
-      verifyProfile: (): Promise<boolean> => Promise.resolve(true), approvalTimeoutMs: 2_000 };
-    const outcome = admitProcess(loaded, deps).then(() => 'admitted',
-      (error: unknown) => error instanceof ProcessAdmissionError ? error.kind : 'other');
-    const handshake = await Promise.race([
-      new Promise<Record<string, unknown>>((resolveHandshake) => {
-        const orig = child.send.bind(child);
-        child.send = (message: unknown) => {
-          if (message !== null && typeof message === 'object' && (message as Record<string, unknown>)['type'] === 'p05/launch/handshake') {
-            resolveHandshake(message as Record<string, unknown>);
-          }
-          return orig(message);
-        };
-      }),
-      outcome.then((o) => { throw new Error(`child ended before handshake: ${o}`); }),
-    ]);
+    let resolveHandshake: (message: object) => void = () => undefined;
+    const pendingHandshake = new Promise<object>((resolve) => { resolveHandshake = resolve; });
+    const wire = testLaunchChannel((message) => {
+      if ('type' in message && message.type === 'p05/launch/handshake') { resolveHandshake(message); }
+    });
+    const outcome = withTestLaunchChannel(wire.channel, () => admitProcess(loaded, {
+      database: databaseConfig(current.database), approvalTimeoutMs: 5_000,
+    })).then(() => 'admitted', (error: unknown) => error instanceof ProcessAdmissionError ? error.kind : 'other');
+    const handshake = await Promise.race([pendingHandshake,
+      outcome.then((o) => { throw new Error(`child ended before handshake: ${o}`); })]);
     let approvals = 0;
     const decision = await decideLaunch(launcherDeps,
-      { instanceId, launchNonce: nonce, consumerKind: 'WORKER' as const, proofDigest,
-        issuerGeneration: generation, witnessHolderPid: loaded.binding.witnessHolderPid, channelId },
-      handshake as unknown as Parameters<typeof decideLaunch>[2],
-      () => { approvals += 1; for (const l of listeners) { l({ type: 'p05/launch/approve', instanceId, launchNonce: nonce }); } },
-      () => undefined,
-      () => new Promise<boolean>(() => undefined)); // SILENT child: never acks.
-    // The approval was sent exactly once, but the launcher's OWN deadline
-    // resolved the unacked outcome instead of awaiting forever.
+      { instanceId, launchNonce: nonce, consumerKind: 'WORKER', proofDigest,
+        issuerGeneration: generation, witnessHolderPid: loaded.binding.witnessHolderPid, channelId,
+        database: loaded.binding.database, databaseOid: loaded.binding.databaseOid,
+        role: loaded.binding.role, profile: loaded.binding.profile },
+      handshake, process.pid, {
+        live: () => true,
+        send: (message) => { approvals += 1; wire.deliver(message); return Promise.resolve(true); },
+        ack: new Promise<never>(() => undefined), // Drop the ACK; never deliver activate.
+        receipt: new Promise<never>(() => undefined),
+      });
     expect(approvals).toBe(1);
-    expect(decision.approved).toBe(true);
-    expect((decision as { acked?: boolean }).acked).toBe(false);
-    // The proof was durably consumed by the (failed) launch.
+    expect(decision).toEqual({ approved: false, reason: 'NO_ACK' });
     expect((await readRegistryState(owner, generation, nonce))?.state).toBe('CONSUMED');
-    expect(await outcome).toBe('admitted'); // the child DID start; the launch is reported unacked
+    expect(await outcome).toBe('ADMISSION_DENIED');
   } finally {
     await owner.end().catch(() => undefined);
     await admitted.release().catch(() => undefined);
   }
 });
 
-proof('launcher DB deadlines: a control endpoint that accepts and never answers refuses quickly (r8 MUST 2)', { timeout: 60_000 }, async () => {
+labProof('launcher DB deadlines: a control endpoint that accepts and never answers refuses quickly (r8 MUST 2)', { timeout: 60_000 }, async () => {
   const current = requireFixture();
+  // Control contour first: see the process-handshake proof above.
+  const control = verifiedControlConfig(current.database);
   const admitted = await admitFixture(current.migrator, current.database, 'WORKER');
   try {
     const loaded = loadRuntimeAdmission(admitted.env, { database: databaseConfig(current.database), requiredConsumer: 'WORKER' });
-    const { ensureLaunchRegistry, issueProof } = await import('../src/infrastructure/admission/registry.js');
+    const { issueProof } = await import('../src/infrastructure/admission/registry.js');
     const { decideLaunch } = await import('../src/infrastructure/admission/launcher.js');
-    const { Client } = await import('pg');
-    const owner = new Client({ ...connection, database: current.database, user: 'fixlevelup_migrator', password: migratorPassword() });
-    await owner.connect();
+    const owner = await openVerifiedControl(control);
     try {
-      await ensureLaunchRegistry(owner);
-      const instanceId = String(admitted.env['LAUNCH_INSTANCE_ID']);
+        const instanceId = String(admitted.env['LAUNCH_INSTANCE_ID']);
       const channelId = String(admitted.env['LAUNCH_CHANNEL_ID']);
       const generation = Number(admitted.env['LAUNCH_ISSUER_GENERATION']);
       const nonce = String(admitted.env['LAUNCH_NONCE']);
@@ -509,24 +517,19 @@ proof('launcher DB deadlines: a control endpoint that accepts and never answers 
       try {
         const deps = { app: { host: '127.0.0.1', port: 55432, database: current.database,
           user: 'fixlevelup_migrator', password: migratorPassword() },
-          control: { host: '127.0.0.1', port, database: current.database,
-            user: 'fixlevelup_migrator', password: migratorPassword() },
+          control: { ...control, port },
           witnessKeyOf: witnessKeyForInstance, ackTimeoutMs: 500 };
-        const child: LauncherChannel = {
-          send: () => true,
-          on: () => child,
-        };
-        const handshake = { type: 'p05/launch/handshake', pid: process.pid, database: bindingDatabase(loaded),
+        const expected = { database: loaded.binding.database,
           databaseOid: loaded.binding.databaseOid, role: loaded.binding.role,
-          witnessHolderPid: loaded.binding.witnessHolderPid, consumerKind: 'WORKER',
+          witnessHolderPid: loaded.binding.witnessHolderPid, consumerKind: 'WORKER' as const,
           instanceId, channelId, issuerGeneration: generation, launchNonce: nonce,
-          proofDigest: loaded.proofDigest, profile: 'S1' };
+          proofDigest: loaded.proofDigest, profile: loaded.binding.profile };
+        const handshake = { ...expected, type: 'p05/launch/handshake', pid: process.pid };
         const started = Date.now();
-        const decision = await decideLaunch(deps, { instanceId, launchNonce: nonce, consumerKind: 'WORKER' as const,
-          proofDigest: loaded.proofDigest, issuerGeneration: generation,
-          witnessHolderPid: loaded.binding.witnessHolderPid, channelId },
-          handshake as unknown as Parameters<typeof decideLaunch>[2],
-          () => undefined, () => undefined, () => new Promise<boolean>(() => undefined));
+        const decision = await decideLaunch(deps, expected, handshake, process.pid, {
+          live: () => true, send: () => Promise.resolve(false), ack: new Promise<never>(() => undefined),
+          receipt: new Promise<never>(() => undefined),
+        });
         // The stalled control read is bounded: CAS refused, quickly.
         expect(decision.approved).toBe(false);
         expect((decision as { reason: string }).reason).toBe('CAS');
@@ -540,14 +543,15 @@ proof('launcher DB deadlines: a control endpoint that accepts and never answers 
   }
 });
 
-function bindingDatabase(loaded: ReturnType<typeof loadRuntimeAdmission>): string {
-  return loaded.binding.database;
+function migratorPassword(): string {
+  return wiringPassword('FIXLEVELUP_MIGRATOR_PASSWORD');
 }
 
-function migratorPassword(): string {
-  const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  const password = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-  if (!password) { throw new Error('Local isolated PostgreSQL migrator credentials are required'); }
+function wiringPassword(key: 'FIXLEVELUP_RUNTIME_PASSWORD' | 'FIXLEVELUP_MIGRATOR_PASSWORD'): string {
+  const password = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
+    ? process.env[key]
+    : new RegExp(`^${key}=([a-f0-9]{64})$`, 'm').exec(readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8'))?.[1];
+  if (!password || !/^[a-f0-9]{64}$/.test(password)) { throw new Error('Isolated PostgreSQL test credentials are required'); }
   return password;
 }
 

@@ -356,6 +356,10 @@ integration('P04-03 staff HTTP on isolated PostgreSQL', () => {
     } finally {
       await f.base.db.query('ALTER TABLE foundation.role_permissions ENABLE TRIGGER rbac_grant_write');
     }
+    problem(await f.read(CATEGORIES), 503);
+    problem(await command(), 503);
+    expect(await f.evidence()).toEqual(before);
+    await f.base.rotateAdmission();
     check(await f.read(CATEGORIES), 200);
     receipt(await command(), 201);
   }, TIMEOUT);

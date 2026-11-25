@@ -2,20 +2,21 @@ import type { OnModuleDestroy } from '@nestjs/common';
 import type { DatabaseConfig } from '../infrastructure/database/runtime-database.js';
 import { admittedPool } from '../infrastructure/admission/pool-guard.js';
 import type { GuardedPool } from '../infrastructure/admission/pool-guard.js';
-import type { RuntimeAdmission } from '../infrastructure/admission/runtime-admission.js';
+import type { ProcessAuthorization } from '../infrastructure/admission/process-admission.js';
 import type { WebAuthConfig } from './web-auth.config.js';
 import { WebAuthService } from './web-auth.service.js';
 
 /** A separate bounded pool prevents leaked credentials or raw driver errors in logs. */
 export class WebAuthResources implements OnModuleDestroy {
   private readonly pool: GuardedPool;
+  private closing = false;
   private timer: NodeJS.Timeout | undefined;
   private cleanup: Promise<void> | undefined;
   readonly service: WebAuthService;
 
-  constructor(database: DatabaseConfig, config: WebAuthConfig, admission: RuntimeAdmission) {
+  constructor(database: DatabaseConfig, config: WebAuthConfig, authorization: ProcessAuthorization) {
     // P05-01 §7: this pool is admitted per checkout by the launch gate.
-    this.pool = admittedPool({ gate: admission.gate }, { ...database, max: 4, connectionTimeoutMillis: 1000,
+    this.pool = admittedPool({ authorization, kind: 'API' }, database, { max: 4, connectionTimeoutMillis: 1000,
       query_timeout: 5000, statement_timeout: 5000, idleTimeoutMillis: 1000,
       application_name: 'fixlevelup-web-auth' });
     this.pool.on('error', () => { /* Never log raw driver errors. */ });
@@ -27,7 +28,7 @@ export class WebAuthResources implements OnModuleDestroy {
   }
 
   private startCleanupTimer(): void {
-    if (this.timer) { return; }
+    if (this.closing || this.timer) { return; }
     this.timer = setInterval(() => {
       this.cleanup ??= this.cleanExpired().finally(() => { this.cleanup = undefined; });
     }, 10_000);
@@ -42,6 +43,7 @@ export class WebAuthResources implements OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
     await this.cleanup;
     await this.pool.end();

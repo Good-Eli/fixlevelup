@@ -5,14 +5,15 @@ import type { Server } from 'node:http';
 import { resolve } from 'node:path';
 import { ConsoleLogger, HttpException } from '@nestjs/common';
 import { StaffService } from '../src/staff/staff.service.js';
-import { Client, Pool } from 'pg';
+import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, vi } from 'vitest';
 import { createApi } from '../src/bootstrap/factories.js';
-import { authFixtureMigrations } from './auth-db-fixture.js';
-import { admitFixture } from './admission-fixture.js';
+import { authFixtureMigrations, installPinnedMigrationHistory } from './auth-db-fixture.js';
+import { admitFixture, admitVerifiedTestInstance } from './admission-fixture.js';
 import type { AdmittedHandle } from './admission-fixture.js';
+import { OwnedTestDatabase, fixtureCredentials } from './owned-test-database.js';
 import { loadConfig } from '../src/runtime/config.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
@@ -52,10 +53,9 @@ export class RbacFixture {
   private server!: Server;
   admin!: Web;
   private initialized = false;
-  /** Set exactly when this run's CREATE DATABASE succeeded (CREATE is the reuse guard). */
-  private dbCreated = false;
+  /** Owned database lifecycle: drops only this run's database, also on failure. */
+  private owned?: OwnedTestDatabase;
   private closed = false;
-  private adminPassword?: string;
   get ready() { return this.initialized; }
   get httpPort(): number {
     const a = this.server.address(); if (!a || typeof a === 'string' || a.address !== '127.0.0.1') { throw new Error('Missing loopback listener'); }
@@ -64,48 +64,66 @@ export class RbacFixture {
   private secrets: string[] = [];
   private logs = vi.spyOn(ConsoleLogger.prototype, 'log').mockImplementation(() => undefined);
   get db(): Pool { if (!this.pool) { throw new Error('Missing isolated fixture'); } return this.pool; }
+  /** The COMPLETED admission of this fixture (P05-02 side fixtures reuse its gate
+   * and authorization to compose additional admitted apps on the same database). */
+  get admitted(): AdmittedHandle { if (!this.admission) { throw new Error('Missing isolated fixture'); } return this.admission; }
   async start(): Promise<void> {
     const name = this.options.p04 === true ? /^fixlevelup_configuration_test_[a-f0-9]{24}$/ : /^fixlevelup_rbac_test_[a-f0-9]{24}$/;
     if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1' || !name.test(this.database)) { throw new Error('Refusing non-isolated DB'); }
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const postgresPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    if (!postgresPassword || !runtimePassword || !migratorPassword) { throw new Error('Missing local test credentials'); }
-    this.secrets.push(postgresPassword, runtimePassword, migratorPassword, this.botToken);
-    this.adminPassword = postgresPassword;
-    // No connection to the working dev DB. Maintenance role can only reach these three DDL statements;
-    // it is closed before migrations, bootstrap, fixtures or HTTP start. CREATE must succeed (no reuse).
-    const maintenance = new Pool({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: postgresPassword, max: 1 });
-    try {
-      await maintenance.query(`CREATE DATABASE "${this.database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-      this.dbCreated = true;
-      await maintenance.query(`REVOKE ALL ON DATABASE "${this.database}" FROM PUBLIC`);
-      await maintenance.query(`GRANT CONNECT ON DATABASE "${this.database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    } finally { await maintenance.end(); }
+    // Credentials come from the shared fixture policy: lab mode reads only the lab
+    // process env, dev mode reads the local tooling env — never the dev `.env`
+    // in lab mode, and never a partially-populated lab env fallback.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
+    this.secrets.push(runtimePassword, migratorPassword, this.botToken);
+    // Owned lifecycle: the maintenance role only reaches `postgres` for this one
+    // CREATE/REVOKE/GRANT block, and any failure from here to the returned fixture
+    // drops exactly this run's database (see owned-test-database.ts).
+    const owned = await OwnedTestDatabase.create({
+      name: this.database,
+      pattern: name,
+      prepare: async (maintenance) => {
+        await maintenance.query(`REVOKE ALL ON DATABASE "${this.database}" FROM PUBLIC`);
+        await maintenance.query(`GRANT CONNECT ON DATABASE "${this.database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      },
+    });
+    this.owned = owned;
     try {
       this.pool = new Pool({ ...connection, database: this.database, user: 'fixlevelup_migrator', password: migratorPassword });
       const actual = await this.db.query<{ db: string }>('SELECT current_database() AS db');
       if (actual.rows[0]?.db !== this.database) { throw new Error('Fixture DB mismatch'); }
       await this.db.query('CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator');
       for (const migration of authFixtureMigrations) { await this.db.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8')); }
-      await this.db.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
+      // The REAL Prisma history (exact structure + checksums), installed by the
+      // migration owner: the runtime role still gets no grant on it, so the
+      // legacy readiness predicate keeps proving that runtime cannot read it.
+      await installPinnedMigrationHistory(this.db, authFixtureMigrations);
       const login = random(); const password = random();
       const { staffId } = await bootstrapFirstAdmin(this.db, { login, password });
-      // P05-01: the app is admitted through the same launch gate contour — a real
-      // migrator-held witness in this fixture DB pins the admission.
-      this.admission = await admitFixture(this.db, this.database, 'API');
-      this.app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'),
-        { ...connection, database: this.database, user: 'fixlevelup_runtime', password: runtimePassword },
-        { origin, csrfSecret: random(), throttleSecret: random() }, { botToken: this.botToken }, this.admission.authorization);
-      this.server = this.app.getHttpServer() as Server;
+      await this.openAdmittedApp(runtimePassword);
       this.admin = await this.login(staffId, login, password); this.initialized = true;
     } catch (error) {
-      // Provisioning failed after CREATE: the same lifecycle cleanup runs before rethrowing.
-      await this.close().catch(() => undefined);
-      throw error;
+      // Provisioning failed after CREATE: close this run's app/admission/pool, drop
+      // exactly this run's database, and surface a teardown failure instead of
+      // swallowing it (AggregateError carries both errors).
+      this.closed = true;
+      throw await owned.failure(error, async () => { await this.releaseOwnResources(); });
     }
+  }
+  private readonly webConfig = { origin, csrfSecret: random(), throttleSecret: random() };
+  private async openAdmittedApp(runtimePassword: string): Promise<void> {
+    this.admission = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
+      ? await admitVerifiedTestInstance(this.db, this.database, { consumerKind: 'API' })
+      : await admitFixture(this.db, this.database, 'API');
+    this.app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'),
+      { ...connection, database: this.database, user: 'fixlevelup_runtime', password: runtimePassword },
+      this.webConfig, { botToken: this.botToken }, this.admission.authorization);
+    this.server = this.app.getHttpServer() as Server;
+  }
+  /** Repairing the schema cannot revive the revoked instance; drain it before a new launch. */
+  async rotateAdmission(): Promise<void> {
+    if (!this.initialized || this.closed) { throw new Error('No live fixture to rotate'); }
+    try { await this.app?.close(); } finally { await this.admission?.release(); }
+    await this.openAdmittedApp(fixtureCredentials().runtime);
   }
   /** No automatic issue at setup, login, startup or recovery. Only a fresh opted-in fixture can call this. */
   async issueP04Synthetic(): Promise<void> {
@@ -119,37 +137,22 @@ export class RbacFixture {
       await client.query('SELECT foundation.issue_p04_synthetic_permissions()');
     } finally { client.release(); }
   }
-  /**
-   * Ownership proof for the teardown drop. Returns this fixture's database name only
-   * when BOTH hold: this run's CREATE DATABASE succeeded (the `dbCreated` flag), and the
-   * name still matches this fixture's strict disposable-name pattern. Consumes the
-   * flag, so a second call (double close) never drops anything.
-   */
-  private takeCreatedDatabase(): string | undefined {
-    if (!this.dbCreated) { return undefined; }
-    this.dbCreated = false;
-    const pattern = this.options.p04 === true ? /^fixlevelup_configuration_test_[a-f0-9]{24}$/ : /^fixlevelup_rbac_test_[a-f0-9]{24}$/;
-    return pattern.test(this.database) ? this.database : undefined;
+  /** Ends every resource this fixture opened; the mock restore always runs. */
+  private async releaseOwnResources(): Promise<void> {
+    try { await this.app?.close(); } finally { try { await this.admission?.release(); } finally { try { await this.pool?.end(); } finally { this.logs.mockRestore(); } } }
   }
   async close(): Promise<void> {
     if (this.closed) { return; }
     this.closed = true;
-    // Capture the database to drop BEFORE any teardown, so the flag is consumed even
-    // when a later teardown step fails (the drop then still runs in the finally).
-    const ownedDatabase = this.takeCreatedDatabase();
-    try {
-      try { await this.app?.close(); } finally { try { await this.admission?.release(); } finally { try { await this.pool?.end(); } finally { this.logs.mockRestore(); } } }
-    } finally {
-      // Only a database created by THIS run is dropped, after every pool/client of this
-      // run was ended. FORCE handles stragglers.
-      if (ownedDatabase !== undefined && this.adminPassword !== undefined) {
-        const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: this.adminPassword });
-        try {
-          await admin.connect();
-          await admin.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
-        } finally { await admin.end().catch(() => undefined); }
-      }
+    const owned = this.owned;
+    if (owned === undefined) {
+      // Provisioning never reached CREATE: only this run's own resources remain.
+      await this.releaseOwnResources();
+      return;
     }
+    // Ends this run's resources first, then drops exactly this run's database.
+    // A teardown failure propagates instead of being swallowed.
+    await owned.dispose(async () => { await this.releaseOwnResources(); });
   }
   private safe(value: unknown): void {
     const json = JSON.stringify(value); expect(this.secrets.some((secret) => json.includes(secret))).toBe(false);

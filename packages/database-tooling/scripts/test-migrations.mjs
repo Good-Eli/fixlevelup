@@ -16,9 +16,11 @@ import { pricingChecks, provePricingMigrationUpgrade, provePricingFresh } from '
 import { catalogManagementChecks, catalogManagementCodes, proveCatalogManagementUpgrade, proveCatalogManagementFresh,
   proveCatalogManagementIssuer, proveCatalogManagementCollision } from './test-catalog-management-migration.mjs';
 import { requestIntakeChecks, proveRequestIntakeUpgrade } from './test-request-intake-migration.mjs';
+import { formSessionChecks, formSessionMigration, proveFormSessionGrants, proveFormSessionUpgrade } from './test-form-session-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { admin, credentials, connection, prepareDatabase, runPrisma, root } from './migration-local.mjs';
+import { admin, credentials, connection, prepareDatabase, runPrisma, root,
+  assertReviewedProfile, syntheticMode, testDatabaseName } from './migration-local.mjs';
 
 function assert(condition, label) { if (!condition) { throw new Error(label); } }
 function command(args, database, expected = 0, shadow, history) {
@@ -55,11 +57,12 @@ const p03Migrations = [
 const catalogHistoryNames = [...p03Migrations, p04CatalogMigration];
 const pricingHistoryNames = [...catalogHistoryNames, '20261122000600_pricing_rules_ranges'];
 const catalogManagementNames = [...pricingHistoryNames, '20261122000700_catalog_management'];
-const migrations = [...catalogManagementNames, '20261123000100_request_intake_foundation'];
+const migrations = [...catalogManagementNames, '20261123000100_request_intake_foundation', formSessionMigration];
 const expectedChecks = [
   ...cityChecks,
   ...areaChecks, ...geoAccessChecks, ...settingsChecks, ...fileReservationChecks, ...fileUploadChecks, ...fileProcessingChecks, ...filePrivacyChecks,
   ...settingsManagementChecks, ...catalogFixedPriceChecks, ...pricingChecks, ...catalogManagementChecks, ...requestIntakeChecks,
+  ...formSessionChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -75,20 +78,22 @@ const expectedChecks = [
 const client = await admin();
 const passwords = credentials();
 const suffix = randomBytes(6).toString('hex');
-const fresh = `fixlevelup_p017a_fresh_${suffix}`;
-const upgrade = `fixlevelup_p017a_upgrade_${suffix}`;
-const upgradeSecond = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
-const upgradeThird = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
-const upgradeFourth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
-const upgradeFifth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
-const upgradeEighth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
-const upgradeSeventeenth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
-const collisionSeventeenth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
+// The legacy SQL proofs require these exact random disposable prefixes. Lab
+// isolation is asserted independently (cluster, endpoint, role, run binding).
+const fresh = testDatabaseName('fresh', suffix);
+const upgrade = testDatabaseName('upgrade', suffix);
+const upgradeSecond = testDatabaseName('upgrade', randomBytes(6).toString('hex'));
+const upgradeThird = testDatabaseName('upgrade', randomBytes(6).toString('hex'));
+const upgradeFourth = testDatabaseName('upgrade', randomBytes(6).toString('hex'));
+const upgradeFifth = testDatabaseName('upgrade', randomBytes(6).toString('hex'));
+const upgradeEighth = testDatabaseName('upgrade', randomBytes(6).toString('hex'));
+const upgradeSeventeenth = testDatabaseName('upgrade', randomBytes(6).toString('hex'));
+const collisionSeventeenth = testDatabaseName('upgrade', randomBytes(6).toString('hex'));
 // A database capped at exactly 012: the 012 runtime ACL proof must not run on the
 // final fresh database once 013 exists, because 013 deliberately extends the
 // business_settings_versions read/write surface.
-const upgradeTwelfth = `fixlevelup_p017a_upgrade_${randomBytes(6).toString('hex')}`;
-const shadow = `fixlevelup_p017a_shadow_${suffix}`;
+const upgradeTwelfth = testDatabaseName('upgrade', randomBytes(6).toString('hex'));
+const shadow = testDatabaseName('shadow', suffix);
 const historyRoot = resolve(root, `node_modules/.cache/p017a-${suffix}`);
 const firstHistory = resolve(historyRoot, 'first/migrations');
 const secondHistory = resolve(historyRoot, 'second/migrations');
@@ -112,6 +117,7 @@ const twentiethHistory = resolve(historyRoot, 'twentieth/migrations');
 // 021's proof anchor: capped at exactly catalog_management so the 022 slice
 // cannot silently enter the P04 comparison.
 const twentyFirstHistory = resolve(historyRoot, 'twentyfirst/migrations');
+const twentySecondHistory = resolve(historyRoot, 'twentysecond/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
   for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, upgradeTwelfth, upgradeSeventeenth, collisionSeventeenth, shadow]) { await prepareDatabase(client, database, true); }
@@ -120,7 +126,7 @@ try {
     [twelfthHistory, migrations.slice(0,12)], [thirteenthHistory, migrations.slice(0,13)], [fourteenthHistory, migrations.slice(0,14)],
     [fifteenthHistory, migrations.slice(0,15)], [sixteenthHistory, migrations.slice(0,16)], [seventeenthHistory, migrations.slice(0,17)],
     [eighteenthHistory, p03Migrations], [nineteenthHistory, catalogHistoryNames], [twentiethHistory, pricingHistoryNames],
-    [twentyFirstHistory, catalogManagementNames]]) {
+    [twentyFirstHistory, catalogManagementNames], [twentySecondHistory, migrations.slice(0,22)]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -193,22 +199,33 @@ try {
         () => command(['migrate', 'deploy'], upgradeEighth, 0, undefined, twentyFirstHistory), expected => {
           command(['migrate', 'diff', '--from-migrations', twentyFirstHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, expected, shadow);
         });
-      // P05-01 (022): deploy the S1 request intake foundation on the same
-      // populated chain from the live migrations directory, prove the exact
-      // history, replay idempotency and both full drift checks, then run the
-      // 022 grants/fence/guards proof with a runtime connection.
+      // Stop at 022 before installing 023: S2 alone cannot prove S1 was launchable.
+      command(['migrate', 'deploy'], upgradeEighth, 0, undefined, twentySecondHistory);
+      const atS1 = await eighthReader.query('SELECT migration_name FROM foundation._prisma_migrations ORDER BY migration_name');
+      assert(JSON.stringify(atS1.rows.map(r => r.migration_name)) === JSON.stringify(migrations.slice(0,22)), 'S1 history mismatch');
+      if (syntheticMode()) {
+        await assertReviewedProfile(upgradeEighth, 'S1');
+        console.log('022 populated S1 shared physical profile: PASS');
+      }
+      command(['migrate', 'deploy'], upgradeEighth, 0, undefined, twentySecondHistory);
+      command(['migrate', 'diff', '--from-migrations', twentySecondHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, 0, shadow);
       command(['migrate', 'deploy'], upgradeEighth);
       {
         const history = await eighthReader.query('SELECT migration_name,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
         assert(history.rowCount === migrations.length
           && JSON.stringify(history.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
-          && history.rows.every((entry) => entry.finished_at instanceof Date), '022 populated history mismatch');
+          && history.rows.every((entry) => entry.finished_at instanceof Date), '022+023 populated history mismatch');
       }
       command(['migrate', 'deploy'], upgradeEighth);
       command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeEighth, 0, shadow);
       command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth, 0);
       await proveRequestIntakeUpgrade(eighthReader, catalogRuntime,
         () => connection('fixlevelup_migrator', passwords.fixlevelup_migrator, upgradeEighth));
+      // P05-02 (023): the S2 form session foundation is applied on the same
+      // populated chain from the live migrations directory (deployed above
+      // with 022), so its guard proofs run against real reviewed fixtures.
+      await proveFormSessionUpgrade(eighthReader, catalogRuntime);
+      console.log('023 form session foundation: populated upgrade guards: PASS');
     } finally { await catalogRuntime.end(); }
   } finally { await eighthReader.end(); }
   for (const database of [collisionSeventeenth, upgradeSeventeenth]) {
@@ -442,6 +459,16 @@ try {
     // by the migration owner so the runtime under test cannot authorize itself.
     reservationFixtures = await seedFileReservationFixtures(migration, runtimeStaffId);
   } finally { await migration.end(); }
+  // P05-02 S4 regression (lab opt-in only): after 023 the freshly migrated
+  // database must satisfy the SAME shared physical-profile probe that runtime
+  // readiness and the §5.3 restore gate use. It runs through a real runtime-role
+  // client and returns a plain boolean — no hash parsing, no override, no
+  // skip mode. Outside the lab opt-in nothing runs here, so dev behaviour and
+  // its dependency set are unchanged.
+  if (syntheticMode()) {
+    await assertReviewedProfile(fresh, 'S2');
+    console.log('S2 shared physical profile (probeP05Catalog via runtime role): PASS');
+  }
   console.log(`Migration-history diff/schema drift detection/restoration/catalog checks (${expectedChecks.length} CHECKs): PASS`);
   const runtime = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, fresh);
   await runtime.connect();
@@ -454,6 +481,9 @@ try {
     // (including consent_records) is unchanged by the additive consent-basis index.
     await proveFileReservationsGrants(runtime, reservationFixtures, { expectFenceTriggers: true });
     await proveFileUploadGrants(runtime, reservationFixtures);
+    // 023 exact ACL on the final fresh database (the full chain carries the
+    // single REVOKE/GRANT cycle of the S2 tables).
+    await proveFormSessionGrants(runtime);
     await proveFilePrivacyRuntime(runtime, passwords.fixlevelup_migrator, fresh);
     const role = await runtime.query("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolinherit FROM pg_roles WHERE rolname IN ('fixlevelup_runtime','fixlevelup_migrator')");
     assert(role.rowCount === 2 && role.rows.every((row) => Object.values(row).every((value) => value === false)), 'Unsafe technical role flags');

@@ -21,7 +21,7 @@ export interface ControlStatement {
   query: PoolClient['query'];
 }
 
-export type RegistryErrorCode = 'ALREADY_ISSUED' | 'CAS_FAILED' | 'DIGEST_MISMATCH';
+export type RegistryErrorCode = 'ALREADY_ISSUED' | 'CAS_FAILED' | 'DIGEST_MISMATCH' | 'COMMIT_UNKNOWN';
 
 export class RegistryError extends Error {
   readonly code: RegistryErrorCode;
@@ -44,6 +44,27 @@ export interface RegistryRow {
   readonly issued_at: Date;
   readonly expires_at: Date;
   readonly consumed_at: Date | null;
+}
+
+// A connection whose COMMIT outcome is indeterminate must be discarded by its
+// owner. Never allow a subsequent operation through this registry on it.
+const uncertainConnections = new WeakSet<ControlStatement>();
+
+function requireKnownConnection(client: ControlStatement): void {
+  if (uncertainConnections.has(client)) {
+    throw new RegistryError('COMMIT_UNKNOWN', 'Discard control connection after unconfirmed COMMIT');
+  }
+}
+
+async function confirmCommit(client: ControlStatement): Promise<void> {
+  try {
+    const result = await client.query('COMMIT');
+    if (result.command === 'COMMIT') { return; }
+  } catch {
+    // Neither a driver failure nor an unexpected command tag is a positive ACK.
+  }
+  uncertainConnections.add(client);
+  throw new RegistryError('COMMIT_UNKNOWN', 'Launch registry COMMIT was not confirmed');
 }
 
 function pgErrorCode(error: unknown): string | undefined {
@@ -89,7 +110,9 @@ export async function ensureLaunchRegistry(client: ControlStatement): Promise<vo
             RAISE EXCEPTION 'invalid launch proof issue' USING ERRCODE = '23514';
           END IF;
         ELSE
-          IF OLD.state <> 'ISSUED' OR NEW.state <> 'CONSUMED' OR NEW.consumed_at IS NULL THEN
+          IF OLD.state <> 'ISSUED' OR NEW.state <> 'CONSUMED' OR NEW.consumed_at IS NULL
+            OR NEW.consumed_at < OLD.issued_at OR NEW.consumed_at >= OLD.expires_at
+            OR clock_timestamp() >= OLD.expires_at THEN
             RAISE EXCEPTION 'invalid launch proof transition' USING ERRCODE = '23514';
           END IF;
           IF NEW.issuer_generation IS DISTINCT FROM OLD.issuer_generation
@@ -134,6 +157,7 @@ export interface IssueProofInput {
  * the confirmed COMMIT is durable on the control database.
  */
 export async function issueProof(client: ControlStatement, input: IssueProofInput): Promise<void> {
+  requireKnownConnection(client);
   await client.query('BEGIN');
   try {
     await client.query('SET LOCAL synchronous_commit = on');
@@ -142,7 +166,6 @@ export async function issueProof(client: ControlStatement, input: IssueProofInpu
       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
     [input.issuerGeneration, input.launchNonce, input.proofDigest,
       input.consumerKind, input.instanceId, input.channelId, input.expiresAt]);
-    await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
     if (pgErrorCode(error) === '23505') {
@@ -150,6 +173,7 @@ export async function issueProof(client: ControlStatement, input: IssueProofInpu
     }
     throw error;
   }
+  await confirmCommit(client);
 }
 
 export interface ConsumeProofInput {
@@ -181,6 +205,14 @@ export interface ConsumeProofInput {
  * = on (plan §7) so the confirmed COMMIT is durable.
  */
 export async function consumeProof(client: ControlStatement, input: ConsumeProofInput): Promise<boolean> {
+  return (await consumeProofWithExpiry(client, input)) !== undefined;
+}
+
+/** Returns the winning row's expiry only after a confirmed COMMIT. On
+ * COMMIT_UNKNOWN the caller must discard the connection and the waiting launch. */
+export async function consumeProofWithExpiry(client: ControlStatement, input: ConsumeProofInput): Promise<Date | undefined> {
+  requireKnownConnection(client);
+  let expiresAt: Date;
   try {
     await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
     await client.query('SET LOCAL synchronous_commit = on');
@@ -191,31 +223,35 @@ export async function consumeProof(client: ControlStatement, input: ConsumeProof
     const row = selected.rows[0];
     if (!row) {
       await client.query('ROLLBACK');
-      return false;
+      return undefined;
     }
     if (row.proof_digest !== input.expectedDigest) {
       await client.query('ROLLBACK');
       throw new RegistryError('DIGEST_MISMATCH', 'Launch proof digest mismatch');
     }
-    const consumed = await client.query(
+    const consumed = await client.query<{ expires_at: Date }>(
       `UPDATE launch_control.launch_proofs
        SET state = 'CONSUMED', consumed_at = clock_timestamp()
        WHERE issuer_generation = $1 AND launch_nonce = $2 AND state = 'ISSUED'
          AND proof_digest = $3 AND clock_timestamp() < expires_at
-         AND consumer_kind = $4 AND instance_id = $5::uuid AND channel_id = $6::uuid`,
+         AND consumer_kind = $4 AND instance_id = $5::uuid AND channel_id = $6::uuid
+       RETURNING expires_at`,
       [input.issuerGeneration, input.launchNonce, input.expectedDigest,
         input.binding.consumerKind, input.binding.instanceId, input.binding.channelId]);
     if (consumed.rowCount !== 1) {
       await client.query('ROLLBACK');
-      return false;
+      return undefined;
     }
-    await client.query('COMMIT');
-    return true;
+    const expiry = consumed.rows[0]?.expires_at;
+    if (!(expiry instanceof Date) || !Number.isFinite(expiry.getTime())) { throw new Error('Invalid registry expiry'); }
+    expiresAt = expiry;
   } catch (error) {
     if (error instanceof RegistryError) { throw error; }
     await client.query('ROLLBACK').catch(() => undefined);
     throw new RegistryError('CAS_FAILED', 'Launch proof consumption failed');
   }
+  await confirmCommit(client);
+  return expiresAt;
 }
 
 /** Read-only registry state, for tests and operator teardown. */
@@ -224,6 +260,7 @@ export async function readRegistryState(
   issuerGeneration: number,
   launchNonce: string,
 ): Promise<RegistryRow | undefined> {
+  requireKnownConnection(client);
   const result = await client.query<RegistryRow>(
     `SELECT issuer_generation, launch_nonce, proof_digest, consumer_kind, instance_id, channel_id,
        state, issued_at, expires_at, consumed_at

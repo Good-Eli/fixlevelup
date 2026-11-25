@@ -3,15 +3,11 @@
  *
  * Every runtime DB consumer routes its pg.Pool through `admittedPool`: a real
  * pool is created (no driver replacement), but every checkout — `connect()` or
- * a promise-style `query(...)` — first runs the admission gate's single-query
- * verification on the acquired connection. Per plan §7 the check happens for
- * каждое новое физическое соединение до любой бизнес-операции: pg creates
- * physical connections lazily at acquire time, so verify-on-acquire covers
- * every new connection. A failing verification releases the client with
- * `release(true)` (the connection is never reused) and surfaces only the typed
- * AdmissionRequiredError — driver errors and credentials never leak. A client
- * already checked out before the witness disappeared keeps working until it is
- * released (verify-on-acquire semantics); the next checkout fails closed.
+ * a promise-style `query(...)` — first verifies the branded authorization,
+ * witness, and exact physical profile on the acquired connection. A failing
+ * verification on a connected backend destroys that connection and revokes the
+ * admission across pools; a repaired target does not reactivate it. A unit of
+ * work already checked out cannot be rolled back retroactively by this guard.
  *
  * Prisma compatibility: the guard is a Proxy over the real pg.Pool instance
  * (`instanceof pg.Pool` keeps holding), so `PrismaPg(pool, ...)` accepts it and
@@ -20,7 +16,14 @@
 import { Pool } from 'pg';
 import type { PoolClient, PoolConfig, QueryConfig, QueryResult, QueryResultRow } from 'pg';
 import { AdmissionError } from './admission.js';
-import type { AdmissionErrorCode, AdmissionGate } from './admission.js';
+import type { AdmissionErrorCode } from './admission.js';
+import { requireAuthorizationKind } from './process-admission.js';
+import type { ProcessAuthorization } from './process-admission.js';
+import { matchesRuntimeTarget } from './runtime-admission.js';
+import type { RuntimeAdmission } from './runtime-admission.js';
+import type { ConsumerKind } from './proof.js';
+import type { DatabaseConfig } from '../database/runtime-database.js';
+import { verifyPhysicalProfile } from './physical-profile.js';
 
 /** The subset of pg.Pool the application consumes (checked against usages). */
 export interface PoolLike {
@@ -59,23 +62,59 @@ export type GuardedPool = Pool & { readonly whenAdmitted: () => Promise<void> };
  * DB work before the gate has verified a connection. All other pool members —
  * including the `error` event wiring — forward to the underlying pool.
  */
-export function admittedPool(deps: { gate: AdmissionGate; now?: () => Date }, options: PoolConfig): GuardedPool {
-  const now = deps.now ?? (() => new Date());
-  const pool = new Pool(options);
+const revoked = new WeakSet<RuntimeAdmission>();
+const poolAdmissions = new WeakMap<object, () => RuntimeAdmission>();
+
+/** A structural query port alone is not a completed S2 launch. */
+export function requireFormSessionPool(pool: object): void {
+  const binding = poolAdmissions.get(pool)?.().binding;
+  if (!binding || binding.profile !== 'S2'
+    || (binding.expected.consumerKind !== 'API' && binding.expected.consumerKind !== 'TEST')) {
+    throw new AdmissionRequiredError();
+  }
+}
+
+export function requireRuntimeAuthorization(authorization: ProcessAuthorization, kind: ConsumerKind, target: DatabaseConfig): RuntimeAdmission {
+  const admission = requireAuthorizationKind(authorization, kind);
+  if (revoked.has(admission) || !matchesRuntimeTarget(admission, target)) { throw new AdmissionRequiredError(); }
+  return admission;
+}
+
+type PoolTuning = Pick<PoolConfig, 'max' | 'connectionTimeoutMillis' | 'query_timeout' | 'statement_timeout'
+  | 'idleTimeoutMillis' | 'options' | 'application_name'>;
+
+export function admittedPool(deps: { authorization: ProcessAuthorization; kind: ConsumerKind }, target: DatabaseConfig,
+  tuning: PoolTuning): GuardedPool {
+  const config = Object.freeze({ host: target.host, port: target.port, database: target.database,
+    user: target.user, password: target.password });
+  const admission = requireRuntimeAuthorization(deps.authorization, deps.kind, config);
+  const pool = new Pool({ ...tuning, ...config });
   let resolveAdmitted: (() => void) | undefined;
   const admitted = new Promise<void>((resolve) => { resolveAdmitted = resolve; });
   const whenAdmitted = (): Promise<void> => admitted;
 
   const guardedConnect = async (): Promise<PoolClient> => {
-    const client = await pool.connect();
+    if (revoked.has(admission)) { throw new AdmissionRequiredError(); }
+    let client: PoolClient | undefined;
     try {
-      await deps.gate.verifyConnection(client, now());
+      client = await pool.connect();
+      if (requireRuntimeAuthorization(deps.authorization, deps.kind, config) !== admission) {
+        throw new AdmissionRequiredError();
+      }
+      await admission.gate.verifyConnection(client, new Date());
+      if (!await verifyPhysicalProfile(client, config, admission.binding.profile)) { throw new AdmissionRequiredError(); }
+      await admission.gate.verifyConnection(client, new Date());
+      if (requireRuntimeAuthorization(deps.authorization, deps.kind, config) !== admission) {
+        throw new AdmissionRequiredError();
+      }
       const resolve = resolveAdmitted;
       if (resolve) { resolveAdmitted = undefined; resolve(); }
       return client;
     } catch (error) {
       // Disconnect the unverified connection; it must never serve business work.
-      client.release(true);
+      // Acquisition failures deny this attempt; evidence from a connected
+      // backend revokes this authorization across all its runtime consumers.
+      if (client) { revoked.add(admission); client.release(true); }
       throw error instanceof AdmissionError
         ? new AdmissionRequiredError(error.code)
         : new AdmissionRequiredError();
@@ -110,5 +149,6 @@ export function admittedPool(deps: { gate: AdmissionGate; now?: () => Date }, op
       return value;
     },
   });
+  poolAdmissions.set(guarded, () => requireRuntimeAuthorization(deps.authorization, deps.kind, config));
   return guarded as GuardedPool;
 }

@@ -1,12 +1,12 @@
 import { spawnSync } from 'node:child_process';
 import { argon2, randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { recoverAdmin } from '../src/staff/recovery.js';
 import { migrateAuthFixture, reassignFixture, spareAdmin } from './auth-db-fixture.js';
+import { becomeOwner, dropOwnedTestDatabase, fixtureCredentials, maintenanceOpener } from './owned-test-database.js';
 
 // Identical opt-in and isolation policy to staff-bootstrap.test.ts: only random,
 // newly created databases are changed, and this run's teardown drops exactly the
@@ -98,23 +98,19 @@ integration('administrator recovery against isolated PostgreSQL', () => {
       await Promise.all(fixtures.map((item) => item.end()));
     } finally {
       try {
-        if (ownedDatabase !== undefined) {
-          await admin?.query(`DROP DATABASE IF EXISTS "${ownedDatabase}" WITH (FORCE)`);
+        if (ownedDatabase !== undefined && admin !== undefined) {
+          await dropOwnedTestDatabase(admin, ownedDatabase);
         }
       } finally { await admin?.end(); }
     }
   }
 
   beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    // Lab mode reads the lab process env and the attested maintenance binding;
+    // dev mode reads the local ignored env files. Never the dev database.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
     const connection = { host: '127.0.0.1', port: 55432 };
-    admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
+    admin = await maintenanceOpener()();
     const name = `fixlevelup_recovery_test_${randomBytes(12).toString('hex')}`;
     try {
       await admin.query(`CREATE DATABASE "${name}" OWNER fixlevelup_migrator TEMPLATE template0`);
@@ -122,6 +118,8 @@ integration('administrator recovery against isolated PostgreSQL', () => {
       // CREATE proves this run owns the disposable database (the flag gates the drop).
       dbName = name;
       dbCreated = true;
+      // GRANT/REVOKE need the owner: in the lab the orchestrator is a NOINHERIT member.
+      await becomeOwner(admin);
       await admin.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${name}" TO fixlevelup_migrator, fixlevelup_runtime`);
       fixture = new Client({ ...connection, database: name, user: 'fixlevelup_migrator', password: migratorPassword });
