@@ -6,10 +6,11 @@
   "exports": {
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
     "./p04": { "types": "./dist/p04.d.ts", "import": "./dist/p04.js" },
-    "./p04-json": { "types": "./dist/p04-json.d.ts", "import": "./dist/p04-json.js" }
+    "./p04-json": { "types": "./dist/p04-json.d.ts", "import": "./dist/p04-json.js" },
+    "./p05": { "types": "./dist/p05.d.ts", "import": "./dist/p05.js" }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node generate-p04.mjs",
+    "build": "tsc -p tsconfig.json && node generate-p04.mjs && node generate-p05.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }

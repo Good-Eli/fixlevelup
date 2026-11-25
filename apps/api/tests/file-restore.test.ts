@@ -17,25 +17,31 @@ import { drainFencedFileDecisions, reconcileFileDeletion } from '../src/files/fi
 import { makeFilePrivacyGrant, makeHoldGrant } from '../src/files/file-privacy/grants.js';
 import { changeFileHold, planRetention } from '../src/files/file-privacy/retention.js';
 import type { RetentionPolicy } from '../src/files/file-privacy/contract.js';
-import type { RestoreContext, RestoreGateReceipt, RestoreLimits, SnapshotManifest } from '../src/files/file-restore/contract.js';
+import type { AuthorityRecordV2, RestoreContext, RestoreGateReceipt, RestoreLimits, SnapshotManifest } from '../src/files/file-restore/contract.js';
 import { AUTHORITY_TABLES, readAuthorityInventory, readRestoreInventory } from '../src/files/file-restore/inventory.js';
-import { observeFencedSource } from '../src/files/file-restore/p05-source-fence.js';
+import { observeFencedSource, readClusterFact } from '../src/files/file-restore/p05-source-fence.js';
+import { measureCarriedRestorePolicy, readP05SourceState, readP05TargetDrainState } from '../src/files/file-restore/p05-inventory.js';
 import { createRestoreObjectIO } from '../src/files/file-restore/objects.js';
-import { readSnapshot, sha256, signApproval, signAuthority, signSnapshot } from '../src/files/file-restore/records.js';
+import { readSnapshot, sha256, signApproval, signAuthority, signAuthorityV2, signAuthorityV3, signSnapshot } from '../src/files/file-restore/records.js';
 import { createRestoredReadyStorage, rescrubFileRestore } from '../src/files/file-restore/rescrub.js';
 import { verifyClosedBase } from '../src/infrastructure/database/closed-profile-base.js';
-import { readP05Metadata } from '../src/infrastructure/database/p05-profile-catalog.js';
+import { readP05Metadata, readS3Metadata } from '../src/infrastructure/database/p05-profile-catalog.js';
 import { createS3Client, validateConfig, type PrivateQuarantineStorageConfig } from '../src/files/storage/config.js';
 import { createPrivateQuarantineStorage } from '../src/files/storage/index.js';
-import { authFixtureMigrations, installPinnedMigrationHistory } from './auth-db-fixture.js';
+import { authFixtureMigrations, installPinnedMigrationHistory, verifyOperatorMigrationHistory } from './auth-db-fixture.js';
 import { accessPolicy, faultEvidence, png, processingPolicy, provision, uploadPolicy, withQueryHook } from './file-lifecycle-fixture.js';
-import { revokeConsent, startFileReservationsDatabase } from './file-reservations-fixture.js';
+import { FILE_RESTORE_S0_CAP, revokeConsent, startFileReservationsDatabase } from './file-reservations-fixture.js';
 import { inRuntimeTransaction } from './legal-fixture.js';
+import { commitNoFileCallback, lateRestorePolicyPin, seedLateCallbackPolicy, seedLateCallbackReference } from './p05-restore-late-callback.js';
+import { createSyntheticKeySlots } from './p05-key-slot-fixture.js';
+import { checkTerminalPause, prepareTerminalRestarts } from './p05-restore-terminal-pause.js';
+import { loadKeyring } from '../src/requests/crypto/keyring.js';
 import type { FileReservationsFixture } from './file-reservations-fixture.js';
 import { pinFreshFileDatabase } from './owned-test-database.js';
 import { TECHNICAL_TIMEOUTS } from './file-storage-fixture.js';
 
-const enabled = process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1';
+const enabled = process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
+  && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1';
 const live = enabled ? describe : describe.skip;
 const limits: RestoreLimits = { maxObjects: 80, maxIntents: 20, maxObjectBytes: 65_536, maxTotalObjectBytes: 524_288,
   maxManifestBytes: 524_288, maxDumpBytes: 8_388_608 };
@@ -102,6 +108,13 @@ async function published(db: FileReservationsFixture, config: PrivateQuarantineS
 
 const expectCode = async (run: Promise<unknown>, code: string): Promise<void> => { await expect(run).rejects.toMatchObject({ code }); };
 
+/** Independent archive/after-drain equality check, covering the complete physical tuple. */
+async function archivedPolicyRows(client: Pick<Client, 'query'>): Promise<readonly string[]> {
+  const { rows } = await client.query<{ digest: string }>(`SELECT encode(sha256(convert_to(row_to_json(p)::text,'UTF8')),'hex') AS digest
+    FROM foundation.request_policy_packages p ORDER BY id LIMIT 2`);
+  return rows.map(row => row.digest);
+}
+
 type Completion = 'confirmed' | 'committed-unacknowledged' | 'aborted-unacknowledged';
 
 async function finishRestoreRun(failures: unknown[], releases: readonly (() => void | Promise<void>)[]): Promise<void> {
@@ -115,7 +128,7 @@ async function finishRestoreRun(failures: unknown[], releases: readonly (() => v
 // Redacted diagnostics for a real source/destination mismatch, no row values.
 async function schemaMeasurement(connection: Pick<Client, 'query'>) {
   return { legacy: await verifyClosedBase(connection), S1: await readP05Metadata(connection, 'S1'),
-    S2: await readP05Metadata(connection, 'S2') };
+    S2: await readP05Metadata(connection, 'S2'), S3: await readS3Metadata(connection) };
 }
 
 /** Only the target's terminal COMMIT is faulted. A real PG transaction is
@@ -169,21 +182,31 @@ async function checkUncertainCompletion(ctx: RestoreContext, manifest: ReturnTyp
 }
 
 live('P03-04D copy-only isolated restore', () => {
-  it.each(['confirmed', 'committed-unacknowledged', 'aborted-unacknowledged'] as const)('uses real archives, Garage copy, fenced overlay and independent ledger: %s', async mode => {
+  const terminalModes = process.env['FIXLEVELUP_RESTORE_TERMINAL_PAUSE_TESTS'] === '1'
+    ? ['terminal-pause', 'terminal-fence-loss'] as const : [];
+  it.each(['confirmed', 'carried-policy-confirmed', 'carried-policy-late-callback', 'carried-policy-stale-base',
+    'committed-unacknowledged', 'aborted-unacknowledged', 'legacy-s0', 'legacy-s0-target-s1', ...terminalModes] as const)('uses real archives, Garage copy, fenced overlay and independent ledger: %s', async mode => {
     const sig = AbortSignal.timeout(170_000);
     const policy = restorePolicy();
+    const lateCallback = mode === 'carried-policy-late-callback';
+    const stalePolicyBase = mode === 'carried-policy-stale-base';
+    const carriedPolicy = mode === 'carried-policy-confirmed' || lateCallback || stalePolicyBase;
+    const mismatch = mode === 'legacy-s0-target-s1';
+    const legacy = mismatch || mode === 'legacy-s0';
+    const sourceProfile = legacy ? 'S0' : 'S3';
+    const sourceFact = legacy ? 'P05_SCHEMA_ABSENT_AFTER_DRAIN' : 'P05_EMPTY_AFTER_DRAIN';
     expect(process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS']).toBe('1');
     expect(process.env['FIXLEVELUP_STORAGE_S3_TESTS']).toBe('1');
-    const schemaVersion = authFixtureMigrations.at(-1) ?? '';
+    const migrations = legacy ? authFixtureMigrations.slice(0, 21) : authFixtureMigrations;
+    const schemaVersion = migrations.at(-1) ?? '';
     expect(authFixtureMigrations[17]).toBe('20261122000400_settings_management');
     expect(authFixtureMigrations[18]).toBe('20261122000500_catalog_fixed_prices');
     expect(authFixtureMigrations[19]).toBe('20261122000600_pricing_rules_ranges');
     expect(authFixtureMigrations[20]).toBe('20261122000700_catalog_management');
     expect(authFixtureMigrations[21]).toBe('20261123000100_request_intake_foundation');
-    // The restore contour now runs on the S2 profile (023 form session
-    // foundation over the 022 request intake); its source-side P05 fact is
-    // SCHEMA-verified through the new callback.
-    expect(schemaVersion).toBe('20261124000100_form_session_foundation');
+    // An expanded S3 restore must prove emptiness; a capped S0 restore must
+    // instead prove the pre-P05 physical schema, not just an older manifest head.
+    expect(schemaVersion).toBe(legacy ? '20261122000700_catalog_management' : '20261125000100_request_intake_effects');
     const [ops, writer, nextWriter, signer, floorOps, floorRuntime] = [ledgerPool('file_ledger_operator'), ledgerPool('file_ledger_writer'),
       ledgerPool('file_ledger_writer_next'), ledgerPool('file_ledger_signer'), ledgerPool('file_floor_operator'), ledgerPool('file_floor_verifier')] as const;
     const maintenance = new Pool(restoreDbOptions('postgres', 'maintenance'));
@@ -218,7 +241,7 @@ live('P03-04D copy-only isolated restore', () => {
       }
     };
     const failures: unknown[] = [];
-    const sourceDb = await startFileReservationsDatabase();
+    const sourceDb = await startFileReservationsDatabase(legacy ? FILE_RESTORE_S0_CAP : undefined);
     try {
       const genesis = await bootstrapFileLedgerNamespace({ mode: 'local-synthetic', ledgerOperatorPool: ops, floorOperatorPool: floorOps,
         signerPublicKey: ledgerKeys.publicKey, initialEpoch: 1n });
@@ -236,7 +259,10 @@ live('P03-04D copy-only isolated restore', () => {
       const staleVerifier: FileLedgerVerifier = createFileLedgerVerifier({ ledger: {
         getEvents: (s, from, to) => ledger.getEvents(s, from, to), getHead: (_scope, nonce) => ledger.getHead(scope, nonce),
       }, floor, signerPublicKey: ledgerKeys.publicKey, limits: proofLimits });
-      await installPinnedMigrationHistory(sourceDb.migrator);
+      const history = await installPinnedMigrationHistory(sourceDb.migrator, migrations);
+      if (legacy) { await expect(verifyOperatorMigrationHistory(sourceDb.migrator, migrations)).resolves.toEqual({ ok: true, ...history }); }
+      const terminalRestarts = mode === 'terminal-pause' || mode === 'terminal-fence-loss'
+        ? await prepareTerminalRestarts(sourceDb.migrator, sourceDb.database) : undefined;
       await sourceDb.migrator.query(`INSERT INTO foundation.file_runtime_epochs (singleton,namespace_id,epoch,mode) VALUES (true,$1,1,'ACTIVE')`, [namespace]);
       const sourceTarget = freshGarageBucket(namespace);
       const fresh = freshGarageBucket();
@@ -275,13 +301,43 @@ live('P03-04D copy-only isolated restore', () => {
         FROM foundation.p03_bootstrap_permissions ORDER BY assignment_id,permission_code COLLATE "C"`;
       const originalFounderSources = (await sourceDb.migrator.query(sourceRowsSql)).rows;
       expect(originalFounderSources).toHaveLength(18);
-      const dumpHash = archives.dump();
+      const callbackReference = carriedPolicy ? await seedLateCallbackReference(sourceDb.migrator, { reviewerId: sourceDb.reviewer }) : undefined;
+      // Simulate an honestly signed but stale base: its verified bytes contain no
+      // policy, although the after-drain source matches the new signed digest.
+      const staleDumpHash = stalePolicyBase ? archives.dump() : undefined;
+      const callbackBasis = callbackReference ? await seedLateCallbackPolicy(sourceDb.migrator, callbackReference) : undefined;
+      const policySha256 = carriedPolicy ? await measureCarriedRestorePolicy(sourceDb.migrator, lateRestorePolicyPin) : undefined;
+      const carried = policySha256 === undefined ? undefined : { pin: lateRestorePolicyPin, sha256: policySha256 };
+      const policyBeforeDump = carried ? await readP05SourceState(sourceDb.migrator, 'S3') : undefined;
+      const policyRowsBeforeDump = carried ? await archivedPolicyRows(sourceDb.migrator) : undefined;
+      if (carried) { expect(policyRowsBeforeDump).toHaveLength(1); }
+      const dumpHash = staleDumpHash ?? archives.dump();
       for (const item of oldInventory) {if (item.disposition === 'COPY') {archives.artifact(item, await io.exportSource(item, sig));}}
       const payload: SnapshotManifest = { sourceDatabase: sourceDb.database, destinationDatabase: destination, schemaVersion,
-        dumpSha256: dumpHash, base, aliases: [{ source: sourceTarget.target, destination: fresh.target }], inventory: oldInventory };
+        dumpSha256: dumpHash, base, aliases: [{ source: sourceTarget.target, destination: fresh.target }], inventory: oldInventory,
+        ...(policySha256 === undefined ? {} : { policySha256 }) };
       const manifest = signSnapshot(payload, snapshotKeys.privateKey);
       archives.manifest(manifest);
       const authHash = readSnapshot(manifest, snapshotKeys.publicKey, limits).hash;
+      let lateAggregate: Awaited<ReturnType<typeof commitNoFileCallback>> | undefined;
+      if (lateCallback) {
+        if (!callbackBasis || !policyBeforeDump) { throw new Error('Missing paired callback prerequisites'); }
+        expect(await readP05SourceState(sourceDb.migrator, 'S3')).toEqual(policyBeforeDump);
+        const managed = await createSyntheticKeySlots('p05-restore-late');
+        cleanups.push(() => managed.close());
+        const ring = loadKeyring({ activeKekId: 'test-kek-1', activeHmacKeyId: 'test-hmac-1',
+          kek: [{ keyId: 'test-kek-1', secretHex: randomBytes(32).toString('hex') }],
+          hmac: [{ keyId: 'test-hmac-1', secretHex: randomBytes(32).toString('hex') }] });
+        lateAggregate = await inRuntimeTransaction(sourceDb.runtime, client => commitNoFileCallback(client, {
+          ring, keySlots: managed.slots, environment: 'p05-restore-late', basis: callbackBasis, staffId: sourceDb.reviewer,
+          cityId: sourceDb.city.cityId, cityVersionId: sourceDb.city.cityVersionId }));
+        expect(lateAggregate.writerRole).toBe('fixlevelup_runtime');
+        expect(await readP05SourceState(sourceDb.migrator, 'S3')).toEqual({ profile: 'S3', empty: false, counts: { ...policyBeforeDump.counts,
+          customers: 1, requests: 1, request_payload_cells: 1, request_contact_revisions: 1,
+          request_preference_revisions: 1, request_intake_provenance: 1, request_events: 1,
+          request_command_receipts: 1, phone_permission_events: 1, request_staff_evidence: 2 } });
+        expect(await readRestoreInventory(sourceDb.migrator, limits)).toEqual(oldInventory);
+      }
 
       const operator = (role: 'HOLD' | 'RETENTION' | 'SOURCE_DRAIN' | 'DELETE') => makeFilePrivacyGrant({ mode: 'local-synthetic', namespace,
         role, actorId: sourceDb.reviewer });
@@ -317,7 +373,17 @@ live('P03-04D copy-only isolated restore', () => {
         await expectCode(readReadyMetadata(sourceAccess, survivor.file), 'NOT_CONFIGURED');
       }
       expect((await drainFencedFileDecisions({ ...sourcePrivacy, grant: operator('SOURCE_DRAIN'), scope, ledger, verifier }, sig)).advanced).toBe(1);
-      const fenceRow = await maintenance.query(`REVOKE CONNECT ON DATABASE "${sourceDb.database}" FROM fixlevelup_runtime`);
+      const hardFence = legacy || carriedPolicy || terminalRestarts !== undefined;
+      const fenceRoles = hardFence ? 'PUBLIC,fixlevelup_runtime,fixlevelup_migrator,fixlevelup_lab_orchestrator' : 'fixlevelup_runtime';
+      // Hold the dedicated read-only connection before revoking the owner login's
+      // CONNECT; none of the write-capable identities can start another session.
+      const terminalObserver = hardFence ? new Client({ ...restoreDbOptions(sourceDb.database, 'migrator'),
+        options: '-c default_transaction_read_only=on' }) : undefined;
+      if (terminalObserver) {
+        cleanups.push(async () => { await terminalObserver.end(); });
+        await terminalObserver.connect();
+      }
+      const fenceRow = await maintenance.query(`REVOKE CONNECT ON DATABASE "${sourceDb.database}" FROM ${fenceRoles}`);
       expect(fenceRow.command).toBe('REVOKE');
       // Only this fixture's runtime service is shut down; the dev DB/roles and other fixtures are not touched.
       await closeSourceStorage();
@@ -328,28 +394,44 @@ live('P03-04D copy-only isolated restore', () => {
       expect(head.seq).toBe(1n);
       const inventorySha256 = await readAuthorityInventory(sourceDb.migrator, limits);
       const overlaySha256 = archives.overlay();
-      const sourceObserver = new Client({ ...restoreDbOptions(sourceDb.database, 'migrator'),
+      const sourceObserver = terminalObserver ?? new Client({ ...restoreDbOptions(sourceDb.database, 'migrator'),
         options: '-c default_transaction_read_only=on' });
-      cleanups.push(async () => { await sourceObserver.end(); });
-      await sourceObserver.connect();
+      if (!terminalObserver) {
+        cleanups.push(async () => { await sourceObserver.end(); });
+        await sourceObserver.connect();
+      }
       const sourceOid = (await sourceObserver.query<{ oid: string }>(
         'SELECT oid::text AS oid FROM pg_database WHERE datname=current_database()',
       )).rows[0]?.oid;
       const sourceDatabaseOid = Number(sourceOid);
       if (!Number.isSafeInteger(sourceDatabaseOid) || sourceDatabaseOid <= 0) { throw new Error('Missing pinned source database OID'); }
-      const sourcePin = { database: sourceDb.database, databaseOid: sourceDatabaseOid, scope, profile: 'S2' as const,
-        manifestSha256: authHash, challenge: randomBytes(32).toString('hex') };
+      const sourcePin = { database: sourceDb.database, databaseOid: sourceDatabaseOid, scope, profile: sourceProfile,
+        manifestSha256: authHash, challenge: randomBytes(32).toString('hex') } as const;
       // The restore core independently checks the hard fence and compares the
       // inventory digest before trusting this manifest/challenge-bound signature.
       const authorityNonces: string[] = [];
+      // The operator bridge signs the cluster identity it reads itself; the core
+      // re-observes it on the same fenced source and refuses a mismatch.
+      const cluster = await readClusterFact(sourceObserver);
+      const authorityFields = (challenge: string, manifestSha256: string): AuthorityRecordV2 => ({
+        challenge, manifestSha256, overlaySha256, inventorySha256, head,
+        sourceDatabase: sourceDb.database, sourceDatabaseOid, cluster, sourceProfile, oldNamespace: scope.namespace,
+        oldWriterEpoch: scope.writerEpoch.toString(), destinationDatabase: destination });
       const currentAuthority: RestoreContext['currentAuthority'] = async ({ challenge, manifestSha256 }) => {
-        if (manifestSha256 !== authHash || await readAuthorityInventory(sourceObserver, limits) !== inventorySha256) {
+        const observed = legacy || carried
+          ? await observeFencedSource(sourceObserver, { ...sourcePin, challenge, manifestSha256 }, limits, carried) : undefined;
+        if (manifestSha256 !== authHash || (observed?.inventorySha256 ?? await readAuthorityInventory(sourceObserver, limits)) !== inventorySha256) {
           throw new Error('Current authority is not fenced');
         }
         authorityNonces.push(challenge);
-        return signAuthority({ challenge, manifestSha256, overlaySha256, inventorySha256, head }, authorityKeys.privateKey);
+        const fields = authorityFields(challenge, manifestSha256);
+        return observed?.policySha256 && observed.fact === 'P05_EMPTY_AFTER_DRAIN' && observed.profile === 'S3'
+          ? signAuthorityV3({ ...fields, sourceProfile: observed.profile, drainFact: observed.fact, policySha256: observed.policySha256 }, authorityKeys.privateKey)
+          : signAuthorityV2(fields, authorityKeys.privateKey);
       };
-      const heldSession = new Client(restoreDbOptions(sourceDb.database, 'migrator'));
+      const heldSession = new Client(hardFence
+        ? { ...restoreDbOptions('postgres', 'maintenance'), database: sourceDb.database }
+        : restoreDbOptions(sourceDb.database, 'migrator'));
       await heldSession.connect();
       try {
         await sourceDb.drainPools();
@@ -359,14 +441,20 @@ live('P03-04D copy-only isolated restore', () => {
         finally { await rejectedObserver.end(); }
         await expectCode(observeFencedSource(sourceObserver, sourcePin, limits), 'RESTORE_AUTHORITY');
       } finally { await heldSession.end(); }
-      await expect(observeFencedSource(sourceObserver, sourcePin, limits)).resolves.toMatchObject({ profile: 'S2',
-        fact: 'P05_EMPTY_AFTER_DRAIN', nonce: sourcePin.challenge, manifestSha256: authHash, inventorySha256 });
-      const sourceSchema = await schemaMeasurement(sourceObserver);
+      if (lateCallback) {
+        await expectCode(observeFencedSource(sourceObserver, sourcePin, limits, carried), 'RESTORE_AUTHORITY');
+      } else {
+        await expect(observeFencedSource(sourceObserver, sourcePin, limits, carried)).resolves.toMatchObject({ profile: sourceProfile,
+          fact: sourceFact, nonce: sourcePin.challenge, manifestSha256: authHash, inventorySha256,
+          cluster: { systemIdentifier: cluster.systemIdentifier, serverVersionNum: cluster.serverVersionNum,
+            postmasterStart: cluster.postmasterStart } });
+      }
+      const sourceSchema = legacy ? undefined : await schemaMeasurement(sourceObserver);
       const ctx: RestoreContext = {
         mode: 'local-synthetic', schemaVersion, sourceDatabase: sourceDb.database, destinationDatabase: destination, oldScope: scope,
         nextEpoch: nextScope.writerEpoch, limits, targetOperatorPool: targetOps, snapshotKey: snapshotKeys.publicKey,
         approvalKey: approvalKeys.publicKey, authorityKey: authorityKeys.publicKey, verifier, currentAuthority,
-        sourceObserver, sourceDatabaseOid,
+        sourceObserver, sourceDatabaseOid, ...(carried ? { policyPin: carried.pin } : {}),
         async restoreArchives(snapshot, authority) {
           await archives.restore(snapshot.dumpSha256, authority.overlaySha256, async () => {
             await maintenance.query(`CREATE DATABASE "${destination}" OWNER fixlevelup_migrator TEMPLATE template0 ALLOW_CONNECTIONS false`);
@@ -377,23 +465,203 @@ live('P03-04D copy-only isolated restore', () => {
           }, async () => {
             const restored = await targetOps.connect();
             try {
-              await restoreReviewedExpressions(sourceObserver, restored, snapshot.destinationDatabase);
-              expect(await schemaMeasurement(restored)).toEqual(sourceSchema);
+              await restoreReviewedExpressions(sourceObserver, restored, snapshot.destinationDatabase, legacy ? 'S0' : undefined);
+              if (legacy) {
+                await expect(readP05TargetDrainState(restored, 'S0')).resolves.toEqual({ profile: sourceProfile, fact: sourceFact });
+                await expect(verifyOperatorMigrationHistory(restored, migrations)).resolves.toEqual({ ok: true, ...history });
+              } else {
+                expect(await schemaMeasurement(restored)).toEqual(sourceSchema);
+              }
               await restored.query(`INSERT INTO foundation.file_runtime_epochs (singleton,namespace_id,epoch,mode)
                 VALUES (true,$1,$2,'RESTORE_CLOSED')`, [namespace, epoch.epoch.toString()]);
+              if (mismatch) {
+                // Deliberately finish the operator restore at a different, fully
+                // reviewed empty profile. Only this owned target gets migration 022;
+                // the signed archive and the physical source remain S0.
+                const sql = resolve(import.meta.dirname, '../../../prisma/migrations', FILE_RESTORE_S0_CAP, 'migration.sql');
+                await restored.query(readFileSync(sql, 'utf8'));
+                const targetMigrations = authFixtureMigrations.slice(0, 22);
+                const targetHistory = await installPinnedMigrationHistory(restored, targetMigrations);
+                await expect(verifyOperatorMigrationHistory(restored, targetMigrations)).resolves.toEqual({ ok: true, ...targetHistory });
+                await expect(readP05TargetDrainState(restored)).resolves.toEqual({ profile: 'S1', fact: 'P05_EMPTY_AFTER_DRAIN' });
+              }
             } finally { restored.release(); }
           });
         },
         openBackupObject: (item) => Promise.resolve(archives.object(item, limits.maxObjectBytes)),
         copyToFreshTarget: io.copyToFreshTarget,
         async approve(binding) {
+          if (legacy) {
+            expect((await targetOps.query(`SELECT mode,epoch::text FROM foundation.file_runtime_epochs WHERE singleton`)).rows)
+              .toEqual([{ mode: 'RESTORE_CLOSED', epoch: '1' }]);
+          }
           const probe = new Client(restoreDbOptions(destination, 'runtime'));
           try { await expect(probe.connect()).rejects.toMatchObject({ code: '42501' }); }
           finally { await probe.end(); }
           return signApproval(binding, approvalKeys.privateKey);
         },
       };
-      if (mode !== 'confirmed') {
+      if (lateCallback) {
+        if (!lateAggregate || !callbackBasis) { throw new Error('Expected committed late callback'); }
+        const signer = vi.fn(ctx.currentAuthority);
+        const archiveRestore = vi.fn(ctx.restoreArchives);
+        const copy = vi.fn(ctx.copyToFreshTarget);
+        const readObject = vi.fn(ctx.openBackupObject);
+        const approval = vi.fn(ctx.approve);
+        const lineageVerifier = vi.fn(ctx.verifier.verifyLineage.bind(ctx.verifier));
+        await expectCode(rescrubFileRestore({ ...ctx, currentAuthority: signer, restoreArchives: archiveRestore,
+          copyToFreshTarget: copy, openBackupObject: readObject, approve: approval,
+          verifier: { ...ctx.verifier, verifyLineage: lineageVerifier } }, manifest, sig), 'RESTORE_AUTHORITY');
+        for (const probe of [signer, archiveRestore, copy, readObject, approval, lineageVerifier]) { expect(probe).not.toHaveBeenCalled(); }
+        expect(destinationCreated).toBe(false);
+        expect(targetOps.totalCount).toBe(0);
+        expect((await maintenance.query('SELECT FROM pg_database WHERE datname=$1', [destination])).rowCount).toBe(0);
+        expect((await reader.send(new ListObjectsV2Command({ Bucket: fresh.target.bucket }), { abortSignal: sig })).KeyCount).toBe(0);
+        expect(await archivedPolicyRows(sourceObserver)).toEqual(policyRowsBeforeDump);
+        expect((await sourceObserver.query(`SELECT r.type,r.status,r.row_version,p.id::text AS policy
+          FROM foundation.requests r JOIN foundation.request_policy_packages p ON r.intake_policy_revision_id=p.id
+          JOIN foundation.request_events e ON e.request_id=r.id
+          JOIN foundation.request_command_receipts c ON c.request_id=r.id AND c.event_id=e.id
+          WHERE r.id=$1 AND e.id=$2 AND NOT EXISTS (SELECT FROM foundation.request_files f WHERE f.request_id=r.id)`,
+        [lateAggregate.requestId, lateAggregate.eventId])).rows).toEqual([{ type: 'CALLBACK', status: 'CALLBACK_REQUIRED', row_version: 1,
+          policy: callbackBasis.policyId }]);
+        expect(sha256(readFileSync(resolve(archives.directory, 'database.dump')))).toBe(dumpHash);
+        archives.evidence({ policySha256, policyUnchanged: true, baseDumpSha256: dumpHash, durableCallback: true,
+          downstreamCalls: 0, targetCreated: false, targetRuntimeConnect: false });
+        return;
+      }
+      if (stalePolicyBase) {
+        const install = vi.fn(ctx.restoreArchives);
+        const approve = vi.fn(ctx.approve);
+        const copy = vi.fn(ctx.copyToFreshTarget);
+        await expectCode(rescrubFileRestore({ ...ctx, restoreArchives: install, copyToFreshTarget: copy, approve }, manifest, sig),
+          'RESTORE_AUTHORITY');
+        expect(install).toHaveBeenCalledTimes(1);
+        expect(authorityNonces).toHaveLength(1);
+        expect(copy).not.toHaveBeenCalled();
+        expect(approve).not.toHaveBeenCalled();
+        expect(await archivedPolicyRows(targetOps)).toEqual([]);
+        expect(await archivedPolicyRows(sourceObserver)).toEqual(policyRowsBeforeDump);
+        expect((await targetOps.query(`SELECT mode,epoch::text,has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT') AS connect
+          FROM foundation.file_runtime_epochs WHERE singleton`)).rows).toEqual([{ mode: 'RESTORE_CLOSED', epoch: '1', connect: false }]);
+        const denied = new Client(restoreDbOptions(destination, 'runtime'));
+        try { await expect(denied.connect()).rejects.toMatchObject({ code: '42501' }); }
+        finally { await denied.end(); }
+        archives.evidence({ policySha256, staleBaseWithoutPolicy: true, baseDumpSha256: dumpHash,
+          targetMode: 'RESTORE_CLOSED', runtimeConnect: false });
+        return;
+      }
+      if (carried) {
+        const restore = vi.fn(ctx.restoreArchives);
+        const signer = vi.fn(currentAuthority);
+        const strictPayload: SnapshotManifest = { sourceDatabase: sourceDb.database, destinationDatabase: destination,
+          schemaVersion, dumpSha256: dumpHash, base, aliases: payload.aliases, inventory: oldInventory };
+        // Old records cannot opt in, and a newly signed wrong digest or independent
+        // canonical pin cannot vouch for the actual immutable configuration.
+        for (const snapshot of [signSnapshot(strictPayload, snapshotKeys.privateKey),
+          signSnapshot({ ...payload, policySha256: '0'.repeat(64) }, snapshotKeys.privateKey)]) {
+          await expectCode(rescrubFileRestore({ ...ctx, restoreArchives: restore, currentAuthority: signer }, snapshot, sig), 'RESTORE_AUTHORITY');
+        }
+        await expectCode(rescrubFileRestore({ ...ctx, restoreArchives: restore, currentAuthority: signer,
+          policyPin: { ...carried.pin, metadataSha256: '0'.repeat(64) } }, manifest, sig), 'RESTORE_AUTHORITY');
+        expect(signer).not.toHaveBeenCalled();
+        const oldSigners: readonly RestoreContext['currentAuthority'][] = [
+          ({ challenge, manifestSha256 }) => Promise.resolve(signAuthority(authorityFields(challenge, manifestSha256), authorityKeys.privateKey)),
+          ({ challenge, manifestSha256 }) => Promise.resolve(signAuthorityV2(authorityFields(challenge, manifestSha256), authorityKeys.privateKey)),
+          ({ challenge, manifestSha256 }) => Promise.resolve(signAuthorityV3({ ...authorityFields(challenge, manifestSha256),
+            sourceProfile: 'S3', drainFact: 'P05_EMPTY_AFTER_DRAIN', policySha256: '0'.repeat(64) }, authorityKeys.privateKey)),
+        ];
+        for (const oldSigner of oldSigners) {
+          const signed = vi.fn(oldSigner);
+          await expectCode(rescrubFileRestore({ ...ctx, restoreArchives: restore, currentAuthority: signed }, manifest, sig), 'RESTORE_AUTHORITY');
+          expect(signed).toHaveBeenCalledTimes(1);
+        }
+        expect(restore).not.toHaveBeenCalled();
+        expect(destinationCreated).toBe(false);
+        const receipt = await rescrubFileRestore(ctx, manifest, sig);
+        expect(receipt).toEqual({ mode: 'ACTIVE', epoch: { namespace, epoch: 2n }, copied: 7, tombstoned: 3, unresolved: 0 });
+        expect(new Set(authorityNonces).size).toBe(2);
+        expect(await readP05SourceState(targetOps, 'S3')).toEqual(policyBeforeDump);
+        expect(await archivedPolicyRows(targetOps)).toEqual(policyRowsBeforeDump);
+        expect(await archivedPolicyRows(sourceObserver)).toEqual(policyRowsBeforeDump);
+        expect(await measureCarriedRestorePolicy(targetOps, carried.pin)).toBe(policySha256);
+        expect((await targetOps.query(`SELECT mode,epoch::text,has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT') AS connect
+          FROM foundation.file_runtime_epochs WHERE singleton`)).rows).toEqual([{ mode: 'ACTIVE', epoch: '2', connect: false }]);
+        expect(sha256(readFileSync(resolve(archives.directory, 'database.dump')))).toBe(dumpHash);
+        archives.evidence({ policySha256, policyCopiedExactly: true, baseDumpSha256: dumpHash,
+          distinctAuthorityChallenges: authorityNonces.length, operationalRows: 0, epoch: '2', runtimeConnect: false });
+        return;
+      }
+      if (mode === 'terminal-pause' || mode === 'terminal-fence-loss') {
+        if (!terminalRestarts) { throw new Error('Missing old source admissions'); }
+        const evidence = await checkTerminalPause(ctx, manifest, { maintenance, old: terminalRestarts,
+          loseFence: mode === 'terminal-fence-loss', signal: sig });
+        expect(authorityNonces).toHaveLength(2);
+        archives.evidence(evidence);
+        return;
+      }
+      if (mismatch) {
+        const installed = vi.fn(ctx.restoreArchives);
+        const approve = vi.fn(ctx.approve);
+        const copy = vi.fn(ctx.copyToFreshTarget);
+        await expectCode(rescrubFileRestore({ ...ctx, restoreArchives: installed, approve, copyToFreshTarget: copy }, manifest, sig), 'RESTORE_AUTHORITY');
+        expect(installed).toHaveBeenCalledTimes(1);
+        expect(destinationCreated).toBe(true);
+        expect(authorityNonces).toHaveLength(1);
+        expect(approve).not.toHaveBeenCalled();
+        expect(copy).not.toHaveBeenCalled();
+        expect((await targetOps.query<{ mode: string; epoch: string; connect: boolean }>(`SELECT mode,epoch::text,
+          has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT') AS connect
+          FROM foundation.file_runtime_epochs WHERE singleton`)).rows).toEqual([{ mode: 'RESTORE_CLOSED', epoch: '1', connect: false }]);
+        const denied = new Client(restoreDbOptions(destination, 'runtime'));
+        try { await expect(denied.connect()).rejects.toMatchObject({ code: '42501' }); }
+        finally { await denied.end(); }
+        await expect(observeFencedSource(sourceObserver, sourcePin, limits)).resolves.toMatchObject({
+          profile: 'S0', fact: 'P05_SCHEMA_ABSENT_AFTER_DRAIN', inventorySha256, cluster });
+        expect((await reader.send(new ListObjectsV2Command({ Bucket: fresh.target.bucket }), { abortSignal: sig })).KeyCount).toBe(0);
+        archives.evidence({ sourceProfile, targetProfile: 'S1', targetMode: 'RESTORE_CLOSED', runtimeConnect: false,
+          archiveRestored: true, approvals: 0, copies: 0, sourcePreserved: true });
+        return;
+      }
+      if (legacy) {
+        // A genuinely signed v1 record over the same old format is not admission.
+        // Run the control before the positive handoff; it cannot create a target.
+        const restore = vi.fn(ctx.restoreArchives);
+        await expectCode(rescrubFileRestore({ ...ctx, restoreArchives: restore,
+          currentAuthority: ({ challenge, manifestSha256 }) => Promise.resolve(signAuthority({
+            challenge, manifestSha256, overlaySha256, inventorySha256, head }, authorityKeys.privateKey)),
+        }, manifest, sig), 'RESTORE_AUTHORITY');
+        expect(restore).not.toHaveBeenCalled();
+        expect(destinationCreated).toBe(false);
+        const receipt = await rescrubFileRestore(ctx, manifest, sig);
+        expect(receipt).toEqual({ mode: 'ACTIVE', epoch: { namespace, epoch: 2n }, copied: 7, tombstoned: 3, unresolved: 0 });
+        expect(authorityNonces).toHaveLength(2);
+        expect(new Set(authorityNonces).size).toBe(2);
+        const { rows: [targetState] } = await targetOps.query<{ mode: string; epoch: string; connect: boolean }>(`SELECT mode,epoch::text,
+          has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT') AS connect
+          FROM foundation.file_runtime_epochs WHERE singleton`);
+        expect(targetState).toEqual({ mode: 'ACTIVE', epoch: '2', connect: false });
+        expect(await readAuthorityInventory(targetOps, limits)).toBe(inventorySha256);
+        expect((await targetOps.query(sourceRowsSql)).rows).toEqual(originalFounderSources);
+        // The production copy port already verifies each byte PUT by bounded
+        // full GET. Independently check that only surviving keys are present.
+        const expectedKeys = oldInventory.filter(item => item.disposition === 'COPY' && item.intentId !== retired.file.intentId)
+          .map(item => item.key).sort();
+        const listing = await reader.send(new ListObjectsV2Command({ Bucket: fresh.target.bucket }), { abortSignal: sig });
+        expect(listing.IsTruncated).not.toBe(true);
+        expect(listing.Contents?.map(item => item.Key).sort()).toEqual(expectedKeys);
+        for (const item of oldInventory) {
+          if (item.disposition === 'COPY') { expect(sha256(await io.exportSource(item, sig))).toBe(item.sha256); }
+        }
+        expect(await floor.read(namespace)).toMatchObject({ writerEpoch: 2n, seq: 1n, hash: head.hash });
+        await expect(observeFencedSource(sourceObserver, sourcePin, limits)).resolves.toMatchObject({
+          profile: sourceProfile, fact: sourceFact, inventorySha256, cluster });
+        archives.evidence({ sourceProfile, targetProfile: 'S0', sourceFact, historyManifestDigest: history.historyManifestDigest,
+          legacyAuthorityRejected: true, freshV2Challenges: 2, epoch: '2', ledgerSeq: '1', copied: receipt.copied,
+          skippedTombstoned: receipt.tombstoned, sourceObjectsPreserved: true, runtimeConnect: false });
+        return;
+      }
+      if (mode === 'committed-unacknowledged' || mode === 'aborted-unacknowledged') {
         await checkUncertainCompletion(ctx, manifest, mode, sig);
         expect(authorityNonces).toHaveLength(2);
         archives.evidence({ terminalCompletion: mode, receipt: false, runtimeConnect: false, automaticRetry: false });
@@ -552,4 +820,179 @@ live('P03-04D copy-only isolated restore', () => {
       await finishRestoreRun(failures, [...cleanups.reverse(), ...pools.map(pool => () => pool.end()), () => sourceDb.close(), dropDestination]);
     }
   }, 175_000);
+
+  /** §5.3 diagnosis: distinguish a strictly empty S3 dump from one with all
+   * callback prerequisites. The policy itself is an inventoried P05 row and a
+   * mandatory FK target. Do not label the policy-only state an admissible base,
+   * or claim the eventual refusal uniquely diagnoses the callback. */
+  it('separates the real empty dump, policy-only refusal and durable late callback delta', { timeout: 175_000 }, async () => {
+    const sig = AbortSignal.timeout(170_000);
+    expect(process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS']).toBe('1');
+    expect(process.env['FIXLEVELUP_STORAGE_S3_TESTS']).toBe('1');
+    const schemaVersion = authFixtureMigrations.at(-1) ?? '';
+    expect(schemaVersion).toBe('20261125000100_request_intake_effects');
+    const destination = `fixlevelup_file_restore_${randomBytes(12).toString('hex')}`;
+    const maintenance = new Pool(restoreDbOptions('postgres', 'maintenance'));
+    // The destination never exists in this proof: the pool is only here so a real
+    // connection attempt would be visible. It must stay unused.
+    const targetOps = new Pool({ ...restoreDbOptions(destination, 'migrator'), max: 1 });
+    const pools = [maintenance, targetOps];
+    const cleanups: (() => void | Promise<void>)[] = [];
+    const failures: unknown[] = [];
+    const sourceDb = await startFileReservationsDatabase();
+    try {
+      await installPinnedMigrationHistory(sourceDb.migrator);
+      const namespace = randomUUID();
+      const oldScope = { namespace, incarnation: randomUUID(), writerEpoch: 1n };
+      await sourceDb.migrator.query(`INSERT INTO foundation.file_runtime_epochs (singleton,namespace_id,epoch,mode)
+        VALUES (true,$1,1,'ACTIVE')`, [namespace]);
+      const reference = await seedLateCallbackReference(sourceDb.migrator, { reviewerId: sourceDb.reviewer });
+      const ring = loadKeyring({ activeKekId: 'test-kek-1', activeHmacKeyId: 'test-hmac-1',
+        kek: [{ keyId: 'test-kek-1', secretHex: randomBytes(32).toString('hex') }],
+        hmac: [{ keyId: 'test-hmac-1', secretHex: randomBytes(32).toString('hex') }] });
+      const archive = () => newArchives(sourceDb.database, destination, AUTHORITY_TABLES.map(([table]) => table), limits.maxDumpBytes);
+
+      // Real strict-empty control. The independent confirmed handoff above also
+      // exercises restore/ACTIVE with a real, strictly empty S3 base.
+      const emptyState = await readP05SourceState(sourceDb.migrator, 'S3');
+      expect(emptyState).toMatchObject({ profile: 'S3', empty: true });
+      expect(await readP05TargetDrainState(sourceDb.migrator, 'S3'))
+        .toEqual({ fact: 'P05_EMPTY_AFTER_DRAIN', profile: 'S3' });
+      const cleanArchives = archive();
+      const cleanDumpSha256 = cleanArchives.dump();
+      expect(sha256(readFileSync(resolve(cleanArchives.directory, 'database.dump')))).toBe(cleanDumpSha256);
+      expect(await readP05SourceState(sourceDb.migrator, 'S3')).toEqual(emptyState);
+
+      // Independent policy-only refusal on the exact application source, before
+      // a callback is even attempted. All prerequisites precede the second dump.
+      const basis = await seedLateCallbackPolicy(sourceDb.migrator, reference);
+      const preDump = await readP05SourceState(sourceDb.migrator, 'S3');
+      expect(preDump).toEqual({ profile: 'S3', empty: false, counts: { ...emptyState.counts, request_policy_packages: 1 } });
+      await expect(readP05TargetDrainState(sourceDb.migrator, 'S3')).rejects.toMatchObject({ code: 'P05_ROWS_PRESENT' });
+      const emptyInventory = await readRestoreInventory(sourceDb.migrator, limits);
+      expect(emptyInventory).toEqual([]);
+      const archives = archive();
+      const applicationDumpSha256 = archives.dump();
+      expect(applicationDumpSha256).not.toBe(cleanDumpSha256);
+      expect(await readP05SourceState(sourceDb.migrator, 'S3')).toEqual(preDump);
+
+      // Only application mutation between the application dump and the post-dump
+      // checkpoint: one synchronous COMMIT of the no-file runtime aggregate.
+      const managed = await createSyntheticKeySlots('p05-restore-late');
+      cleanups.push(() => managed.close());
+      const callback = await inRuntimeTransaction(sourceDb.runtime, (client) => commitNoFileCallback(client, {
+        ring, keySlots: managed.slots, environment: 'p05-restore-late', basis, staffId: sourceDb.reviewer,
+        cityId: sourceDb.city.cityId, cityVersionId: sourceDb.city.cityVersionId }));
+      expect(callback.writerRole).toBe('fixlevelup_runtime');
+      const afterCallback = await readP05SourceState(sourceDb.migrator, 'S3');
+      expect(afterCallback).toEqual({ profile: 'S3', empty: false, counts: { ...preDump.counts,
+        customers: 1, requests: 1, request_payload_cells: 1, request_contact_revisions: 1,
+        request_preference_revisions: 1, request_intake_provenance: 1, request_events: 1,
+        request_command_receipts: 1, phone_permission_events: 1, request_staff_evidence: 2 } });
+      expect(await readRestoreInventory(sourceDb.migrator, limits)).toEqual(emptyInventory);
+
+      // 3. The physical hard drain, exactly like the operator bridge: fenced epoch,
+      //    no runtime CONNECT, no other backend, `datallowconn=false`.
+      await sourceDb.migrator.query(`UPDATE foundation.file_runtime_epochs SET mode='FENCED'
+        WHERE singleton AND namespace_id=$1 AND epoch=1 AND mode='ACTIVE'`, [namespace]);
+      await maintenance.query(`REVOKE CONNECT ON DATABASE "${sourceDb.database}" FROM fixlevelup_runtime`);
+      await sourceDb.drainPools();
+      const observer = new Client({ ...restoreDbOptions(sourceDb.database, 'migrator'),
+        options: '-c default_transaction_read_only=on' });
+      cleanups.push(async () => { await observer.end(); });
+      await observer.connect();
+      const sourceDatabaseOid = Number((await observer.query<{ oid: string }>(
+        'SELECT oid::text AS oid FROM pg_database WHERE datname=current_database()')).rows[0]?.oid);
+      expect(Number.isSafeInteger(sourceDatabaseOid)).toBe(true);
+      await maintenance.query(`ALTER DATABASE "${sourceDb.database}" ALLOW_CONNECTIONS false`);
+      await expect.poll(async () => (await observer.query<{ allow: boolean; others: number; mode: string; connect: boolean }>(`SELECT
+        d.datallowconn AS allow,
+        (SELECT count(*)::int FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid()) AS others,
+        (SELECT mode FROM foundation.file_runtime_epochs WHERE singleton) AS mode,
+        has_database_privilege('fixlevelup_runtime',d.oid,'CONNECT') AS connect
+        FROM pg_database d WHERE d.datname=current_database()`)).rows[0], { timeout: 3000, interval: 25 })
+        .toEqual({ allow: false, others: 0, mode: 'FENCED', connect: false });
+      const rejected = new Client(restoreDbOptions(sourceDb.database, 'migrator'));
+      try { await expect(rejected.connect()).rejects.toMatchObject({ code: '55000' }); }
+      finally { await rejected.end(); }
+
+      // Valid signed manifest bound to the application dump, whose P05 state
+      // differed from the strict-empty control by exactly the required policy row.
+      const snapshotKeys = generateKeyPairSync('ed25519');
+      const payload: SnapshotManifest = { sourceDatabase: sourceDb.database, destinationDatabase: destination,
+        schemaVersion, dumpSha256: applicationDumpSha256,
+        base: { ...oldScope, seq: 0n, hash: 'a'.repeat(64) }, aliases: [], inventory: emptyInventory };
+      const manifest = signSnapshot(payload, snapshotKeys.privateKey);
+      archives.manifest(manifest);
+      const cleanManifest = signSnapshot({ ...payload, dumpSha256: cleanDumpSha256 }, snapshotKeys.privateKey);
+      cleanArchives.manifest(cleanManifest);
+      expect(readSnapshot(manifest, snapshotKeys.publicKey, limits).hash).toMatch(/^[a-f0-9]{64}$/u);
+
+      // Exact production observation on the actual hard-fenced source. The
+      // broad refusal covers both the unchanged policy and the new aggregate.
+      const sourcePin = { database: sourceDb.database, databaseOid: sourceDatabaseOid, scope: oldScope,
+        profile: 'S3' as const, manifestSha256: readSnapshot(manifest, snapshotKeys.publicKey, limits).hash,
+        challenge: randomBytes(32).toString('hex') };
+      await expect(observeFencedSource(observer, sourcePin, limits)).rejects.toMatchObject({ code: 'RESTORE_AUTHORITY' });
+      await expect(readP05TargetDrainState(observer, 'S3')).rejects.toMatchObject({ code: 'P05_ROWS_PRESENT' });
+      expect((await readP05SourceState(observer, 'S3')).counts['requests']).toBe(1);
+      expect((await observer.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM foundation.requests WHERE id=$1', [callback.requestId])).rows[0]?.n).toBe(1);
+      expect(await readClusterFact(observer)).toMatchObject({ serverVersionNum: '180007' });
+
+      // 5. Every downstream effect is a tripwire: none of them may run.
+      const authorityCalls: string[] = [];
+      const restoreCalls: unknown[] = [];
+      const approvalCalls: unknown[] = [];
+      const objectCalls: unknown[] = [];
+      const copyCalls: unknown[] = [];
+      const verifierCalls: string[] = [];
+      const ctx: RestoreContext = {
+        mode: 'local-synthetic', schemaVersion, sourceDatabase: sourceDb.database, destinationDatabase: destination,
+        oldScope, nextEpoch: oldScope.writerEpoch + 1n, limits, targetOperatorPool: targetOps,
+        snapshotKey: snapshotKeys.publicKey,
+        approvalKey: generateKeyPairSync('ed25519').publicKey,
+        authorityKey: generateKeyPairSync('ed25519').publicKey,
+        verifier: {
+          verifyMembership() { verifierCalls.push('verifyMembership'); return Promise.reject(new Error('Unreachable ledger read')); },
+          verifyLineage() { verifierCalls.push('verifyLineage'); return Promise.reject(new Error('Unreachable ledger read')); },
+        },
+        currentAuthority() { authorityCalls.push('currentAuthority'); return Promise.reject(new Error('Unreachable signer')); },
+        sourceObserver: observer, sourceDatabaseOid,
+        restoreArchives() { restoreCalls.push('restoreArchives'); return Promise.reject(new Error('Unreachable archive')); },
+        openBackupObject(item) { objectCalls.push(item.key); return Promise.reject(new Error('Unreachable object')); },
+        copyToFreshTarget(_destination, item) { copyCalls.push(item.key); return Promise.reject(new Error('Unreachable copy')); },
+        approve(binding) { approvalCalls.push(binding); return Promise.reject(new Error('Unreachable approval')); },
+      };
+      // Exercise the strict-empty archive as well as the application archive. Neither
+      // can substitute historical rows for the live, hard-fenced source observation.
+      await expectCode(rescrubFileRestore({ ...ctx }, cleanManifest, sig), 'RESTORE_AUTHORITY');
+      await expectCode(rescrubFileRestore(ctx, manifest, sig), 'RESTORE_AUTHORITY');
+      for (const tripwire of [authorityCalls, restoreCalls, approvalCalls, objectCalls, copyCalls, verifierCalls]) {
+        expect(tripwire).toEqual([]);
+      }
+      // No target connection was even opened, and no destination database exists.
+      expect(targetOps.totalCount).toBe(0);
+      expect((await maintenance.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM pg_database WHERE datname=$1', [destination])).rows[0]?.n).toBe(0);
+      // The source kept its callback and stayed hard-fenced: the refusal changed nothing.
+      expect((await observer.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM foundation.requests WHERE id=$1', [callback.requestId])).rows[0]?.n).toBe(1);
+      expect((await observer.query<{ mode: string; allow: boolean; connect: boolean }>(`SELECT
+        (SELECT mode FROM foundation.file_runtime_epochs WHERE singleton) AS mode,
+        d.datallowconn AS allow,
+        has_database_privilege('fixlevelup_runtime',d.oid,'CONNECT') AS connect
+        FROM pg_database d WHERE d.datname=current_database()`)).rows[0])
+        .toEqual({ mode: 'FENCED', allow: false, connect: false });
+      expect(await readP05SourceState(observer, 'S3')).toEqual(afterCallback);
+      expect(sha256(readFileSync(resolve(archives.directory, 'database.dump')))).toBe(applicationDumpSha256);
+      archives.evidence({ strictEmptyControl: 'P05_EMPTY_AFTER_DRAIN', policyOnlyControl: 'P05_ROWS_PRESENT',
+        cleanDumpSha256, applicationDumpSha256, policyOnlyCounts: preDump.counts, postCallbackCounts: afterCallback.counts,
+        sourcePreserved: true, targetCreated: false, targetRuntimeConnect: false });
+    } catch (error) { failures.push(error); }
+    finally {
+      await finishRestoreRun(failures, [...cleanups.reverse(), ...pools.map(pool => () => pool.end()),
+        () => sourceDb.close()]);
+    }
+  });
 });

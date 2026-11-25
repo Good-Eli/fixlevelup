@@ -120,22 +120,24 @@ async function pinLauncherIdentity(launcher: PoolClient, database: string): Prom
 
 interface PhysicalState {
   /** The schema profile the target database actually is. */
-  readonly profile: 'S0' | 'S1' | 'S2';
+  readonly profile: 'S0' | 'S1' | 'S2' | 'S3';
   /** True when the migration chain has been applied (`foundation.staff` exists). */
   readonly migrated: boolean;
 }
 
 /** Detects the ACTUAL physical profile and whether migrations already ran. */
 async function detectPhysicalState(launcher: PoolClient): Promise<PhysicalState> {
-  const { rows } = await launcher.query<{ has_staff: boolean; has_requests: boolean; has_form_groups: boolean }>(
+  const { rows } = await launcher.query<{ has_staff: boolean; has_requests: boolean; has_form_groups: boolean; has_effects: boolean }>(
     `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
         WHERE n.nspname='foundation' AND c.relname='staff') AS has_staff,
        EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
         WHERE n.nspname='foundation' AND c.relname='requests') AS has_requests,
        EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-        WHERE n.nspname='foundation' AND c.relname='form_browser_groups') AS has_form_groups`);
+        WHERE n.nspname='foundation' AND c.relname='form_browser_groups') AS has_form_groups,
+       to_regclass('foundation.request_command_receipts') IS NOT NULL AS has_effects`);
   const row = rows[0];
-  const profile: 'S0' | 'S1' | 'S2' = row?.has_form_groups === true ? 'S2' : row?.has_requests === true ? 'S1' : 'S0';
+  const profile: 'S0' | 'S1' | 'S2' | 'S3' = row?.has_effects === true ? 'S3'
+    : row?.has_form_groups === true ? 'S2' : row?.has_requests === true ? 'S1' : 'S0';
   return { profile, migrated: row?.has_staff === true };
 }
 
@@ -144,10 +146,11 @@ async function detectPhysicalState(launcher: PoolClient): Promise<PhysicalState>
  * `src/infrastructure/admission/physical-profile.ts` (every profile also
  * requires legacy readiness and the separate P04 catalog gate).
  */
-const profileContractPredicates: Record<'S0' | 'S1' | 'S2', readonly string[]> = {
+const profileContractPredicates: Record<'S0' | 'S1' | 'S2' | 'S3', readonly string[]> = {
   S0: ['legacy.ready', 'catalog.management.ready', 'preIntakeProfileAbsent', 'formSessionProfileAbsent'],
   S1: ['legacy.ready', 'catalog.management.ready', 'requestIntakeReady', 'formSessionProfileAbsent'],
   S2: ['legacy.ready', 'catalog.management.ready', 'requestIntakeReady', 'formSessionReady'],
+  S3: ['legacy.ready', 'catalog.management.ready', 'formSessionReady', 'requestEffectsReady'],
 };
 
 /**
@@ -155,7 +158,7 @@ const profileContractPredicates: Record<'S0' | 'S1' | 'S2', readonly string[]> =
  * fact the launcher carries in the signed proof. Tests derive it from the
  * profile instead of random bytes, so the proof is reproducible.
  */
-export function physicalContractDigestOf(profile: 'S0' | 'S1' | 'S2'): string {
+export function physicalContractDigestOf(profile: 'S0' | 'S1' | 'S2' | 'S3'): string {
   const predicates = profileContractPredicates[profile];
   return createHash('sha256')
     .update(`p05/physical-contract/v1/${profile}\n${predicates.join('\n')}`, 'utf8')
@@ -406,7 +409,7 @@ export async function holdFixtureWitness(
   schema = 'public',
   /** Test override: mint a proof for a profile the database does NOT have
    * (used to prove the exact-profile refusal in both directions). */
-  forceProfile?: 'S0' | 'S1' | 'S2',
+  forceProfile?: 'S0' | 'S1' | 'S2' | 'S3',
 ): Promise<AdmissionHandle> {
   const fromPool = holder instanceof Pool;
   const launcher: PoolClient = fromPool ? await holder.connect() : holder as unknown as PoolClient;
@@ -420,7 +423,7 @@ export async function holdFixtureWitness(
     // request-intake foundation exists, S0 for a pre-P05 chain (e.g. the dev
     // database). The exact-profile verifier refuses a mismatch, so the fixture
     // must state the true profile.
-    const profile: 'S0' | 'S1' | 'S2' = forceProfile ?? state.profile;
+    const profile: 'S0' | 'S1' | 'S2' | 'S3' = forceProfile ?? state.profile;
     // Per-instance witness key (§7): derived from the pinned instanceId, so the
     // loader (which derives from the env instanceId) and this fixture agree, and
     // independent launcher sessions never contend for one exclusive key.
@@ -456,7 +459,7 @@ export async function admitFixture(holder: Pool | Client, database: string, cons
 }
 export interface VerifiedAdmissionOptions {
   /** Force the proof profile (negative drift tests). Default: the actual profile. */
-  readonly profile?: 'S0' | 'S1' | 'S2';
+  readonly profile?: 'S0' | 'S1' | 'S2' | 'S3';
   readonly consumerKind?: ConsumerKind;
   /** Expected operator migration manifest (default: the full pinned chain). */
   readonly expectedMigrations?: readonly string[];

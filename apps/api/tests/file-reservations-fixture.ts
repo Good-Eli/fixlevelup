@@ -72,10 +72,18 @@ export interface FileReservationsFixture {
   close(): Promise<void>;
 }
 
-/** Creates one isolated database, applies the real chain and seeds reviewed rows. */
-export async function startFileReservationsDatabase(): Promise<FileReservationsFixture> {
+export const FILE_RESTORE_S0_CAP = '20261123000100_request_intake_foundation';
+
+/** Creates one isolated database, applies the real chain and seeds reviewed rows.
+ * Only the synthetic full-archive restore proof may opt in to the exact S0 cap. */
+export async function startFileReservationsDatabase(capBefore?: typeof FILE_RESTORE_S0_CAP): Promise<FileReservationsFixture> {
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') {
     throw new Error('File reservation fixture requires FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1');
+  }
+  if (capBefore !== undefined && (!Object.is(capBefore, FILE_RESTORE_S0_CAP)
+    || process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] !== '1'
+    || process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] !== '1')) {
+    throw new Error('Legacy file restore requires the exact synthetic S0 cap');
   }
   // Credentials follow the shared fixture policy: lab mode reads only the lab
   // process env (never the dev `.env` files, no partial-env fallback).
@@ -110,7 +118,7 @@ export async function startFileReservationsDatabase(): Promise<FileReservationsF
     const migrationClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
     await migrationClient.connect();
     try {
-      await migrateAuthFixture(migrationClient, database);
+      await migrateAuthFixture(migrationClient, database, capBefore);
     } finally {
       await migrationClient.end();
     }

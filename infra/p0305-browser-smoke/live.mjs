@@ -5,22 +5,31 @@ import { request } from 'node:http';
 import { createServer } from 'node:https';
 import { createServer as createHttpServer } from 'node:http';
 import { setTimeout as wait } from 'node:timers/promises';
-import { database, provision, token, verifyPublication } from './database.mjs';
+import { database, provision, verifyPublication } from './database.mjs';
+import { compileLauncherModules, host, launchGuarded, pgPort, token } from './launch.mjs';
 
-const host = '127.0.0.1';
 const api = 4174;
 const web = 4175;
 const tls = 4176;
 const origin = `https://${host}:${tls}`;
 const run = [];
 const approved = new Set(['/api/v1/auth/me', '/api/v1/auth/login', '/api/v1/auth/logout', '/api/v1/access', '/api/v1/permissions', '/api/v1/roles', '/api/v1/staff', '/api/v1/staff/self']);
-const legal = /^\/api\/v1\/legal\/documents(?:\/[a-f0-9-]{36}(?:\/(?:publish|versions(?:\/[a-f0-9-]{36})?))?)?$/;
+const legal = /^\/api\/v1\/legal\/documents(?:\/[a-f0-9-]{36}(?:\/(?:publish|versions(?:\/[a-f0-9-]{36})?))?)?$/u;
 let unexpected = 0;
 
+const baseEnv = { PATH: process.env['PATH'], HOME: process.env['HOME'], COREPACK_HOME: process.env['COREPACK_HOME'],
+  PLAYWRIGHT_BROWSERS_PATH: '/ms-playwright', NODE_ENV: 'production', NEXT_TELEMETRY_DISABLED: '1', CI: '1' };
+
 function start(args, extra = {}) {
-  const env = { PATH: process.env['PATH'], HOME: process.env['HOME'], COREPACK_HOME: process.env['COREPACK_HOME'],
-    PLAYWRIGHT_BROWSERS_PATH: '/ms-playwright', NODE_ENV: 'production', NEXT_TELEMETRY_DISABLED: '1', CI: '1', ...extra };
-  const child = spawn(process.execPath, args, { env, stdio: 'ignore' });
+  const child = spawn(process.execPath, args, { env: { ...baseEnv, ...extra }, stdio: 'ignore' });
+  child.on('error', () => {});
+  run.push(child);
+  return child;
+}
+/** Spawns the real compiled entrypoint with the inherited private IPC channel. */
+function startAdmitted(extra) {
+  const child = spawn(process.execPath, ['apps/api/dist/bootstrap/api.js'],
+    { env: { ...baseEnv, ...extra }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
   child.on('error', () => {});
   run.push(child);
   return child;
@@ -61,19 +70,20 @@ function proxy(keys) {
   });
 }
 
-let fixture, ingress, evidence;
+let fixture, ingress, evidence, launch;
 let stage = 'namespace guard';
 try {
   if (process.platform !== 'linux' || process.version !== 'v24.22.3' || process.env['P0305_ISOLATED_BROWSER'] !== '1') {
     throw new Error('Must invoke isolated container fixture');
   }
-  if ((await readFile('/proc/net/dev', 'utf8')).trim().split('\n').slice(2).some(line => !/^\s*lo:/.test(line))) {
+  if ((await readFile('/proc/net/dev', 'utf8')).trim().split('\n').slice(2).some(line => !/^\s*lo:/u.test(line))) {
     throw new Error('Fixture network namespace has a non-loopback interface');
   }
   const marker = process.env['P0305_NAMESPACE'];
-  if (!marker || !/^[a-f0-9]{24}$/.test(marker)) { throw new Error('Disposable network identity missing'); }
-  stage = 'fresh migrations and synthetic commissioning';
-  fixture = await provision();
+  if (!/^[a-f0-9]{24}$/u.test(marker ?? '')) { throw new Error('Disposable network identity missing'); }
+  stage = 'pinned S0 migrations, synthetic commissioning and disposable control contour';
+  fixture = await provision(marker);
+  console.log(`P03-05 S0 cap: applied ${String(fixture.migrationReport.applied)} of ${String(fixture.migrationReport.chain)} migrations; excluded ${fixture.migrationReport.excluded.join(', ')}`);
   stage = 'ephemeral TLS';
   await mkdir('node_modules/.cache', { recursive: true, mode: 0o700 });
   const dir = await mkdtemp('node_modules/.cache/p0305-live-');
@@ -85,11 +95,24 @@ try {
   ingress.listen(tls, host);
   await once(ingress, 'listening');
 
-  stage = 'compiled Nest and Next readiness';
-  const nest = start(['apps/api/dist/bootstrap/api.js'], { APP_HOST: host, APP_PORT: String(api), DB_HOST: host,
-    DB_PORT: '55432', DB_NAME: database, DB_USER: 'fixlevelup_runtime', DB_PASSWORD: fixture.runtimePassword,
-    WEB_AUTH_ENABLED: '1', WEB_AUTH_ORIGIN: origin, WEB_AUTH_CSRF_SECRET: token(), WEB_AUTH_THROTTLE_SECRET: token() });
+  stage = 'guarded launch of the compiled API (one-use proof, launcher witness)';
+  const modules = await compileLauncherModules();
+  launch = await launchGuarded({
+    modules, consumerKind: 'API', appDatabase: fixture.database, appOperator: fixture.operator,
+    control: fixture.control.facts, databaseOid: fixture.databaseOid,
+    artifact: fixture.artifact, history: fixture.history, physical: fixture.physical,
+    startChild: (launchEnv) => startAdmitted({
+      ...launchEnv, APP_HOST: host, APP_PORT: String(api), DB_HOST: host, DB_PORT: String(pgPort), DB_NAME: database,
+      DB_USER: 'fixlevelup_runtime', DB_PASSWORD: fixture.database.password,
+      WEB_AUTH_ENABLED: '1', WEB_AUTH_ORIGIN: origin, WEB_AUTH_CSRF_SECRET: token(), WEB_AUTH_THROTTLE_SECRET: token(),
+    }),
+  });
+  const nest = launch.child;
   await probe(`http://${host}:${api}/health/ready`, nest);
+  const consumed = await launch.registryState();
+  if (consumed?.state !== 'CONSUMED') { throw new Error('Launch proof was not consumed exactly once'); }
+
+  stage = 'compiled Next readiness';
   const next = start(['apps/web/scripts/next.mjs', 'start', '--hostname', host, '--port', String(web)]);
   await probe(`http://${host}:${web}/crm/access`, next);
 
@@ -134,5 +157,6 @@ try {
   for (const server of [evidence, ingress]) {
     if (server) { server.closeAllConnections(); server.close(); }
   }
-  if (fixture) { await fixture.migrator.end(); }
+  await launch?.stop().catch(() => undefined);
+  if (fixture) { await fixture.migrator.end().catch(() => undefined); }
 }

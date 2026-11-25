@@ -52,7 +52,7 @@ export function matchesRuntimeTarget(admission: RuntimeAdmission,
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const digestPattern = /^[0-9a-f]{64}$/;
 const consumerKinds: readonly ConsumerKind[] = ['API', 'WORKER', 'TEST'];
-const profiles: readonly ProofProfile[] = ['S0', 'S1', 'S2'];
+const profiles: readonly ProofProfile[] = ['S0', 'S1', 'S2', 'S3'];
 
 /** Deterministic per-instance witness objectId inside the 557001 namespace
  * (positive 31-bit, collision-safe for the isolated contour). */

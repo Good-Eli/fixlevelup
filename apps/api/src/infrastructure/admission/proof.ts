@@ -10,7 +10,7 @@
 import { createHash, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto';
 
 export type ConsumerKind = 'API' | 'WORKER' | 'TEST';
-export type ProofProfile = 'S0' | 'S1' | 'S2';
+export type ProofProfile = 'S0' | 'S1' | 'S2' | 'S3';
 
 /** Exact identity the proof binds to the configured connection endpoint. */
 export interface LaunchProofTargetIdentity {
@@ -137,7 +137,7 @@ export function proofDigestOf(payload: LaunchProofPayload): string {
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const digestPattern = /^[0-9a-f]{64}$/;
 const consumerKinds: readonly ConsumerKind[] = ['API', 'WORKER', 'TEST'];
-const profiles: readonly ProofProfile[] = ['S0', 'S1', 'S2'];
+const profiles: readonly ProofProfile[] = ['S0', 'S1', 'S2', 'S3'];
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) { return undefined; }

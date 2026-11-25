@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+#
+# P05 S3 (024) test image — SEPARATE from the frozen 023 gateway image.
+#
+# Built from a snapshot of the CURRENT working tree (tracked + untracked
+# non-ignored files, no `.env`/secrets/generated artifacts; see `s3test` in
+# lab.mjs). It runs against its own disposable 024 database inside the same
+# private network namespace, and never touches the 023 gateway database.
+#
+# LAYER CACHING (owner request): the dependency layer is copied and installed
+# BEFORE the sources, so a source-only edit rebuilds only the last two layers
+# instead of reinstalling the whole workspace. The install is still the exact
+# frozen one: same lockfile, `--frozen-lockfile --ignore-scripts
+# --strict-peer-dependencies`, no weakened check and no script execution.
+#
+# Prime Prisma's pinned schema engine once (no datasource or credentials),
+# then build production artifacts offline before the test gets any DB/S3 env.
+# A failed build stops the run.
+
+# Pinned PostgreSQL 18.7 client tools for the reviewed file-restore lab branch
+# (`/opt/p05-lab/bin/{psql,pg_dump,pg_restore}` + `/opt/p05-lab/lib` on
+# LD_LIBRARY_PATH). Extracted from the SAME pinned image the lab cluster runs,
+# so the binaries are byte-identical to the reviewed `tool-digests.txt`:
+#   psql       b72cd11342d78e91e33f20615ac98fac84fcb99dc31c474ebfd9b7312bb092c0
+#   pg_dump    49ff3d2b38958c977205fd30007f0bf5ee0165747fffdf2a85af0d84fed26e81
+#   pg_restore ab7f6e74a6e89f9e7346560c69dcbf34e193886e5a25b9d4f22867a5fb1b9212
+# No package installation, no network fetch, no tool substitution.
+FROM postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402 AS pgtools
+RUN mkdir -p /out/bin /out/lib \
+ && cp /usr/lib/postgresql/18/bin/psql /usr/lib/postgresql/18/bin/pg_dump \
+       /usr/lib/postgresql/18/bin/pg_restore /out/bin/ \
+ && for tool in psql pg_dump pg_restore; do \
+      ldd "/out/bin/$tool" | awk '/=> \//{print $3}'; \
+    done | sort -u | xargs -I{} cp -L {} /out/lib/ \
+ && ls /out/lib | wc -l
+
+# Garage CLI client for the reviewed lab branch (`/opt/p05-lab/bin/garage`,
+# digest 2ff667286217cd73ebcb1c03af993822365000441dfe31a80cb64c5189a9dea8,
+# statically linked: the reviewed stand ships no extra garage libraries).
+FROM dxflrs/garage:v2.5.0@sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5 AS garage
+
+FROM node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54
+
+LABEL dsh.owner="pg-lab" \
+      dsh.task="task-1" \
+      dsh.purpose="p05-lab-s3" \
+      dsh.ephemeral="true"
+
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends openssl=3.0.22-1~deb12u2 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=pgtools /out/bin /opt/p05-lab/bin
+COPY --from=pgtools /out/lib /opt/p05-lab/lib
+COPY --from=garage /garage /opt/p05-lab/bin/garage
+# The client config and node-id file are written at CONTAINER START by
+# `containerenv.mjs` (they carry the per-run RPC secret and node id), never baked
+# into the image.
+RUN chmod 0755 /opt/p05-lab/bin/psql /opt/p05-lab/bin/pg_dump /opt/p05-lab/bin/pg_restore \
+      /opt/p05-lab/bin/garage \
+ && LD_LIBRARY_PATH=/opt/p05-lab/lib /opt/p05-lab/bin/psql --version \
+ && LD_LIBRARY_PATH=/opt/p05-lab/lib /opt/p05-lab/bin/pg_dump --version \
+ && LD_LIBRARY_PATH=/opt/p05-lab/lib /opt/p05-lab/bin/pg_restore --version \
+ && /opt/p05-lab/bin/garage --version
+
+WORKDIR /workspace
+ENV CI=1 \
+    NEXT_TELEMETRY_DISABLED=1 \
+    COREPACK_ENABLE_AUTO_PIN=0 \
+    COREPACK_DEFAULT_TO_LATEST=0 \
+    COREPACK_HOME=/opt/fixlevelup-corepack
+
+# ---- layer 1: dependency manifests only (changes rarely) -------------------
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+COPY apps/miniapp/package.json apps/miniapp/
+COPY packages/tooling/package.json packages/tooling/
+COPY packages/database-tooling/package.json packages/database-tooling/
+COPY packages/storage-tooling/package.json packages/storage-tooling/
+COPY packages/browser-tooling/package.json packages/browser-tooling/
+COPY packages/p03-contracts/package.json packages/p03-contracts/
+
+# ---- layer 2: frozen install (cached until the lockfile changes) -----------
+RUN corepack pnpm install --frozen-lockfile --ignore-scripts --strict-peer-dependencies
+
+# ---- layer 3: sources (invalidated by any working-tree edit) ---------------
+COPY . .
+
+# The frozen install suppresses lifecycle scripts; fetch Prisma's pinned
+# schema engine here rather than granting network to the workspace build.
+RUN corepack pnpm run db:generate
+RUN --network=none corepack pnpm run build
+
+CMD ["sleep", "infinity"]

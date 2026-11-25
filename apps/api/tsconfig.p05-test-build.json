@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "noEmitOnError": true,
+    "incremental": false,
+    "rootDir": ".",
+    "outDir": "build/p05-t"
+  },
+  "files": ["tests/p05-composition.ts", "tests/p05-native-business.ts"],
+  "include": []
+}

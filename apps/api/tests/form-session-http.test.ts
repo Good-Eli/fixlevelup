@@ -45,7 +45,7 @@ import { physicalProfileVerifier } from '../src/infrastructure/admission/physica
 import { loadConfig } from '../src/runtime/config.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 import { ProblemFilter } from '../src/runtime/problem.filter.js';
-import { boundedJsonForFormSession } from '../src/settings/management/body-parser.js';
+import { boundedJsonForFormSession } from '../src/form-session/body-parser.js';
 import { FormSessionController, FORM_SESSION_HTTP_DEPS } from '../src/form-session/controller.js';
 import { FormSessionService } from '../src/form-session/service.js';
 import { issueCsrfProof } from '../src/form-session/csrf.js';
@@ -59,6 +59,7 @@ import { createConfigurationFixture } from './configuration-fixture.js';
 import { GeographyFixture, check as geoCheck, geoTag, idOf as geoIdOf, versionOf as geoVersionOf } from './geography-fixture.js';
 import { fixturePerTest, integration, record, text } from './rbac-fixture.js';
 import type { RbacFixture } from './rbac-fixture.js';
+import { fixtureCredentials } from './owned-test-database.js';
 import { admittedPool } from '../src/infrastructure/admission/pool-guard.js';
 import { ManagementFixture, fixtureCode, legalInput } from './settings-management-fixture.js';
 
@@ -198,12 +199,7 @@ class FormSessionHttpFixture {
   }
 
   private static runtimePassword(): string {
-    // The RbacFixture already read and validated this file; reuse the same source.
-    const root = resolve(import.meta.dirname, '../../..');
-    const source = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const password = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(source)?.[1];
-    if (!password) { throw new Error('Missing local runtime credentials for the F pool'); }
-    return password;
+    return fixtureCredentials().runtime;
   }
 
   async start(): Promise<void> {
@@ -1790,7 +1786,7 @@ integration('P05-02 F form-session HTTP surface over isolated PostgreSQL', () =>
       expectedMigrations: authFixtureMigrations,
     });
     try {
-      expect(verified.admission.binding.profile).toBe('S2');
+      expect(verified.admission.binding.profile).toBe('S3');
       const verifiedF = await fixture.isolatedClient({}, 2, verified);
       await bootstrapGroup(verifiedF);
       const groupsBeforeRelease = await fixture.base.count('SELECT count(*)::int n FROM foundation.form_browser_groups');

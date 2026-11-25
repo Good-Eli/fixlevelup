@@ -347,11 +347,34 @@ interface SelectedProof {
 
 export class FormSessionService implements FormSessionApi {
   private readonly config: FormSessionConfig;
+  private readonly schema: 'S2' | 'S3';
 
   constructor(private readonly pool: FormSessionPool, config: FormSessionConfig) {
-    requireFormSessionPool(pool);
+    this.schema = requireFormSessionPool(pool);
     validateConfig(config);
     this.config = config;
+  }
+
+  /** Reuse the same F proof and quota on downstream commands. Preparation has
+   * no business authority; only lock() inside the caller's own transaction does. */
+  async prepareRequestProof(input: Omit<FormSessionSelectorInput, 'body'>, mutation: boolean) {
+    const cookies = parseCookieHeader(input.cookieHeader);
+    readFormCookies(cookies);
+    const proof = this.selectFormCookie(cookies, input.selector);
+    await this.throttleProvenAnchor(input.source, proof);
+    return Object.freeze({ selector: proof.selector, secret: proof.secret,
+      lock: async (client: PoolClient) => {
+        const anchor = await this.liveAnchor(client, proof.selector, proof.secret);
+        const recheck = async (): Promise<Date> => {
+          const now = await this.dbClock(client);
+          this.assertAnchorUnexpired(anchor, now);
+          if (mutation) { this.verifyCsrf(anchor.id, proof.secret, input.csrf, now.getTime(), anchor.expires_at.getTime()); }
+          return now;
+        };
+        await recheck();
+        return Object.freeze({ anchor, recheck });
+      },
+    });
   }
 
   /* ------------------------------ throttle core ----------------------------- */
@@ -936,6 +959,10 @@ export class FormSessionService implements FormSessionApi {
       // that event and a reused key with another intent is a conflict instead of
       // a second write.
       bindIdempotencyKey(key, parsed.evidenceRef);
+      if (parsed.action === 'GIVEN' && this.schema === 'S3' && (await client.query(
+        'SELECT session_id FROM foundation.request_session_submits WHERE session_id=$1', [selector])).rowCount !== 0) {
+        throw new FormSessionError('CONFLICT');
+      }
       await this.requireSameConsentIntent(client, selector, parsed);
       if (parsed.action === 'GIVEN') {
         // A new GIVEN requires the current city/version the anchor was issued with.

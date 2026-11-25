@@ -17,6 +17,7 @@ import { catalogManagementChecks, catalogManagementCodes, proveCatalogManagement
   proveCatalogManagementIssuer, proveCatalogManagementCollision } from './test-catalog-management-migration.mjs';
 import { requestIntakeChecks, proveRequestIntakeUpgrade } from './test-request-intake-migration.mjs';
 import { formSessionChecks, formSessionMigration, proveFormSessionGrants, proveFormSessionUpgrade } from './test-form-session-migration.mjs';
+import { requestEffectsChecks, requestEffectsCodes, requestEffectsMigration, proveRequestEffectsUpgrade } from './test-request-effects-migration.mjs';
 import { mkdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { admin, credentials, connection, prepareDatabase, runPrisma, root,
@@ -57,12 +58,16 @@ const p03Migrations = [
 const catalogHistoryNames = [...p03Migrations, p04CatalogMigration];
 const pricingHistoryNames = [...catalogHistoryNames, '20261122000600_pricing_rules_ranges'];
 const catalogManagementNames = [...pricingHistoryNames, '20261122000700_catalog_management'];
-const migrations = [...catalogManagementNames, '20261123000100_request_intake_foundation', formSessionMigration];
+const migrations = [...catalogManagementNames, '20261123000100_request_intake_foundation', formSessionMigration,
+  requestEffectsMigration];
 const expectedChecks = [
   ...cityChecks,
   ...areaChecks, ...geoAccessChecks, ...settingsChecks, ...fileReservationChecks, ...fileUploadChecks, ...fileProcessingChecks, ...filePrivacyChecks,
   ...settingsManagementChecks, ...catalogFixedPriceChecks, ...pricingChecks, ...catalogManagementChecks, ...requestIntakeChecks,
   ...formSessionChecks,
+  // P05-03/P05-04 (024) is its own cap: the 30 new CHECKs are listed separately
+  // from the historical P05-01/P05-02 numbers above.
+  ...requestEffectsChecks,
   'audit_logs_operation_check', 'outbox_events_status_check', 'outbox_events_type_check', 'outbox_events_attempt_count_check',
   'outbox_events_lease_generation_check', 'outbox_events_lease_pair_check', 'outbox_events_lease_pending_check', 'outbox_events_last_error_code_check',
   'staff_role_check', 'staff_employment_state_check', 'staff_auth_version_check', 'staff_profile_version_check', 'staff_display_name_check',
@@ -118,6 +123,7 @@ const twentiethHistory = resolve(historyRoot, 'twentieth/migrations');
 // cannot silently enter the P04 comparison.
 const twentyFirstHistory = resolve(historyRoot, 'twentyfirst/migrations');
 const twentySecondHistory = resolve(historyRoot, 'twentysecond/migrations');
+const twentyThirdHistory = resolve(historyRoot, 'twentythird/migrations');
 const fifthHistory = resolve(historyRoot, 'fifth/migrations');
 try {
   for (const database of [fresh, upgrade, upgradeSecond, upgradeThird, upgradeFourth, upgradeFifth, upgradeEighth, upgradeTwelfth, upgradeSeventeenth, collisionSeventeenth, shadow]) { await prepareDatabase(client, database, true); }
@@ -126,7 +132,8 @@ try {
     [twelfthHistory, migrations.slice(0,12)], [thirteenthHistory, migrations.slice(0,13)], [fourteenthHistory, migrations.slice(0,14)],
     [fifteenthHistory, migrations.slice(0,15)], [sixteenthHistory, migrations.slice(0,16)], [seventeenthHistory, migrations.slice(0,17)],
     [eighteenthHistory, p03Migrations], [nineteenthHistory, catalogHistoryNames], [twentiethHistory, pricingHistoryNames],
-    [twentyFirstHistory, catalogManagementNames], [twentySecondHistory, migrations.slice(0,22)]]) {
+    [twentyFirstHistory, catalogManagementNames], [twentySecondHistory, migrations.slice(0,22)],
+  [twentyThirdHistory, migrations.slice(0,23)]]) {
     mkdirSync(history, { recursive: true });
     cpSync(resolve(root, 'prisma/migrations/migration_lock.toml'), resolve(history, 'migration_lock.toml'));
     for (const name of names) { cpSync(resolve(root, 'prisma/migrations', name), resolve(history, name), { recursive: true }); }
@@ -209,23 +216,50 @@ try {
       }
       command(['migrate', 'deploy'], upgradeEighth, 0, undefined, twentySecondHistory);
       command(['migrate', 'diff', '--from-migrations', twentySecondHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, 0, shadow);
+      // P05-01 (022) proof at its EXACT cap. It asserts 022's runtime column ACL
+      // and the effective row guards of that surface; 024 later widens the
+      // `requests` UPDATE grant and adds `request_preference_revisions.contact_mode`,
+      // so running this proof after the full chain would compare a 022 expectation
+      // against a 024 reality. Its committed rows then carry into 023 and 024,
+      // which is what makes the later deploys real populated upgrades.
+      await proveRequestIntakeUpgrade(eighthReader, catalogRuntime,
+        () => connection('fixlevelup_migrator', passwords.fixlevelup_migrator, upgradeEighth));
+      console.log('022 request intake foundation: populated upgrade guards and exact ACL: PASS');
+      // Stop at 023 before installing 024: S3 must be proven as a filled upgrade of
+      // the real S2 chain, not only as part of one fresh deploy.
+      command(['migrate', 'deploy'], upgradeEighth, 0, undefined, twentyThirdHistory);
+      {
+        const atS2 = await eighthReader.query('SELECT migration_name FROM foundation._prisma_migrations ORDER BY migration_name');
+        assert(JSON.stringify(atS2.rows.map((r) => r.migration_name)) === JSON.stringify(migrations.slice(0, 23)),
+          'S2 (023) history mismatch');
+      }
+      command(['migrate', 'diff', '--from-migrations', twentyThirdHistory, '--to-config-datasource', '--exit-code'], upgradeEighth, 0, shadow);
+      // The cumulative profile probe is asserted at the exact cap that defines the
+      // profile: S2 here, on the 023 chain, before 024 changes the S1 base.
+      if (syntheticMode()) {
+        await assertReviewedProfile(upgradeEighth, 'S2');
+        console.log('023 populated S2 shared physical profile: PASS');
+      }
+      // P05-02 (023) proof also runs at its exact cap, for the same reason: it
+      // asserts the S2 guard surface, which 024 does not own and must not restate.
+      await proveFormSessionUpgrade(eighthReader, catalogRuntime);
+      console.log('023 form session foundation: populated upgrade guards: PASS');
       command(['migrate', 'deploy'], upgradeEighth);
       {
         const history = await eighthReader.query('SELECT migration_name,finished_at FROM foundation._prisma_migrations ORDER BY migration_name');
         assert(history.rowCount === migrations.length
           && JSON.stringify(history.rows.map((entry) => entry.migration_name)) === JSON.stringify(migrations)
-          && history.rows.every((entry) => entry.finished_at instanceof Date), '022+023 populated history mismatch');
+          && history.rows.every((entry) => entry.finished_at instanceof Date), '022+023+024 populated history mismatch');
       }
       command(['migrate', 'deploy'], upgradeEighth);
       command(['migrate', 'diff', '--from-migrations', '../../prisma/migrations', '--to-config-datasource', '--exit-code'], upgradeEighth, 0, shadow);
       command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], upgradeEighth, 0);
-      await proveRequestIntakeUpgrade(eighthReader, catalogRuntime,
-        () => connection('fixlevelup_migrator', passwords.fixlevelup_migrator, upgradeEighth));
-      // P05-02 (023): the S2 form session foundation is applied on the same
-      // populated chain from the live migrations directory (deployed above
-      // with 022), so its guard proofs run against real reviewed fixtures.
-      await proveFormSessionUpgrade(eighthReader, catalogRuntime);
-      console.log('023 form session foundation: populated upgrade guards: PASS');
+      // P05-03/P05-04 (024): its own cap on the now fully populated chain — inert
+      // S3 start, exact column ACL, history triggers, closed CHECKs and runtime
+      // denials. Only 024 validators run after the full deploy.
+      const requestEffects = await proveRequestEffectsUpgrade(eighthReader, catalogRuntime);
+      console.log(`024 request intake effects: populated upgrade, ${String(requestEffects.tables)} tables, `
+        + `${String(requestEffects.checks)} new CHECKs, exact ACL and immutability: PASS`);
     } finally { await catalogRuntime.end(); }
   } finally { await eighthReader.end(); }
   for (const database of [collisionSeventeenth, upgradeSeventeenth]) {
@@ -451,7 +485,7 @@ try {
     await migration.query('ALTER TABLE foundation.audit_logs DROP COLUMN p017a_drift_probe');
     command(['migrate', 'diff', '--from-schema', '../../prisma/schema.prisma', '--to-config-datasource', '--exit-code'], fresh);
     await proveRbacCutover(migration, ['geography.read','geography.manage','geography.publish','staff.geography.read','staff.geography.manage',
-      ...settingsManagementCodes, ...catalogManagementCodes]);
+      ...settingsManagementCodes, ...catalogManagementCodes, ...requestEffectsCodes]);
     await proveRbacInvariants(migration);
     await checkViolation(migration, "UPDATE foundation.permissions SET protected=false WHERE code='roles.create'");
     await checkViolation(migration, "UPDATE foundation.staff_web_credentials SET login='bad login'");
@@ -459,15 +493,18 @@ try {
     // by the migration owner so the runtime under test cannot authorize itself.
     reservationFixtures = await seedFileReservationFixtures(migration, runtimeStaffId);
   } finally { await migration.end(); }
-  // P05-02 S4 regression (lab opt-in only): after 023 the freshly migrated
-  // database must satisfy the SAME shared physical-profile probe that runtime
-  // readiness and the §5.3 restore gate use. It runs through a real runtime-role
-  // client and returns a plain boolean — no hash parsing, no override, no
-  // skip mode. Outside the lab opt-in nothing runs here, so dev behaviour and
-  // its dependency set are unchanged.
+  // P05 S4 regression (lab opt-in only): the freshly migrated database must satisfy
+  // the SAME shared physical-profile probe that runtime readiness and the §5.3
+  // restore gate use. The full chain ends at 024, i.e. profile S3, so S3 is the
+  // profile asserted here. The historical S1 (at the 022 cap) and S2 (at the 023
+  // cap) profiles are asserted at their own exact caps above — the cumulative
+  // profile probe must never be compared against a chain that already moved on.
+  // It runs through a real runtime-role client and returns a plain boolean — no
+  // hash parsing, no override, no skip mode. Outside the lab opt-in nothing runs
+  // here, so dev behaviour and its dependency set are unchanged.
   if (syntheticMode()) {
-    await assertReviewedProfile(fresh, 'S2');
-    console.log('S2 shared physical profile (probeP05Catalog via runtime role): PASS');
+    await assertReviewedProfile(fresh, 'S3');
+    console.log('S3 shared physical profile (probeP05Catalog via runtime role): PASS');
   }
   console.log(`Migration-history diff/schema drift detection/restoration/catalog checks (${expectedChecks.length} CHECKs): PASS`);
   const runtime = connection('fixlevelup_runtime', passwords.fixlevelup_runtime, fresh);

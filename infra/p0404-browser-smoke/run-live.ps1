@@ -52,6 +52,9 @@ try {
     # Only test tooling is overlaid; Next/Nest, Prisma and all dependencies
     # remain the exact compiled artifacts from the chosen image.
     Invoke-ProofDocker cp $PSScriptRoot "${browserId}:/p0305/infra/"
+    # The shared launcher fixture is owned by the P03-05 directory; overlay it
+    # so a fixture correction never requires rebuilding the immutable image.
+    Invoke-ProofDocker cp (Join-Path $PSScriptRoot '../p0305-browser-smoke/launch.mjs') "${browserId}:/p0305/infra/p0305-browser-smoke/launch.mjs"
     if (!$FixtureOnly) {
         $root = Join-Path $PSScriptRoot '../..'
         Invoke-ProofDocker cp (Join-Path $root 'packages/browser-tooling/playwright.p0404.config.ts') "${browserId}:/p0305/packages/browser-tooling/playwright.p0404.config.ts"

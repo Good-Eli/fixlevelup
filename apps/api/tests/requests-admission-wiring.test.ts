@@ -146,7 +146,7 @@ let handle: AdmittedHandle | undefined;
 
 beforeAll(async () => {
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') { return; }
-  fixture = await createConfigurationFixture();
+  fixture = await createConfigurationFixture({ capBefore: '20261125000100_request_intake_effects' });
 }, 240_000);
 
 afterAll(async () => {

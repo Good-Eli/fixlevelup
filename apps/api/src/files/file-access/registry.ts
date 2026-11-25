@@ -24,6 +24,12 @@ export interface ReadClaim {
   readonly deadline: number;
 }
 
+/** The part of the access policy that bounds the original READY window. */
+export type ReadyWindowPolicy = {
+  readonly expiresAt: string;
+  readonly maxAccessAgeMs: number;
+};
+
 type ReadLimits = Pick<ReadContext['policy'], 'expiresAt' | 'maxAccessAgeMs' | 'maxChunkBytes'>;
 export type ReadAuthority = { readonly pool: ReadContext['pool']; readonly epoch: RuntimeEpoch; readonly policy: ReadLimits };
 
@@ -39,14 +45,14 @@ export function assertReadSignal(signal: AbortSignal): void {
  * returned local deadline is conservative: project remaining DB time onto the pre-query
  * monotonic instant, not onto the later receipt of the reply.
  */
-async function accessWindow(client: PoolClient, auth: FileAuthorization, policy: ReadLimits,
+async function accessWindow(client: PoolClient, auth: FileAuthorization, policy: ReadyWindowPolicy,
   publication: Publication | undefined, readExpiresAt: string | null = null,
-): Promise<number> {
+): Promise<{ localDeadlineMs: number; expiresAtMs: number | null }> {
   const { mime } = await checkFileAuthorization(client, auth);
   const sampleStarted = performance.now();
   const { rows: [gate] } = await client.query<{
     policy_live: boolean; ready_live: boolean | null; lease_live: boolean; remaining_ms: number | null;
-    session_live: boolean; intent_live: boolean; original_policy_live: boolean;
+    session_live: boolean; intent_live: boolean; original_policy_live: boolean; expires_at_ms: number | null;
   }>(`WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now)
     SELECT $3::timestamptz > t.now AS policy_live,
       ($4::timestamptz + $5::integer * interval '1 millisecond') > t.now AS ready_live,
@@ -56,7 +62,10 @@ async function accessWindow(client: PoolClient, auth: FileAuthorization, policy:
       CASE WHEN $6::timestamptz IS NOT NULL THEN greatest(0,floor(extract(epoch FROM
         (least(s.expires_at,i.expires_at,i.policy_expires_at,$3::timestamptz,
           $4::timestamptz + $5::integer * interval '1 millisecond',$6::timestamptz) - t.now)) * 1000))::float8
-      END AS remaining_ms
+      END AS remaining_ms,
+       CASE WHEN $4::timestamptz IS NOT NULL THEN floor(extract(epoch FROM least(
+         s.expires_at,i.expires_at,i.policy_expires_at,$3::timestamptz,
+         $4::timestamptz + $5::integer * interval '1 millisecond')) * 1000)::float8 END AS expires_at_ms
     FROM ${INTENTS} i JOIN foundation.request_sessions s ON s.id=i.owner_request_session_id CROSS JOIN t
     WHERE i.id=$1 AND s.id=$2`, [auth.intent.id, auth.owner, policy.expiresAt, publication?.published_at ?? null,
     policy.maxAccessAgeMs, readExpiresAt]);
@@ -76,12 +85,12 @@ async function accessWindow(client: PoolClient, auth: FileAuthorization, policy:
     refuseLifecycle('NOT_READY');
   }
   if (readExpiresAt === null) {
-    return 0;
+    return { localDeadlineMs: 0, expiresAtMs: gate.expires_at_ms };
   }
   if (!gate.lease_live || gate.remaining_ms === null || !Number.isSafeInteger(gate.remaining_ms) || gate.remaining_ms < 1) {
     refuseLifecycle('STALE_CLAIM');
   }
-  return sampleStarted + gate.remaining_ms;
+  return { localDeadlineMs: sampleStarted + gate.remaining_ms, expiresAtMs: gate.expires_at_ms };
 }
 
 export async function authorizeMetadata(client: PoolClient, ctx: ReadAuthority, cmd: FFile) {
@@ -92,6 +101,22 @@ export async function authorizeMetadata(client: PoolClient, ctx: ReadAuthority, 
     refuseLifecycle('NOT_READY');
   }
   return toReadyFileView(publication);
+}
+
+/**
+ * Read-only proof of the original READY access window, for P05 attachment admission.
+ *
+ * No claim, no ticket and no byte access: it re-runs exactly the same
+ * `checkFileAuthorization` + window statement the read path uses, so the attach
+ * decision cannot drift from the access policy. `publication` must be the exact
+ * immutable publication already read under the enclosing intent lock.
+ */
+export async function proveReadyWindow(client: PoolClient, auth: FileAuthorization, policy: ReadyWindowPolicy,
+  publication: Publication | undefined,
+): Promise<number> {
+  const { expiresAtMs } = await accessWindow(client, auth, policy, publication);
+  if (expiresAtMs === null || !Number.isSafeInteger(expiresAtMs)) { return refuseLifecycle('NOT_READY'); }
+  return expiresAtMs;
 }
 
 async function claimControl(client: PoolClient, auth: FileAuthorization, control: PrivacyControl,
@@ -143,7 +168,7 @@ export async function claimRead(client: PoolClient, ctx: ReadContext, cmd: FFile
   hold(reserveRead(ctx.budget, auth.runtime.namespace, bytes, ctx.policy));
   const claim = await claimControl(client, auth, control, ctx.policy, publication);
   await auditLifecycle(client, 'READ_CLAIM', auth.intent.id, claim.id);
-  const deadline = await accessWindow(client, auth, ctx.policy, publication, claim.expires);
+  const { localDeadlineMs: deadline } = await accessWindow(client, auth, ctx.policy, publication, claim.expires);
   assertReadSignal(cmd.signal);
   return { runtime: auth.runtime, publication, accessEpoch: BigInt(control.access_epoch),
     id: claim.id, generation: claim.generation, deadline };

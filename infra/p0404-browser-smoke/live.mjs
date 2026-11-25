@@ -8,6 +8,7 @@ import { commission } from './commission.mjs';
 import { provision } from './database.mjs';
 import { observer } from './observer.mjs';
 import { apiPort, host, isolated, origin, proofPort, tlsPort, token, webPort } from './isolation.mjs';
+import { compileLauncherModules, launchGuarded } from '../p0305-browser-smoke/launch.mjs';
 import { P04_ROUTES } from '../../packages/p03-contracts/dist/p04.js';
 import { P03_ROUTES } from '../../packages/p03-contracts/dist/index.js';
 
@@ -106,17 +107,28 @@ async function browser(fixture, proofToken) {
   }
 }
 
-let fixture, ingress, evidence;
+let fixture, ingress, evidence, launch;
 let stage = 'namespace guard';
 try {
   const namespace = await isolated();
-  stage = 'fresh PG 18.7 and pinned Prisma migrations / first-admin bootstrap';
+  stage = 'pinned S0 cap / first-admin bootstrap / disposable control contour';
   fixture = await provision(namespace);
+  console.log(`P04-04 S0 cap: applied ${String(fixture.migrationReport.applied)} of ${String(fixture.migrationReport.chain)} migrations; excluded ${fixture.migrationReport.excluded.join(', ')}`);
   delete process.env['P0404_PG_BOOTSTRAP'];
-  stage = 'compiled Nest / P03 and P04 readiness';
-  const app = childProcess(fork(new URL('./launch-api.mjs', import.meta.url), [], { execArgv: [], stdio: ['ignore','ignore','ignore','ipc'],
-    env: { ...env, P0404_ISOLATED_BROWSER: '1', P0404_NAMESPACE: namespace.marker, P0404_RUNTIME_PASSWORD: fixture.runtimePassword } }));
-  await awaitApi(app);
+  stage = 'compiled Nest / P03 and P04 readiness behind a guarded one-use launch';
+  const modules = await compileLauncherModules();
+  launch = await launchGuarded({
+    modules, consumerKind: 'API', appDatabase: fixture.database, appOperator: fixture.operator,
+    control: fixture.control.facts, databaseOid: fixture.databaseOid,
+    artifact: fixture.artifact, history: fixture.history, physical: fixture.physical,
+    startChild: (launchEnv) => childProcess(fork(new URL('./launch-api.mjs', import.meta.url), [],
+      { execArgv: [], stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+        env: { ...env, ...launchEnv, P0404_ISOLATED_BROWSER: '1', P0404_NAMESPACE: namespace.marker,
+          P0404_RUNTIME_PASSWORD: fixture.runtimePassword } })),
+  });
+  await awaitApi(launch.child);
+  const consumed = await launch.registryState();
+  if (consumed?.state !== 'CONSUMED') { throw new Error('Launch proof was not consumed exactly once'); }
   stage = 'authorized staff, role and city commissioning';
   await commission(fixture, label => { stage = `authorized commissioning / ${label}`; });
   const reports = [], proofToken = token();
@@ -127,7 +139,7 @@ try {
     stage = 'standalone real command and observer verification';
     await (await import('./self-check.mjs')).selfCheck(fixture, proofToken, label => { stage = `standalone commands / ${label}`; });
     assertScenario(reports);
-    console.log('P04-04 fixture: PG 18.7 / 21 migrations / real P03/P04 command and authorization / exact observer PASS (no browser scenario)');
+    console.log('P04-04 fixture: PG 18.7 / pinned S0 cap (21 of 24) / real P03/P04 command and authorization / exact observer PASS (no browser scenario)');
   } else {
     stage = 'production Next and ephemeral HTTPS ingress';
     const next = childProcess(spawn(process.execPath, ['apps/web/scripts/next.mjs','start','--hostname',host,'--port',String(webPort)], { env, stdio: 'ignore' }));
@@ -143,7 +155,7 @@ try {
     stage = 'production HTTPS browser scenario / exact and denied PostgreSQL evidence';
     await browser(fixture, proofToken);
     assertScenario(reports);
-    console.log('P04-04 browser proof: PG 18.7 / 21 migrations / production Nest + Next / exact item, price, district, coverage, FAQ, contact / denied counts unchanged / unexpected ingress 0');
+    console.log('P04-04 browser proof: PG 18.7 / pinned S0 cap (21 of 24) / guarded one-use launch / production Nest + Next / exact item, price, district, coverage, FAQ, contact / denied counts unchanged / unexpected ingress 0');
     console.log(JSON.stringify(reports.filter(r => groups.every(key => r.writes[key]?.exact)).at(-1)));
   }
 } catch {
@@ -156,5 +168,6 @@ try {
   for (const server of [evidence, ingress]) {
     if (server) { server.close(); server.closeAllConnections(); }
   }
+  await launch?.stop().catch(() => undefined);
   if (fixture) { await fixture.migrator.end(); }
 }

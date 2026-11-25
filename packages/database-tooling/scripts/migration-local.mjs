@@ -328,7 +328,7 @@ export function runPrisma(args, database, shadow, history) {
 }
 
 /**
- * S2 physical-profile regression, lab mode only.
+ * Physical-profile regression, lab mode only.
  *
  * Runs the SINGLE shared module that runtime readiness and the §5.3 restore gate
  * use — `probeP05Catalog` from
@@ -338,9 +338,13 @@ export function runPrisma(args, database, shadow, history) {
  * override: the boolean the runtime would compute is the boolean asserted here.
  * Outside the lab opt-in this function is never called, so dev behaviour and its
  * dependencies are unchanged.
+ *
+ * `S3` is accepted because the reviewed 024 SQL is in the tree: a fresh 001…024
+ * database is an S3 database, while the historical S1/S2 pins stay untouched and
+ * are still asserted at their exact earlier caps.
  */
 export async function assertReviewedProfile(database, profile) {
-  if (!syntheticMode() || !['S1','S2'].includes(profile)) { throw new Error('Invalid lab profile assertion'); }
+  if (!syntheticMode() || !['S1','S2','S3'].includes(profile)) { throw new Error('Invalid lab profile assertion'); }
   validateDatabase(database);
   const client = connection('fixlevelup_runtime', credentials().fixlevelup_runtime, database);
   await client.connect();

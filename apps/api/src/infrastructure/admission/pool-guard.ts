@@ -66,12 +66,17 @@ const revoked = new WeakSet<RuntimeAdmission>();
 const poolAdmissions = new WeakMap<object, () => RuntimeAdmission>();
 
 /** A structural query port alone is not a completed S2 launch. */
-export function requireFormSessionPool(pool: object): void {
+export function requireFormSessionPool(pool: object): 'S2' | 'S3' {
   const binding = poolAdmissions.get(pool)?.().binding;
-  if (!binding || binding.profile !== 'S2'
+  if (!binding || (binding.profile !== 'S2' && binding.profile !== 'S3')
     || (binding.expected.consumerKind !== 'API' && binding.expected.consumerKind !== 'TEST')) {
     throw new AdmissionRequiredError();
   }
+  return binding.profile;
+}
+
+export function requireRequestEffectsPool(pool: object): void {
+  if (requireFormSessionPool(pool) !== 'S3') { throw new AdmissionRequiredError(); }
 }
 
 export function requireRuntimeAuthorization(authorization: ProcessAuthorization, kind: ConsumerKind, target: DatabaseConfig): RuntimeAdmission {

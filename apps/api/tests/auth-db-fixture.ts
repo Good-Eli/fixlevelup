@@ -25,6 +25,7 @@ const expectedSteps = [
   '20261122000700_catalog_management',
   '20261123000100_request_intake_foundation',
   '20261124000100_form_session_foundation',
+  '20261125000100_request_intake_effects',
 ];
 function discoverMigrations(): readonly string[] {
   const dirs = readdirSync(migrationRoot, { withFileTypes: true })
@@ -36,14 +37,16 @@ function discoverMigrations(): readonly string[] {
 }
 export const authFixtureMigrations = discoverMigrations();
 
-export async function migrateAuthFixture(db: Client, database: string): Promise<void> {
+export async function migrateAuthFixture(db: Client, database: string, capBefore?: string): Promise<void> {
   // Isolation guard: only an allowlisted disposable database may be migrated by a fixture.
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1'
     || !/^fixlevelup_(bootstrap|recovery|web_auth|auth_e2e|legal|configuration)_test_[a-f0-9]{24}$/.test(database)
     || (await db.query<{ db: string }>('SELECT current_database() AS db')).rows[0]?.db !== database) {
     throw new Error('Refusing non-isolated auth fixture');
   }
-  for (const migration of authFixtureMigrations) {
+  const end = capBefore === undefined ? authFixtureMigrations.length : authFixtureMigrations.indexOf(capBefore);
+  if (end < 1) { throw new Error('Unknown auth fixture cap'); }
+  for (const migration of authFixtureMigrations.slice(0,end)) {
     await db.query(readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8'));
   }
 }

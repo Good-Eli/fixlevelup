@@ -149,7 +149,7 @@ async function commandCounts(commandId: string): Promise<{ effects: number; audi
   return counts;
 }
 
-describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
+describe.runIf(process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1')('real PostgreSQL outbox leases (P01-01.9A)', () => {
   // Set exactly when this run's CREATE DATABASE succeeded (below): the flag plus the
   // strict disposable-name pattern gate the teardown drop to this run's own database.
   let dbCreated = false;

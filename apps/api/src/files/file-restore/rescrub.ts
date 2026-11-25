@@ -4,10 +4,12 @@ import type { StorageTarget } from '../storage/attempt.js';
 import type { RestoreContext, RestoreObject, RestoreReaderTarget, RestoreGateReceipt, SignedSnapshotManifest, FileRestoreFailure, SnapshotManifest } from './contract.js';
 import { refuseRestore } from './contract.js';
 import { readAuthorityInventory, readRestoreInventory, requireExactTombstones, requireMatchingInventory } from './inventory.js';
-import { p05Tables, readP05TargetDrainState } from './p05-inventory.js';
+import { p05Tables, readP05RestoreDrainState, type CarriedRestorePolicy } from './p05-inventory.js';
+import { S3_HEAD } from '../../infrastructure/database/p05-profile-catalog.js';
 import { observeFencedSource } from './p05-source-fence.js';
+import type { FencedSourceObservation } from './p05-source-fence.js';
 import { verifyP05Attestation } from './p05-attestation.js';
-import { objectId, readAuthority, readSnapshot, sameHead, sha256, targetId, validateLimits, verifyApproval } from './records.js';
+import { objectId, readSnapshot, requireAuthorityV2, requireAuthorityV3, sameHead, sha256, targetId, validateLimits, verifyApproval } from './records.js';
 import { issueReadyGetGrant, requireLifecycleGetGrant, type ReadyGetGrant } from '../storage/lifecycle-proof.js';
 import type { ReadyReadStorage } from '../file-lifecycle/contract.js';
 import { privateStorageError } from '../storage/errors.js';
@@ -27,14 +29,16 @@ import { privateStorageError } from '../storage/errors.js';
  * finding #9): the full rescrubFileRestore contour needs S3/Garage IO, while
  * this gate is provable against real disposable PostgreSQL targets alone. */
 export async function requireP05AbsentForActivation(client: { readonly query: import('pg').PoolClient['query'] },
-  manifest: Pick<SnapshotManifest, 'schemaVersion'>): Promise<'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'> {
-  let expectedProfile: 'S0' | 'S1' | 'S2';
+  manifest: Pick<SnapshotManifest, 'schemaVersion' | 'policySha256'>,
+  carried?: CarriedRestorePolicy): Promise<'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'> {
+  let expectedProfile: 'S0' | 'S1' | 'S2' | 'S3';
   try {
     expectedProfile = manifestSourceSchemaProfile(manifest);
   } catch {return refuseRestore('RESTORE_AUTHORITY');}
   const expectedFact = expectedProfile === 'S0' ? 'P05_SCHEMA_ABSENT_AFTER_DRAIN' : 'P05_EMPTY_AFTER_DRAIN';
   try {
-    const target = await readP05TargetDrainState(client, expectedProfile);
+    if (manifest.policySha256 !== carried?.sha256) {refuseRestore('RESTORE_AUTHORITY');}
+    const target = await readP05RestoreDrainState(client, expectedProfile, carried);
     if (target.profile !== expectedProfile || target.fact !== expectedFact) {refuseRestore('RESTORE_AUTHORITY');}
     return target.fact;
   } catch { return refuseRestore('RESTORE_AUTHORITY'); }
@@ -45,7 +49,8 @@ export async function requireP05AbsentForActivation(client: { readonly query: im
  * §1 base 7a60d4c = 021, the only pre-P05 profile the P05 plan accepts as a
  * restore source), the reviewed P05 act 022 = migration
  * `20261123000100_request_intake_foundation` (S1) and the reviewed P05-02
- * head 023 = migration `20261124000100_form_session_foundation` (S2). The
+ * head 023 = migration `20261124000100_form_session_foundation` (S2) and the
+ * reviewed S3 head 024. The
  * manifest schemaVersion is the exact reviewed migration directory name
  * (records.ts enforces `^\d{14}_[a-z_]+$`). Any other head — earlier unknown,
  * later unknown or malformed-but-syntax-valid — is never silently classified;
@@ -55,12 +60,49 @@ const REVIEWED_S0_HEAD = '20261122000700_catalog_management';
 const REVIEWED_S1_HEAD = '20261123000100_request_intake_foundation';
 const REVIEWED_S2_HEAD = '20261124000100_form_session_foundation';
 
-export function manifestSourceSchemaProfile(manifest: Pick<SnapshotManifest, 'schemaVersion'>): 'S0' | 'S1' | 'S2' {
+export function manifestSourceSchemaProfile(manifest: Pick<SnapshotManifest, 'schemaVersion'>): 'S0' | 'S1' | 'S2' | 'S3' {
   const version = manifest.schemaVersion;
   if (version === REVIEWED_S0_HEAD) { return 'S0'; }
   if (version === REVIEWED_S1_HEAD) { return 'S1'; }
   if (version === REVIEWED_S2_HEAD) { return 'S2'; }
+  if (version === S3_HEAD) { return 'S3'; }
   throw new Error(`Unreviewed schema profile: ${version}`);
+}
+
+function sameCluster(left: { readonly systemIdentifier: string; readonly serverVersionNum: string;
+  readonly postmasterStart: string }, right: { readonly systemIdentifier: string; readonly serverVersionNum: string;
+  readonly postmasterStart: string }): boolean {
+  return left.systemIdentifier === right.systemIdentifier && left.serverVersionNum === right.serverVersionNum
+    && left.postmasterStart === right.postmasterStart;
+}
+
+/**
+ * §5.3: the signed v2 authority must name exactly the source this run fenced
+ * (database, numeric OID, cluster identity, reviewed schema profile, old ledger
+ * namespace/epoch) and exactly the destination the manifest names. The cluster
+ * fact is compared against the SAME observation that produced the drain fact, so
+ * a signature over another cluster's facts can never admit this target.
+ */
+export function requireBoundAuthority(record: {
+  readonly sourceDatabase: string; readonly sourceDatabaseOid: number;
+  readonly cluster: { readonly systemIdentifier: string; readonly serverVersionNum: string; readonly postmasterStart: string };
+  readonly sourceProfile: 'S0' | 'S1' | 'S2' | 'S3'; readonly oldNamespace: string; readonly oldWriterEpoch: string;
+  readonly destinationDatabase: string; readonly manifestSha256: string; readonly inventorySha256: string;
+}, expected: {
+  readonly manifestSha256: string; readonly sourceDatabase: string; readonly destinationDatabase: string;
+  readonly sourceDatabaseOid: number; readonly sourceProfile: 'S0' | 'S1' | 'S2' | 'S3';
+  readonly oldNamespace: string; readonly oldWriterEpoch: string;
+  readonly observed: Pick<FencedSourceObservation, 'cluster' | 'inventorySha256'>;
+}): void {
+  if (record.manifestSha256 !== expected.manifestSha256
+    || record.inventorySha256 !== expected.observed.inventorySha256
+    || record.sourceDatabase !== expected.sourceDatabase || record.destinationDatabase !== expected.destinationDatabase
+    || record.sourceDatabaseOid !== expected.sourceDatabaseOid
+    || !sameCluster(record.cluster, expected.observed.cluster)
+    || record.sourceProfile !== expected.sourceProfile
+    || record.oldNamespace !== expected.oldNamespace || record.oldWriterEpoch !== expected.oldWriterEpoch) {
+    refuseRestore('RESTORE_AUTHORITY');
+  }
 }
 
 /** The bridge callback returns no clock reading: the drain fact is bound to the
@@ -78,7 +120,7 @@ const P05_SOURCE_FACT_MAX_AGE_MS = 60_000;
  * arbitrary/self-minted nonce from an unbound (possibly replayed) response
  * refuses as RESTORE_AUTHORITY. */
 export function requireP05ProfileFact(manifest: Pick<SnapshotManifest, 'schemaVersion' | 'sourceDatabase'>,
-  attestation: { readonly fact: 'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'; readonly profile: 'S0' | 'S1' | 'S2'; readonly nonce: string },
+  attestation: { readonly fact: 'P05_EMPTY_AFTER_DRAIN' | 'P05_SCHEMA_ABSENT_AFTER_DRAIN'; readonly profile: 'S0' | 'S1' | 'S2' | 'S3'; readonly nonce: string },
   previousNonce: string | undefined, observedAt: Date, expectedChallenge?: string): void {
   const expected = manifestSourceSchemaProfile(manifest);
   if (attestation.profile !== expected || typeof attestation.nonce !== 'string' || attestation.nonce === ''
@@ -157,16 +199,33 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
     stage = 'RESTORE_AUTHORITY';
     const challenge = NONCE();
     const observer = ctx.sourceObserver;
+    const sourceProfile = manifestSourceSchemaProfile(manifest);
+    let carried: CarriedRestorePolicy | undefined;
+    if (manifest.policySha256 !== undefined) {
+      if (sourceProfile !== 'S3' || ctx.policyPin === undefined) {refuseRestore('RESTORE_AUTHORITY');}
+      carried = Object.freeze({ pin: Object.freeze({ ...ctx.policyPin }), sha256: manifest.policySha256 });
+    }
     const source = Object.freeze({ database: manifest.sourceDatabase, databaseOid: ctx.sourceDatabaseOid,
-      scope: old, profile: manifestSourceSchemaProfile(manifest), manifestSha256: hash });
-    const drained = await observeFencedSource(observer, { ...source, challenge }, limits);
+      scope: old, profile: sourceProfile, manifestSha256: hash });
+    const drained = await observeFencedSource(observer, { ...source, challenge }, limits, carried);
     requireP05ProfileFact(manifest, drained, undefined, new Date(), challenge);
     if (drained.manifestSha256 !== hash) { refuseRestore('RESTORE_AUTHORITY'); }
     abortCheck(signal);
-    const auth = readAuthority(await ctx.currentAuthority({ manifestSha256: hash, challenge }, signal), ctx.authorityKey);
-    if (auth.record.challenge !== challenge || auth.record.manifestSha256 !== hash || auth.record.inventorySha256 !== drained.inventorySha256
-      || auth.record.head.namespace !== nextScope.namespace
-      || auth.record.head.incarnation !== nextScope.incarnation || auth.record.head.writerEpoch !== nextScope.writerEpoch) {refuseRestore('RESTORE_AUTHORITY');}
+    const readCurrentAuthority = async (nonce: string) => {
+      const signed = await ctx.currentAuthority({ manifestSha256: hash, challenge: nonce }, signal);
+      if (carried === undefined) { return requireAuthorityV2(signed, ctx.authorityKey); }
+      const result = requireAuthorityV3(signed, ctx.authorityKey);
+      if (result.record.policySha256 !== drained.policySha256 || result.record.drainFact !== drained.fact) {refuseRestore('RESTORE_AUTHORITY');}
+      return result;
+    };
+    const auth = await readCurrentAuthority(challenge);
+    if (auth.record.challenge !== challenge || auth.record.head.namespace !== nextScope.namespace
+      || auth.record.head.incarnation !== nextScope.incarnation || auth.record.head.writerEpoch !== nextScope.writerEpoch) {
+      refuseRestore('RESTORE_AUTHORITY');
+    }
+    requireBoundAuthority(auth.record, { manifestSha256: hash, sourceDatabase: manifest.sourceDatabase,
+      destinationDatabase: manifest.destinationDatabase, sourceDatabaseOid: ctx.sourceDatabaseOid,
+      sourceProfile, oldNamespace: old.namespace, oldWriterEpoch: old.writerEpoch.toString(), observed: drained });
     abortCheck(signal);
     stage = 'RESTORE_LEDGER';
     const lineage = await ctx.verifier.verifyLineage(nextScope, manifest.base);
@@ -190,7 +249,7 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
     if (epoch === undefined || !epoch.primary || epoch.db !== manifest.destinationDatabase || epoch.namespace !== old.namespace
       || epoch.epoch !== old.writerEpoch.toString() || epoch.mode !== 'RESTORE_CLOSED' || epoch.connect) {refuseRestore('RESTORE_CLOSED');}
     stage = 'RESTORE_AUTHORITY';
-    await requireP05AbsentForActivation(conn, manifest);
+    await requireP05AbsentForActivation(conn, manifest, carried);
     if (await readAuthorityInventory(conn, limits) !== auth.record.inventorySha256) {refuseRestore('RESTORE_AUTHORITY');}
     const current = await readRestoreInventory(conn, limits);
     requireMatchingInventory(manifest.inventory, current);
@@ -220,9 +279,17 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
     verifyApproval(await ctx.approve(binding, signal), ctx.approvalKey, binding);
     // Re-read the source fence/authority and current floor-extended head after all IO. Same signed facts, new nonce.
     const last = NONCE();
-    const fresh = readAuthority(await ctx.currentAuthority({ manifestSha256: hash, challenge: last }, signal), ctx.authorityKey).record;
-    if (fresh.challenge !== last || fresh.manifestSha256 !== hash || fresh.overlaySha256 !== auth.record.overlaySha256
-      || fresh.inventorySha256 !== auth.record.inventorySha256 || !sameHead(fresh.head, lineage.head)) {refuseRestore('RESTORE_AUTHORITY');}
+    const fresh = (await readCurrentAuthority(last)).record;
+    if (fresh.challenge !== last || fresh.overlaySha256 !== auth.record.overlaySha256
+      || !sameHead(fresh.head, lineage.head)) {refuseRestore('RESTORE_AUTHORITY');}
+    // The second signature must still name the same source/cluster/profile/epoch
+    // AND the same drain inventory: only the challenge may differ. Binding the
+    // fresh record to the ORIGINAL drain inventory (not to itself) is what makes
+    // this a real check rather than a tautology.
+    requireBoundAuthority(fresh, { manifestSha256: hash, sourceDatabase: manifest.sourceDatabase,
+      destinationDatabase: manifest.destinationDatabase, sourceDatabaseOid: ctx.sourceDatabaseOid,
+      sourceProfile, oldNamespace: old.namespace, oldWriterEpoch: old.writerEpoch.toString(),
+      observed: { cluster: drained.cluster, inventorySha256: drained.inventorySha256 } });
     stage = 'RESTORE_LEDGER';
     if (!sameHead((await ctx.verifier.verifyLineage(nextScope, lineage.head)).head, lineage.head)) {refuseRestore('RESTORE_LEDGER');}
     stage = 'RESTORE_CLOSED';
@@ -242,10 +309,12 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
       if (tables.length > 0) {
         await client.query(`LOCK TABLE ${tables.map(table => `foundation.${table}`).join(', ')} IN SHARE MODE`);
       }
-      await requireP05AbsentForActivation(client, manifest);
-      const terminal = await observeFencedSource(observer, { ...source, challenge: last, backendPid: drained.backendPid }, limits);
+      await requireP05AbsentForActivation(client, manifest, carried);
+      const terminal = await observeFencedSource(observer, { ...source, challenge: last, backendPid: drained.backendPid }, limits, carried);
       requireP05ProfileFact(manifest, terminal, drained.nonce, new Date(), last);
-      if (terminal.fact !== drained.fact || terminal.manifestSha256 !== hash || terminal.inventorySha256 !== fresh.inventorySha256) {
+      if (terminal.fact !== drained.fact || terminal.policySha256 !== drained.policySha256
+        || terminal.manifestSha256 !== hash || terminal.inventorySha256 !== fresh.inventorySha256
+        || !sameCluster(terminal.cluster, fresh.cluster)) {
         refuseRestore('RESTORE_AUTHORITY');
       }
       abortCheck(signal);

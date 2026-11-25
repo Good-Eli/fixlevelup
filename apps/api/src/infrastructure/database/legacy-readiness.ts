@@ -1,6 +1,9 @@
 import type { Client, QueryResultRow } from 'pg';
 import { P04_CAPABILITIES } from '../../authz/capability.js';
 
+const S3_SETTINGS_PIN = '5d51e88aaf1d3b95476e6576d1fad431554816446dc5799445b03819e0599574';
+const S3_CATALOG_PIN = 'a91b68bb9bc9948f1183693186674b68adf643766337c9a1c97d780119ec2a57';
+
 export interface ReadinessRow {
   database: string;
   role: string;
@@ -492,6 +495,15 @@ export class LegacyReadinessProbes {
   // P03-05 (018), deliberately separate from the 013 and historical auth probes.
   // Also used by the management HTTP boundary; a failed probe never reaches a command.
   async settingsManagementReady(): Promise<boolean> {
+    const m = await this.measureSettingsManagement();
+    return m?.compatible === true && [
+      '0495cf5140136b04298a8428bb99eb80b064c62b05863a247810b58c4019553a', // 018–020
+      'c41a3d75fc824c5a967c242f45c3a05d02e28c3c27b9a20325b95a011e535183', // 021–023
+      S3_SETTINGS_PIN, // exact 024 role scope delta
+    ].includes(m.metadata);
+  }
+
+  async measureSettingsManagement() {
     // Hash only the fixed physical contract, not business/configuration rows or personal
     // source state. `prosrc` is deliberately included: presence/name/ACL checks cannot
     // distinguish the real guards or issuer from same-signature no-op replacements.
@@ -567,14 +579,17 @@ export class LegacyReadinessProbes {
           OR EXISTS(SELECT FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl WHERE acl.grantee<>p.proowner))
         AS compatible
     `;
-    return rows[0]?.compatible === true && [
-      '0495cf5140136b04298a8428bb99eb80b064c62b05863a247810b58c4019553a', // 018–020
-      'c41a3d75fc824c5a967c242f45c3a05d02e28c3c27b9a20325b95a011e535183', // 021: exact extended role_permissions_scope_check
-    ].includes(rows[0].metadata);
+    return rows[0];
   }
 
   /** P04 has its own mechanical gate; legacy readiness never depends on this probe. */
   async catalogManagementReady(): Promise<boolean> {
+    const m = await this.measureCatalogManagement();
+    return m?.compatible === true && (m.metadata === '00a7323a31b502c1bb375aa3ca84cdc570da9bbffd4b87da5e4e0c463964725c'
+      || m.metadata === S3_CATALOG_PIN);
+  }
+
+  async measureCatalogManagement() {
     // Exact PostgreSQL 18 metadata for 019–021 and the upstream policy state they
     // trust. In particular, the RBAC writer fence must cover role, grant, assignment,
     // and geography changes. Fingerprint the trigger definitions/activation and their
@@ -659,7 +674,7 @@ export class LegacyReadinessProbes {
           FROM pg_roles WHERE rolname='fixlevelup_runtime')
         AND NOT has_function_privilege('fixlevelup_runtime','foundation.issue_p04_synthetic_permissions()','EXECUTE') AS compatible
     `, [P04_CAPABILITIES, this.database, this.inspectorRole]);
-    return rows[0]?.compatible === true && rows[0].metadata === '00a7323a31b502c1bb375aa3ca84cdc570da9bbffd4b87da5e4e0c463964725c';
+    return rows[0];
   }
 
   private async authReady(): Promise<boolean> {

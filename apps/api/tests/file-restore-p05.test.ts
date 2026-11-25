@@ -1,10 +1,9 @@
 /**
  * P05-01/P05-02 slice (g): file-only restore guard extension (docs/P05-PLAN.md §5.3).
  *
- * Real PostgreSQL integration test, opt-in via FIXLEVELUP_FILE_RESTORE_TESTS=1
- * (same gating style as file-restore.test.ts). No S3/Garage is required: these
- * proofs are pure closed-source checks, so the suite runs against the disposable
- * isolated PostgreSQL fixture only (FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1).
+ * Real PostgreSQL integration test with the explicit restore opt-in and the
+ * synthetic lab binding, never a legacy dev fallback. No S3/Garage is required:
+ * these closed-source checks only need disposable PostgreSQL.
  *
  * Covered:
  *  - full S2 chain (through 023): readP05SourceState reports profile 'S2' with
@@ -57,7 +56,8 @@ import { buildP05Attestation, verifyP05Attestation } from '../src/files/file-res
 import { manifestSourceSchemaProfile, requireP05AbsentForActivation, requireP05ProfileFact } from '../src/files/file-restore/rescrub.js';
 import { FileRestoreError } from '../src/files/file-restore/contract.js';
 
-const enabled = process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1';
+const enabled = process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
+  && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1';
 const live = enabled ? describe : describe.skip;
 
 live('P05-01 file-only restore P05 guard', () => {
@@ -67,8 +67,8 @@ live('P05-01 file-only restore P05 guard', () => {
 
   beforeAll(async () => {
     expect(process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS']).toBe('1');
-    // Full chain = schema profile S2 (through 023, thirteen P05 relations).
-    s2 = await createConfigurationFixture();
+    // Preserve the exact 023 profile (thirteen P05 relations).
+    s2 = await createConfigurationFixture({ capBefore: '20261125000100_request_intake_effects' });
     // Capped at 023 = the pure 022 profile S1 (ten P05 relations).
     s1 = await createConfigurationFixture({ capBefore: '20261124000100_form_session_foundation' });
     // Capped at 022 = the exact pre-P05 profile S0 (no P05 relations).
@@ -353,6 +353,13 @@ live('P05-01 file-only restore P05 guard', () => {
       expect(await readClosedTarget(db)).toMatchObject({ mode: 'RESTORE_CLOSED', active: 0, connect: false });
       await db.migrator.query('ALTER TABLE foundation.form_throttle_buckets SET LOGGED');
       expect(await readP05TargetDrainState(db.migrator)).toEqual({ fact: 'P05_EMPTY_AFTER_DRAIN', profile: 'S2' });
+      // Drift 3: a reserved sibling outside the three hashed S2 tables.
+      await db.migrator.query('CREATE VIEW foundation.form_browser_groups_extra AS SELECT 1 AS extra');
+      try {
+        await expect(readP05TargetDrainState(db.migrator)).rejects.toMatchObject({ code: 'PARTIAL_SCHEMA' });
+        expect(await activationGate(db, S2_MANIFEST)).toMatchObject({ refused: { code: 'RESTORE_AUTHORITY' } });
+        expect(await readClosedTarget(db)).toMatchObject({ mode: 'RESTORE_CLOSED', active: 0, connect: false });
+      } finally { await db.migrator.query('DROP VIEW foundation.form_browser_groups_extra'); }
       // The S1 fixture measured empty is S1, never S2: the source-side measured
       // profile (not a constant) is what carries across the handoff, so an S2
       // manifest over an S1 target still refuses even with the same fact.

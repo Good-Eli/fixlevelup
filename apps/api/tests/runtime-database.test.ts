@@ -489,7 +489,7 @@ describe('API runtime database readiness', () => {
       // ...and the positive pre-S2 absence probe holds: no 023 object exists.
       expect(await db.formSessionProfileAbsent()).toBe(true);
       // ...and legacy readiness never depends on it (no P05 tables at all yet).
-      await migrateAuthFixture(owner, name);
+      await migrateAuthFixture(owner, name, '20261125000100_request_intake_effects');
       await owner.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
       // The S1 gate turns true exactly on the full 022 profile, the S2 gate on
       // the full 023 profile, and the 023-absence probe is now false.
@@ -623,6 +623,8 @@ describe('API runtime database readiness', () => {
         'GRANT SELECT(id) ON foundation.form_browser_groups TO PUBLIC',
         // Persistence drift: an unlogged 023 table changes crash durability.
         'ALTER TABLE foundation.form_throttle_buckets SET UNLOGGED',
+        // Extra reserved object unrelated to the three reviewed tables.
+        'CREATE VIEW foundation.form_browser_groups_extra AS SELECT 1 AS extra',
       ];
       const s2Restore = [
         'ALTER TABLE foundation.form_browser_groups ENABLE TRIGGER form_browser_groups_guard',
@@ -634,6 +636,7 @@ describe('API runtime database readiness', () => {
         'REVOKE UPDATE(expires_at) ON foundation.form_browser_groups FROM fixlevelup_runtime',
         'REVOKE SELECT(id) ON foundation.form_browser_groups FROM PUBLIC',
         'ALTER TABLE foundation.form_throttle_buckets SET LOGGED',
+        'DROP VIEW foundation.form_browser_groups_extra',
       ];
       for (const [index, broken] of s2Drift.entries()) {
         const undo = s2Restore[index];

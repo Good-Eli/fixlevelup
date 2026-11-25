@@ -18,6 +18,7 @@ const root = resolve(import.meta.dirname, '../../..');
 export const moduleUrl = (path: string): string => pathToFileURL(resolve(root, 'apps/api/dist', path)).href;
 
 export interface LaunchOutcome {
+  readonly pid: number | undefined;
   readonly status: number | null;
   readonly stdout: string;
   readonly stderr: string;
@@ -54,14 +55,15 @@ type LauncherTarget = {
     readonly user: string; readonly password: string };
   readonly artifactPaths: readonly string[];
   readonly expectedMigrations?: readonly string[];
+  /** Only TEST may pin a separate emitted composition. */
+  readonly isolatedArtifactRoot?: string;
 };
 
 const CHILD_ENV = ['NODE_ENV', 'APP_HOST', 'APP_PORT', 'SHUTDOWN_TIMEOUT_MS', 'LAUNCH_APPROVAL_TIMEOUT_MS',
   'WEB_AUTH_ENABLED', 'WEB_AUTH_ORIGIN', 'WEB_AUTH_CSRF_SECRET', 'WEB_AUTH_THROTTLE_SECRET'] as const;
 
-function artifactDigestOf(paths: readonly string[]): string {
+function artifactDigestOf(paths: readonly string[], dist: string): string {
   if (paths.length === 0) { throw new Error('No compiled launch artifact was pinned'); }
-  const dist = resolve(root, 'apps/api/dist');
   if (!lstatSync(dist).isDirectory() || relative(realpathSync(root), realpathSync(dist)) !== relative(root, dist)) {
     throw new Error('Invalid compiled launch artifact root');
   }
@@ -92,16 +94,22 @@ function artifactDigestOf(paths: readonly string[]): string {
 }
 
 /** Starts an explicitly targeted isolated launch; no dev or control-owner fallback. */
-export async function startLauncher(consumerKind: 'API' | 'WORKER', target: LauncherTarget): Promise<LauncherHandle> {
-  const { runtime, operator } = target;
+export async function startLauncher(consumerKind: 'API' | 'WORKER' | 'TEST', target: LauncherTarget): Promise<LauncherHandle> {
+  const { runtime, operator, isolatedArtifactRoot } = target;
   const { database } = runtime;
-  if (!/^fixlevelup_p05_[a-z0-9_]{1,48}$/.test(database) || database !== operator.database
-    || operator.host !== runtime.host || operator.port !== runtime.port || operator.user !== 'fixlevelup_migrator') {
+  const databasePattern = consumerKind === 'TEST'
+    ? /^fixlevelup_configuration_test_[0-9a-f]{24}$/ : /^fixlevelup_p05_[a-z0-9_]{1,48}$/;
+  if (!databasePattern.test(database) || database !== operator.database
+    || operator.host !== runtime.host || operator.port !== runtime.port || operator.user !== 'fixlevelup_migrator'
+    || (consumerKind === 'TEST' ? isolatedArtifactRoot === undefined
+      || !/^p05-t-[A-Za-z0-9]+$/.test(relative(resolve(root, 'apps/api/build'), isolatedArtifactRoot))
+      : isolatedArtifactRoot !== undefined)) {
     throw new Error('Invalid isolated compiled launcher target');
   }
+  const dist = isolatedArtifactRoot ?? resolve(root, 'apps/api/dist');
   const control = verifiedControlConfig(database);
   const paths = [...target.artifactPaths];
-  const artifactDigest = artifactDigestOf(paths);
+  const artifactDigest = artifactDigestOf(paths, dist);
   const holder = new Client({ ...operator, connectionTimeoutMillis: 3000, statement_timeout: 3000, query_timeout: 4000 });
   const admission = await (async () => {
     try {
@@ -122,7 +130,7 @@ export async function startLauncher(consumerKind: 'API' | 'WORKER', target: Laun
   const expected = { instanceId, launchNonce: nonce, consumerKind, proofDigest: admission.admission.proofDigest,
     issuerGeneration: generation, witnessHolderPid: binding.witnessHolderPid, channelId,
     database, databaseOid: binding.databaseOid, role: binding.role, profile: binding.profile };
-  let supervisor: LaunchSupervisor | undefined;
+  const supervisors = new Set<LaunchSupervisor>();
   return {
     admission,
     launch: (options) => new Promise<LaunchOutcome>((resolveLaunch) => {
@@ -131,12 +139,18 @@ export async function startLauncher(consumerKind: 'API' | 'WORKER', target: Laun
       const trusted = options.corruptBinding === true
         ? { ...expected, launchNonce: randomUUID() }
         : expected;
-      if (artifactDigestOf(paths) !== artifactDigest) { throw new Error('Pinned launch artifacts changed'); }
+      if (artifactDigestOf(paths, dist) !== artifactDigest) { throw new Error('Pinned launch artifacts changed'); }
       const env: NodeJS.ProcessEnv = {
         ...admission.env, FIXLEVELUP_LAB_DATABASE: database,
         DB_HOST: runtime.host, DB_PORT: String(runtime.port), DB_NAME: database,
         DB_USER: runtime.user, DB_PASSWORD: runtime.password,
       };
+      if (consumerKind === 'TEST') {
+        const cluster = process.env['FIXLEVELUP_CLUSTER_NAME'];
+        if (!cluster || !/^fixlevelup_p05s4_lab_[a-z0-9_]{1,40}$/.test(cluster)) { throw new Error('Invalid test child cluster'); }
+        env['FIXLEVELUP_CLUSTER_NAME'] = cluster;
+        env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] = '1';
+      }
       for (const name of CHILD_ENV) {
         const value = options.env[name];
         if (value !== undefined) { env[name] = value; }
@@ -158,7 +172,7 @@ export async function startLauncher(consumerKind: 'API' | 'WORKER', target: Laun
           if (type === 'p05/launch/reject') { rejects += 1; }
         },
       });
-      supervisor = supervised;
+      supervisors.add(supervised);
       if (options.repeatFirstHandshake) {
         let repeated = false;
         child.on('message', (message: unknown) => {
@@ -170,12 +184,12 @@ export async function startLauncher(consumerKind: 'API' | 'WORKER', target: Laun
       }
       void Promise.all([supervised.activation, supervised.closed]).then(([result]) => {
         const code = child.exitCode;
-        resolveLaunch({ status: code, stdout, stderr, approvals, rejects, acked: result.approved, exitCode: code,
+        resolveLaunch({ pid: child.pid, status: code, stdout, stderr, approvals, rejects, acked: result.approved, exitCode: code,
           decision: result.approved ? 'approved:acked' : `rejected:${result.reason}` });
       });
     }),
     close: async () => {
-      await supervisor?.stop();
+      await Promise.all([...supervisors].map((supervisor) => supervisor.stop()));
       await admission.release();
       await holder.end().catch(() => undefined);
     },

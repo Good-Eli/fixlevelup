@@ -8,6 +8,7 @@ import type { GuardedPool } from '../admission/pool-guard.js';
 import type { ProcessAuthorization } from '../admission/process-admission.js';
 import { LegacyReadinessProbes } from './legacy-readiness.js';
 import { probeP05Layer } from './p05-profile-catalog.js';
+import { requestEffectsHistoryComplete } from './request-phone-history.js';
 import type { PoolClient } from 'pg';
 import type { ConsumerKind } from '../admission/proof.js';
 
@@ -96,12 +97,22 @@ export class RuntimeDatabase implements OnModuleDestroy {
       new LegacyReadinessProbes(client, config.database, true).catalogManagementReady()) : Promise.resolve(false);
   }
 
-  private layer(layer: 'S1' | 'S2' | 'NO_S1' | 'NO_S2'): Promise<boolean> {
+  private layer(layer: 'S1' | 'S2' | 'S3' | 'NO_S1' | 'NO_S2'): Promise<boolean> {
     return this.authEnabled ? this.run(layer, (client) => probeP05Layer(client, layer)) : Promise.resolve(false);
   }
 
-  requestIntakeReady(): Promise<boolean> { return this.layer('S1'); }
+  requestIntakeReady(): Promise<boolean> {
+    return this.authEnabled ? this.run('intake', async (client) =>
+      await probeP05Layer(client, 'S1') || await probeP05Layer(client, 'S3')) : Promise.resolve(false);
+  }
   formSessionReady(): Promise<boolean> { return this.layer('S2'); }
+  requestEffectsReady(): Promise<boolean> {
+    if (!this.authEnabled) { return Promise.resolve(false); }
+    // Closed test feature: a physically reviewed schema is necessary but is
+    // not enough. Partial durable effects never make an anchor/key reusable.
+    return this.run('request-effects', async (client) =>
+      await probeP05Layer(client, 'S3') && await requestEffectsHistoryComplete(client));
+  }
   preIntakeProfileAbsent(): Promise<boolean> { return this.layer('NO_S1'); }
   formSessionProfileAbsent(): Promise<boolean> { return this.layer('NO_S2'); }
 

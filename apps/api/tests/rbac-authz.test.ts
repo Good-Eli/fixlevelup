@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { Capability, GeoCapability, Scope } from '../src/authz/capability.js';
 import {
   GEO_CAPABILITIES, GEO_SCOPE_CONTRACT, GLOBAL_SCOPE, isCapability, isGeoCapability, isPermissionCode,
-  isP04Capability, P03_CAPABILITIES, P04_CAPABILITIES, PERMISSION_CONTRACT, PERMISSION_CODES,
+  isP04Capability, isP05Capability, P03_CAPABILITIES, P04_CAPABILITIES, P05_CAPABILITIES, PERMISSION_CONTRACT, PERMISSION_CODES,
   PROTECTED_CAPABILITIES, scopeMatches, STAFF_CAPABILITIES, staffScope,
 } from '../src/authz/capability.js';
 import { AuthorizationError, AuthorizationService, isSystemAdmin, P03CommitUnknown } from '../src/authz/authorization.service.js';
@@ -17,12 +17,20 @@ describe('server permission contracts are not grants', () => {
     expect(GEO_CAPABILITIES).toEqual(['geography.read', 'geography.manage', 'geography.publish',
       'staff.geography.read', 'staff.geography.manage']);
     expect(P03_CAPABILITIES).toHaveLength(18);
-    expect(new Set(PERMISSION_CODES).size).toBe(45);
+    expect(new Set(PERMISSION_CODES).size).toBe(52);
     expect(P04_CAPABILITIES).toEqual(['catalog.read', 'catalog.manage', 'pricing.rules.read', 'pricing.rules.manage',
       'pricing.read', 'pricing.manage', 'content.externalreviews.read', 'content.externalreviews.manage', 'content.externalreviews.publish']);
     expect(P04_CAPABILITIES.every((code) => isPermissionCode(code) && isP04Capability(code)
       && !isCapability(code) && !isGeoCapability(code) && !(P03_CAPABILITIES as readonly string[]).includes(code))).toBe(true);
     expect(P03_CAPABILITIES.every((code) => !isCapability(code) && !isGeoCapability(code))).toBe(true);
+    // P05 request processing is a closed, disjoint domain contract: seven ordinary codes,
+    // never part of the staff dictionary, geography, P03 or P04, and never protected.
+    expect(P05_CAPABILITIES).toEqual(['requests.read', 'requests.create', 'requests.review',
+      'requests.coverage.assess', 'requests.contact.manage', 'requests.ready', 'requests.cancel']);
+    expect(P05_CAPABILITIES.every((code) => isPermissionCode(code) && isP05Capability(code)
+      && !isCapability(code) && !isGeoCapability(code) && !isP04Capability(code)
+      && !(P03_CAPABILITIES as readonly string[]).includes(code))).toBe(true);
+    expect(P05_CAPABILITIES.some((code) => (PROTECTED_CAPABILITIES as readonly string[]).includes(code))).toBe(false);
     for (const input of [null, [], {}, 'staff.manage', 'jobs.create', '__proto__', 'constructor', 'roles.READ',
       'geography', 'geography.write', 'geography.self.read', 'geography.admin.assign', 'geography.bootstrap.revoke']) {
       expect(isPermissionCode(input)).toBe(false);

@@ -1,45 +1,61 @@
-import { randomBytes, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { readdir } from 'node:fs/promises';
-import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as wait } from 'node:timers/promises';
 import { bootstrapFirstAdmin } from '../../apps/api/dist/staff/bootstrap.js';
 import { hashPassword } from '../../apps/api/dist/staff/password.js';
+import { Pool, applyCappedMigrations, artifactDigest, compileLauncherModules, createControlContour, host,
+  migrationInventory, pgPort, physicalContractDigest, token } from './launch.mjs';
 
-const requireApi = createRequire(new URL('../../apps/api/package.json', import.meta.url));
-const { Pool } = requireApi('pg');
-const migrationRoot = new URL('../../prisma/migrations/', import.meta.url);
-const head = '20261122000700_catalog_management';
-export const database = 'fixlevelup_dev'; // Required by compiled production API, inside a new network namespace only.
-export const token = () => randomBytes(32).toString('hex');
+// Required by the compiled production API entrypoint. It is only reachable
+// inside the container's own network namespace: no host or preexisting
+// fixlevelup_dev is reachable from it.
+export const database = 'fixlevelup_dev';
 
-async function connected(pool) {
+const adminRole = 'p0305_postgres';
+function pool(facts) {
+  const pool = new Pool({ ...facts, ssl: false, connectionTimeoutMillis: 1000, max: 2,
+    statement_timeout: 60_000, query_timeout: 65_000, application_name: 'p0305-fixture' });
+  pool.on('error', () => { /* Driver errors never surface with values. */ });
+  return pool;
+}
+async function connected(client) {
   for (let attempt = 0; attempt < 40; attempt++) {
-    try { await pool.query('SELECT 1'); return; }
+    try { await client.query('SELECT 1'); return; }
     catch { await wait(500); }
   }
   throw new Error('Isolated PostgreSQL not available');
 }
 
-export async function provision() {
+/** The disposable cluster must be fresh: exact version, cluster marker, no prior schema/roles. */
+async function proveFresh(admin, marker) {
+  const proof = await admin.query(`SELECT current_database()=$1 AND current_user=$2
+      AND current_setting('server_version_num')='180007' AND current_setting('cluster_name')=$3
+      AND current_setting('listen_addresses')='127.0.0.1'
+      AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname='foundation')
+      AND NOT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace='public'::regnamespace)
+      AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname !~ '^pg_' AND rolname<>$2)
+      AND NOT EXISTS (SELECT 1 FROM pg_database WHERE datname NOT IN ($1,'postgres','template0','template1'))
+      AND (SELECT count(*)::int FROM pg_database)=4 AS ok`,
+  [database, adminRole, `p0305-${marker}`]);
+  if (proof.rows[0]?.ok !== true) { throw new Error('Refusing non-disposable or initialized cluster'); }
+}
+
+export async function provision(marker) {
   // No existing env file, connection string or default driver config is accepted.
-  const connection = { host: '127.0.0.1', port: 55432, database, ssl: false,
-    connectionTimeoutMillis: 1000, statement_timeout: 30000, max: 1 };
   const adminPassword = process.env['P0305_PG_BOOTSTRAP'];
-  if (!/^[a-f0-9]{64}$/.test(adminPassword ?? '')) { throw new Error('Disposable database token missing'); }
-  const admin = new Pool({ ...connection, user: 'p0305_postgres', password: adminPassword });
+  if (!/^[a-f0-9]{64}$/u.test(adminPassword ?? '')) { throw new Error('Disposable database token missing'); }
+  if (!/^[a-f0-9]{24}$/u.test(marker ?? '')) { throw new Error('Disposable namespace marker missing'); }
+  const operator = Object.freeze({ host, port: pgPort, user: adminRole, password: adminPassword });
+  const admin = pool({ ...operator, database });
   const passwords = { fixlevelup_migrator: token(), fixlevelup_runtime: token() };
-  const marker = process.env['P0305_NAMESPACE'];
-  if (!marker || !/^[a-f0-9]{24}$/.test(marker)) { throw new Error('Disposable namespace marker missing'); }
+  const pinned = await migrationInventory();
+  let control;
   try {
     await connected(admin);
-    const proof = await admin.query(`SELECT current_database()=$1 AND current_user='p0305_postgres'
-      AND current_setting('server_version_num')='180007' AND current_setting('cluster_name')=$2
-      AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname='foundation')
-      AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname IN ('fixlevelup_migrator','fixlevelup_runtime')) AS ok`, [database, `p0305-${marker}`]);
-    if (proof.rows[0]?.ok !== true) { throw new Error('Refusing non-disposable or initialized cluster'); }
+    await proveFresh(admin, marker);
+    // Identifier/password interpolation is confined to fixed identifiers and generated hex.
     for (const [role, password] of Object.entries(passwords)) {
-      await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '${password}'`);
+      await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+        NOBYPASSRLS NOINHERIT PASSWORD '${password}'`);
     }
     await admin.query(`ALTER DATABASE ${database} OWNER TO fixlevelup_migrator;
       REVOKE ALL ON DATABASE ${database} FROM PUBLIC;
@@ -47,42 +63,50 @@ export async function provision() {
       CREATE SCHEMA foundation AUTHORIZATION fixlevelup_migrator;
       REVOKE ALL ON SCHEMA foundation FROM PUBLIC;
       REVOKE CREATE ON SCHEMA public FROM PUBLIC`);
-  } finally { await admin.end(); }
+    // Separate disposable control contour (plan §7): own database, own narrow
+    // launcher role, no CONNECT for the application roles.
+    control = await createControlContour({ admin, owner: operator, marker, modules: await compileLauncherModules() });
+  } finally { await admin.end().catch(() => undefined); }
 
-  const migrator = new Pool({ ...connection, user: 'fixlevelup_migrator', password: passwords.fixlevelup_migrator });
+  const migratorFacts = Object.freeze({ host, port: pgPort, database, user: 'fixlevelup_migrator',
+    password: passwords.fixlevelup_migrator });
+  const migrator = pool(migratorFacts);
   const administrator = { login: `p0305-admin-${randomUUID()}`, password: token() };
   const manager = { id: randomUUID(), login: `p0305-manager-${randomUUID()}`, password: token() };
   try {
-    const steps = (await readdir(migrationRoot)).filter(name => /^\d{14}_/.test(name)).sort();
-    if (steps.length !== 21 || steps[17] !== '20261122000400_settings_management'
-      || steps[18] !== '20261122000500_catalog_fixed_prices' || steps[19] !== '20261122000600_pricing_rules_ranges'
-      || steps.at(-1) !== head) {
-      throw new Error('Unexpected migration chain for P03 regression smoke');
-    }
-    const databaseTooling = new URL('../../packages/database-tooling/', import.meta.url);
-    const requirePrisma = createRequire(new URL('package.json', databaseTooling));
-    const deployed = spawnSync(process.execPath, [requirePrisma.resolve('prisma/build/index.js'), 'migrate', 'deploy', '--config', 'prisma.config.ts'], {
-      cwd: databaseTooling, stdio: 'ignore', timeout: 60_000,
-      env: { PATH: process.env['PATH'], HOME: process.env['HOME'], CHECKPOINT_DISABLE: '1', PRISMA_HIDE_UPDATE_MESSAGE: '1',
-        FIXLEVELUP_MIGRATION_URL: `postgresql://fixlevelup_migrator:${passwords.fixlevelup_migrator}@127.0.0.1:55432/${database}?schema=foundation` },
-    });
-    if (deployed.status !== 0) { throw new Error('Production migration deploy failed on isolated cluster'); }
-    const history = await migrator.query('SELECT migration_name FROM foundation._prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL ORDER BY migration_name');
-    if (history.rows.map(row => row.migration_name).join() !== steps.join()) { throw new Error('Incomplete isolated migration history'); }
+    const migrationClient = await migrator.connect();
+    let history;
+    try { history = await applyCappedMigrations(migrationClient, pinned); }
+    finally { migrationClient.release(); }
     const { staffId: actor } = await bootstrapFirstAdmin(migrator, administrator);
     const client = await migrator.connect();
     try {
       await client.query('BEGIN');
       await client.query("INSERT INTO foundation.staff (id,role,employment_state) VALUES ($1,'MANAGER','ACTIVE')", [manager.id]);
-      await client.query('INSERT INTO foundation.staff_web_credentials (staff_id,login,password_hash) VALUES ($1,$2,$3)', [manager.id, manager.login, await hashPassword(manager.password)]);
+      await client.query('INSERT INTO foundation.staff_web_credentials (staff_id,login,password_hash) VALUES ($1,$2,$3)',
+        [manager.id, manager.login, await hashPassword(manager.password)]);
       const assignment = await client.query(`INSERT INTO foundation.staff_role_assignments (id,staff_id,role_id,assigned_by)
-        SELECT gen_random_uuid(),$1,id,$2 FROM foundation.roles WHERE role_type='SYSTEM' AND code='MANAGER' AND status='ACTIVE'`, [manager.id, actor]);
+        SELECT gen_random_uuid(),$1,id,$2 FROM foundation.roles WHERE role_type='SYSTEM' AND code='MANAGER' AND status='ACTIVE'`,
+      [manager.id, actor]);
       if (assignment.rowCount !== 1) { throw new Error('Synthetic manager role missing'); }
       await client.query('COMMIT');
     } catch (error) { await client.query('ROLLBACK'); throw error; }
     finally { client.release(); }
-    return { administrator, manager, actor, migrator, runtimePassword: passwords.fixlevelup_runtime };
-  } catch (error) { await migrator.end(); throw error; }
+    const identity = await migrator.query(`SELECT oid FROM pg_database WHERE datname=current_database()`);
+    const databaseOid = identity.rows[0]?.oid;
+    if (!Number.isSafeInteger(databaseOid) || databaseOid <= 0) { throw new Error('Application database OID missing'); }
+    return Object.freeze({
+      administrator, manager, actor, migrator, databaseOid,
+      database: Object.freeze({ host, port: pgPort, database, user: 'fixlevelup_runtime',
+        password: passwords.fixlevelup_runtime }),
+      operator: migratorFacts,
+      control,
+      artifact: await artifactDigest(),
+      physical: await physicalContractDigest(),
+      history: history.historyManifestDigest,
+      migrationReport: Object.freeze({ applied: history.applied, chain: history.chain, excluded: history.excluded }),
+    });
+  } catch (error) { await migrator.end().catch(() => undefined); throw error; }
 }
 
 export async function verifyPublication({ migrator, actor }, request) {

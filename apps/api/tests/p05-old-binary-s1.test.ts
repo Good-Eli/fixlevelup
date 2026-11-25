@@ -1,22 +1,13 @@
 /**
- * P05 plan §7 rollback floor: “прежний 7a60d4c + S1 не допускается” and the same
- * refusal on the current S2 profile.
+ * P05 plan §7 rollback floor: the exact old 7a60d4c catalog writer is usable
+ * on 021 and cannot reach the same write on any expanded schema S1/S2/S3.
  *
- * Compile the detached old catalog entry and its import graph using the old API
- * tsconfig and the current repo's installed dependencies (including built
- * p03-contracts). pnpm links API-only dependencies at the workspace package,
- * not the root; link just those packages by absolute real path in the checkout
- * (junctions on Windows). No install, source patch, or Prisma stub is needed:
- * this graph does not import the generated client and the writer uses pg only.
- * The incremental tsc cache lives inside the ignored worktree. A pre-existing
- * clean checkout at the exact revision may be reused, but is never removed.
- *
- * Two schema profiles are proven against their own disposable database:
- *  - S1: the chain capped before 023 (the exact 022 request-intake profile);
- *  - S2: the full 001…023 chain (the current reviewed profile).
- * Each profile first asserts its own shape (the 022 anchor present, the 023
- * objects absent on S1 and present on S2), so the S2 pair cannot silently run
- * against a capped database.
+ * The isolated launcher supplies a read-only `git archive` from the frozen
+ * commit, verified against the exact archive digest before extraction. No
+ * live Git directory, branch switch, old worktree, dependency install or
+ * Prisma stub is needed. The command uses the real current pg driver and
+ * compiled old source; it does not claim a whole old API/worker launch.
+ * Each profile is migrated to a separate disposable database.
  *
  * This deliberately exercises the command boundary, not HTTP or authentication.
  * Both versions receive the same synthetic, already-authorized GeoContext on a
@@ -26,8 +17,8 @@
  * is used for the negative command.
  */
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { PoolClient } from 'pg';
@@ -39,30 +30,22 @@ import type { ConfigurationFixture } from './configuration-fixture.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 const oldRevision = '7a60d4c5a84adeb2f6cbec6a0eb1b8723e104a62';
-const oldTree = resolve(root, 'node_modules/.cache/p05-oldbin');
-const oldApi = resolve(oldTree, 'apps/api');
+const archivePath = process.env['FIXLEVELUP_P05_OLD_ARCHIVE'];
+const archiveDigest = 'fdce94115f6b1af090e74b27104fa64805eb5288e9682c83fa78a75ade1cb3c7';
+const archiveEnabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1' && archivePath !== undefined;
+const predecessorIntegration = archiveEnabled ? configurationIntegration : configurationIntegration.skip;
 const oldDependencies = ['@nestjs/common', '@fixlevelup/p03-contracts', 'pg', '@types/pg'];
 const lockSql = 'SELECT pg_advisory_xact_lock(734305,1)';
 const coverageDelete = /DELETE FROM foundation\.service_area_district_coverage\b/;
 const guardMessage = 'GEO/CFG basis writes require the unified writer fence';
 
-function git(args: string[], cwd = root): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 60_000 }).trim();
-}
-
-function assertOldCheckout(): void {
-  if (!lstatSync(resolve(oldTree, '.git')).isFile()
-    || realpathSync(git(['rev-parse', '--show-toplevel'], oldTree)) !== realpathSync(oldTree)
-    || git(['rev-parse', 'HEAD'], oldTree) !== oldRevision) {
-    throw new Error(`Expected the ${oldRevision} linked worktree at ${oldTree}`);
+function buildOldCatalog(oldTree: string): string {
+  if (!archivePath || process.env['FIXLEVELUP_P05_OLD_ARCHIVE_SHA256'] !== archiveDigest
+    || !lstatSync(archivePath).isFile() || createHash('sha256').update(readFileSync(archivePath)).digest('hex') !== archiveDigest) {
+    throw new Error(`Historical writer archive does not match the pinned Git input ${oldRevision}`);
   }
-}
-
-function buildOldCatalog(): string {
-  assertOldCheckout();
-  if (git(['status', '--porcelain', '--untracked-files=no'], oldTree) !== '') {
-    throw new Error('Refusing a modified old writer checkout');
-  }
+  execFileSync('tar', ['-xf', archivePath, '-C', oldTree], { timeout: 30_000, stdio: 'inherit' });
+  const oldApi = resolve(oldTree, 'apps/api');
   for (const dep of oldDependencies) {
     const dependency = realpathSync(resolve(root, 'apps/api/node_modules', dep));
     const link = resolve(oldApi, 'node_modules', dep);
@@ -281,23 +264,22 @@ async function proveRollbackFloor(
   expect((await snapshot(f, target.versionId)).row_version).toBe(before.row_version + 1);
 }
 
-configurationIntegration('P05 §7 rollback floor: old binary against S1 and S2', () => {
-  let createdOldTree = false;
+predecessorIntegration('P05 §7 rollback floor: old binary against S0–S3', () => {
+  let oldTree: string | undefined;
   let s1: ConfigurationFixture | undefined;
   let s2: ConfigurationFixture | undefined;
   let oldCoverage: Pick<GeoCommand, 'run'>;
 
   beforeAll(async () => {
-    if (!existsSync(oldTree)) {
-      git(['worktree', 'add', '--detach', oldTree, oldRevision]);
-      createdOldTree = true;
-    }
-    oldCoverage = await importOldCoverage(buildOldCatalog());
+    const cache = resolve(root, 'node_modules/.cache');
+    mkdirSync(cache, { recursive: true });
+    oldTree = mkdtempSync(resolve(cache, 'p05-oldwriter-'));
+    oldCoverage = await importOldCoverage(buildOldCatalog(oldTree));
     // Two independent disposable databases, one per reviewed profile:
     //  - S1: capped before 023, the exact 022 request-intake profile;
     //  - S2: the full 001…023 chain, the current reviewed profile.
     s1 = await createConfigurationFixture({ capBefore: '20261124000100_form_session_foundation' });
-    s2 = await createConfigurationFixture();
+    s2 = await createConfigurationFixture({ capBefore: '20261125000100_request_intake_effects' });
   }, 300_000);
 
   afterAll(async () => {
@@ -305,15 +287,15 @@ configurationIntegration('P05 §7 rollback floor: old binary against S1 and S2',
       if (s1) { await dropFixture(s1); }
       if (s2) { await dropFixture(s2); }
     } finally {
-      if (createdOldTree) {
-        assertOldCheckout();
-        // Do not give recursive removal access to the current packages through
-        // Windows junctions; unlink only the four links created by this suite.
+      const cache = resolve(root, 'node_modules/.cache');
+      if (oldTree && /^p05-oldwriter-[A-Za-z0-9]+$/.test(relative(cache, oldTree)) && realpathSync(oldTree) === oldTree) {
+        // Unlink only the dependency links created by this run, then remove
+        // the exact owned scratch directory. An input archive is never removed.
         for (const dep of oldDependencies) {
-          const link = resolve(oldApi, 'node_modules', dep);
+          const link = resolve(oldTree, 'apps/api/node_modules', dep);
           if (existsSync(link) && lstatSync(link).isSymbolicLink()) { unlinkSync(link); }
         }
-        git(['worktree', 'remove', '--force', oldTree]);
+        rmSync(oldTree, { recursive: true, force: true });
       }
     }
   }, 300_000);
@@ -345,5 +327,15 @@ configurationIntegration('P05 §7 rollback floor: old binary against S1 and S2',
       formThrottleBuckets: 'foundation.form_throttle_buckets',
     });
     await proveRollbackFloor(s2, oldCoverage);
+  });
+
+  it('S3 (024): refuses the old coverage writer and preserves the current bridge writer', { timeout: 120_000 }, async () => {
+    const expanded = await createConfigurationFixture();
+    try {
+      const { rows: [objects] } = await expanded.migrator.query<{ link: string }>(
+        `SELECT to_regclass('foundation.request_files')::text AS link`);
+      expect(objects?.link).toBe('foundation.request_files');
+      await proveRollbackFloor(expanded, oldCoverage);
+    } finally { await expanded.close(); }
   });
 });

@@ -1,8 +1,9 @@
 import type { Client } from 'pg';
 
 type CatalogClient = Pick<Client, 'query'>;
-type Profile = 'S0' | 'S1' | 'S2';
-type Layer = Exclude<Profile,'S0'>;
+export type P05Profile = 'S0' | 'S1' | 'S2' | 'S3';
+type Layer = 'S1' | 'S2';
+export const S3_HEAD = '20261125000100_request_intake_effects';
 
 // Preserve the original migration pins; the independent enforcement hash below
 // additionally covers catalog properties that those byte formats did not encode.
@@ -421,6 +422,68 @@ const ENFORCEMENT_PINS: Readonly<Record<Layer, string>> = Object.freeze({
   S2: 'b0d1690f052669f276bb376c61ccd1e78594e2f027ddd22f32076481d1a9388a',
 });
 
+export const S3_TABLES = Object.freeze(['request_staff_evidence', 'request_command_receipts', 'request_session_submits',
+  'phone_permission_events', 'request_files', 'request_appliance_brands', 'request_channel_choices', 'request_address_review_attempts',
+  'request_coverage_assessments', 'request_intake_provenance']);
+const S3_FUNCTIONS = Object.freeze(['request_role_grant_guard', 'request_effect_guard', 'request_aggregate_guard',
+  'request_phone_permission_guard']);
+const S3_DEPENDENCIES = Object.freeze(['role_permissions', 'permissions', 'file_privacy_controls', 'file_publications',
+  'file_upload_intents', 'request_sessions', 'consent_records']);
+const S3_INDEXES = Object.freeze(['request_sessions_intake_tuple_key', 'consent_records_request_given_tuple_key',
+  'request_events_receipt_tuple_key', 'request_events_request_version_key', 'request_events_form_submit_key',
+  'file_publications_intent_file_key', 'file_privacy_controls_intent_open_key', 'requests_id_city_key']);
+const S3_CODES = Object.freeze(['requests.read', 'requests.create', 'requests.review', 'requests.coverage.assess',
+  'requests.contact.manage', 'requests.ready', 'requests.cancel']);
+
+// Positive S3 represents the whole reviewed delta, including objects on legacy
+// parents and the closed permission catalogue. No business rows enter the hash.
+const S3_SQL = `WITH app AS (
+  SELECT * FROM pg_catalog.pg_class WHERE relnamespace='foundation'::regnamespace AND relname=ANY($1::text[])
+), boundary AS (
+  SELECT * FROM pg_catalog.pg_class WHERE relnamespace='foundation'::regnamespace AND relname=ANY($2::text[])
+), rels AS (SELECT * FROM app UNION ALL SELECT * FROM boundary), facts(section,name,value) AS (
+  SELECT 'owner',r.relname,jsonb_build_array(pg_get_userbyid(r.relowner)) FROM rels r
+  UNION ALL SELECT 'column',r.relname||'.'||a.attname,jsonb_build_array(pg_get_expr(d.adbin,d.adrelid))
+    FROM app r JOIN pg_attribute a ON a.attrelid=r.oid AND a.attnum>0 AND NOT a.attisdropped
+    LEFT JOIN pg_attrdef d ON d.adrelid=r.oid AND d.adnum=a.attnum
+  UNION ALL SELECT 'trigger',r.relname||'.'||g.tgname,jsonb_build_array(g.tgenabled,pg_get_triggerdef(g.oid))
+    FROM rels r JOIN pg_trigger g ON g.tgrelid=r.oid AND NOT g.tgisinternal
+  UNION ALL SELECT 'function',n.nspname||'.'||p.proname,jsonb_build_array(pg_get_userbyid(p.proowner),
+    replace(pg_get_functiondef(p.oid),chr(13)||chr(10),chr(10)),p.prokind,p.proleakproof,p.proparallel,p.proisstrict)
+    FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE p.oid IN
+      (SELECT g.tgfoid FROM rels r JOIN pg_trigger g ON g.tgrelid=r.oid AND NOT g.tgisinternal)
+  UNION ALL SELECT 'policy',r.relname||'.'||p.polname,jsonb_build_array(p.polroles,p.polpermissive,p.polcmd,
+    pg_get_expr(p.polqual,r.oid),pg_get_expr(p.polwithcheck,r.oid))
+    FROM rels r JOIN pg_policy p ON p.polrelid=r.oid
+  UNION ALL SELECT 'constraint',r.relname||'.'||k.conname,jsonb_build_array(k.contype,k.convalidated,k.conenforced,
+    pg_get_constraintdef(k.oid)) FROM boundary r JOIN pg_constraint k ON k.conrelid=r.oid
+  UNION ALL SELECT 'index',i.indexrelid::regclass::text,jsonb_build_array(i.indisvalid,i.indisready,i.indislive,
+    pg_get_indexdef(i.indexrelid)) FROM boundary r JOIN pg_index i ON i.indrelid=r.oid
+  UNION ALL SELECT 'permission',p.code,jsonb_build_array(p.module,p.description,p.active,p.protected)
+    FROM foundation.permissions p WHERE p.code=ANY($3::text[])
+) SELECT encode(sha256(convert_to(jsonb_agg(jsonb_build_array(section,name,value)
+    ORDER BY section COLLATE "C",name COLLATE "C",value::text COLLATE "C")::text,'UTF8')),'hex') AS metadata FROM facts`;
+
+// Measured on freshly migrated isolated PostgreSQL 18.7, not on a launch target.
+// Re-pinned after the reviewed 024 PHONE-completeness guard was added: the new
+// `request_phone_permission_guard` trigger function enters the enforcement graph and
+// `request_effect_guard` is re-created, which also moves the S1 base hashes.
+const S3_PINS = Object.freeze({
+  metadata: '8f2ac462c39d2bcf9bfc99896d8b563778e41b495e6f77b213413f8673ee2158',
+  enforcement: '0dd83e1dad3593b0db50b268ce51cef0586b5d499cef5aff0dd72e24efd07723',
+  base: 'fdb0e4bfd8554af5d4a3b96dc87ee855f3dd2e1ce051124de0e81f6c4e353d4d',
+  baseEnforcement: '967e5798d23f2c138a5de44feaf83fb992feafd1ccd87319aee4ac53dc51334f',
+});
+
+export async function readS3Metadata(client: CatalogClient) {
+  const { rows: [facts] } = await client.query<{ metadata: string }>(S3_SQL, [S3_TABLES, S3_DEPENDENCIES, S3_CODES]);
+  const { rows: [enforcement] } = await client.query<{ enforcement: string }>(ENFORCEMENT_SQL,
+    [S3_TABLES, S3_DEPENDENCIES, S3_FUNCTIONS, []]);
+  const base = await readP05Metadata(client, 'S1');
+  return { metadata: facts?.metadata, enforcement: enforcement?.enforcement,
+    base: base?.metadata, baseEnforcement: base?.enforcement, baseCompatible: base?.compatible === true };
+}
+
 type Measurement = { metadata: string | null; enforcement: string | null; compatible: boolean };
 
 /** Read metadata only. Admission never learns an allowlist from its target. */
@@ -454,27 +517,81 @@ const sourceIndexes = ['requests_is_waiting_link_idx', 'requests_customer_id_idx
 const formIndexes = ['form_browser_groups_secret_hash_key', 'form_session_group_memberships_group_id_idx',
   'form_throttle_buckets_kind_key_hash_window_started_at_key'];
 
-export async function probeP05Layer(client: CatalogClient, layer: Layer | 'NO_S1' | 'NO_S2'): Promise<boolean> {
+// Positive S2 checks must also reject extension objects in the reserved namespace.
+// The per-table hashes cannot see, for example, an independent view or table.
+// Named objects on S2 tables are already checked by BASE/ENFORCEMENT; here only
+// the reviewed relations/routines and their automatically created row types are
+// allowed in the namespace, never a same-prefixed sibling outside those checks.
+const FORM_NAMESPACE_SQL = `WITH holders AS (
+    SELECT c.oid,c.relname FROM pg_catalog.pg_class c
+    WHERE c.relnamespace='foundation'::regnamespace AND c.relname=ANY($1::text[])
+  ), objects(name, allowed) AS (
+    SELECT c.relname, c.relname=ANY($2::text[]) OR ($5::boolean AND EXISTS (
+      SELECT FROM pg_catalog.pg_index i JOIN holders h ON h.oid=i.indrelid WHERE i.indexrelid=c.oid))
+      FROM pg_catalog.pg_class c WHERE c.relnamespace='foundation'::regnamespace
+    UNION ALL SELECT ltrim(t.typname, '_'), EXISTS (SELECT FROM holders h WHERE h.oid=t.typrelid OR h.oid=element.typrelid)
+      FROM pg_catalog.pg_type t LEFT JOIN pg_catalog.pg_type element ON element.oid=t.typelem
+      WHERE t.typnamespace='foundation'::regnamespace
+    UNION ALL SELECT p.proname, p.proname=ANY($3::text[]) FROM pg_catalog.pg_proc p WHERE p.pronamespace='foundation'::regnamespace
+    UNION ALL SELECT k.conname, EXISTS (SELECT FROM holders h WHERE h.oid=k.conrelid)
+      FROM pg_catalog.pg_constraint k WHERE k.connamespace='foundation'::regnamespace
+    UNION ALL SELECT g.tgname, EXISTS (SELECT FROM holders h WHERE h.oid=g.tgrelid)
+      FROM pg_catalog.pg_trigger g JOIN pg_catalog.pg_class c ON c.oid=g.tgrelid
+      WHERE c.relnamespace='foundation'::regnamespace AND NOT g.tgisinternal
+  ) SELECT NOT EXISTS (SELECT FROM objects o CROSS JOIN unnest($4::text[]) AS stem(name)
+    WHERE NOT o.allowed AND (o.name=stem.name OR starts_with(o.name,stem.name||'_'))) AS exact`;
+
+async function formNamespaceExact(client: CatalogClient): Promise<boolean> {
+  const relations = [...S2_TABLES, ...S2_TABLES.map((name) => name + '_pkey'), ...formIndexes];
+  return (await client.query<{ exact: boolean }>(FORM_NAMESPACE_SQL, [S2_TABLES, relations, S2_FUNCTIONS,
+    [...S2_TABLES, 'form_history_reject_truncate'], false])).rows[0]?.exact === true;
+}
+
+export async function preS3Absent(client: CatalogClient): Promise<boolean> {
+  const absent = (await client.query<{ absent: boolean }>(ABSENCE_SQL, [S3_TABLES.concat(S3_INDEXES),
+    S3_FUNCTIONS, ['request_effect_complete', 'request_aggregate_complete', 'request_role_grant_guard',
+      'phone_permission_complete'], S3_TABLES])).rows[0]?.absent;
+  if (absent !== true) { return false; }
+  const { rows } = await client.query<{ absent: boolean }>(`SELECT
+    NOT EXISTS (SELECT FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('foundation.requests')
+      AND attname='current_assessment_id' AND NOT attisdropped)
+    AND NOT EXISTS (SELECT FROM foundation.permissions WHERE code=ANY($1::text[])) AS absent`, [S3_CODES]);
+  return rows[0]?.absent === true;
+}
+
+export async function probeP05Layer(client: CatalogClient, layer: Layer | 'S3' | 'NO_S1' | 'NO_S2'): Promise<boolean> {
   try {
+    if (layer === 'S3') {
+      const m = await readS3Metadata(client);
+      if (!m.baseCompatible || m.metadata !== S3_PINS.metadata || m.enforcement !== S3_PINS.enforcement
+        || m.base !== S3_PINS.base || m.baseEnforcement !== S3_PINS.baseEnforcement) { return false; }
+      return (await client.query<{ exact: boolean }>(FORM_NAMESPACE_SQL,
+        [S3_TABLES, [...S3_TABLES, ...S3_INDEXES], S3_FUNCTIONS, S3_TABLES, true])).rows[0]?.exact === true;
+    }
     if (layer === 'NO_S1' || layer === 'NO_S2') {
       const first = layer === 'NO_S1';
       const tables = first ? S1_TABLES : S2_TABLES;
       const names = [...tables, ...tables.map(name => name + '_pkey'), ...(first ? [...sourceIndexes, 'request_public_numbers'] : formIndexes)];
       const triggers = first ? FENCES.map(name => name + '_geo_cfg_fence') : S2_TABLES.flatMap(name => [name + '_guard', name + '_reject_truncate']);
-      return (await client.query<{ absent: boolean }>(ABSENCE_SQL, [names, first ? S1_FUNCTIONS : S2_FUNCTIONS, triggers, tables])).rows[0]?.absent === true;
+      return (await client.query<{ absent: boolean }>(ABSENCE_SQL, [names, first ? S1_FUNCTIONS : S2_FUNCTIONS, triggers,
+        first ? tables : [...tables, 'form_history_reject_truncate']])).rows[0]?.absent === true;
     }
     if (!Object.hasOwn(BASE_PINS, layer)) { return false; }
     const m = await readP05Metadata(client, layer);
     return m?.compatible === true && m.metadata === BASE_PINS[layer] && Boolean(ENFORCEMENT_PINS[layer])
-      && m.enforcement === ENFORCEMENT_PINS[layer];
+      && m.enforcement === ENFORCEMENT_PINS[layer] && (layer !== 'S2' || await formNamespaceExact(client));
   } catch { return false; }
 }
 
-export async function probeP05Catalog(client: CatalogClient, profile: Profile): Promise<boolean> {
-  switch (profile) {
-    case 'S0': return await probeP05Layer(client, 'NO_S1') && await probeP05Layer(client, 'NO_S2');
-    case 'S1': return await probeP05Layer(client, 'S1') && await probeP05Layer(client, 'NO_S2');
-    case 'S2': return await probeP05Layer(client, 'S1') && await probeP05Layer(client, 'S2');
-    default: return false;
-  }
+export async function probeP05Catalog(client: CatalogClient, profile: P05Profile): Promise<boolean> {
+  try {
+    if (profile === 'S3') { return await probeP05Layer(client, 'S2') && await probeP05Layer(client, 'S3'); }
+    if (!await preS3Absent(client)) { return false; }
+    switch (profile) {
+      case 'S0': return await probeP05Layer(client, 'NO_S1') && await probeP05Layer(client, 'NO_S2');
+      case 'S1': return await probeP05Layer(client, 'S1') && await probeP05Layer(client, 'NO_S2');
+      case 'S2': return await probeP05Layer(client, 'S1') && await probeP05Layer(client, 'S2');
+      default: return false;
+    }
+  } catch { return false; }
 }

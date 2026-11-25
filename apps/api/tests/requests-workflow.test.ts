@@ -9,6 +9,13 @@
  * is written by hand from the plan table as an independent oracle; it does
  * not read the runtime registry. Any `AWAIT_DEPENDENCY` must deny before a
  * domain write, so its result carries no target.
+ *
+ * The oracle also carries the §6.2 late-`CancelRequest` overlay for the two
+ * P05 actor classes: the plan explicitly allows F/S late cancellation from
+ * `WAITING_ASSIGNMENT` (F only) and `ASSIGNED`/`TECHNICIAN_ACCEPTED`, which are
+ * classified `AWAIT_DEPENDENCY` and never executable. Every §6.1 EARLY cell and
+ * every other early negative is unchanged; the full §6.2 cross-product is
+ * proven separately in `p05-x01-dependencies.test.ts`.
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -68,11 +75,21 @@ const EARLY: readonly RequestStatus[] = [
   'NEW', 'CALLBACK_REQUIRED', 'WAITING_TELEGRAM_LINK', 'WAITING_CHANNEL_LINK', 'MANAGER_REVIEW',
 ];
 const W: readonly RequestStatus[] = ['WAITING_TELEGRAM_LINK', 'WAITING_CHANNEL_LINK'];
+/** WF-R2:517-519 — before departure, where the late F/S cancellation starts. */
+const BEFORE_DEPARTURE: readonly RequestStatus[] = ['ASSIGNED', 'TECHNICIAN_ACCEPTED'];
+
+/** WF-R2:545-556 dependency token of the §6.2 late cancellation cells. */
+const LATE_CANCEL_DEPENDENCY = 'P07/P09/P12';
 
 function executable(
   target: RequestStatus | null, resultingType: RequestType | null = null,
 ): Expected {
   return { decision: 'EXECUTABLE', target, awaitDependency: null, resultingType, reason: 'MATCHED' };
+}
+
+/** §6.2 late cell: classified, never executable, never a target. */
+function awaitDependency(dependency: string): Expected {
+  return { decision: 'AWAIT_DEPENDENCY', target: null, awaitDependency: dependency, resultingType: null, reason: 'MATCHED' };
 }
 
 /** Handwritten §6.1 oracle, independent of the registry data. */
@@ -84,11 +101,12 @@ function expected(command: CommandName, actor: ActorClass, status: RequestStatus
         ? executable('CALLBACK_REQUIRED', 'CALLBACK')
         : DENIED;
     case 'CreateRepair':
-      // Two rows: F -> messenger multi-target (channel resolved by the caller,
-      // branch PHONE never matches a row), S -> branch PHONE -> NEW.
+      // Phone is limited to staff. No-call for either actor resolves the
+      // waiting code from the independently admitted provider.
       if (status !== null || type === 'CALLBACK') { return DENIED; }
       if (actor === 'S') {
-        return branch === 'PHONE' ? executable('NEW', 'REPAIR') : DENIED;
+        return branch === 'PHONE' ? executable('NEW', 'REPAIR')
+          : branch === 'MESSENGER' ? executable(null, 'REPAIR') : DENIED;
       }
       return branch === 'PHONE' ? DENIED : executable(null, 'REPAIR');
     case 'StartReview':
@@ -129,11 +147,16 @@ function expected(command: CommandName, actor: ActorClass, status: RequestStatus
       return DENIED;
     case 'CancelRequest':
       if (status === null) { return DENIED; }
+      // §6.1: EARLY is executable for F and S; S alone may also cancel a
+      // request still waiting for assignment.
+      if (EARLY.includes(status)) { return executable('CANCELLED'); }
       if (status === 'WAITING_ASSIGNMENT') {
-        return actor === 'S' ? executable('CANCELLED') : DENIED;
+        return actor === 'S' ? executable('CANCELLED') : awaitDependency(LATE_CANCEL_DEPENDENCY);
       }
-      if (!EARLY.includes(status)) { return DENIED; }
-      return executable('CANCELLED');
+      // §6.2 late overlay: F/S before departure are normatively allowed later
+      // but never executable here.
+      if (BEFORE_DEPARTURE.includes(status)) { return awaitDependency(LATE_CANCEL_DEPENDENCY); }
+      return DENIED;
   }
 }
 
@@ -174,7 +197,7 @@ describe('P05-01 workflow registry X01 matrix (wf-r2-p05-v1)', () => {
     // S: only the explicit PHONE branch leads to NEW.
     expect(decide({ ...base, actor: 'S', branch: 'PHONE' })).toEqual(executable('NEW', 'REPAIR'));
     expect(decide({ ...base, actor: 'S' }).decision).toBe('DENIED');
-    expect(decide({ ...base, actor: 'S', branch: 'MESSENGER' }).decision).toBe('DENIED');
+    expect(decide({ ...base, actor: 'S', branch: 'MESSENGER' })).toEqual(executable(null, 'REPAIR'));
     // A conflicting explicit CALLBACK type refuses for both actors.
     expect(decide({ ...base, actor: 'F', type: 'CALLBACK' }).decision).toBe('DENIED');
     expect(decide({ ...base, actor: 'S', branch: 'PHONE', type: 'CALLBACK' }).decision).toBe('DENIED');
@@ -236,11 +259,27 @@ describe('P05-01 workflow registry X01 matrix (wf-r2-p05-v1)', () => {
     }
   });
 
-  it('splits CancelRequest: S cancels from WAITING_ASSIGNMENT, F there is denied', () => {
+  it('splits CancelRequest: S cancels from WAITING_ASSIGNMENT, F there is only late', () => {
     expect(decide({ workflowVersion: WORKFLOW_VERSION, command: 'CancelRequest', actor: 'S', status: 'WAITING_ASSIGNMENT', type: 'REPAIR' }))
       .toEqual(executable('CANCELLED'));
-    expect(decide({ workflowVersion: WORKFLOW_VERSION, command: 'CancelRequest', actor: 'F', status: 'WAITING_ASSIGNMENT', type: 'REPAIR' }).decision)
-      .toBe('DENIED');
+    // §6.2: the same cell for F is normatively allowed later, never executable.
+    expect(decide({ workflowVersion: WORKFLOW_VERSION, command: 'CancelRequest', actor: 'F', status: 'WAITING_ASSIGNMENT', type: 'REPAIR' }))
+      .toEqual(awaitDependency(LATE_CANCEL_DEPENDENCY));
+    // Before departure both P05 actor classes are late-only; no write target.
+    for (const actor of ACTORS) {
+      for (const status of BEFORE_DEPARTURE) {
+        const result = decide({ workflowVersion: WORKFLOW_VERSION, command: 'CancelRequest', actor, status, type: 'REPAIR' });
+        expect(result).toEqual(awaitDependency(LATE_CANCEL_DEPENDENCY));
+        expect(result.target).toBeNull();
+      }
+    }
+    // After departure (and every other stage) there is no row at all.
+    for (const status of ['ON_THE_WAY', 'ARRIVED', 'DIAGNOSTICS', 'IN_PROGRESS', 'CLOSED', 'CANCELLED'] as const) {
+      for (const actor of ACTORS) {
+        expect(decide({ workflowVersion: WORKFLOW_VERSION, command: 'CancelRequest', actor, status, type: 'REPAIR' }).decision)
+          .toBe('DENIED');
+      }
+    }
   });
 
   it('runtime ALL_STATUSES equals the handwritten 19-status inventory', () => {

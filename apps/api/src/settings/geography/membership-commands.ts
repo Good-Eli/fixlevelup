@@ -7,6 +7,7 @@ import type { PoolClient } from 'pg';
 import type { P03Page, P03TechnicianPickerItem } from '@fixlevelup/p03-contracts';
 import { isSystemAdmin } from '../../authz/authorization.service.js';
 import { requireDomainCityExpansion } from '../../authz/p03-grants.js';
+import { requireNoP05CityExpansion } from '../../authz/p05-grants.js';
 import { uuid } from '../../authz/rbac-http.js';
 import type { GeoCapability, GeoGrant } from '../../authz/capability.js';
 import type { GeoCommand, GeoContext, GeoReceipt, GeoTarget } from './geo-contract.js';
@@ -435,6 +436,9 @@ const adminAssign: GeoCommand = {
     // A new city widens every effective CITY P03/P04 grant of the target. This runs
     // under the RBAC write and target staff locks, only on the actual INSERT path.
     await requireDomainCityExpansion(ctx, staffId);
+    // The same assignment would widen a live CITY-scoped P05 request grant, which the
+    // ordinary composition must never do implicitly: P05 provisioning is operator-owned.
+    await requireNoP05CityExpansion(ctx, staffId);
     const id = randomUUID();
     // `granted_at` is database-stamped and deliberately not insertable by the runtime:
     // the caller cannot backdate a grant.
