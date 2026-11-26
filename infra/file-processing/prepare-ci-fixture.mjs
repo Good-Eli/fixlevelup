@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
-import { DECODER_INDEX_SHA, DECODER_PLATFORM_SHA, SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA,
+import { DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA,
   syntheticSnapshotDigest } from './docker-test-launcher.mjs';
 
 const root = resolve(import.meta.dirname, '../..');
@@ -79,9 +79,11 @@ function download(url, output) {
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
 function docker(args, options = {}) { return command('docker', args, options); }
-function exactImage(indexSha, platformSha, tag, metadataPath, ociTarPath, layoutPath) {
-  // The docker exporter used by --load does not expose an OCI manifest digest.
-  // Verify the OCI layout separately, then bind it to the loaded Docker config ID.
+function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layoutPath) {
+  // The legacy reviewed "indexSha256" value was compared with Docker .Id;
+  // it is therefore the exact config digest, not a root OCI-index digest.
+  // Verify the OCI layout's structure/child manifest separately and bind its
+  // config blob plus the loaded Docker image to that reviewed config digest.
   const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
   const isDigest = (value) => typeof value === 'string' && /^sha256:[0-9a-f]{64}$/u.test(value);
   const sha256 = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
@@ -92,7 +94,7 @@ function exactImage(indexSha, platformSha, tag, metadataPath, ociTarPath, layout
   const metadataConfigDigest = metadata['containerimage.config.digest'];
   const failIdentity = (reason, extra = {}) => {
     throw new Error('Rebuilt engine OCI identity mismatch: ' + JSON.stringify({
-      reason, expectedIndex: indexSha, expectedPlatform: platformSha,
+      reason, expectedConfig: configSha, expectedPlatform: platformSha,
       metadataConfig: safe(metadataConfigDigest), descriptor: safe(descriptorDigest),
       descriptorMediaType: typeof descriptorMediaType === 'string' ? descriptorMediaType.slice(0, 100) : null,
       output: safe(outputDigest), ...extra,
@@ -108,72 +110,69 @@ function exactImage(indexSha, platformSha, tag, metadataPath, ociTarPath, layout
   if (index.schemaVersion !== 2 || index.mediaType !== 'application/vnd.oci.image.index.v1+json'
       || !Array.isArray(index.manifests)) {
     failIdentity('OCI layout index has an unexpected schema or media type', {
-      indexDigest: sha256(indexBytes), indexMediaType: index.mediaType ?? null,
+      exportIndexSha256: sha256(indexBytes), indexMediaType: index.mediaType ?? null,
     });
   }
-  const indexDigest = sha256(indexBytes);
+  const exportIndexSha256 = sha256(indexBytes);
   const candidates = index.manifests.filter((item) => item?.platform?.os === 'linux'
     && item?.platform?.architecture === 'amd64'
     && item?.mediaType === 'application/vnd.oci.image.manifest.v1+json');
   if (candidates.length !== 1 || candidates[0]?.digest !== platformSha) {
     failIdentity('OCI index does not contain exactly the reviewed linux/amd64 manifest', {
-      indexDigest, platformDescriptors: candidates.map((item) => ({ digest: safe(item.digest), mediaType: item.mediaType })),
+      exportIndexSha256,
+      platformDescriptors: candidates.map((item) => ({ digest: safe(item.digest), mediaType: item.mediaType })),
     });
   }
-  const readVerifiedBlob = (digest, label) => {
+  const readVerifiedBlob = (digest, expectedSize, label) => {
     if (!isDigest(digest)) { failIdentity(label + ' digest is invalid'); }
     const path = join(layoutPath, 'blobs', 'sha256', digest.slice('sha256:'.length));
     const bytes = readFileSync(path);
+    if (expectedSize !== undefined && bytes.byteLength !== expectedSize) {
+      failIdentity(label + ' blob size does not match its descriptor');
+    }
     if (sha256(bytes) !== digest) { failIdentity(label + ' blob content does not match its digest'); }
     return bytes;
   };
-  const manifestBytes = readVerifiedBlob(candidates[0].digest, 'platform manifest');
+  const manifestBytes = readVerifiedBlob(candidates[0].digest, candidates[0].size, 'platform manifest');
   const manifest = JSON.parse(manifestBytes.toString('utf8'));
   if (manifest.schemaVersion !== 2 || manifest.mediaType !== 'application/vnd.oci.image.manifest.v1+json'
       || !manifest.config || !Array.isArray(manifest.layers)) {
     failIdentity('reviewed platform manifest has an unexpected structure');
   }
   const configDigest = manifest.config.digest;
-  const configBytes = readVerifiedBlob(configDigest, 'image config');
+  const configBytes = readVerifiedBlob(configDigest, manifest.config.size, 'image config');
   const imageConfig = JSON.parse(configBytes.toString('utf8'));
   if (imageConfig.os !== 'linux' || imageConfig.architecture !== 'amd64') {
     failIdentity('reviewed image config is not linux/amd64', { config: safe(configDigest) });
+  }
+  if (configDigest !== configSha) {
+    failIdentity('OCI manifest config differs from the reviewed config digest', {
+      config: safe(configDigest), exportIndexSha256,
+    });
   }
   if (metadataConfigDigest !== undefined && metadataConfigDigest !== configDigest) {
     failIdentity('Buildx config metadata differs from OCI manifest config', {
       config: safe(configDigest), metadataConfig: safe(metadataConfigDigest),
     });
   }
-  // The exported index file may carry a local ref-name annotation. In that case
-  // Buildx's root descriptor digest is the registry-equivalent index identity.
-  const rootMatches = indexDigest === indexSha || descriptorDigest === indexSha || outputDigest === indexSha;
-  if (!rootMatches) {
-    failIdentity('OCI root index digest does not match the reviewed pin', {
-      indexDigest, config: configDigest, platform: candidates[0].digest,
-    });
-  }
-  for (const [label, value] of [['Buildx descriptor', descriptorDigest], ['Buildx output', outputDigest]]) {
-    if (value !== undefined && value !== configDigest && value !== indexSha && value !== platformSha) {
-      failIdentity(label + ' digest is not tied to the reviewed OCI image', { config: configDigest });
-    }
-  }
-  if (descriptorDigest === indexSha && descriptorMediaType !== undefined
-      && descriptorMediaType !== 'application/vnd.oci.image.index.v1+json') {
-    failIdentity('Buildx root descriptor media type is not an OCI image index');
-  }
-  if (descriptorDigest === platformSha && descriptorMediaType !== undefined
-      && descriptorMediaType !== 'application/vnd.oci.image.manifest.v1+json') {
-    failIdentity('Buildx platform descriptor media type is not an OCI image manifest');
+  if (descriptorDigest !== platformSha || outputDigest !== platformSha
+      || descriptorMediaType !== 'application/vnd.oci.image.manifest.v1+json') {
+    failIdentity('Buildx output descriptor does not match the reviewed platform manifest');
   }
   const actual = docker(['image', 'inspect', '--format', '{{.Id}} {{.Os}}/{{.Architecture}}', tag], {
     safeFailure: 'Docker local image inspection failed for the rebuilt pinned engine image',
     includeStderr: true,
   }).trim().split(/\s+/u);
-  if (actual[0] !== configDigest || actual[1] !== 'linux/amd64') {
+  if (actual[0] !== configSha || actual[1] !== 'linux/amd64') {
     failIdentity('loaded Docker image config differs from the verified OCI image', {
       config: configDigest, loadedConfig: actual[0] ?? null, loadedPlatform: actual[1] ?? null,
+      exportIndexSha256,
     });
   }
+  // The export index hash is diagnostic only; the original reviewed pair did
+  // not preserve a root OCI-index digest separately from the Docker config ID.
+  return configDigest;
+}
   return configDigest;
 }
 function clamscan(args) {
@@ -236,9 +235,11 @@ try {
   // pins remain fixed; Buildx metadata binds the child manifest to the loaded
   // local config digest without relying on unsupported --platform inspection.
   const review = JSON.parse(readFileSync(resolve(root, 'infra/file-processing/oci-review-evidence.json'), 'utf8'));
-  if (review.scanner?.indexSha256 !== SCANNER_INDEX_SHA.slice(7)
+  // Backward-compatible review key "indexSha256" is the historical Docker
+  // image ID/config digest, as confirmed by the original launcher's .Id check.
+  if (review.scanner?.indexSha256 !== SCANNER_CONFIG_SHA.slice(7)
       || review.scanner?.linuxAmd64ManifestSha256 !== SCANNER_PLATFORM_SHA.slice(7)
-      || review.decoder?.indexSha256 !== DECODER_INDEX_SHA.slice(7)
+      || review.decoder?.indexSha256 !== DECODER_CONFIG_SHA.slice(7)
       || review.decoder?.linuxAmd64ManifestSha256 !== DECODER_PLATFORM_SHA.slice(7)) {
     throw new Error('Pinned OCI index/platform digests do not match the reviewed OCI evidence');
   }
@@ -250,9 +251,9 @@ try {
   command('docker', ['buildx', 'build', '--builder', buildxBuilderName, '--platform', 'linux/amd64',
     '--output', 'type=oci,dest=' + decoderOciTarPath, '--load', '--metadata-file', decoderMetadataPath,
     '-f', resolve(root, 'infra/file-processing/Dockerfile'), '-t', decoderTag, root], { inherit: true });
-  scannerImageId = exactImage(SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA, scannerTag,
+  scannerImageId = exactImage(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerTag,
     scannerMetadataPath, scannerOciTarPath, scannerLayoutPath);
-  decoderImageId = exactImage(DECODER_INDEX_SHA, DECODER_PLATFORM_SHA, decoderTag,
+  decoderImageId = exactImage(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderTag,
     decoderMetadataPath, decoderOciTarPath, decoderLayoutPath);
 
   // FreshClam is a one-shot updater and the only container here with network access.
@@ -304,12 +305,10 @@ try {
       defsBuiltAt: new Date(builtAtMs).toISOString(),
     },
     imageIdentity: {
-      scannerIndexSha256: SCANNER_INDEX_SHA.slice(7),
+      scannerConfigSha256: SCANNER_CONFIG_SHA.slice(7),
       scannerPlatformSha256: SCANNER_PLATFORM_SHA.slice(7),
-      scannerConfigSha256: scannerImageId.slice(7),
-      decoderIndexSha256: DECODER_INDEX_SHA.slice(7),
+      decoderConfigSha256: DECODER_CONFIG_SHA.slice(7),
       decoderPlatformSha256: DECODER_PLATFORM_SHA.slice(7),
-      decoderConfigSha256: decoderImageId.slice(7),
     },
     scannerImageId,
     decoderImage: decoderImageId,

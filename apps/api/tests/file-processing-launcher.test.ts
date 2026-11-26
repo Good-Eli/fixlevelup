@@ -23,11 +23,11 @@ vi.mock('node:fs/promises', () => ({
 // @ts-expect-error The local synthetic infrastructure is native ESM, not an API TS module.
 import * as infrastructure from '../../../infra/file-processing/docker-test-launcher.mjs';
 
-const { createFileProcessingTestLauncher, syntheticSnapshotDigest, DECODER_INDEX_SHA, DECODER_PLATFORM_SHA,
-  SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA } = infrastructure as {
+const { createFileProcessingTestLauncher, syntheticSnapshotDigest, DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA,
+  SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA } = infrastructure as {
   createFileProcessingTestLauncher: (config: unknown) => Promise<{ launcher: FileProcessingLauncher; epoch: DefinitionEpoch }>;
   syntheticSnapshotDigest: (path: string) => Promise<string>;
-  DECODER_INDEX_SHA: string; DECODER_PLATFORM_SHA: string; SCANNER_INDEX_SHA: string; SCANNER_PLATFORM_SHA: string;
+  DECODER_CONFIG_SHA: string; DECODER_PLATFORM_SHA: string; SCANNER_CONFIG_SHA: string; SCANNER_PLATFORM_SHA: string;
 };
 const scannerImageId = `sha256:${'a'.repeat(64)}`;
 const decoderImageId = `sha256:${'b'.repeat(64)}`;
@@ -79,10 +79,10 @@ function fixtureDescriptor() {
     snapshotDir: fixtureRoot, scannerImageId, decoderImage: decoderImageId,
     epoch: { engineVersion: '1.4.7', engineImageSha256: SCANNER_PLATFORM_SHA.slice(7),
       defsSha256: h.digest('hex'), defsBuiltAt: '2026-11-21T06:27:04Z' },
-    imageIdentity: { scannerIndexSha256: SCANNER_INDEX_SHA.slice(7),
-      scannerPlatformSha256: SCANNER_PLATFORM_SHA.slice(7), scannerConfigSha256: scannerImageId.slice(7),
-      decoderIndexSha256: DECODER_INDEX_SHA.slice(7), decoderPlatformSha256: DECODER_PLATFORM_SHA.slice(7),
-      decoderConfigSha256: decoderImageId.slice(7) },
+    imageIdentity: { scannerConfigSha256: SCANNER_CONFIG_SHA.slice(7),
+      scannerPlatformSha256: SCANNER_PLATFORM_SHA.slice(7),
+      decoderConfigSha256: DECODER_CONFIG_SHA.slice(7),
+      decoderPlatformSha256: DECODER_PLATFORM_SHA.slice(7) },
     scanner: { ...limits, dailyRevision: 28190, maxFileBytes: 4096, maxScanBytes: 8192, maxFiles: 64, maxRecursion: 8 },
     decoder: limits,
   };
