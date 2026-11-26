@@ -1094,9 +1094,16 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
         if (performance.now()-began >= budget-25000) { throw new Error('P05 HTTPS matrix work deadline reached'); }
       };
       progress('setup',0);
-      const tg=await RequestOfferFixture.attach(db(),{provider:'TG',schema:'p05_offer_fixture_mxtg'});
-      const vk=await RequestOfferFixture.attach(db(),{provider:'VK',schema:'p05_offer_fixture_mxvk'});
-      const max=await RequestOfferFixture.attach(db(),{provider:'MAX',schema:'p05_offer_fixture_mxmax'});
+      // Each phase owns three separate provider schemas inside the same
+      // disposable test database. The database is the lifecycle boundary:
+      // schemas are never dropped while other phases/clients may still use them.
+      // Reusing the fixed mxtg/mxvk/mxmax names made the second phase collide
+      // with the first even though each RequestOfferFixture instance is new.
+      const phaseTag=phase.replace(/[^a-z0-9]/gi,'').toLowerCase();
+      if (!/^[a-z0-9]{1,12}$/.test(phaseTag)) { throw new Error('Invalid P05 matrix phase schema tag'); }
+      const tg=await RequestOfferFixture.attach(db(),{provider:'TG',schema:`p05_offer_fixture_${phaseTag}tg`});
+      const vk=await RequestOfferFixture.attach(db(),{provider:'VK',schema:`p05_offer_fixture_${phaseTag}vk`});
+      const max=await RequestOfferFixture.attach(db(),{provider:'MAX',schema:`p05_offer_fixture_${phaseTag}max`});
       // Each provider uses the fixture's real same-connection admission. They
       // share the same PG offer fence; the preliminary lock is provider-independent.
       const byProvider={TG:tg,VK:vk,MAX:max};
