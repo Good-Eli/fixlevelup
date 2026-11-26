@@ -51,8 +51,8 @@ function command(name, args, options = {}) {
   if (result.error || result.status !== 0 || result.signal) {
     const failure = options.safeFailure ?? (name + ' exited unsuccessfully');
     const detail = options.includeStderr
-      ? String(result.stderr ?? '').trim().replace(/[\\r\\n\\t]+/gu, ' ')
-        .replace(/(authorization|token|password|secret)(\\s*[:=]\\s*)\\S+/giu, '$1$2[REDACTED]')
+      ? String(result.stderr ?? '').trim().replace(/[\r\n\t]+/gu, ' ')
+        .replace(/(authorization|token|password|secret)(\s*[:=]\s*)\S+/giu, '$1$2[REDACTED]')
         .slice(0, 600)
       : '';
     throw new Error(detail ? failure + ': ' + detail : failure);
