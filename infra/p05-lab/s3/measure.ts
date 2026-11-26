@@ -22,11 +22,12 @@ import { readS3Metadata } from '../../../apps/api/src/infrastructure/database/p0
  * resolvable from `infra/`; a structural interface keeps the script fully typed
  * without pulling the driver's types into this project.
  */
-interface LabClient {
+type MeasurementQueryClient = Parameters<typeof readS3Metadata>[0];
+type ReadinessQueryClient = ConstructorParameters<typeof LegacyReadinessProbes>[0];
+type LabClient = MeasurementQueryClient & ReadinessQueryClient & {
   connect(): Promise<void>;
   end(): Promise<void>;
-  query(text: string, values?: readonly unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
-}
+};
 interface PgModule { readonly Client: new (options: Record<string, unknown>) => LabClient }
 const apiRequire = createRequire(new URL('../../../apps/api/package.json', import.meta.url));
 const { Client } = apiRequire('pg') as PgModule;
