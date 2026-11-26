@@ -153,8 +153,11 @@ function restoreTestDiagnostic(event: string, error?: unknown): void {
   const pgCode = typeof value?.code === 'string' && /^[0-9A-Z]{5}$/.test(value.code) ? value.code : undefined;
   const labStage = typeof value?.message === 'string'
     ? /^Synthetic lab restore failed: ([a-z0-9:-]{1,48})$/.exec(value.message)?.[1] : undefined;
+  const expressionStage = typeof value?.message === 'string'
+    ? /^Unrecognised reviewed restore expression: ([a-z-]{1,40})(?:\\s|$)/.exec(value.message)?.[1] : undefined;
   process.stderr.write(`[p05-restore-diagnostic] ${JSON.stringify({ event, name,
-    ...(pgCode === undefined ? {} : { pgCode }), ...(labStage === undefined ? {} : { labStage }) })}\\n`);
+    ...(pgCode === undefined ? {} : { pgCode }), ...(labStage === undefined ? {} : { labStage }),
+    ...(expressionStage === undefined ? {} : { expressionStage }) })}\\n`);
 }
 interface AliasFacts { readonly object: RestoreObject; readonly destination: StorageTarget }
 const ALIASES = new WeakMap<RestoreGateReceipt, { readonly database: string; readonly entries: ReadonlyMap<string, AliasFacts>;
