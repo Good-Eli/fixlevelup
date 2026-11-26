@@ -63,8 +63,9 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
       connectionTimeoutMillis: 5_000, statement_timeout: 10_000 });
     // Idle-client socket errors must be observed and asserted during teardown,
     // never escape Vitest as process-level unhandled errors.
-    p.on('error', (error) => {
-      backgroundPoolErrors.push(typeof error.code === 'string' ? error.code : 'PG_POOL_ERROR');
+    p.on('error', (error: unknown) => {
+      const code: unknown = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+      backgroundPoolErrors.push(typeof code === 'string' ? code : 'PG_POOL_ERROR');
     });
     pools.push(p);
     return p;
@@ -133,6 +134,7 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
     // If any pool fails to close, do not force-drop its DB: that would SIGTERM
     // live clients and turn a cleanup defect into Vitest unhandled 57P01 errors.
     const droppers = [ledgerAdmin, floorAdmin];
+    let teardownFailure: string | undefined;
     try {
       const closing = await Promise.allSettled(pools
         .filter((p) => p !== ledgerAdmin && p !== floorAdmin).map((p) => p.end()));
@@ -143,11 +145,15 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
         throw new Error('SYNTHETIC_LEDGER_BACKGROUND_CONNECTION_ERROR');
       }
       await dropCreatedDatabases();
-    } finally {
-      const closingDroppers = await Promise.allSettled(droppers.map((p) => p.end()));
-      if (closingDroppers.some((result) => result.status === 'rejected')) {
-        throw new Error('SYNTHETIC_LEDGER_ADMIN_POOL_CLOSE_FAILED');
-      }
+    } catch (error: unknown) {
+      teardownFailure = error instanceof Error ? error.message : 'SYNTHETIC_LEDGER_TEARDOWN_FAILED';
+    }
+    const closingDroppers = await Promise.allSettled(droppers.map((p) => p.end()));
+    if (closingDroppers.some((result) => result.status === 'rejected')) {
+      teardownFailure ??= 'SYNTHETIC_LEDGER_ADMIN_POOL_CLOSE_FAILED';
+    }
+    if (teardownFailure !== undefined) {
+      throw new Error(teardownFailure);
     }
   });
 
