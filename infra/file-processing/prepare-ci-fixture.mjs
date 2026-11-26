@@ -49,7 +49,13 @@ function command(name, args, options = {}) {
     env: options.env ?? process.env,
   });
   if (result.error || result.status !== 0 || result.signal) {
-    throw new Error(options.safeFailure ?? (name + ' exited unsuccessfully'));
+    const failure = options.safeFailure ?? (name + ' exited unsuccessfully');
+    const detail = options.includeStderr
+      ? String(result.stderr ?? '').trim().replace(/[\\r\\n\\t]+/gu, ' ')
+        .replace(/(authorization|token|password|secret)(\\s*[:=]\\s*)\\S+/giu, '$1$2[REDACTED]')
+        .slice(0, 600)
+      : '';
+    throw new Error(detail ? failure + ': ' + detail : failure);
   }
   return String(result.stdout ?? '');
 }
@@ -62,9 +68,15 @@ function download(url, output) {
 }
 function docker(args, options = {}) { return command('docker', args, options); }
 function exactImage(imageId, platformSha, tag) {
-  const actualImageId = docker(['image', 'inspect', '--format', '{{.Id}}', tag]).trim();
+  const actualImageId = docker(['image', 'inspect', '--format', '{{.Id}}', tag], {
+    safeFailure: 'Docker image-ID inspection failed for the rebuilt pinned engine image',
+    includeStderr: true,
+  }).trim();
   const platform = docker(['image', 'inspect', '--platform', 'linux/amd64',
-    '--format', '{{.Os}}/{{.Architecture}} {{.Descriptor.digest}}', tag]).trim();
+    '--format', '{{.Os}}/{{.Architecture}} {{.Descriptor.digest}}', tag], {
+    safeFailure: 'Docker platform-descriptor inspection failed for the rebuilt pinned engine image',
+    includeStderr: true,
+  }).trim();
   if (actualImageId !== imageId || platform !== 'linux/amd64 ' + platformSha) {
     throw new Error('Reviewed engine image identity mismatch; independent OCI review is required for a changed image');
   }
