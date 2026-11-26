@@ -15,13 +15,6 @@ const baseImage = 'clamav/clamav:1.4.7_base@sha256:21622d96b8a7080af7974d99ca60a
 const fixtureRelease = 'https://github.com/Good-Eli/fixlevelup/releases/download/p03-04cde-oci-fixtures-v1/';
 const scannerArchiveSha256 = '781a35a36a26cbe33fe69c0c46851a3395db814a69f1519dad0836fd1b371eb5';
 const decoderArchiveSha256 = '61fb5af102aea942ec86d7a5048fef9105c344040590275dcfac6a3a88b4b56b';
-const patchFiles = [
-  'f3acb0a3328046741479482c51cec815839e1b05',
-  'c8f6d04f8e6d40b1bf83334e4a2ec9daf5943a3d',
-  '9491b0d9cc7950af1f3dc89499bd5433b9cd4f43',
-  '468c287cf451a834b370b69ab321b8ffdfac23aa',
-  '1c65edebefa0dd11aa41cb1a31078ecd9c79d472',
-];
 const runId = String(process.env.GITHUB_RUN_ID ?? ('local-' + process.pid)).replace(/[^a-zA-Z0-9-]/gu, '-');
 mkdirSync(cacheRoot, { recursive: true });
 const work = mkdtempSync(join(cacheRoot, 'engine-ci-' + runId + '-'));
