@@ -161,7 +161,13 @@ async function runCase(role, signal) {
   await state.wait(() => state.closed, 7500);
   const shutdownMs = Math.ceil(performance.now() - beforeSignal);
   stage = `${prefix}-assertions`;
-  requireCondition(shutdownMs < 8000 && state.result.code === 0 && state.result.signal === null);
+  if (!(shutdownMs < 8000 && state.result.code === 0 && state.result.signal === null)) {
+    // Redacted lifecycle facts only; never print child output, paths, env or credentials.
+    console.error(`lifecycle outcome: ${JSON.stringify({ role, signal, shutdownMs,
+      exitCode: state.result?.code ?? null, exitSignal: state.result?.signal ?? null,
+      events: state.events, fault: state.fault, stderrBytes: Buffer.byteLength(state.stderr) })}`);
+    throw new Error('Lifecycle child did not exit cleanly');
+  }
   for (const event of ['started', 'shutdown_started', 'shutdown_completed']) {
     requireCondition(state.events.filter((value) => value === event).length === 1);
   }
