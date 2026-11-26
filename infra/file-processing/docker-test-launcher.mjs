@@ -210,18 +210,19 @@ async function run(kind, config, command, frames, maxOutputBytes, signal) {
   throw new UnknownWorkerSettlementError();
 }
 
-export async function createFileProcessingTestLauncher({ snapshotDir, epoch, scannerImageId, decoderImage, scanner, decoder }) {
+export async function createFileProcessingTestLauncher({ snapshotDir, epoch, imageIdentity, scannerImageId, decoderImage, scanner, decoder }) {
   check(process.env.DOCKER_HOST === undefined);
   check(imageIdPattern.test(scannerImageId));
   check(decoderImage === undefined || imageIdPattern.test(decoderImage));
-  check(epoch?.engineIndexSha256 === SCANNER_INDEX_SHA.slice(7)
+  check(imageIdentity?.scannerIndexSha256 === SCANNER_INDEX_SHA.slice(7)
+    && imageIdentity?.scannerPlatformSha256 === SCANNER_PLATFORM_SHA.slice(7)
+    && imageIdentity?.scannerConfigSha256 === scannerImageId.slice(7)
     && epoch?.engineImageSha256 === SCANNER_PLATFORM_SHA.slice(7)
-    && epoch?.engineConfigSha256 === scannerImageId.slice(7)
     && epoch.engineVersion === '1.4.7' && hex256.test(epoch.defsSha256));
   if (decoderImage !== undefined) {
-    check(epoch?.decoderIndexSha256 === DECODER_INDEX_SHA.slice(7)
-      && epoch?.decoderImageSha256 === DECODER_PLATFORM_SHA.slice(7)
-      && epoch?.decoderConfigSha256 === decoderImage.slice(7));
+    check(imageIdentity?.decoderIndexSha256 === DECODER_INDEX_SHA.slice(7)
+      && imageIdentity?.decoderPlatformSha256 === DECODER_PLATFORM_SHA.slice(7)
+      && imageIdentity?.decoderConfigSha256 === decoderImage.slice(7));
   }
   check(typeof epoch.defsBuiltAt === 'string' && Number.isFinite(Date.parse(epoch.defsBuiltAt)));
   const context = good(await control(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'])).trim();

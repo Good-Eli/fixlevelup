@@ -77,11 +77,12 @@ function fixtureDescriptor() {
   const limits = { cpuMilli: 1000, memoryMiB: 1200, pids: 32, tmpfsMiB: 32, wallMs: 750 };
   return {
     snapshotDir: fixtureRoot, scannerImageId, decoderImage: decoderImageId,
-    epoch: { engineVersion: '1.4.7', engineIndexSha256: SCANNER_INDEX_SHA.slice(7),
-      engineImageSha256: SCANNER_PLATFORM_SHA.slice(7), engineConfigSha256: scannerImageId.slice(7),
-      decoderIndexSha256: DECODER_INDEX_SHA.slice(7), decoderImageSha256: DECODER_PLATFORM_SHA.slice(7),
-      decoderConfigSha256: decoderImageId.slice(7),
+    epoch: { engineVersion: '1.4.7', engineImageSha256: SCANNER_PLATFORM_SHA.slice(7),
       defsSha256: h.digest('hex'), defsBuiltAt: '2026-11-21T06:27:04Z' },
+    imageIdentity: { scannerIndexSha256: SCANNER_INDEX_SHA.slice(7),
+      scannerPlatformSha256: SCANNER_PLATFORM_SHA.slice(7), scannerConfigSha256: scannerImageId.slice(7),
+      decoderIndexSha256: DECODER_INDEX_SHA.slice(7), decoderPlatformSha256: DECODER_PLATFORM_SHA.slice(7),
+      decoderConfigSha256: decoderImageId.slice(7) },
     scanner: { ...limits, dailyRevision: 28190, maxFileBytes: 4096, maxScanBytes: 8192, maxFiles: 64, maxRecursion: 8 },
     decoder: limits,
   };
@@ -143,7 +144,7 @@ describe('bounded Docker synthetic fixture', () => {
 
   it('refuses a descriptor with the wrong pinned linux/amd64 manifest before inspecting Docker', async () => {
     const fixture = fixtureDescriptor();
-    fixture.epoch.decoderImageSha256 = 'f'.repeat(64);
+    fixture.imageIdentity.decoderPlatformSha256 = 'f'.repeat(64);
     await expect(createFileProcessingTestLauncher(fixture)).rejects.toThrow('Synthetic worker unavailable or misconfigured');
     expect(operations()).toEqual([]);
   });
