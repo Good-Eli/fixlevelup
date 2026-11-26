@@ -1,5 +1,5 @@
-// Rebuild the exact reviewed scanner/decoder OCI images and prepare a fresh,
-// signed ClamAV definitions snapshot for the isolated P05 engine tests.
+// Restore the exact Astra-reviewed scanner/decoder OCI images and prepare a
+// fresh, signed ClamAV definitions snapshot for isolated P05 engine tests.
 // Fails closed on ANY image/platform digest drift; this script never changes pins.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -14,8 +14,10 @@ const baseImage = 'clamav/clamav:1.4.7_base@sha256:21622d96b8a7080af7974d99ca60a
 const opensslPrimary = 'B146647E45A7B33947AB226B2A2C87D161692D40';
 // Official BuildKit v0.35.1 multi-platform index, pinned by full digest.
 const buildkitImage = 'moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c';
-// Exact epoch recovered from the original reviewed scanner image; embedded libcrypto SHA verified locally.
-const scannerSourceDateEpoch = '1795305328';
+// Immutable Release assets exported from the original Astra-reviewed OCI images.
+const fixtureRelease = 'https://github.com/Good-Eli/fixlevelup/releases/download/p03-04cde-oci-fixtures-v1/';
+const scannerArchiveSha256 = '781a35a36a26cbe33fe69c0c46851a3395db814a69f1519dad0836fd1b371eb5';
+const decoderArchiveSha256 = '61fb5af102aea942ec86d7a5048fef9105c344040590275dcfac6a3a88b4b56b';
 const patchFiles = [
   'f3acb0a3328046741479482c51cec815839e1b05',
   'c8f6d04f8e6d40b1bf83334e4a2ec9daf5943a3d',
@@ -34,15 +36,12 @@ const descriptorDir = join(cacheRoot, 'engines-ci-' + runId);
 const descriptorPath = join(descriptorDir, 'worker-fixture-backport-v1.json');
 const scannerTag = 'fixlevelup-p05-clamav-ci:' + runId;
 const decoderTag = 'fixlevelup-p05-decoder-ci:' + runId;
-const scannerMetadataPath = join(work, 'scanner-build-metadata.json');
-const decoderMetadataPath = join(work, 'decoder-build-metadata.json');
-const scannerOciTarPath = join(work, 'scanner-image.oci.tar');
-const decoderOciTarPath = join(work, 'decoder-image.oci.tar');
+const scannerOciTarPath = join(work, 'scanner-original.docker.tar');
+const decoderOciTarPath = join(work, 'decoder-original.docker.tar');
 const scannerLayoutPath = join(work, 'scanner-oci-layout');
 const decoderLayoutPath = join(work, 'decoder-oci-layout');
 const updaterName = 'fixlevelup-p05-defs-' + runId;
-const buildxBuilderName = 'fixlevelup-p05-oci-' + runId;
-let buildxBuilderCreated = false;
+
 let scannerImageId;
 let decoderImageId;
 mkdirSync(inputDir, { recursive: true });
@@ -81,19 +80,14 @@ function download(url, output) {
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
 function docker(args, options = {}) { return command('docker', args, options); }
-function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layoutPath, runtimeCheck) {
+function exactImage(configSha, platformSha, tag, ociTarPath, layoutPath, runtimeCheck) {
   // The legacy reviewed "indexSha256" value was compared with Docker .Id;
   // it is therefore the exact config digest, not a root OCI-index digest.
   // Verify the OCI layout's structure/child manifest separately and bind its
   // config blob plus the loaded Docker image to that reviewed config digest.
-  const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
   const isDigest = (value) => typeof value === 'string' && /^sha256:[0-9a-f]{64}$/u.test(value);
   const sha256 = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
   const safe = (value) => isDigest(value) ? value : null;
-  const descriptorDigest = metadata['containerimage.descriptor']?.digest;
-  const descriptorMediaType = metadata['containerimage.descriptor']?.mediaType;
-  const outputDigest = metadata['containerimage.digest'];
-  const metadataConfigDigest = metadata['containerimage.config.digest'];
   // On identity drift, report whether the payload's reviewed libcrypto byte hash
   // still matches. This distinguishes runtime-library drift from OCI identity drift
   // without weakening the OCI pin.
@@ -178,10 +172,8 @@ function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layou
   };
   const failIdentity = (reason, extra = {}) => {
     throw new Error('Rebuilt engine OCI identity mismatch: ' + JSON.stringify({
-      reason, expectedConfig: configSha, expectedPlatform: platformSha,
-      metadataConfig: safe(metadataConfigDigest), descriptor: safe(descriptorDigest),
-      descriptorMediaType: typeof descriptorMediaType === 'string' ? descriptorMediaType.slice(0, 100) : null,
-      output: safe(outputDigest), ...readRuntimeEvidence(), ...extra,
+      reason, expectedImageIdentity: configSha, expectedPlatform: platformSha,
+      ...readRuntimeEvidence(), ...extra,
     }));
   };
   command('tar', ['-xf', ociTarPath, '-C', layoutPath], {
@@ -248,8 +240,24 @@ function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layou
     includeStderr: true,
   }).trim().split(/\s+/u);
   if (actual[0] !== configSha || actual[1] !== 'linux/amd64') {
-    failIdentity('loaded Docker image config differs from the verified OCI image', {
-      config: configDigest, loadedConfig: actual[0] ?? null, loadedPlatform: actual[1] ?? null,
+    failIdentity('loaded Docker image identity differs from the verified OCI index', {
+      expectedImageIdentity: configSha, loadedImageIdentity: actual[0] ?? null,
+      manifestConfig: configDigest, loadedPlatform: actual[1] ?? null, exportIndexSha256,
+    });
+  }
+  if (runtimeCheck !== undefined) {
+    const evidence = readRuntimeEvidence();
+    if (!evidence.runtimeShaMatches) {
+      const reason = evidence.runtimeProbe === 'unavailable'
+        ? 'could not verify the reviewed runtime file SHA-256'
+        : 'loaded runtime file differs from its reviewed SHA-256';
+      failIdentity(reason, evidence);
+    }
+  }
+  // The export root index is a docker-save wrapper; the nested reviewed index
+  // and linux/amd64 manifest are authenticated independently above.
+  return configDigest;
+}gDigest, loadedConfig: actual[0] ?? null, loadedPlatform: actual[1] ?? null,
       exportIndexSha256,
     });
   }
@@ -322,34 +330,71 @@ try {
   copyFileSync(resolve(root, 'infra/file-processing/openssl-inputs.sha256'), join(inputDir, 'openssl-inputs.sha256'));
   command('sha256sum', ['--check', 'openssl-inputs.sha256'], { cwd: inputDir });
 
-  // Preserve the scoped Astra-reviewed identities. The index and child-manifest
-  // pins remain fixed; Buildx metadata binds the child manifest to the loaded
-  // local config digest without relying on unsupported --platform inspection.
+  // Preserve the exact Astra-reviewed pins; no image is rebuilt or repinned.
   const review = JSON.parse(readFileSync(resolve(root, 'infra/file-processing/oci-review-evidence.json'), 'utf8'));
-  // Backward-compatible review key "indexSha256" is the historical Docker
-  // image ID/config digest, as confirmed by the original launcher's .Id check.
   if (review.scanner?.indexSha256 !== SCANNER_CONFIG_SHA.slice(7)
       || review.scanner?.linuxAmd64ManifestSha256 !== SCANNER_PLATFORM_SHA.slice(7)
       || review.decoder?.indexSha256 !== DECODER_CONFIG_SHA.slice(7)
-      || review.decoder?.linuxAmd64ManifestSha256 !== DECODER_PLATFORM_SHA.slice(7)) {
-    throw new Error('Pinned OCI index/platform digests do not match the reviewed OCI evidence');
+      || review.decoder?.linuxAmd64ManifestSha256 !== DECODER_PLATFORM_SHA.slice(7)
+      || review.scanner?.libcrypto?.runtimeSha256 !== 'ffe3c003b7685b0d589c94b4ba58df70a1d6d792e3b08a85f17bbd9b97bd429a') {
+    throw new Error('Pinned OCI identities/runtime do not match the reviewed OCI evidence');
+  }
+  download(fixtureRelease + 'scanner-original.docker.tar', scannerOciTarPath);
+  download(fixtureRelease + 'decoder-original.docker.tar', decoderOciTarPath);
+  for (const [file, expected] of [[scannerOciTarPath, scannerArchiveSha256], [decoderOciTarPath, decoderArchiveSha256]]) {
+    const actual = createHash('sha256').update(readFileSync(file)).digest('hex');
+    if (actual !== expected) { throw new Error('Reviewed OCI fixture archive SHA-256 mismatch'); }
   }
   mkdirSync(scannerLayoutPath, { recursive: true });
   mkdirSync(decoderLayoutPath, { recursive: true });
-  command('docker', ['buildx', 'build', '--builder', buildxBuilderName, '--platform', 'linux/amd64',
-    '--build-arg', 'SOURCE_DATE_EPOCH=' + scannerSourceDateEpoch,
-    '--output', 'type=oci,dest=' + scannerOciTarPath, '--load', '--metadata-file', scannerMetadataPath,
-    '-f', resolve(root, 'infra/file-processing/ClamAV-libcrypto.Dockerfile'), '-t', scannerTag, inputDir], { inherit: true });
-  command('docker', ['buildx', 'build', '--builder', buildxBuilderName, '--platform', 'linux/amd64',
-    '--output', 'type=oci,dest=' + decoderOciTarPath, '--load', '--metadata-file', decoderMetadataPath,
-    '-f', resolve(root, 'infra/file-processing/Dockerfile'), '-t', decoderTag, root], { inherit: true });
+  command('tar', ['-xf', scannerOciTarPath, '-C', scannerLayoutPath]);
+  command('tar', ['-xf', decoderOciTarPath, '-C', decoderLayoutPath]);
+  // Authenticate every OCI descriptor/blob before Docker imports either image.
+  const verifyArchive = (imageIdentity, platform, archivePath, layoutPath) => {
+    const layout = JSON.parse(readFileSync(join(layoutPath, 'oci-layout'), 'utf8'));
+    const rootIndex = JSON.parse(readFileSync(join(layoutPath, 'index.json'), 'utf8'));
+    if (layout.imageLayoutVersion !== '1.0.0' || rootIndex.schemaVersion !== 2
+        || rootIndex.mediaType !== 'application/vnd.oci.image.index.v1+json'
+        || !Array.isArray(rootIndex.manifests)) throw new Error('Reviewed OCI archive root layout is invalid');
+    const blob = (digest, size, label) => {
+      if (!/^sha256:[0-9a-f]{64}$/u.test(digest)) throw new Error(label + ' digest invalid');
+      const bytes = readFileSync(join(layoutPath, 'blobs', 'sha256', digest.slice(7)));
+      if (bytes.length !== size || 'sha256:' + createHash('sha256').update(bytes).digest('hex') !== digest) {
+        throw new Error(label + ' blob digest/size mismatch');
+      }
+      return bytes;
+    };
+    const nested = rootIndex.manifests.filter(x => x.digest === imageIdentity
+      && x.mediaType === 'application/vnd.oci.image.index.v1+json');
+    if (nested.length !== 1) throw new Error('Reviewed nested OCI index descriptor missing/ambiguous');
+    const inner = JSON.parse(blob(nested[0].digest, nested[0].size, 'nested OCI index').toString('utf8'));
+    if (inner.schemaVersion !== 2 || inner.mediaType !== 'application/vnd.oci.image.index.v1+json'
+        || !Array.isArray(inner.manifests)) throw new Error('Nested OCI index is invalid');
+    const manifests = inner.manifests.filter(x => x.digest === platform
+      && x.mediaType === 'application/vnd.oci.image.manifest.v1+json'
+      && x.platform?.os === 'linux' && x.platform?.architecture === 'amd64');
+    if (manifests.length !== 1) throw new Error('Reviewed linux/amd64 manifest missing/ambiguous');
+    const manifest = JSON.parse(blob(manifests[0].digest, manifests[0].size, 'platform manifest').toString('utf8'));
+    if (manifest.schemaVersion !== 2 || manifest.mediaType !== 'application/vnd.oci.image.manifest.v1+json'
+        || !manifest.config || !Array.isArray(manifest.layers)) throw new Error('Platform manifest invalid');
+    const configBytes = blob(manifest.config.digest, manifest.config.size, 'image config');
+    const config = JSON.parse(configBytes.toString('utf8'));
+    if (config.os !== 'linux' || config.architecture !== 'amd64') throw new Error('Image config platform mismatch');
+    for (const layer of manifest.layers) blob(layer.digest, layer.size, 'image layer');
+  };
+  verifyArchive(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerOciTarPath, scannerLayoutPath);
+  verifyArchive(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderOciTarPath, decoderLayoutPath);
+  docker(['load', '--input', scannerOciTarPath], { inherit: true });
+  docker(['load', '--input', decoderOciTarPath], { inherit: true });
+  docker(['tag', 'fixlevelup-file-processing-clamav:1.4.7-crypto-backport-v1', scannerTag]);
+  docker(['tag', 'fixlevelup-file-processing-decoder:p0304cde-musl-v1', decoderTag]);
   scannerImageId = exactImage(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerTag,
-    scannerMetadataPath, scannerOciTarPath, scannerLayoutPath, {
+    scannerOciTarPath, scannerLayoutPath, {
       path: '/usr/lib/libcrypto.so.3',
       sha256: review.scanner.libcrypto.runtimeSha256,
     });
   decoderImageId = exactImage(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderTag,
-    decoderMetadataPath, decoderOciTarPath, decoderLayoutPath);
+    decoderOciTarPath, decoderLayoutPath);
 
   // FreshClam is a one-shot updater and the only container here with network access.
   // All actual scanner/decoder workers remain network=none, read-only and non-root.
@@ -430,10 +475,6 @@ try {
   if (updaterCreated) {
     try { command('docker', ['rm', '-f', updaterName]); }
     catch { process.stderr.write('P05 FreshClam updater cleanup failed\n'); }
-  }
-  if (buildxBuilderCreated) {
-    try { command('docker', ['buildx', 'rm', '--force', buildxBuilderName]); }
-    catch { process.stderr.write('P05 isolated BuildKit builder cleanup failed\n'); }
   }
   rmSync(gnupgDir, { recursive: true, force: true });
   rmSync(inputDir, { recursive: true, force: true });
