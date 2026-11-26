@@ -12,6 +12,8 @@ const root = resolve(import.meta.dirname, '../..');
 const cacheRoot = resolve(root, 'node_modules/.cache/p0304cde');
 const baseImage = 'clamav/clamav:1.4.7_base@sha256:21622d96b8a7080af7974d99ca60a9e061eff5ff831ed6986d00953fc19ff67f';
 const opensslPrimary = 'B146647E45A7B33947AB226B2A2C87D161692D40';
+// Official BuildKit v0.35.1 multi-platform index, pinned by full digest.
+const buildkitImage = 'moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c';
 const patchFiles = [
   'f3acb0a3328046741479482c51cec815839e1b05',
   'c8f6d04f8e6d40b1bf83334e4a2ec9daf5943a3d',
@@ -37,6 +39,8 @@ const decoderOciTarPath = join(work, 'decoder-image.oci.tar');
 const scannerLayoutPath = join(work, 'scanner-oci-layout');
 const decoderLayoutPath = join(work, 'decoder-oci-layout');
 const updaterName = 'fixlevelup-p05-defs-' + runId;
+const buildxBuilderName = 'fixlevelup-p05-oci-' + runId;
+let buildxBuilderCreated = false;
 let scannerImageId;
 let decoderImageId;
 mkdirSync(inputDir, { recursive: true });
@@ -185,6 +189,20 @@ try {
     throw new Error('Engine fixture preparation requires Linux x64 and Node 24.22.3');
   }
   command('docker', ['version', '--format', '{{.Server.Version}}']);
+  const buildxVersion = command('docker', ['buildx', 'version']).trim();
+  const buildxMatch = /\bv(\d+)\.(\d+)\.(\d+)\b/u.exec(buildxVersion);
+  if (!buildxMatch || (Number(buildxMatch[1]) === 0 && Number(buildxMatch[2]) < 13)) {
+    throw new Error('Pinned OCI proof requires Docker Buildx 0.13.0 or newer for multiple exporters');
+  }
+  // The runner's default docker driver cannot export OCI layouts. Use an
+  // isolated, digest-pinned BuildKit container; never mutate the default builder.
+  docker(['buildx', 'create', '--name', buildxBuilderName, '--driver', 'docker-container',
+    '--driver-opt', 'image=' + buildkitImage], { inherit: true });
+  buildxBuilderCreated = true;
+  const builderInfo = docker(['buildx', 'inspect', '--builder', buildxBuilderName, '--bootstrap'], { inherit: true });
+  if (!/Driver:\s+docker-container/u.test(builderInfo) || !/BuildKit:\s+v0\.35\.1\b/u.test(builderInfo)) {
+    throw new Error('Digest-pinned OCI proof builder did not bootstrap as BuildKit v0.35.1');
+  }
 
   // Download and cryptographically verify OpenSSL's release tarball before
   // using its pinned hash/patch inputs in the offline scanner build.
@@ -226,7 +244,7 @@ try {
   }
   mkdirSync(scannerLayoutPath, { recursive: true });
   mkdirSync(decoderLayoutPath, { recursive: true });
-  command('docker', ['buildx', 'build', '--platform', 'linux/amd64',
+  command('docker', ['buildx', 'build', '--builder', buildxBuilderName, '--platform', 'linux/amd64',
     '--output', 'type=oci,dest=' + scannerOciTarPath, '--load', '--metadata-file', scannerMetadataPath,
     '-f', resolve(root, 'infra/file-processing/ClamAV-libcrypto.Dockerfile'), '-t', scannerTag, inputDir], { inherit: true });
   command('docker', ['buildx', 'build', '--platform', 'linux/amd64',
@@ -318,6 +336,10 @@ try {
   if (updaterCreated) {
     try { command('docker', ['rm', '-f', updaterName]); }
     catch { process.stderr.write('P05 FreshClam updater cleanup failed\n'); }
+  }
+  if (buildxBuilderCreated) {
+    try { command('docker', ['buildx', 'rm', '--force', buildxBuilderName]); }
+    catch { process.stderr.write('P05 isolated BuildKit builder cleanup failed\n'); }
   }
   rmSync(gnupgDir, { recursive: true, force: true });
   rmSync(inputDir, { recursive: true, force: true });
