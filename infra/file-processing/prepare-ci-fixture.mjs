@@ -116,8 +116,11 @@ function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layou
       const markerOffset = runtimeBytes.indexOf(marker);
       let opensslBuiltOn = null;
       let sourceDateEpochMatch = null;
-      const searchStart = Math.floor(Date.parse('2026-11-21T06:00:00Z') / 1000);
-      const searchEnd = Math.floor(Date.parse('2026-11-21T07:00:00Z') / 1000);
+      // Investigative window only: CDE work was based on e44fae8 (2026-11-21T23:09:48Z)
+      // and reviewed implementation was committed as dd87cb4 (2026-11-22T01:35:27Z).
+      // These commits bound the likely build interval; neither timestamp is asserted as SOURCE_DATE_EPOCH.
+      const searchStart = Math.floor(Date.parse('2026-11-21T23:09:48Z') / 1000);
+      const searchEnd = Math.floor(Date.parse('2026-11-22T01:35:27Z') / 1000);
       if (markerOffset >= 0) {
         const dateStart = markerOffset + marker.byteLength;
         const dateEnd = runtimeBytes.indexOf(0, dateStart);
