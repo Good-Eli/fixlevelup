@@ -468,9 +468,12 @@ const S3_SQL = `WITH app AS (
 // Re-pinned after the reviewed 024 PHONE-completeness guard was added: the new
 // `request_phone_permission_guard` trigger function enters the enforcement graph and
 // `request_effect_guard` is re-created, which also moves the S1 base hashes.
+// Re-measured on a fresh isolated PostgreSQL 18.7 (server_version_num 180007)
+// after F-01 tightened request_role_grant_guard in migration 024. The base S1
+// fingerprints are unchanged; only the 024 metadata/enforcement pins moved.
 const S3_PINS = Object.freeze({
-  metadata: '8f2ac462c39d2bcf9bfc99896d8b563778e41b495e6f77b213413f8673ee2158',
-  enforcement: '0dd83e1dad3593b0db50b268ce51cef0586b5d499cef5aff0dd72e24efd07723',
+  metadata: '48e679cca9c8037d7c4c27d7091411611f5cf5f59c1969ea0fb7f045c1787940',
+  enforcement: '74630e5e03405de512bf4bc7677534d33e6b851daca9d08dbb625585bdb71977',
   base: 'fdb0e4bfd8554af5d4a3b96dc87ee855f3dd2e1ce051124de0e81f6c4e353d4d',
   baseEnforcement: '967e5798d23f2c138a5de44feaf83fb992feafd1ccd87319aee4ac53dc51334f',
 });
