@@ -534,13 +534,13 @@ live('024 PHONE completeness guard (real isolated PostgreSQL)', () => {
       // A direct parent-row write with no matching command/effect is rejected by
       // the deferred aggregate constraint. The caller has UPDATE(type), so this
       // proves the DB boundary rather than a table ACL denial.
-      const requestBefore = (await db.migrator.query<{ status: string; row_version: number }>(
-        'SELECT status,row_version FROM foundation.requests WHERE id=$1', [requestId])).rows[0];
+      const requestBefore = (await db.migrator.query<{ type: string; status: string; row_version: number }>(
+        'SELECT type,status,row_version FROM foundation.requests WHERE id=$1', [requestId])).rows[0];
       expect(requestBefore).toBeDefined();
       const direct = await rejectRuntimeRequestMutation(db, requestId);
       expect(direct).toEqual({ code: '23514', message: 'Request version requires a durable command', stage: 'deferred' });
-      expect((await db.migrator.query<{ status: string; row_version: number }>(
-        'SELECT status,row_version FROM foundation.requests WHERE id=$1', [requestId])).rows[0]).toEqual(requestBefore);
+      expect((await db.migrator.query<{ type: string; status: string; row_version: number }>(
+        'SELECT type,status,row_version FROM foundation.requests WHERE id=$1', [requestId])).rows[0]).toEqual(requestBefore);
     } finally {
       await db.close();
     }
