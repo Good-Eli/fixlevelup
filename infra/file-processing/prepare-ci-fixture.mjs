@@ -84,9 +84,10 @@ try {
 
   // Download and cryptographically verify OpenSSL's release tarball before
   // using its pinned hash/patch inputs in the offline scanner build.
-  download('https://www.openssl.org/source/openssl-3.5.9.tar.gz', join(inputDir, 'openssl-3.5.9.tar.gz'));
-  download('https://www.openssl.org/source/openssl-3.5.9.tar.gz.asc', join(inputDir, 'openssl-3.5.9.tar.gz.asc'));
-  download('https://www.openssl.org/source/pubkeys.asc', join(gnupgDir, 'pubkeys.asc'));
+  const release = 'https://github.com/openssl/openssl/releases/download/openssl-3.5.9/';
+  download(release + 'openssl-3.5.9.tar.gz', join(inputDir, 'openssl-3.5.9.tar.gz'));
+  download(release + 'openssl-3.5.9.tar.gz.asc', join(inputDir, 'openssl-3.5.9.tar.gz.asc'));
+  download('https://www.openssl-library.org/source/pubkeys.asc', join(gnupgDir, 'pubkeys.asc'));
   command('gpg', ['--homedir', gnupgDir, '--batch', '--import', join(gnupgDir, 'pubkeys.asc')]);
   const keyInfo = command('gpg', ['--homedir', gnupgDir, '--batch', '--with-colons', '--fingerprint', opensslPrimary]);
   const fingerprints = keyInfo.split('\n')
