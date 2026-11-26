@@ -66,14 +66,14 @@ function download(url, output) {
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
 function docker(args, options = {}) { return command('docker', args, options); }
-function exactImage(imageIdentity, tag, runtimeCheck) {
+function exactImage(imageIdentity, configDigest, tag, runtimeCheck) {
   const actual = docker(['image', 'inspect', '--format', '{{.Id}} {{.Os}}/{{.Architecture}}', tag], {
     safeFailure: 'Docker local image inspection failed for the restored reviewed engine image',
     includeStderr: true,
-  }).trim().split(/\\s+/u);
-  if (actual[0] !== imageIdentity || actual[1] !== 'linux/amd64') {
+  }).trim().split(/\s+/u);
+  if (actual[0] !== configDigest || actual[1] !== 'linux/amd64') {
     throw new Error('Restored engine image identity mismatch: ' + JSON.stringify({
-      expectedImageIdentity: imageIdentity, actualImageIdentity: actual[0] ?? null,
+      expectedImageIdentity: imageIdentity, expectedConfigDigest: configDigest, actualConfigDigest: actual[0] ?? null,
       actualPlatform: actual[1] ?? null,
     }));
   }
@@ -170,18 +170,19 @@ try {
     const config = JSON.parse(configBytes.toString('utf8'));
     if (config.os !== 'linux' || config.architecture !== 'amd64') throw new Error('Image config platform mismatch');
     for (const layer of manifest.layers) blob(layer.digest, layer.size, 'image layer');
+    return manifest.config.digest;
   };
-  verifyArchive(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerLayoutPath);
-  verifyArchive(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderLayoutPath);
+  const scannerConfigDigest = verifyArchive(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerLayoutPath);
+  const decoderConfigDigest = verifyArchive(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderLayoutPath);
   docker(['load', '--input', scannerOciTarPath], { inherit: true });
   docker(['load', '--input', decoderOciTarPath], { inherit: true });
   docker(['tag', 'fixlevelup-file-processing-clamav:1.4.7-crypto-backport-v1', scannerTag]);
   docker(['tag', 'fixlevelup-file-processing-decoder:p0304cde-musl-v1', decoderTag]);
-  scannerImageId = exactImage(SCANNER_CONFIG_SHA, scannerTag, {
+  scannerImageId = exactImage(SCANNER_CONFIG_SHA, scannerConfigDigest, scannerTag, {
     path: '/usr/lib/libcrypto.so.3',
     sha256: review.scanner.libcrypto.runtimeSha256,
   });
-  decoderImageId = exactImage(DECODER_CONFIG_SHA, decoderTag);
+  decoderImageId = exactImage(DECODER_CONFIG_SHA, decoderConfigDigest, decoderTag);
 
   // FreshClam is a one-shot updater and the only container here with network access.
   // All actual scanner/decoder workers remain network=none, read-only and non-root.
