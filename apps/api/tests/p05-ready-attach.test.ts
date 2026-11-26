@@ -311,11 +311,11 @@ class AttachmentDb {
     }
     if (sql.includes("'permission',p.code")) {
       return one([{ metadata: this.fingerprint === 'S3'
-        ? '8f2ac462c39d2bcf9bfc99896d8b563778e41b495e6f77b213413f8673ee2158' : 'f'.repeat(64) }]);
+        ? '48e679cca9c8037d7c4c27d7091411611f5cf5f59c1969ea0fb7f045c1787940' : 'f'.repeat(64) }]);
     }
     if (sql.includes("'rel_acl'")) {
       return one([{ enforcement: this.fingerprint === 'S3'
-        ? '0dd83e1dad3593b0db50b268ce51cef0586b5d499cef5aff0dd72e24efd07723' : 'f'.repeat(64) }]);
+        ? '74630e5e03405de512bf4bc7677534d33e6b851daca9d08dbb625585bdb71977' : 'f'.repeat(64) }]);
     }
     // anchor / consent / request binding
     if (sql.includes('FROM foundation.request_sessions WHERE id=$1')) { return one(this.anchor === null ? [] : [this.anchor]); }
