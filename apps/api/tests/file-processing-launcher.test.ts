@@ -29,8 +29,8 @@ const { createFileProcessingTestLauncher, syntheticSnapshotDigest, DECODER_CONFI
   syntheticSnapshotDigest: (path: string) => Promise<string>;
   DECODER_CONFIG_SHA: string; DECODER_PLATFORM_SHA: string; SCANNER_CONFIG_SHA: string; SCANNER_PLATFORM_SHA: string;
 };
-const scannerImageId = `sha256:${'a'.repeat(64)}`;
-const decoderImageId = `sha256:${'b'.repeat(64)}`;
+const scannerImageId = SCANNER_CONFIG_SHA;
+const decoderImageId = DECODER_CONFIG_SHA;
 const id = '1'.repeat(64);
 const unknown = { name: 'UnknownWorkerSettlementError', message: 'Synthetic worker settlement unknown' };
 const fixtureRoot = resolve('node_modules', '.cache', 'p0304cde', 'launcher-mock');
