@@ -412,6 +412,12 @@ jobs:
         run: |
           mkdir -p node_modules/.cache/ci-artifacts/p05-full
           node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/p05-full/context.json
+      - name: Install pinned host dependencies for Sharp engine preflight
+        run: corepack pnpm install --frozen-lockfile --ignore-scripts --strict-peer-dependencies
+      # Check reviewed scanner/decoder identity before the long PostgreSQL/S3/restore suites.
+      - name: Rebuild exact reviewed scanner/decoder and prepare signed engine fixture
+        id: engine-fixture
+        run: node infra/file-processing/prepare-ci-fixture.mjs
       - name: Build current-tree P05 S3 image
         run: node infra/p05-lab/lab.mjs s3image --rebuild
       - name: Start this job's isolated PostgreSQL 18.7 lab
@@ -430,10 +436,6 @@ jobs:
           node infra/p05-lab/lab.mjs s3test --old-binary --privacy --ledger --s3 --restore -- \
             --cmd env -u FIXLEVELUP_FILE_PROCESSING_TESTS corepack pnpm exec vitest run --maxWorkers 1 \
             --exclude apps/api/tests/p05-attachment-http.test.ts
-      - name: Rebuild exact reviewed scanner/decoder and prepare signed engine fixture
-        if: ${{ always() && steps.lab-up.outcome == 'success' && steps.deps-ready.outcome == 'success' }}
-        id: engine-fixture
-        run: node infra/file-processing/prepare-ci-fixture.mjs
       - name: Run all four real isolated ClamAV/Sharp engine scenarios
         if: ${{ always() && steps.engine-fixture.outcome == 'success' && steps.lab-up.outcome == 'success' && steps.deps-ready.outcome == 'success' }}
         id: engine-run

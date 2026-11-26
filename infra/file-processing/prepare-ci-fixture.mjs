@@ -79,7 +79,7 @@ function download(url, output) {
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
 function docker(args, options = {}) { return command('docker', args, options); }
-function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layoutPath) {
+function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layoutPath, runtimeCheck) {
   // The legacy reviewed "indexSha256" value was compared with Docker .Id;
   // it is therefore the exact config digest, not a root OCI-index digest.
   // Verify the OCI layout's structure/child manifest separately and bind its
@@ -92,12 +92,54 @@ function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layou
   const descriptorMediaType = metadata['containerimage.descriptor']?.mediaType;
   const outputDigest = metadata['containerimage.digest'];
   const metadataConfigDigest = metadata['containerimage.config.digest'];
+  // On identity drift, report whether the payload's reviewed libcrypto byte hash
+  // still matches. This distinguishes runtime-library drift from OCI identity drift
+  // without weakening the OCI pin.
+  let runtimeEvidence;
+  const readRuntimeEvidence = () => {
+    if (runtimeCheck === undefined) { return {}; }
+    if (runtimeEvidence !== undefined) { return runtimeEvidence; }
+    const containerName = 'fixlevelup-p05-runtime-probe-' + process.pid;
+    const copiedFile = join(work, 'runtime-file-probe');
+    let created = false;
+    try {
+      docker(['create', '--name', containerName, '--network', 'none', tag], {
+        safeFailure: 'Could not create an inert container for reviewed runtime hash diagnostics',
+      });
+      created = true;
+      docker(['cp', containerName + ':' + runtimeCheck.path, copiedFile], {
+        safeFailure: 'Could not copy the reviewed runtime file for hash diagnostics',
+      });
+      const actualRuntimeSha256 = createHash('sha256').update(readFileSync(copiedFile)).digest('hex');
+      runtimeEvidence = {
+        runtimeFile: runtimeCheck.path,
+        expectedRuntimeSha256: runtimeCheck.sha256,
+        actualRuntimeSha256,
+        runtimeShaMatches: actualRuntimeSha256 === runtimeCheck.sha256,
+      };
+    } catch {
+      runtimeEvidence = {
+        runtimeFile: runtimeCheck.path,
+        expectedRuntimeSha256: runtimeCheck.sha256,
+        actualRuntimeSha256: null,
+        runtimeShaMatches: false,
+        runtimeProbe: 'unavailable',
+      };
+    } finally {
+      if (created) {
+        try { docker(['rm', '-f', containerName]); }
+        catch { process.stderr.write('P05 runtime hash probe cleanup failed\\n'); }
+      }
+      rmSync(copiedFile, { force: true });
+    }
+    return runtimeEvidence;
+  };
   const failIdentity = (reason, extra = {}) => {
     throw new Error('Rebuilt engine OCI identity mismatch: ' + JSON.stringify({
       reason, expectedConfig: configSha, expectedPlatform: platformSha,
       metadataConfig: safe(metadataConfigDigest), descriptor: safe(descriptorDigest),
       descriptorMediaType: typeof descriptorMediaType === 'string' ? descriptorMediaType.slice(0, 100) : null,
-      output: safe(outputDigest), ...extra,
+      output: safe(outputDigest), ...readRuntimeEvidence(), ...extra,
     }));
   };
   command('tar', ['-xf', ociTarPath, '-C', layoutPath], {
@@ -168,6 +210,15 @@ function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layou
       config: configDigest, loadedConfig: actual[0] ?? null, loadedPlatform: actual[1] ?? null,
       exportIndexSha256,
     });
+  }
+  if (runtimeCheck !== undefined) {
+    const evidence = readRuntimeEvidence();
+    if (!evidence.runtimeShaMatches) {
+      const reason = evidence.runtimeProbe === 'unavailable'
+        ? 'could not verify the reviewed runtime file SHA-256'
+        : 'loaded runtime file differs from its reviewed SHA-256';
+      failIdentity(reason, evidence);
+    }
   }
   // The export index hash is diagnostic only; the original reviewed pair did
   // not preserve a root OCI-index digest separately from the Docker config ID.
@@ -250,7 +301,10 @@ try {
     '--output', 'type=oci,dest=' + decoderOciTarPath, '--load', '--metadata-file', decoderMetadataPath,
     '-f', resolve(root, 'infra/file-processing/Dockerfile'), '-t', decoderTag, root], { inherit: true });
   scannerImageId = exactImage(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerTag,
-    scannerMetadataPath, scannerOciTarPath, scannerLayoutPath);
+    scannerMetadataPath, scannerOciTarPath, scannerLayoutPath, {
+      path: '/usr/lib/libcrypto.so.3',
+      sha256: review.scanner.libcrypto.runtimeSha256,
+    });
   decoderImageId = exactImage(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderTag,
     decoderMetadataPath, decoderOciTarPath, decoderLayoutPath);
 
