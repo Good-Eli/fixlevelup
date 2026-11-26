@@ -73,6 +73,22 @@
 Межфазная регрессия: [33 passed / 1 вынесенный engine case](<../test-results/p05-final-gap-20261125/cross-regression-first.log#L42-L47>), [5/5 адресный итог + typecheck/lint/wire](<../test-results/p05-final-gap-20261125/final-targeted.log>), [wire 16 операций / 36 закрытых схем](<../test-results/p05-final-gap-20261125/final-targeted.log#L1-L4>). Старые 24 SQL, plan v0.4, product code, сборочные входы R и lockfile не менялись в этой дельте. Отдельный [технический diff](<../test-results/p05-final-gap-20261125/candidate.patch>) применяется к точному baseline, а не к Git HEAD. [Сводка всех попыток и SHA](<../test-results/p05-final-gap-20261125/run-index.json>) сохраняет первые красные прогоны; [финальный redacted scan](<../test-results/p05-final-gap-20261125/secrets-final.json>) и [снятие стенда](<../test-results/p05-final-gap-20261125/lab-teardown.log>) находятся вне хешируемого дерева.
 
 ### Кандидат 26.11.2026: F-01 и полная CITY-RBAC × state матрица
+#### Повторный измерительный pin после F-01
+
+Замеры сняты командой node infra/p05-lab/lab.mjs s3measure на свежей одноразовой БД fixlevelup_p05_s3lab_292246379e28, PostgreSQL 18.7 (server_version_num=180007), после применения 24 миграций из текущего source tree. Измеритель печатает только identity без credentials, fingerprints и readiness booleans; временная БД удалена по её OID. CI: [run 45787580200](https://github.com/Good-Eli/fixlevelup/actions/runs/45787580200), job P05 F-01 and CITY-RBAC × state acceptance, step Measure exact P05 S3 catalog pins.
+
+| Fingerprint | Measured value | Interpretation |
+|---|---|---|
+| S3 metadata | 48e679cca9c8037d7c4c27d7091411611f5cf5f59c1969ea0fb7f045c1787940 | Updated after the F-01 guard function change |
+| S3 enforcement | 74630e5e03405de512bf4bc7677534d33e6b851daca9d08dbb625585bdb71977 | Updated after the F-01 guard function change |
+| S1 base | fdb0e4bfd8554af5d4a3b96dc87ee855f3dd2e1ce051124de0e81f6c4e353d4d | Unchanged |
+| S1 base enforcement | 967e5798d23f2c138a5de44feaf83fb992feafd1ccd87319aee4ac53dc51334f | Unchanged |
+| Settings management | 5d51e88aaf1d3b95476e6576d1fad431554816446dc5799445b03819e0599574 | compatible=true; unchanged |
+| Catalog management | a1400f3e7e922fedeee48fac1cc409937869bd6311d4f451cf9fb78f7da6a9d0 | compatible=true; refreshed S3_CATALOG_PIN |
+| Legacy readiness | true | Base readiness accepted |
+
+The old S3 pins did not describe the changed SQL trigger function, and verifyClosedBase() independently checks S3_CATALOG_PIN through catalogManagementReady(). Both fingerprint gates are now updated from measured output; no readiness check was bypassed. These measurements are fingerprints, not an integration-test PASS. The following P05 HTTP/PHONE suites must pass again on the resulting head SHA.
+
 
 Эта секция описывает только добавленные исходники на ветке `fix/p05-db-boundary-city-state-2026-11-26`; пока не опубликованы результаты нового GitHub Actions run, её проверки имеют статус **SOURCE ADDED / CI PENDING**.
 
