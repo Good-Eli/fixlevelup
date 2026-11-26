@@ -1,6 +1,6 @@
 // Restore the exact Astra-reviewed scanner/decoder OCI images and prepare a
 // fresh, signed ClamAV definitions snapshot for isolated P05 engine tests.
-// Fails closed on ANY image/platform digest drift; this script never changes pins.
+// Fails closed on archive, OCI descriptor, platform, runtime or digest drift; never changes pins.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -11,9 +11,6 @@ import { DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, SCANNER_CONFIG_SHA, SCANNER_P
 const root = resolve(import.meta.dirname, '../..');
 const cacheRoot = resolve(root, 'node_modules/.cache/p0304cde');
 const baseImage = 'clamav/clamav:1.4.7_base@sha256:21622d96b8a7080af7974d99ca60a9e061eff5ff831ed6986d00953fc19ff67f';
-const opensslPrimary = 'B146647E45A7B33947AB226B2A2C87D161692D40';
-// Official BuildKit v0.35.1 multi-platform index, pinned by full digest.
-const buildkitImage = 'moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c';
 // Immutable Release assets exported from the original Astra-reviewed OCI images.
 const fixtureRelease = 'https://github.com/Good-Eli/fixlevelup/releases/download/p03-04cde-oci-fixtures-v1/';
 const scannerArchiveSha256 = '781a35a36a26cbe33fe69c0c46851a3395db814a69f1519dad0836fd1b371eb5';
@@ -28,10 +25,8 @@ const patchFiles = [
 const runId = String(process.env.GITHUB_RUN_ID ?? ('local-' + process.pid)).replace(/[^a-zA-Z0-9-]/gu, '-');
 mkdirSync(cacheRoot, { recursive: true });
 const work = mkdtempSync(join(cacheRoot, 'engine-ci-' + runId + '-'));
-const inputDir = join(work, 'scanner-inputs');
 const updateDir = join(work, 'definitions-update');
 const snapshotDir = join(cacheRoot, 'snapshot-ci-' + runId);
-const gnupgDir = join(work, 'gnupg');
 const descriptorDir = join(cacheRoot, 'engines-ci-' + runId);
 const descriptorPath = join(descriptorDir, 'worker-fixture-backport-v1.json');
 const scannerTag = 'fixlevelup-p05-clamav-ci:' + runId;
@@ -44,11 +39,9 @@ const updaterName = 'fixlevelup-p05-defs-' + runId;
 
 let scannerImageId;
 let decoderImageId;
-mkdirSync(inputDir, { recursive: true });
 mkdirSync(updateDir, { recursive: true });
 chmodSync(updateDir, 0o777); // FreshClam runs as UID 65534, not as root.
 mkdirSync(snapshotDir, { recursive: true });
-mkdirSync(gnupgDir, { recursive: true, mode: 0o700 });
 mkdirSync(descriptorDir, { recursive: true });
 let updaterCreated = false;
 let complete = false;
@@ -153,7 +146,7 @@ try {
   command('tar', ['-xf', scannerOciTarPath, '-C', scannerLayoutPath]);
   command('tar', ['-xf', decoderOciTarPath, '-C', decoderLayoutPath]);
   // Authenticate every OCI descriptor/blob before Docker imports either image.
-  const verifyArchive = (imageIdentity, platform, archivePath, layoutPath) => {
+  const verifyArchive = (imageIdentity, platform, layoutPath) => {
     const layout = JSON.parse(readFileSync(join(layoutPath, 'oci-layout'), 'utf8'));
     const rootIndex = JSON.parse(readFileSync(join(layoutPath, 'index.json'), 'utf8'));
     if (layout.imageLayoutVersion !== '1.0.0' || rootIndex.schemaVersion !== 2
@@ -185,8 +178,8 @@ try {
     if (config.os !== 'linux' || config.architecture !== 'amd64') throw new Error('Image config platform mismatch');
     for (const layer of manifest.layers) blob(layer.digest, layer.size, 'image layer');
   };
-  verifyArchive(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerOciTarPath, scannerLayoutPath);
-  verifyArchive(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderOciTarPath, decoderLayoutPath);
+  verifyArchive(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerLayoutPath);
+  verifyArchive(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderLayoutPath);
   docker(['load', '--input', scannerOciTarPath], { inherit: true });
   docker(['load', '--input', decoderOciTarPath], { inherit: true });
   docker(['tag', 'fixlevelup-file-processing-clamav:1.4.7-crypto-backport-v1', scannerTag]);
@@ -277,8 +270,6 @@ try {
     try { command('docker', ['rm', '-f', updaterName]); }
     catch { process.stderr.write('P05 FreshClam updater cleanup failed\n'); }
   }
-  rmSync(gnupgDir, { recursive: true, force: true });
-  rmSync(inputDir, { recursive: true, force: true });
   rmSync(updateDir, { recursive: true, force: true });
   rmSync(work, { recursive: true, force: true });
   if (!complete) {
