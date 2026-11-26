@@ -22,8 +22,7 @@ const S0_MANIFEST = '2b62d7ff18dd7e869c5080f033f42d09d51951707d538a941bb62e7e8be
 const digest = input => createHash('sha256').update(input).digest('hex');
 const dir = fileURLToPath(new URL('../../prisma/migrations/', import.meta.url));
 const identifier = value => /^[a-z_][a-z0-9_]{0,62}$/u.test(value);
-let denyStage = 'unknown';
-const deny = (stage = denyStage) => {
+const deny = (stage) => {
   if (process.env['FIXLEVELUP_LAB_DEBUG_EXPRESSIONS'] === '1') { process.stderr.write('EXPR-DENY ' + stage + String.fromCharCode(10)); }
   throw new Error('Unrecognised reviewed restore expression: ' + stage);
 };
@@ -31,7 +30,7 @@ const deny = (stage = denyStage) => {
 // The inputs are an immutable reviewed SQL set, not arbitrary PostgreSQL SQL.
 // Handle nested parentheses and doubled SQL quote escapes; refuse ambiguity.
 function parenthesized(sql, start) {
-  if (sql[start] !== '(') { return deny(); }
+  if (sql[start] !== '(') { return deny('expression-open'); }
   let depth = 0;
   let quote = '';
   for (let i = start; i < sql.length; i++) {
@@ -43,7 +42,7 @@ function parenthesized(sql, start) {
     else if (ch === '(') { depth++; }
     else if (ch === ')' && --depth === 0) { return sql.slice(start, i + 1); }
   }
-  return deny();
+  return deny('expression-unclosed');
 }
 
 export async function restoreReviewedExpressions(source, destination, expectedDatabase, legacyProfile, rehearsal) {
@@ -63,7 +62,7 @@ export async function restoreReviewedExpressions(source, destination, expectedDa
   const allFiles = migrations.map(name => readFileSync(resolve(dir, name, 'migration.sql'), 'utf8').replaceAll('\r\n','\n'));
   const manifest = migrations.map((name, i) => `${name}:${digest(allFiles[i])}`);
   const pinned = MANIFESTS.get(migrations.length);
-  if (pinned === undefined || digest(manifest.join('\n')) !== pinned) { deny(); }
+  if (pinned === undefined || digest(manifest.join('\n')) !== pinned) { deny('migration-manifest'); }
   if (legacy && (migrations[S0_COUNT - 1] !== S0_HEAD || digest(manifest.slice(0, S0_COUNT).join('\n')) !== S0_MANIFEST)) {
     deny('legacy-evidence-pin');
   }
@@ -184,7 +183,7 @@ export async function restoreReviewedExpressions(source, destination, expectedDa
           }
         }
       }
-      deny();
+      deny('restored-catalog-drift');
     }
     await destination.query('COMMIT');
   } catch (error) { await destination.query('ROLLBACK'); throw error; }
