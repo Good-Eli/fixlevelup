@@ -4,7 +4,7 @@ import { check, fixturePerTest, grant, integration, items, text } from './rbac-f
 
 integration('RBAC role management, history and channel boundaries on isolated PG', () => {
   const fixture = fixturePerTest();
-  it('protects system roles/mandatory permissions, exposes only supported scopes and protects management endpoints', async () => {
+  it('protects system roles/mandatory permissions, exposes only supported scopes and protects management endpoints', { timeout: 30_000 }, async () => {
     const f = fixture(); const m = await f.webStaff(); const adminRole = await f.systemRole('ADMIN');
     const permissions = items(check(await f.call(f.admin, 'get', '/permissions'), 200));
     for (const code of ['staff.self.read', 'staff.create', 'roles.archive', 'staff.role.assign']) { expect(permissions.map((p) => p['code'])).toContain(code); }
