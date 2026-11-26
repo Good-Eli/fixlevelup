@@ -40,7 +40,10 @@ export async function createFileProcessingTestLauncher(descriptor) {
         || frames.reduce((size,b) => size+b.byteLength,0) > 65_100) { reject(); }
     const request = JSON.stringify({ ticket, op, parts: frames.map(b => Buffer.from(b).toString('base64')) });
     const prefix = join(dir, String(n));
-    await writeFile(prefix+'.tmp',request,{flag:'wx',mode:0o600});
+    // The host-side controller runs as the runner UID while this disposable
+    // container writes as root. The exchange parent is mode 0700, so 0644 keeps
+    // the request private to the two bridge processes while allowing host reads.
+    await writeFile(prefix+'.tmp',request,{flag:'wx',mode:0o644});
     // Atomic publish without replacing any previously published request.
     await link(prefix+'.tmp',prefix+'.req');
     const r = await waitFor(prefix+'.res',signal,50_000);
