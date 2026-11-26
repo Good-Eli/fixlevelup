@@ -412,9 +412,6 @@ jobs:
           node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/p05-full/context.json
       - name: Build current-tree P05 S3 image
         run: node infra/p05-lab/lab.mjs s3image --rebuild
-      - name: Rebuild exact reviewed scanner/decoder and prepare signed engine fixture
-        id: engine-fixture
-        run: node infra/file-processing/prepare-ci-fixture.mjs
       - name: Start this job's isolated PostgreSQL 18.7 lab
         run: node infra/p05-lab/lab.mjs up --image=s3
       - name: Start isolated Garage and file ledger/trust-floor
@@ -429,6 +426,9 @@ jobs:
           node infra/p05-lab/lab.mjs s3test --old-binary --privacy --ledger --s3 --restore -- \
             --cmd env -u FIXLEVELUP_FILE_PROCESSING_TESTS corepack pnpm exec vitest run --maxWorkers 1 \
             --exclude apps/api/tests/p05-attachment-http.test.ts
+      - name: Rebuild exact reviewed scanner/decoder and prepare signed engine fixture
+        id: engine-fixture
+        run: node infra/file-processing/prepare-ci-fixture.mjs
       - name: Run all four real isolated ClamAV/Sharp engine scenarios
         id: engine-run
         run: |
