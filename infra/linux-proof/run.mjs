@@ -37,7 +37,7 @@ try {
   run('API runtime graph isolation', ['run','db:runtime-check']);
   const posix = spawnSync(process.execPath,['infra/linux-proof/posix-smoke.mjs'],{stdio:'inherit',timeout:60_000});
   if (posix.error || posix.status !== 0 || posix.signal) { throw new Error('Linux POSIX signal smoke failed'); }
-  steps.push('real OS SIGTERM/SIGINT API/worker');
+  steps.push('admission fail-closed + real OS SIGTERM/SIGINT production lifecycle hook (API/worker roles)');
   mkdirSync(evidence,{recursive:true});
   writeFileSync(`${evidence}/result.json`,JSON.stringify({platform:process.platform,arch:process.arch,node:process.version,lockSha256:initial,steps,network:'none',credentials:'synthetic only',limitations:['no Linux DB/S3 integration','no remote CI','no browser/image security scan','local Docker proof only']},null,2)+'\n');
   console.log('Linux reproducibility and OS signal proof: PASS');
