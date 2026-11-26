@@ -1062,9 +1062,26 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     ['witnesses-2','F normative HTTPS matrix: lawful states 3/3',sliceCells(2),300000],
     ['roles','F normative HTTPS matrix: exact roles and create shapes',5+13+13+13+4,300000],
     ['denials','F normative HTTPS matrix: scope, proof and unmapped-route denials',3*19+8+19+4*10+8+noP05CommandRoutes.length+2,300000],
+    ['city-admin-0','CITY-RBAC × state × command: SYSTEM ADMIN CITY states 1/3',6*8,900000],
+    ['city-admin-1','CITY-RBAC × state × command: SYSTEM ADMIN CITY states 2/3',6*8,900000],
+    ['city-admin-2','CITY-RBAC × state × command: SYSTEM ADMIN CITY states 3/3',6*8,900000],
+    ['city-manager-0','CITY-RBAC × state × command: SYSTEM MANAGER CITY states 1/3',6*8,900000],
+    ['city-manager-1','CITY-RBAC × state × command: SYSTEM MANAGER CITY states 2/3',6*8,900000],
+    ['city-manager-2','CITY-RBAC × state × command: SYSTEM MANAGER CITY states 3/3',6*8,900000],
+    ['city-custom-0','CITY-RBAC × state × command: CUSTOM CITY states 1/3',6*8,900000],
+    ['city-custom-1','CITY-RBAC × state × command: CUSTOM CITY states 2/3',6*8,900000],
+    ['city-custom-2','CITY-RBAC × state × command: CUSTOM CITY states 3/3',6*8,900000],
   ] as const;
   it('F normative HTTPS matrix inventory: phases cover every oracle cell exactly once', () => {
     expect(witnesses).toHaveLength(18);
+    const cityPhases=phases.filter(([phase])=>phase.startsWith('city-'));
+    expect(cityPhases.map(([phase])=>phase)).toEqual([
+      'city-admin-0','city-admin-1','city-admin-2',
+      'city-manager-0','city-manager-1','city-manager-2',
+      'city-custom-0','city-custom-1','city-custom-2',
+    ]);
+    expect(cityPhases.reduce((sum,[, ,cells])=>sum+cells,0)).toBe(432);
+    expect(new Set(cityPhases.map(([phase])=>phase)).size).toBe(9);
     expect(sliceCells(0)+sliceCells(1)+sliceCells(2)).toBe(18*8+9*3);
   });
   for (const [phase,name,expected,budget] of phases) {
