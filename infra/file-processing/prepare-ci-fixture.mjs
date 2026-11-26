@@ -60,7 +60,6 @@ function download(url, output) {
   });
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
-function hash(path) { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
 function docker(args, options = {}) { return command('docker', args, options); }
 function exactImage(imageId, platformSha, tag) {
   const value = docker(['image', 'inspect', '--format', '{{.Id}}|{{.Os}}/{{.Architecture}} {{.Descriptor.digest}}', tag]).trim();

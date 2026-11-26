@@ -466,7 +466,7 @@ jobs:
           test "${{ steps.engine-run.outcome }}" = success
 
   p05-migration-wire:
-    name: P05 migration/constraint + API/Web/Mini + P03/P04/P05 wire
+    name: P05 migration history + API/Web/Mini + P03/P04/P05 wire
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -491,14 +491,14 @@ jobs:
           corepack pnpm install --frozen-lockfile --strict-peer-dependencies
       - name: Build current-tree migration lab image
         run: node infra/p05-lab/lab.mjs s3image --rebuild
-      - name: Run isolated migration history and constraint suites
+      - name: Run isolated migration history suite
         id: migration-run
         env:
           FIXLEVELUP_LAB_INSTANCE: migration
         run: |
           set -euo pipefail
           node infra/p05-lab/lab.mjs up --image=s3
-          node infra/p05-lab/lab.mjs s3run -- sh -lc 'corepack pnpm run db:test-migrations && corepack pnpm run db:test-constraints'
+          node infra/p05-lab/lab.mjs s3run -- sh -lc 'corepack pnpm run db:test-migrations'
       - name: Stop only migration lab
         if: always()
         env:

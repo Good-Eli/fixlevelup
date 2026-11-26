@@ -1246,7 +1246,7 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     // The safe non-PII projection is available to each CITY role shape, but
     // decrypt/compare authority is narrower: role scope and an active city
     // assignment must both match before an audit attempt or ciphertext SELECT.
-    await withHttpMatrixActors(lab(),fixture.cityId,async actors => {
+    await withHttpMatrixActors(lab,fixture.cityId,async actors => {
       await actors.setAdminScope('CITY');
       const actorMutation = (actor: StaffProof) => ({
         ...staffMutation(randomUUID(),etag),
