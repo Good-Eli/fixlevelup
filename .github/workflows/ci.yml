@@ -177,6 +177,41 @@ jobs:
         if: always()
         run: test "${{ steps.integration-run.outcome }}" = success && test "${{ steps.persistence-run.outcome }}" = success
 
+  p05-acceptance:
+    name: P05 F-01 and CITY-RBAC × state acceptance
+    runs-on: ubuntu-24.04
+    needs: linux-integration
+    timeout-minutes: 240
+    steps:
+      - name: Checkout without credential persistence
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node 24.22.3
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.3
+          check-latest: false
+          package-manager-cache: false
+      - name: Verify pinned pnpm and Node
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          test "$(corepack pnpm --version)" = "12.21.0"
+          test "$(node --version)" = "v24.22.3"
+      - name: Build the current-tree P05 S3 image
+        run: node infra/p05-lab/lab.mjs s3image --rebuild
+      - name: Start the dedicated private PostgreSQL 18.7 P05 lab
+        run: node infra/p05-lab/lab.mjs up --image=s3
+      - name: Run real F-01 DML and complete 432-cell CITY HTTPS proof
+        run: |
+          set -euo pipefail
+          node infra/p05-lab/lab.mjs s3test -- --maxWorkers 1 --testNamePattern 'P05 S3 database boundary for request capability grants|024 PHONE completeness guard|F normative HTTPS matrix inventory|CITY-RBAC × state × command' apps/api/tests/p05-bridge-profiles.test.ts apps/api/tests/p05-restore-drain.test.ts apps/api/tests/p05-intake-http.test.ts
+      - name: Stop only this job's dedicated P05 lab
+        if: always()
+        run: node infra/p05-lab/lab.mjs down
+
   browser-proof:
     name: Browser proof
     runs-on: ubuntu-24.04
