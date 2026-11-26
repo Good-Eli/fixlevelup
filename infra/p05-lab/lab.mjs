@@ -904,15 +904,16 @@ function garageDown() {
  * container at the reviewed absolute path, and the exact four opt-in flags.
  */
 const ENGINE_EXCHANGE_PARENT = resolve(root, 'node_modules/.cache/p05-engine-jobs');
-const ENGINE_DESCRIPTOR = resolve(root,
-  'node_modules/.cache/p0304cde/engines-20261121T2315155122Z/worker-fixture-backport-v1.json');
+const ENGINE_DESCRIPTOR = resolve(process.env['FIXLEVELUP_LAB_ENGINE_DESCRIPTOR']
+  ?? resolve(root, 'node_modules/.cache/p0304cde/engines-20261121T2315155122Z/worker-fixture-backport-v1.json'));
 
 function engineFixtureFile() {
   if (!existsSync(ENGINE_DESCRIPTOR)) { throw new Error('Reviewed engine descriptor is missing'); }
-  const descriptor = JSON.parse(readFileSync(ENGINE_DESCRIPTOR, 'utf8'));
+  const bytes = readFileSync(ENGINE_DESCRIPTOR);
+  const descriptor = JSON.parse(bytes.toString('utf8'));
   const path = resolve(cacheRoot, 'engine-fixture.json');
-  writeFileSync(path, `${JSON.stringify(descriptor, null, 2)}\n`);
-  return path;
+  writeFileSync(path, `${JSON.stringify(descriptor, null, 2)}\n`, { mode: 0o600 });
+  return { path, descriptorSha256: createHash('sha256').update(bytes).digest('hex') };
 }
 
 async function engineRun(argv) {
@@ -941,13 +942,15 @@ async function engineRun(argv) {
   const optIn = optInEnv(state, flags);
   const oldBinary = oldBinaryMount(flags);
   process.stdout.write(`p05-lab: engine ticket ${ticket} (image ${image.imageId})\n`);
-  return await startEngineController(state, { ticket, exchange, fixture, database, image, args, optIn, oldBinary });
+  return await startEngineController(state, { ticket, exchange, fixture: fixture.path, descriptorSha256: fixture.descriptorSha256,
+    database, image, args, optIn, oldBinary });
 }
 
-async function startEngineController(state, { ticket, exchange, fixture, database, image, args, optIn, oldBinary }) {
+async function startEngineController(state, { ticket, exchange, fixture, descriptorSha256, database, image, args, optIn, oldBinary }) {
   const controller = spawn('node', ['infra/file-processing/p05-lab-engine-host.mjs'], {
     cwd: root,
-    env: { ...process.env, FIXLEVELUP_LAB_ENGINE_TICKET: ticket, FIXLEVELUP_LAB_ENGINE_EXCHANGE: exchange },
+    env: { ...process.env, FIXLEVELUP_LAB_ENGINE_TICKET: ticket, FIXLEVELUP_LAB_ENGINE_EXCHANGE: exchange,
+      FIXLEVELUP_LAB_ENGINE_DESCRIPTOR: ENGINE_DESCRIPTOR, FIXLEVELUP_LAB_ENGINE_DESCRIPTOR_SHA256: descriptorSha256 },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';

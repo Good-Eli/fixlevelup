@@ -31,6 +31,8 @@ import { RequestOfferFixture } from './p05-offer-fixture.js';
 import { startIsolatedIntake } from './p05-composition.js';
 import { provePartialWire } from './p05-partial-wire-proof.js';
 import { proveHttpMatrix } from './p05-http-matrix-proof.js';
+import { withHttpMatrixActors } from './p05-http-matrix-actors.js';
+import type { StaffProof } from './p05-http-matrix-actors.js';
 import { noP05CommandRoutes, witnesses } from './p05-http-matrix-oracle.js';
 import { createSyntheticKeySlots } from './p05-key-slot-fixture.js';
 
@@ -1239,6 +1241,27 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     } finally {
       await access("INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type) VALUES ($1,$2,'GLOBAL')",[role,'requests.coverage.assess']);
     }
+
+
+    // The safe non-PII projection is available to each CITY role shape, but
+    // decrypt/compare authority is narrower: role scope and an active city
+    // assignment must both match before an audit attempt or ciphertext SELECT.
+    await withHttpMatrixActors(lab(),fixture.cityId,async actors => {
+      await actors.setAdminScope('CITY');
+      const actorMutation = (actor: StaffProof) => ({
+        ...staffMutation(randomUUID(),etag),
+        Cookie: actor.cookie,
+        'X-CSRF-Token': createHmac('sha256',staffCsrf)
+          .update('web-auth-csrf\0').update(actor.token).digest('base64url'),
+      });
+      for (const actor of [actors.cityAdmin,actors.manager,actors.custom]) {
+        closed(await https('GET',path,undefined,{Cookie:actor.cookie}),200,staffViewKeys);
+      }
+      await denyCompare('wrong CITY assignment',404,'NOT_FOUND',{},actorMutation(actors.wrong));
+      await denyCompare('missing CITY assignment',404,'NOT_FOUND',{},actorMutation(actors.noCity));
+      await denyCompare('read-only CITY role without assess',403,'FORBIDDEN',{},actorMutation(actors.reader));
+      await denyCompare('action-only CITY role without scoped read',403,'FORBIDDEN',{},actorMutation(actors.actionOnly));
+    });
 
     const secondary=await lab.login(staffId,lab.admin.login,lab.admin.password);
     const secondaryHeaders={...staffMutation(undefined,etag),Cookie:secondary.cookie,

@@ -5,7 +5,7 @@
 import { createHash } from 'node:crypto';
 import diagnostics from 'node:diagnostics_channel';
 import { link, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createFileProcessingTestLauncher } from './docker-test-launcher.mjs';
 
@@ -17,8 +17,13 @@ if (!/^[a-f0-9]{32}$/u.test(ticket) || basename(owner)!=='p05-engine-jobs' || ba
     || basename(dirname(dirname(owner)))!=='node_modules' || await realpath(owner)!==owner) { deny(); }
 const dir = join(owner,ticket);
 await mkdir(dir,{mode:0o700}); // existing request or old results are never re-used
-const descriptorBytes = await readFile('node_modules/.cache/p0304cde/engines-20261121T2315155122Z/worker-fixture-backport-v1.json');
-if (sha(descriptorBytes)!=='251ca2642e1214dee14c67b24cdd267a5485bb5c0ac95610a0bf7ddfc1c21117') { deny(); }
+const descriptorRoot = resolve('node_modules/.cache/p0304cde');
+const descriptorPath = resolve(process.env.FIXLEVELUP_LAB_ENGINE_DESCRIPTOR ?? '');
+const descriptorSha256 = process.env.FIXLEVELUP_LAB_ENGINE_DESCRIPTOR_SHA256 ?? '';
+if (!descriptorPath.startsWith(descriptorRoot + sep) || await realpath(descriptorPath)!==descriptorPath
+    || !/^[a-f0-9]{64}$/u.test(descriptorSha256)) { deny(); }
+const descriptorBytes = await readFile(descriptorPath);
+if (sha(descriptorBytes)!==descriptorSha256) { deny(); }
 // Record names from this Node process only, for exact-ID post-test cleanup.
 diagnostics.subscribe('tracing:child_process.spawn:start', ({process:child}) => {
   const args=child.spawnargs;
