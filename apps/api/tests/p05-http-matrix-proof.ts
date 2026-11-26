@@ -335,7 +335,9 @@ export async function proveHttpMatrix(p:Ports): Promise<number> {
     const cityPhase=/^city-(admin|manager|custom)-([0-2])$/.exec(p.phase);
     if (cityPhase) {
       const role=cityPhase[1];
-      const slice=Number(cityPhase[2]);
+      const rawSlice=cityPhase[2];
+      if (!role || rawSlice === undefined) { throw new Error('Invalid CITY matrix phase capture'); }
+      const slice=Number(rawSlice);
       const actor=role==='admin' ? actors.cityAdmin : role==='manager' ? actors.manager : actors.custom;
       // A SYSTEM ADMIN's grants are role-wide. Convert the reviewed ADMIN rows
       // to CITY for this entire phase; build and mutating requests are issued by
