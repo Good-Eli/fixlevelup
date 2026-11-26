@@ -32,6 +32,10 @@ const scannerTag = 'fixlevelup-p05-clamav-ci:' + runId;
 const decoderTag = 'fixlevelup-p05-decoder-ci:' + runId;
 const scannerMetadataPath = join(work, 'scanner-build-metadata.json');
 const decoderMetadataPath = join(work, 'decoder-build-metadata.json');
+const scannerOciTarPath = join(work, 'scanner-image.oci.tar');
+const decoderOciTarPath = join(work, 'decoder-image.oci.tar');
+const scannerLayoutPath = join(work, 'scanner-oci-layout');
+const decoderLayoutPath = join(work, 'decoder-oci-layout');
 const updaterName = 'fixlevelup-p05-defs-' + runId;
 let scannerImageId;
 let decoderImageId;
@@ -71,29 +75,103 @@ function download(url, output) {
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
 function docker(args, options = {}) { return command('docker', args, options); }
-function exactImage(indexSha, platformSha, tag, metadataPath) {
-  // Buildx metadata separates Docker's config digest, output descriptor, and
-  // top-level output digest. Keep the two reviewed OCI pins distinct.
+function exactImage(indexSha, platformSha, tag, metadataPath, ociTarPath, layoutPath) {
+  // The docker exporter used by --load does not expose an OCI manifest digest.
+  // Verify the OCI layout separately, then bind it to the loaded Docker config ID.
   const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
-  const configDigest = metadata['containerimage.config.digest'];
-  const descriptor = metadata['containerimage.descriptor'];
-  const descriptorDigest = descriptor?.digest;
-  const outputDigest = metadata['containerimage.digest'];
-  const mediaType = descriptor?.mediaType;
   const isDigest = (value) => typeof value === 'string' && /^sha256:[0-9a-f]{64}$/u.test(value);
-  if (!isDigest(configDigest) || !isDigest(descriptorDigest) || !isDigest(outputDigest)
-      || (descriptorDigest !== platformSha && descriptorDigest !== indexSha)
-      || (outputDigest !== platformSha && outputDigest !== indexSha)) {
-    const safe = (value) => isDigest(value) ? value : null;
-    throw new Error('Rebuilt engine OCI digest metadata mismatch: ' + JSON.stringify({
-      expectedIndex: indexSha, expectedPlatform: platformSha,
-      config: safe(configDigest), descriptor: safe(descriptorDigest),
-      descriptorMediaType: typeof mediaType === 'string' ? mediaType.slice(0, 100) : null,
-      output: safe(outputDigest),
+  const sha256 = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
+  const safe = (value) => isDigest(value) ? value : null;
+  const descriptorDigest = metadata['containerimage.descriptor']?.digest;
+  const descriptorMediaType = metadata['containerimage.descriptor']?.mediaType;
+  const outputDigest = metadata['containerimage.digest'];
+  const metadataConfigDigest = metadata['containerimage.config.digest'];
+  const failIdentity = (reason, extra = {}) => {
+    throw new Error('Rebuilt engine OCI identity mismatch: ' + JSON.stringify({
+      reason, expectedIndex: indexSha, expectedPlatform: platformSha,
+      metadataConfig: safe(metadataConfigDigest), descriptor: safe(descriptorDigest),
+      descriptorMediaType: typeof descriptorMediaType === 'string' ? descriptorMediaType.slice(0, 100) : null,
+      output: safe(outputDigest), ...extra,
     }));
+  };
+  command('tar', ['-xf', ociTarPath, '-C', layoutPath], {
+    safeFailure: 'Could not extract the Buildx OCI image layout',
+  });
+  const layout = JSON.parse(readFileSync(join(layoutPath, 'oci-layout'), 'utf8'));
+  if (layout.imageLayoutVersion !== '1.0.0') { failIdentity('unsupported OCI image-layout version'); }
+  const indexBytes = readFileSync(join(layoutPath, 'index.json'));
+  const index = JSON.parse(indexBytes.toString('utf8'));
+  if (index.schemaVersion !== 2 || index.mediaType !== 'application/vnd.oci.image.index.v1+json'
+      || !Array.isArray(index.manifests)) {
+    failIdentity('OCI layout index has an unexpected schema or media type', {
+      indexDigest: sha256(indexBytes), indexMediaType: index.mediaType ?? null,
+    });
   }
+  const indexDigest = sha256(indexBytes);
+  const candidates = index.manifests.filter((item) => item?.platform?.os === 'linux'
+    && item?.platform?.architecture === 'amd64'
+    && item?.mediaType === 'application/vnd.oci.image.manifest.v1+json');
+  if (candidates.length !== 1 || candidates[0]?.digest !== platformSha) {
+    failIdentity('OCI index does not contain exactly the reviewed linux/amd64 manifest', {
+      indexDigest, platformDescriptors: candidates.map((item) => ({ digest: safe(item.digest), mediaType: item.mediaType })),
+    });
+  }
+  const readVerifiedBlob = (digest, label) => {
+    if (!isDigest(digest)) { failIdentity(label + ' digest is invalid'); }
+    const path = join(layoutPath, 'blobs', 'sha256', digest.slice('sha256:'.length));
+    const bytes = readFileSync(path);
+    if (sha256(bytes) !== digest) { failIdentity(label + ' blob content does not match its digest'); }
+    return bytes;
+  };
+  const manifestBytes = readVerifiedBlob(candidates[0].digest, 'platform manifest');
+  const manifest = JSON.parse(manifestBytes.toString('utf8'));
+  if (manifest.schemaVersion !== 2 || manifest.mediaType !== 'application/vnd.oci.image.manifest.v1+json'
+      || !manifest.config || !Array.isArray(manifest.layers)) {
+    failIdentity('reviewed platform manifest has an unexpected structure');
+  }
+  const configDigest = manifest.config.digest;
+  const configBytes = readVerifiedBlob(configDigest, 'image config');
+  const imageConfig = JSON.parse(configBytes.toString('utf8'));
+  if (imageConfig.os !== 'linux' || imageConfig.architecture !== 'amd64') {
+    failIdentity('reviewed image config is not linux/amd64', { config: safe(configDigest) });
+  }
+  if (metadataConfigDigest !== undefined && metadataConfigDigest !== configDigest) {
+    failIdentity('Buildx config metadata differs from OCI manifest config', {
+      config: safe(configDigest), metadataConfig: safe(metadataConfigDigest),
+    });
+  }
+  // The exported index file may carry a local ref-name annotation. In that case
+  // Buildx's root descriptor digest is the registry-equivalent index identity.
+  const rootMatches = indexDigest === indexSha || descriptorDigest === indexSha || outputDigest === indexSha;
+  if (!rootMatches) {
+    failIdentity('OCI root index digest does not match the reviewed pin', {
+      indexDigest, config: configDigest, platform: candidates[0].digest,
+    });
+  }
+  for (const [label, value] of [['Buildx descriptor', descriptorDigest], ['Buildx output', outputDigest]]) {
+    if (value !== undefined && value !== configDigest && value !== indexSha && value !== platformSha) {
+      failIdentity(label + ' digest is not tied to the reviewed OCI image', { config: configDigest });
+    }
+  }
+  if (descriptorDigest === indexSha && descriptorMediaType !== undefined
+      && descriptorMediaType !== 'application/vnd.oci.image.index.v1+json') {
+    failIdentity('Buildx root descriptor media type is not an OCI image index');
+  }
+  if (descriptorDigest === platformSha && descriptorMediaType !== undefined
+      && descriptorMediaType !== 'application/vnd.oci.image.manifest.v1+json') {
+    failIdentity('Buildx platform descriptor media type is not an OCI image manifest');
+  }
+  const actual = docker(['image', 'inspect', '--format', '{{.Id}} {{.Os}}/{{.Architecture}}', tag], {
+    safeFailure: 'Docker local image inspection failed for the rebuilt pinned engine image',
+    includeStderr: true,
+  }).trim().split(/\\s+/u);
+  if (actual[0] !== configDigest || actual[1] !== 'linux/amd64') {
+    failIdentity('loaded Docker image config differs from the verified OCI image', {
+      config: configDigest, loadedConfig: actual[0] ?? null, loadedPlatform: actual[1] ?? null,
+    });
+  }
+  return configDigest;
 }
-
 function clamscan(args) {
   if (!scannerImageId) { throw new Error('Verified scanner image ID is unavailable'); }
   return docker(['run', '--rm', '--network', 'none', '--read-only', '--user', '65532:65532',
@@ -146,12 +224,18 @@ try {
       || review.decoder?.linuxAmd64ManifestSha256 !== DECODER_PLATFORM_SHA.slice(7)) {
     throw new Error('Pinned OCI index/platform digests do not match the reviewed OCI evidence');
   }
-  command('docker', ['buildx', 'build', '--platform', 'linux/amd64', '--load', '--metadata-file', scannerMetadataPath,
+  mkdirSync(scannerLayoutPath, { recursive: true });
+  mkdirSync(decoderLayoutPath, { recursive: true });
+  command('docker', ['buildx', 'build', '--platform', 'linux/amd64',
+    '--output', 'type=oci,dest=' + scannerOciTarPath, '--load', '--metadata-file', scannerMetadataPath,
     '-f', resolve(root, 'infra/file-processing/ClamAV-libcrypto.Dockerfile'), '-t', scannerTag, inputDir], { inherit: true });
-  command('docker', ['buildx', 'build', '--platform', 'linux/amd64', '--load', '--metadata-file', decoderMetadataPath,
+  command('docker', ['buildx', 'build', '--platform', 'linux/amd64',
+    '--output', 'type=oci,dest=' + decoderOciTarPath, '--load', '--metadata-file', decoderMetadataPath,
     '-f', resolve(root, 'infra/file-processing/Dockerfile'), '-t', decoderTag, root], { inherit: true });
-  scannerImageId = exactImage(SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA, scannerTag, scannerMetadataPath);
-  decoderImageId = exactImage(DECODER_INDEX_SHA, DECODER_PLATFORM_SHA, decoderTag, decoderMetadataPath);
+  scannerImageId = exactImage(SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA, scannerTag,
+    scannerMetadataPath, scannerOciTarPath, scannerLayoutPath);
+  decoderImageId = exactImage(DECODER_INDEX_SHA, DECODER_PLATFORM_SHA, decoderTag,
+    decoderMetadataPath, decoderOciTarPath, decoderLayoutPath);
 
   // FreshClam is a one-shot updater and the only container here with network access.
   // All actual scanner/decoder workers remain network=none, read-only and non-root.
