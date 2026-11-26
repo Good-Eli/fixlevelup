@@ -55,18 +55,18 @@ jobs:
           mkdir -p node_modules/.cache/ci-artifacts/linux-proof
           node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/linux-proof/context.json
           node infra/ci/docker.mjs build --builder default --file infra/linux-proof/Dockerfile --tag fixlevelup-linux-proof:ci-${GITHUB_RUN_ID} .
+      - name: Prepare isolated Linux proof evidence mount
+        run: mkdir -p "$RUNNER_TEMP/linux-proof-raw"
       - name: Run Linux proof with network and resource isolation
         id: linux-run
         run: |
           set -euo pipefail
-          node infra/ci/docker.mjs run --name fixlevelup-linux-proof-ci-${GITHUB_RUN_ID} --network none --cpus 2 --memory 5g fixlevelup-linux-proof:ci-${GITHUB_RUN_ID}
-      - name: Copy redacted Linux proof evidence
+          node infra/ci/docker.mjs run --name fixlevelup-linux-proof-ci-${GITHUB_RUN_ID} --network none --cpus 2 --memory 5g --mount "type=bind,source=$RUNNER_TEMP/linux-proof-raw,target=/workspace/node_modules/.cache/linux-proof" fixlevelup-linux-proof:ci-${GITHUB_RUN_ID}
+      - name: Collect redacted Linux proof evidence
         id: evidence
         if: always()
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/linux-proof-raw"
-          node infra/ci/docker.mjs cp fixlevelup-linux-proof-ci-${GITHUB_RUN_ID}:/workspace/node_modules/.cache/linux-proof "$RUNNER_TEMP/linux-proof-raw"
           node infra/ci/evidence.mjs collect "$RUNNER_TEMP/linux-proof-raw" node_modules/.cache/ci-artifacts/linux-proof/evidence
       - name: Summarize Linux proof
         if: always()
