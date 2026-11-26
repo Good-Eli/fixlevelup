@@ -46,9 +46,13 @@ BEGIN
     -- disabled placeholder or reactivate one. Otherwise a direct runtime INSERT
     -- could reserve the unique (role, permission) key and poison a later reviewed
     -- grant operation without ever becoming an effective permission.
-    IF TG_OP='UPDATE' AND NOT NEW.enabled THEN RETURN NEW; END IF;
-    IF TG_OP='UPDATE' AND OLD.enabled AND ROW(OLD.role_id,OLD.permission_code,OLD.scope_type)
-        IS NOT DISTINCT FROM ROW(NEW.role_id,NEW.permission_code,NEW.scope_type) THEN RETURN NEW; END IF;
+    -- A revocation/no-op is safe only when the old row was already a P05 grant.
+    -- Do not let a runtime repurpose a legacy row into a disabled P05 placeholder.
+    IF TG_OP='UPDATE' AND OLD.permission_code IN ('requests.read','requests.create','requests.review',
+        'requests.coverage.assess','requests.contact.manage','requests.ready','requests.cancel')
+        AND ROW(OLD.role_id,OLD.permission_code,OLD.scope_type)
+            IS NOT DISTINCT FROM ROW(NEW.role_id,NEW.permission_code,NEW.scope_type)
+        AND (NOT NEW.enabled OR OLD.enabled) THEN RETURN NEW; END IF;
     IF current_user<>'fixlevelup_migrator' OR current_database() COLLATE "C" !~
         '^fixlevelup_(p05_[a-z0-9_]+|configuration_test_[0-9a-f]{24})$' THEN
         RAISE EXCEPTION 'Request grants are not issued by the runtime' USING ERRCODE='42501';
