@@ -8,7 +8,12 @@ const initial = hash();
 const steps = [];
 function run(name, args) {
   console.log(`Linux proof: ${name}`);
-  const result = spawnSync('corepack', ['pnpm', ...args], { stdio: 'inherit', timeout: 600_000 });
+  // The whole-repository ESLint pass exceeds Node's default heap in the 4 GiB
+  // sandbox. Give only the lint child a bounded 3.5 GiB V8 heap; CI allocates 5 GiB.
+  const env = name === 'lint'
+    ? { ...process.env, NODE_OPTIONS: '--max-old-space-size=3584' }
+    : process.env;
+  const result = spawnSync('corepack', ['pnpm', ...args], { stdio: 'inherit', timeout: 600_000, env });
   if (result.error || result.status !== 0 || result.signal) { throw new Error(`Linux proof step failed: ${name}`); }
   if (hash() !== initial) { throw new Error('Linux lockfile changed'); }
   steps.push(name);
