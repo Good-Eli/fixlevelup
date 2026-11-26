@@ -200,7 +200,7 @@ try {
   docker(['buildx', 'create', '--name', buildxBuilderName, '--driver', 'docker-container',
     '--driver-opt', 'image=' + buildkitImage], { inherit: true });
   const builderInfo = docker(['buildx', 'inspect', '--builder', buildxBuilderName, '--bootstrap']);
-  if (!/Driver:\s+docker-container/u.test(builderInfo) || !/BuildKit:\s+v0\.35\.1\b/u.test(builderInfo)) {
+  if (!/Driver:\s+docker-container/u.test(builderInfo) || !/BuildKit version:\s+v0\.35\.1\b/u.test(builderInfo)) {
     throw new Error('Digest-pinned OCI proof builder did not bootstrap as BuildKit v0.35.1');
   }
 
