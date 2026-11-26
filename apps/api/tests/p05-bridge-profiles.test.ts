@@ -273,3 +273,75 @@ labIntegration('P05 §7 explicit role revoke over real HTTP on the expanded S3 p
     });
 });
 
+
+labIntegration('P05 S3 database boundary for request capability grants', () => {
+  let fixture: ConfigurationFixture | undefined;
+  afterAll(async () => { await fixture?.close().catch(() => undefined); }, 60_000);
+
+  it('runtime direct DML cannot issue, reserve, reactivate, widen or delete a request grant',
+    { timeout: 120_000 }, async () => {
+      fixture = await createConfigurationFixture();
+      const current = fixture;
+      const roleId = (await current.migrator.query<{ id: string }>(
+        "SELECT id FROM foundation.roles WHERE role_type='SYSTEM' AND code='MANAGER' AND status='ACTIVE'"))
+        .rows[0]?.id;
+      if (!roleId) { throw new Error('Missing active SYSTEM MANAGER role fixture'); }
+      await current.migrator.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type,enabled)
+        VALUES ($1,'requests.review','CITY',true),($1,'requests.create','CITY',false)`, [roleId]);
+
+      const identity = await current.runtime.query<{ current_user: string; session_user: string;
+        insert_columns: boolean; update_enabled: boolean; update_scope: boolean; delete_table: boolean }>(
+        `SELECT current_user::text AS current_user,session_user::text AS session_user,
+          has_column_privilege(current_user,'foundation.role_permissions','role_id','INSERT')
+            AND has_column_privilege(current_user,'foundation.role_permissions','permission_code','INSERT')
+            AND has_column_privilege(current_user,'foundation.role_permissions','scope_type','INSERT')
+            AND has_column_privilege(current_user,'foundation.role_permissions','enabled','INSERT') AS insert_columns,
+          has_column_privilege(current_user,'foundation.role_permissions','enabled','UPDATE') AS update_enabled,
+          has_column_privilege(current_user,'foundation.role_permissions','scope_type','UPDATE') AS update_scope,
+          has_table_privilege(current_user,'foundation.role_permissions','DELETE') AS delete_table`);
+      expect(identity.rows[0]).toEqual({ current_user: 'fixlevelup_runtime', session_user: 'fixlevelup_runtime',
+        insert_columns: true, update_enabled: true, update_scope: true, delete_table: false });
+
+      // The INSERT column ACL exists for legacy role editing. The SECURITY INVOKER
+      // trigger is the hard boundary that rejects P05 grants, including disabled
+      // placeholders that could otherwise poison the unique role/permission key.
+      for (const enabled of [true, false]) {
+        await expect(current.runtime.query(`INSERT INTO foundation.role_permissions
+          (role_id,permission_code,scope_type,enabled) VALUES ($1,'requests.cancel','CITY',$2)`, [roleId, enabled]))
+          .rejects.toMatchObject({ code: '42501', message: 'Request grants are not issued by the runtime' });
+      }
+
+      // An existing disabled row cannot be activated by an application-side UPDATE.
+      await expect(current.runtime.query(`UPDATE foundation.role_permissions SET enabled=true
+        WHERE role_id=$1 AND permission_code='requests.create'`, [roleId]))
+        .rejects.toMatchObject({ code: '42501', message: 'Request grants are not issued by the runtime' });
+
+      // scope_type is an intentionally granted legacy column, but P05 grant
+      // identity is immutable at the row-trigger boundary (CITY cannot be widened).
+      await expect(current.runtime.query(`UPDATE foundation.role_permissions SET scope_type='GLOBAL'
+        WHERE role_id=$1 AND permission_code='requests.review'`, [roleId]))
+        .rejects.toMatchObject({ code: '23514', message: 'Immutable request grant identity' });
+      await expect(current.runtime.query(`DELETE FROM foundation.role_permissions
+        WHERE role_id=$1 AND permission_code='requests.review'`, [roleId]))
+        .rejects.toMatchObject({ code: '42501' });
+
+      const unchanged = (await current.migrator.query<{ permission_code: string; scope_type: string; enabled: boolean }>(
+        `SELECT permission_code,scope_type,enabled FROM foundation.role_permissions
+          WHERE role_id=$1 AND permission_code=ANY($2::text[]) ORDER BY permission_code`,
+        [roleId, ['requests.create','requests.review']])).rows;
+      expect(unchanged).toEqual([
+        { permission_code: 'requests.create', scope_type: 'CITY', enabled: false },
+        { permission_code: 'requests.review', scope_type: 'CITY', enabled: true },
+      ]);
+
+      // Narrow, safe operation retained: runtime may revoke but cannot re-enable.
+      expect((await current.runtime.query(`UPDATE foundation.role_permissions SET enabled=false
+        WHERE role_id=$1 AND permission_code='requests.review'`, [roleId])).rowCount).toBe(1);
+      await expect(current.runtime.query(`UPDATE foundation.role_permissions SET enabled=true
+        WHERE role_id=$1 AND permission_code='requests.review'`, [roleId]))
+        .rejects.toMatchObject({ code: '42501', message: 'Request grants are not issued by the runtime' });
+      expect((await current.migrator.query<{ enabled: boolean }>(
+        `SELECT enabled FROM foundation.role_permissions WHERE role_id=$1 AND permission_code='requests.review'`,
+        [roleId])).rows[0]?.enabled).toBe(false);
+    });
+});
