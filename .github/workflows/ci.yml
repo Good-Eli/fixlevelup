@@ -382,7 +382,7 @@ jobs:
           include-hidden-files: true # Only the dedicated redacted artifact directory.
           retention-days: 14
 
-p05-full-integration:
+  p05-full-integration:
     name: P05 full opt-in integration (PG, Garage, ledger, privacy, restore, engine)
     runs-on: ubuntu-24.04
     timeout-minutes: 360
