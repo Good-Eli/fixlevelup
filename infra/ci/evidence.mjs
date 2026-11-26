@@ -2,7 +2,7 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSy
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const stepNames = new Set(['offline frozen force reinstall', 'lint', 'typecheck', 'build all three targets', 'service-independent tests', 'API runtime graph isolation', 'real OS SIGTERM/SIGINT API/worker', 'runtime preflight', 'offline frozen install', 'isolated credential bootstrap', 'PostgreSQL 18.7 identity and fresh database', 'synthetic persistence marker bootstrap', 'db:roles', 'db:deploy', 'db:test-migrations', 'db:test-constraints', 'S3 bucket credentials preflight', 'full pnpm check', 'db:runtime-check', 'db:check', 'isolated database final invariants', 'PostgreSQL admin disconnect', 'redacted result write', 'browser lint/typecheck', 'browser typecheck', 'all production builds', 'real browser smoke']);
+const stepNames = new Set(['offline frozen force reinstall', 'lint', 'typecheck', 'build all three targets', 'service-independent tests', 'API runtime graph isolation', 'real OS SIGTERM/SIGINT API/worker', 'admission fail-closed + real OS SIGTERM/SIGINT production lifecycle hook (API/worker roles)', 'runtime preflight', 'offline frozen install', 'isolated credential bootstrap', 'PostgreSQL 18.7 identity and fresh database', 'synthetic persistence marker bootstrap', 'db:roles', 'db:deploy', 'db:test-migrations', 'db:test-constraints', 'S3 bucket credentials preflight', 'full pnpm check', 'db:runtime-check', 'db:check', 'isolated database final invariants', 'PostgreSQL admin disconnect', 'redacted result write', 'browser lint/typecheck', 'browser typecheck', 'all production builds', 'real browser smoke']);
 function safeStep(name) {
   const base = typeof name === 'string' ? name.replace(/: (?:command outcome|lockfile invariant)$/, '') : '';
   if (!stepNames.has(base)) { throw new Error('Unapproved evidence step'); }
@@ -38,12 +38,21 @@ export function redactJson(name, value) {
     return result;
   }
   if (name === 'posix.json') {
-    return { node: enumValue(value.node, ['24.22.3']), platform: enumValue(value.platform, ['linux']), arch: enumValue(value.arch, ['x64']), databaseConnectionRefused: enumValue(value.databaseConnectionRefused, [true]), cases: value.cases.map(item => ({
-      role: enumValue(item.role, ['api', 'worker']), signal: enumValue(item.signal, ['SIGTERM', 'SIGINT']), exitCode: enumValue(item.exitCode, [0]), exitSignal: enumValue(item.exitSignal, [null]),
-      ...Object.fromEntries(['shutdownMs', 'started', 'shutdownStarted', 'shutdownCompleted', 'outputBytes', 'stderrBytes'].map(key => [key, numeric(item[key])])),
-      secretCanaryAbsent: enumValue(item.secretCanaryAbsent, [true]),
-      ...(item.role === 'api' ? { http: { live: { status: enumValue(item.http.live.status, [200]), marker: enumValue(item.http.live.marker, ['ok']) }, ready: { status: enumValue(item.http.ready.status, [503]), marker: enumValue(item.http.ready.marker, ['NOT_READY']) } } } : {}),
-    })) };
+    return {
+      node: enumValue(value.node, ['24.22.3']),
+      platform: enumValue(value.platform, ['linux']),
+      arch: enumValue(value.arch, ['x64']),
+      databaseConnectionRefused: enumValue(value.databaseConnectionRefused, [true]),
+      admissionRefusalWithoutProof: enumValue(value.admissionRefusalWithoutProof, [true]),
+      cases: value.cases.map(item => ({
+        role: enumValue(item.role, ['api', 'worker']),
+        signal: enumValue(item.signal, ['SIGTERM', 'SIGINT']),
+        exitCode: enumValue(item.exitCode, [0]),
+        exitSignal: enumValue(item.exitSignal, [null]),
+        ...Object.fromEntries(['shutdownMs', 'started', 'shutdownStarted', 'shutdownCompleted', 'outputBytes', 'stderrBytes'].map(key => [key, numeric(item[key])])),
+        secretCanaryAbsent: enumValue(item.secretCanaryAbsent, [true]),
+      })),
+    };
   }
   if (name === 'browser-smoke.json') {
     const cases = [];
