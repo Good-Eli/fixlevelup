@@ -110,12 +110,49 @@ function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layou
       docker(['cp', containerName + ':' + runtimeCheck.path, copiedFile], {
         safeFailure: 'Could not copy the reviewed runtime file for hash diagnostics',
       });
-      const actualRuntimeSha256 = createHash('sha256').update(readFileSync(copiedFile)).digest('hex');
+      const runtimeBytes = readFileSync(copiedFile);
+      const actualRuntimeSha256 = createHash('sha256').update(runtimeBytes).digest('hex');
+      const marker = Buffer.from('built on: ', 'ascii');
+      const markerOffset = runtimeBytes.indexOf(marker);
+      let opensslBuiltOn = null;
+      let sourceDateEpochMatch = null;
+      const searchStart = Math.floor(Date.parse('2026-11-21T06:00:00Z') / 1000);
+      const searchEnd = Math.floor(Date.parse('2026-11-21T07:00:00Z') / 1000);
+      if (markerOffset >= 0) {
+        const dateStart = markerOffset + marker.byteLength;
+        const dateEnd = runtimeBytes.indexOf(0, dateStart);
+        if (dateEnd > dateStart) {
+          opensslBuiltOn = runtimeBytes.subarray(dateStart, dateEnd).toString('ascii');
+          const dateLength = dateEnd - dateStart;
+          const probeBytes = Buffer.from(runtimeBytes);
+          const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+          const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+          for (let epoch = searchStart; epoch <= searchEnd; epoch++) {
+            const date = new Date(epoch * 1000);
+            const day = String(date.getUTCDate()).padStart(2, ' ');
+            const candidate = weekdays[date.getUTCDay()] + ' ' + months[date.getUTCMonth()] + ' ' + day
+              + ' ' + String(date.getUTCHours()).padStart(2, '0') + ':' + String(date.getUTCMinutes()).padStart(2, '0')
+              + ':' + String(date.getUTCSeconds()).padStart(2, '0') + ' ' + date.getUTCFullYear() + ' UTC';
+            if (candidate.length !== dateLength) { continue; }
+            probeBytes.write(candidate, dateStart, dateLength, 'ascii');
+            if (createHash('sha256').update(probeBytes).digest('hex') === runtimeCheck.sha256) {
+              sourceDateEpochMatch = new Date(epoch * 1000).toISOString();
+              break;
+            }
+          }
+        }
+      }
       runtimeEvidence = {
         runtimeFile: runtimeCheck.path,
         expectedRuntimeSha256: runtimeCheck.sha256,
         actualRuntimeSha256,
         runtimeShaMatches: actualRuntimeSha256 === runtimeCheck.sha256,
+        opensslBuiltOn,
+        sourceDateEpochSearch: {
+          startUtc: new Date(searchStart * 1000).toISOString(),
+          endUtc: new Date(searchEnd * 1000).toISOString(),
+          exactMatchUtc: sourceDateEpochMatch,
+        },
       };
     } catch {
       runtimeEvidence = {
