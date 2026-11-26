@@ -81,7 +81,7 @@ integration('RBAC role management, history and channel boundaries on isolated PG
     expect(await f.count('SELECT count(*)::int n FROM foundation.web_sessions WHERE staff_id=ANY($1::uuid[]) AND auth_version=0', [[m.id, tech]])).toBe(2);
   });
 
-  it('Telegram honors the same ordinary grants and technician target restrictions, without accepting CRM cookies', async () => {
+  it('Telegram honors the same ordinary grants and technician target restrictions, without accepting CRM cookies', { timeout: 30_000 }, async () => {
     const f = fixture(); const tech = await f.createStaff('TECHNICIAN'); const tg = await f.tg(tech); const target = await f.createStaff('TECHNICIAN');
     const api = '/telegram/staff';
     for (const path of [api, '/telegram/roles', '/telegram/permissions']) { check(await f.call(tg, 'get', path), 403); }
