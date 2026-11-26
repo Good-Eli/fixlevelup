@@ -40,8 +40,13 @@ BEGIN
         AND ROW(OLD.role_id,OLD.permission_code,OLD.scope_type) IS DISTINCT FROM ROW(NEW.role_id,NEW.permission_code,NEW.scope_type) THEN
         RAISE EXCEPTION 'Immutable request grant identity' USING ERRCODE='23514';
     END IF;
-    IF NOT NEW.enabled OR NEW.permission_code NOT IN ('requests.read','requests.create','requests.review',
+    IF NEW.permission_code NOT IN ('requests.read','requests.create','requests.review',
         'requests.coverage.assess','requests.contact.manage','requests.ready','requests.cancel') THEN RETURN NEW; END IF;
+    -- Runtime may revoke an existing request grant, but it may not INSERT even a
+    -- disabled placeholder or reactivate one. Otherwise a direct runtime INSERT
+    -- could reserve the unique (role, permission) key and poison a later reviewed
+    -- grant operation without ever becoming an effective permission.
+    IF TG_OP='UPDATE' AND NOT NEW.enabled THEN RETURN NEW; END IF;
     IF TG_OP='UPDATE' AND OLD.enabled AND ROW(OLD.role_id,OLD.permission_code,OLD.scope_type)
         IS NOT DISTINCT FROM ROW(NEW.role_id,NEW.permission_code,NEW.scope_type) THEN RETURN NEW; END IF;
     IF current_user<>'fixlevelup_migrator' OR current_database() COLLATE "C" !~
