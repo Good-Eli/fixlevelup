@@ -57,8 +57,9 @@ function run(name, args) {
   console.log(`Linux integration: ${name}`);
   let result;
   try {
+    // Nine serial CITY slices may consume 135 minutes in the full proof.
     result = spawnSync('corepack', ['pnpm', ...args], {
-      cwd: root, stdio: 'inherit', timeout: 600_000,
+      cwd: root, stdio: 'inherit', timeout: 9_600_000,
       // Do not detach children: the enclosing Docker lifecycle owns the process tree.
       killSignal: 'SIGKILL',
     });
