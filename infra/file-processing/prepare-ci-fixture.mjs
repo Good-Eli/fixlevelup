@@ -14,6 +14,8 @@ const baseImage = 'clamav/clamav:1.4.7_base@sha256:21622d96b8a7080af7974d99ca60a
 const opensslPrimary = 'B146647E45A7B33947AB226B2A2C87D161692D40';
 // Official BuildKit v0.35.1 multi-platform index, pinned by full digest.
 const buildkitImage = 'moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c';
+// Exact epoch recovered from the original reviewed scanner image; embedded libcrypto SHA verified locally.
+const scannerSourceDateEpoch = '1795305328';
 const patchFiles = [
   'f3acb0a3328046741479482c51cec815839e1b05',
   'c8f6d04f8e6d40b1bf83334e4a2ec9daf5943a3d',
@@ -335,6 +337,7 @@ try {
   mkdirSync(scannerLayoutPath, { recursive: true });
   mkdirSync(decoderLayoutPath, { recursive: true });
   command('docker', ['buildx', 'build', '--builder', buildxBuilderName, '--platform', 'linux/amd64',
+    '--build-arg', 'SOURCE_DATE_EPOCH=' + scannerSourceDateEpoch,
     '--output', 'type=oci,dest=' + scannerOciTarPath, '--load', '--metadata-file', scannerMetadataPath,
     '-f', resolve(root, 'infra/file-processing/ClamAV-libcrypto.Dockerfile'), '-t', scannerTag, inputDir], { inherit: true });
   command('docker', ['buildx', 'build', '--builder', buildxBuilderName, '--platform', 'linux/amd64',
