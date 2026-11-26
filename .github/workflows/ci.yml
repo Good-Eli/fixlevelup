@@ -204,6 +204,8 @@ jobs:
         run: node infra/p05-lab/lab.mjs s3image --rebuild
       - name: Start the dedicated private PostgreSQL 18.7 P05 lab
         run: node infra/p05-lab/lab.mjs up --image=s3
+      - name: Measure exact P05 S3 catalog pins on fresh PostgreSQL 18.7
+        run: node infra/p05-lab/lab.mjs s3measure
       - name: Run real F-01 DML and complete 432-cell CITY HTTPS proof
         run: |
           set -euo pipefail
