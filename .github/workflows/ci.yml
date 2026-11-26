@@ -406,6 +406,8 @@ jobs:
           corepack enable
           test "$(node --version)" = "v24.22.3"
           test "$(corepack pnpm --version)" = "12.21.0"
+      - name: Verify exact reviewed restore migration manifest
+        run: node infra/file-restore/verify-migration-manifest.mjs
       - name: Prepare redacted evidence directory
         run: |
           mkdir -p node_modules/.cache/ci-artifacts/p05-full
