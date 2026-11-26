@@ -31,7 +31,8 @@ interface Ports {
   /** Bounded phases of one normative inventory. Vitest's per-case cap would
    * otherwise truncate the walk. Each witness slice runs exactly the cells of
    * its six witnesses; the union over all phases is the full inventory. */
-  phase: 'witnesses-0' | 'witnesses-1' | 'witnesses-2' | 'roles' | 'denials';
+  phase: 'witnesses-0' | 'witnesses-1' | 'witnesses-2' | 'roles' | 'denials'
+    | 'city-admin-0' | 'city-admin-1' | 'city-admin-2' | 'city-manager-0' | 'city-manager-1' | 'city-manager-2' | 'city-custom-0' | 'city-custom-1' | 'city-custom-2';
   contact: { readonly name:string; readonly phone:string }; address: { readonly street:string; readonly building:string };
   send: (method:'GET'|'POST', path:string, body?:unknown, headers?:Record<string,string>) => Promise<Reply>;
   issue(): Promise<Form>;
