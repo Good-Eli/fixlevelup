@@ -344,6 +344,7 @@ export async function proveHttpMatrix(p:Ports): Promise<number> {
       // that same assigned CITY admin, so no unassigned GLOBAL principal is
       // accidentally used to create the witness or its replay targets.
       if (role==='admin') { await actors.setAdminScope('CITY'); }
+      else { await actors.setAdminScope('GLOBAL'); }
       const builder=role==='admin' ? actors.cityAdmin : actors.global;
       const window=witnesses.slice(slice*6,slice*6+6);
       expect(window).toHaveLength(6);
