@@ -154,7 +154,7 @@ function restoreTestDiagnostic(event: string, error?: unknown): void {
   const labStage = typeof value?.message === 'string'
     ? /^Synthetic lab restore failed: ([a-z0-9:-]{1,48})$/.exec(value.message)?.[1] : undefined;
   const expressionStage = typeof value?.message === 'string'
-    ? /^Unrecognised reviewed restore expression: ([a-z-]{1,40})(?:\s|$)/.exec(value.message)?.[1] : undefined;
+    ? /^Unrecognised reviewed restore expression: ([a-z0-9-]{1,96})(?:\s|$)/.exec(value.message)?.[1] : undefined;
   process.stderr.write(`[p05-restore-diagnostic] ${JSON.stringify({ event, name,
     ...(pgCode === undefined ? {} : { pgCode }), ...(labStage === undefined ? {} : { labStage }),
     ...(expressionStage === undefined ? {} : { expressionStage }) })}\n`);
