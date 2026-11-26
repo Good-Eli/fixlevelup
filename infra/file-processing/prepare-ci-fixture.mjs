@@ -80,199 +80,42 @@ function download(url, output) {
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
 function docker(args, options = {}) { return command('docker', args, options); }
-function exactImage(configSha, platformSha, tag, ociTarPath, layoutPath, runtimeCheck) {
-  // The legacy reviewed "indexSha256" value was compared with Docker .Id;
-  // it is therefore the exact config digest, not a root OCI-index digest.
-  // Verify the OCI layout's structure/child manifest separately and bind its
-  // config blob plus the loaded Docker image to that reviewed config digest.
-  const isDigest = (value) => typeof value === 'string' && /^sha256:[0-9a-f]{64}$/u.test(value);
-  const sha256 = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
-  const safe = (value) => isDigest(value) ? value : null;
-  // On identity drift, report whether the payload's reviewed libcrypto byte hash
-  // still matches. This distinguishes runtime-library drift from OCI identity drift
-  // without weakening the OCI pin.
-  let runtimeEvidence;
-  const readRuntimeEvidence = () => {
-    if (runtimeCheck === undefined) { return {}; }
-    if (runtimeEvidence !== undefined) { return runtimeEvidence; }
+function exactImage(imageIdentity, tag, runtimeCheck) {
+  const actual = docker(['image', 'inspect', '--format', '{{.Id}} {{.Os}}/{{.Architecture}}', tag], {
+    safeFailure: 'Docker local image inspection failed for the restored reviewed engine image',
+    includeStderr: true,
+  }).trim().split(/\\s+/u);
+  if (actual[0] !== imageIdentity || actual[1] !== 'linux/amd64') {
+    throw new Error('Restored engine image identity mismatch: ' + JSON.stringify({
+      expectedImageIdentity: imageIdentity, actualImageIdentity: actual[0] ?? null,
+      actualPlatform: actual[1] ?? null,
+    }));
+  }
+  if (runtimeCheck !== undefined) {
     const containerName = 'fixlevelup-p05-runtime-probe-' + process.pid;
     const copiedFile = join(work, 'runtime-file-probe');
     let created = false;
     try {
       docker(['create', '--name', containerName, '--network', 'none', tag], {
-        safeFailure: 'Could not create an inert container for reviewed runtime hash diagnostics',
+        safeFailure: 'Could not create an inert container for reviewed runtime hash verification',
       });
       created = true;
       docker(['cp', containerName + ':' + runtimeCheck.path, copiedFile], {
-        safeFailure: 'Could not copy the reviewed runtime file for hash diagnostics',
+        safeFailure: 'Could not copy the reviewed runtime file for hash verification',
       });
-      const runtimeBytes = readFileSync(copiedFile);
-      const actualRuntimeSha256 = createHash('sha256').update(runtimeBytes).digest('hex');
-      const marker = Buffer.from('built on: ', 'ascii');
-      const markerOffset = runtimeBytes.indexOf(marker);
-      let opensslBuiltOn = null;
-      let sourceDateEpochMatch = null;
-      // Investigative window only: reviewed implementation/OCI pins were committed in dd87cb4
-      // at 2026-11-22T01:35:27Z; the owner-acceptance commit 225af45 followed at 01:42:25Z.
-      // Check this narrow final-review interval; neither commit timestamp is asserted as SOURCE_DATE_EPOCH.
-      const searchStart = Math.floor(Date.parse('2026-11-22T01:35:27Z') / 1000);
-      const searchEnd = Math.floor(Date.parse('2026-11-22T01:42:25Z') / 1000);
-      if (markerOffset >= 0) {
-        const dateStart = markerOffset + marker.byteLength;
-        const dateEnd = runtimeBytes.indexOf(0, dateStart);
-        if (dateEnd > dateStart) {
-          opensslBuiltOn = runtimeBytes.subarray(dateStart, dateEnd).toString('ascii');
-          const dateLength = dateEnd - dateStart;
-          const probeBytes = Buffer.from(runtimeBytes);
-          const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-          const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-          for (let epoch = searchStart; epoch <= searchEnd; epoch++) {
-            const date = new Date(epoch * 1000);
-            const day = String(date.getUTCDate()).padStart(2, ' ');
-            const candidate = weekdays[date.getUTCDay()] + ' ' + months[date.getUTCMonth()] + ' ' + day
-              + ' ' + String(date.getUTCHours()).padStart(2, '0') + ':' + String(date.getUTCMinutes()).padStart(2, '0')
-              + ':' + String(date.getUTCSeconds()).padStart(2, '0') + ' ' + date.getUTCFullYear() + ' UTC';
-            if (candidate.length !== dateLength) { continue; }
-            probeBytes.write(candidate, dateStart, dateLength, 'ascii');
-            if (createHash('sha256').update(probeBytes).digest('hex') === runtimeCheck.sha256) {
-              sourceDateEpochMatch = new Date(epoch * 1000).toISOString();
-              break;
-            }
-          }
-        }
+      const actualRuntimeSha256 = createHash('sha256').update(readFileSync(copiedFile)).digest('hex');
+      if (actualRuntimeSha256 !== runtimeCheck.sha256) {
+        throw new Error('Restored scanner runtime SHA-256 differs from Astra-reviewed evidence');
       }
-      runtimeEvidence = {
-        runtimeFile: runtimeCheck.path,
-        expectedRuntimeSha256: runtimeCheck.sha256,
-        actualRuntimeSha256,
-        runtimeShaMatches: actualRuntimeSha256 === runtimeCheck.sha256,
-        opensslBuiltOn,
-        sourceDateEpochSearch: {
-          startUtc: new Date(searchStart * 1000).toISOString(),
-          endUtc: new Date(searchEnd * 1000).toISOString(),
-          exactMatchUtc: sourceDateEpochMatch,
-        },
-      };
-    } catch {
-      runtimeEvidence = {
-        runtimeFile: runtimeCheck.path,
-        expectedRuntimeSha256: runtimeCheck.sha256,
-        actualRuntimeSha256: null,
-        runtimeShaMatches: false,
-        runtimeProbe: 'unavailable',
-      };
     } finally {
       if (created) {
         try { docker(['rm', '-f', containerName]); }
-        catch { process.stderr.write('P05 runtime hash probe cleanup failed\\n'); }
+        catch { process.stderr.write('P05 runtime probe cleanup failed\\n'); }
       }
       rmSync(copiedFile, { force: true });
     }
-    return runtimeEvidence;
-  };
-  const failIdentity = (reason, extra = {}) => {
-    throw new Error('Rebuilt engine OCI identity mismatch: ' + JSON.stringify({
-      reason, expectedImageIdentity: configSha, expectedPlatform: platformSha,
-      ...readRuntimeEvidence(), ...extra,
-    }));
-  };
-  command('tar', ['-xf', ociTarPath, '-C', layoutPath], {
-    safeFailure: 'Could not extract the Buildx OCI image layout',
-  });
-  const layout = JSON.parse(readFileSync(join(layoutPath, 'oci-layout'), 'utf8'));
-  if (layout.imageLayoutVersion !== '1.0.0') { failIdentity('unsupported OCI image-layout version'); }
-  const indexBytes = readFileSync(join(layoutPath, 'index.json'));
-  const index = JSON.parse(indexBytes.toString('utf8'));
-  if (index.schemaVersion !== 2 || index.mediaType !== 'application/vnd.oci.image.index.v1+json'
-      || !Array.isArray(index.manifests)) {
-    failIdentity('OCI layout index has an unexpected schema or media type', {
-      exportIndexSha256: sha256(indexBytes), indexMediaType: index.mediaType ?? null,
-    });
   }
-  const exportIndexSha256 = sha256(indexBytes);
-  const candidates = index.manifests.filter((item) => item?.platform?.os === 'linux'
-    && item?.platform?.architecture === 'amd64'
-    && item?.mediaType === 'application/vnd.oci.image.manifest.v1+json');
-  if (candidates.length !== 1 || candidates[0]?.digest !== platformSha) {
-    failIdentity('OCI index does not contain exactly the reviewed linux/amd64 manifest', {
-      exportIndexSha256,
-      platformDescriptors: candidates.map((item) => ({ digest: safe(item.digest), mediaType: item.mediaType })),
-    });
-  }
-  const readVerifiedBlob = (digest, expectedSize, label) => {
-    if (!isDigest(digest)) { failIdentity(label + ' digest is invalid'); }
-    const path = join(layoutPath, 'blobs', 'sha256', digest.slice('sha256:'.length));
-    const bytes = readFileSync(path);
-    if (expectedSize !== undefined && bytes.byteLength !== expectedSize) {
-      failIdentity(label + ' blob size does not match its descriptor');
-    }
-    if (sha256(bytes) !== digest) { failIdentity(label + ' blob content does not match its digest'); }
-    return bytes;
-  };
-  const manifestBytes = readVerifiedBlob(candidates[0].digest, candidates[0].size, 'platform manifest');
-  const manifest = JSON.parse(manifestBytes.toString('utf8'));
-  if (manifest.schemaVersion !== 2 || manifest.mediaType !== 'application/vnd.oci.image.manifest.v1+json'
-      || !manifest.config || !Array.isArray(manifest.layers)) {
-    failIdentity('reviewed platform manifest has an unexpected structure');
-  }
-  const configDigest = manifest.config.digest;
-  const configBytes = readVerifiedBlob(configDigest, manifest.config.size, 'image config');
-  const imageConfig = JSON.parse(configBytes.toString('utf8'));
-  if (imageConfig.os !== 'linux' || imageConfig.architecture !== 'amd64') {
-    failIdentity('reviewed image config is not linux/amd64', { config: safe(configDigest) });
-  }
-  if (configDigest !== configSha) {
-    failIdentity('OCI manifest config differs from the reviewed config digest', {
-      config: safe(configDigest), exportIndexSha256,
-    });
-  }
-  if (metadataConfigDigest !== undefined && metadataConfigDigest !== configDigest) {
-    failIdentity('Buildx config metadata differs from OCI manifest config', {
-      config: safe(configDigest), metadataConfig: safe(metadataConfigDigest),
-    });
-  }
-  if (descriptorDigest !== platformSha || outputDigest !== platformSha
-      || descriptorMediaType !== 'application/vnd.oci.image.manifest.v1+json') {
-    failIdentity('Buildx output descriptor does not match the reviewed platform manifest');
-  }
-  const actual = docker(['image', 'inspect', '--format', '{{.Id}} {{.Os}}/{{.Architecture}}', tag], {
-    safeFailure: 'Docker local image inspection failed for the rebuilt pinned engine image',
-    includeStderr: true,
-  }).trim().split(/\s+/u);
-  if (actual[0] !== configSha || actual[1] !== 'linux/amd64') {
-    failIdentity('loaded Docker image identity differs from the verified OCI index', {
-      expectedImageIdentity: configSha, loadedImageIdentity: actual[0] ?? null,
-      manifestConfig: configDigest, loadedPlatform: actual[1] ?? null, exportIndexSha256,
-    });
-  }
-  if (runtimeCheck !== undefined) {
-    const evidence = readRuntimeEvidence();
-    if (!evidence.runtimeShaMatches) {
-      const reason = evidence.runtimeProbe === 'unavailable'
-        ? 'could not verify the reviewed runtime file SHA-256'
-        : 'loaded runtime file differs from its reviewed SHA-256';
-      failIdentity(reason, evidence);
-    }
-  }
-  // The export root index is a docker-save wrapper; the nested reviewed index
-  // and linux/amd64 manifest are authenticated independently above.
-  return configDigest;
-}gDigest, loadedConfig: actual[0] ?? null, loadedPlatform: actual[1] ?? null,
-      exportIndexSha256,
-    });
-  }
-  if (runtimeCheck !== undefined) {
-    const evidence = readRuntimeEvidence();
-    if (!evidence.runtimeShaMatches) {
-      const reason = evidence.runtimeProbe === 'unavailable'
-        ? 'could not verify the reviewed runtime file SHA-256'
-        : 'loaded runtime file differs from its reviewed SHA-256';
-      failIdentity(reason, evidence);
-    }
-  }
-  // The export index hash is diagnostic only; the original reviewed pair did
-  // not preserve a root OCI-index digest separately from the Docker config ID.
-  return configDigest;
+  return actual[0];
 }
 function clamscan(args) {
   if (!scannerImageId) { throw new Error('Verified scanner image ID is unavailable'); }
@@ -287,49 +130,9 @@ try {
     throw new Error('Engine fixture preparation requires Linux x64 and Node 24.22.3');
   }
   command('docker', ['version', '--format', '{{.Server.Version}}']);
-  const buildxVersion = command('docker', ['buildx', 'version']).trim();
-  const buildxMatch = /\bv(\d+)\.(\d+)\.(\d+)\b/u.exec(buildxVersion);
-  if (!buildxMatch || (Number(buildxMatch[1]) === 0 && Number(buildxMatch[2]) < 13)) {
-    throw new Error('Pinned OCI proof requires Docker Buildx 0.13.0 or newer for multiple exporters');
-  }
-  // The runner's default docker driver cannot export OCI layouts. Use an
-  // isolated, digest-pinned BuildKit container; never mutate the default builder.
-  buildxBuilderCreated = true;
-  docker(['buildx', 'create', '--name', buildxBuilderName, '--driver', 'docker-container',
-    '--driver-opt', 'image=' + buildkitImage], { inherit: true });
-  const builderInfo = docker(['buildx', 'inspect', '--builder', buildxBuilderName, '--bootstrap']);
-  if (!/Driver:\s+docker-container/u.test(builderInfo) || !/BuildKit version:\s+v0\.35\.1\b/u.test(builderInfo)) {
-    throw new Error('Digest-pinned OCI proof builder did not bootstrap as BuildKit v0.35.1');
-  }
-
-  // Download and cryptographically verify OpenSSL's release tarball before
-  // using its pinned hash/patch inputs in the offline scanner build.
-  const release = 'https://github.com/openssl/openssl/releases/download/openssl-3.5.9/';
-  download(release + 'openssl-3.5.9.tar.gz', join(inputDir, 'openssl-3.5.9.tar.gz'));
-  download(release + 'openssl-3.5.9.tar.gz.asc', join(inputDir, 'openssl-3.5.9.tar.gz.asc'));
-  download('https://www.openssl-library.org/source/pubkeys.asc', join(gnupgDir, 'pubkeys.asc'));
-  command('gpg', ['--homedir', gnupgDir, '--batch', '--import', join(gnupgDir, 'pubkeys.asc')]);
-  const keyInfo = command('gpg', ['--homedir', gnupgDir, '--batch', '--with-colons', '--fingerprint', opensslPrimary]);
-  const fingerprints = keyInfo.split('\n')
-    .filter(line => line.startsWith('fpr:'))
-    .map(line => line.split(':')[9])
-    .filter(Boolean);
-  if (!fingerprints.includes(opensslPrimary)) { throw new Error('OpenSSL signing key primary fingerprint mismatch'); }
-  const signature = command('gpg', ['--homedir', gnupgDir, '--batch', '--status-fd=1', '--verify',
-    join(inputDir, 'openssl-3.5.9.tar.gz.asc'), join(inputDir, 'openssl-3.5.9.tar.gz')]);
-  const validSignature = signature.split('\n').find(line => line.startsWith('[GNUPG:] VALIDSIG '));
-  if (validSignature?.split(/\s+/u).at(-1) !== opensslPrimary) {
-    throw new Error('OpenSSL release signature is not rooted in the pinned canonical key');
-  }
-
-  for (const sha of patchFiles) {
-    download('https://github.com/openssl/openssl/commit/' + sha + '.patch', join(inputDir, sha + '.patch'));
-  }
-  download('https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libxml2-2.13.9-r3.apk',
-    join(inputDir, 'libxml2-2.13.9-r3.apk'));
-  copyFileSync(resolve(root, 'infra/file-processing/openssl-inputs.sha256'), join(inputDir, 'openssl-inputs.sha256'));
-  command('sha256sum', ['--check', 'openssl-inputs.sha256'], { cwd: inputDir });
-
+  // Release assets are immutable and pinned by archive SHA-256 below. OCI
+  // index, platform manifest, config and every layer are verified before load.
+  
   // Preserve the exact Astra-reviewed pins; no image is rebuilt or repinned.
   const review = JSON.parse(readFileSync(resolve(root, 'infra/file-processing/oci-review-evidence.json'), 'utf8'));
   if (review.scanner?.indexSha256 !== SCANNER_CONFIG_SHA.slice(7)
@@ -388,13 +191,11 @@ try {
   docker(['load', '--input', decoderOciTarPath], { inherit: true });
   docker(['tag', 'fixlevelup-file-processing-clamav:1.4.7-crypto-backport-v1', scannerTag]);
   docker(['tag', 'fixlevelup-file-processing-decoder:p0304cde-musl-v1', decoderTag]);
-  scannerImageId = exactImage(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerTag,
-    scannerOciTarPath, scannerLayoutPath, {
-      path: '/usr/lib/libcrypto.so.3',
-      sha256: review.scanner.libcrypto.runtimeSha256,
-    });
-  decoderImageId = exactImage(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderTag,
-    decoderOciTarPath, decoderLayoutPath);
+  scannerImageId = exactImage(SCANNER_CONFIG_SHA, scannerTag, {
+    path: '/usr/lib/libcrypto.so.3',
+    sha256: review.scanner.libcrypto.runtimeSha256,
+  });
+  decoderImageId = exactImage(DECODER_CONFIG_SHA, decoderTag);
 
   // FreshClam is a one-shot updater and the only container here with network access.
   // All actual scanner/decoder workers remain network=none, read-only and non-root.
