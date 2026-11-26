@@ -331,6 +331,57 @@ export async function proveHttpMatrix(p:Ports): Promise<number> {
       expect(await lab.count(`SELECT count(*)::int n FROM foundation.requests WHERE status=ANY($1::text[])`,[futureStates])).toBe(0);
       return observed;
     }
+    const cityPhase=/^city-(admin|manager|custom)-([0-2])$/.exec(p.phase);
+    if (cityPhase) {
+      const role=cityPhase[1];
+      const slice=Number(cityPhase[2]);
+      const actor=role==='admin' ? actors.cityAdmin : role==='manager' ? actors.manager : actors.custom;
+      // A SYSTEM ADMIN's grants are role-wide. Convert the reviewed ADMIN rows
+      // to CITY for this entire phase; build and mutating requests are issued by
+      // that same assigned CITY admin, so no unassigned GLOBAL principal is
+      // accidentally used to create the witness or its replay targets.
+      if (role==='admin') { await actors.setAdminScope('CITY'); }
+      const builder=role==='admin' ? actors.cityAdmin : actors.global;
+      const window=witnesses.slice(slice*6,slice*6+6);
+      expect(window).toHaveLength(6);
+      for (const w of window) {
+        const {target,initial}=await build(w,builder);
+        const labelPrefix=`${role.toUpperCase()} CITY/${w.label}`;
+        const cityTag=(await view(target,actor,`${labelPrefix}/GET`)).etag;
+        const denialInventory=await inventory();
+        // All state-inapplicable commands are executed on the same untouched
+        // target under the real CITY principal. Each refusal must preserve its
+        // request snapshot and every durable/audit/outbox inventory counter.
+        for (const cmd of byStaff) {
+          const decision=expectedMutation(w,'STAFF',cmd);
+          if (!('http' in decision)) { continue; }
+          const label=`${labelPrefix}/${cmd}/expected-${decision.code}`;
+          const request=prepared(target,initial,cmd,actor,cityTag);
+          deny(await request.apply(),decision.http,decision.code,label);
+          observed++;
+        }
+        expect(await inventory(),`${labelPrefix}/refusals have no effects`).toEqual(denialInventory);
+        expect(await p.capture(target.id),`${labelPrefix}/refusals preserve state`).toEqual(initial);
+
+        // Every executable cell gets a fresh lawful witness. This avoids SQL
+        // rewinds and prevents one successful command from changing the state
+        // tested by the next command. The independent oracle decides the exact
+        // success effect; the actual HTTP request is authenticated as this CITY role.
+        for (const cmd of byStaff) {
+          const decision=expectedMutation(w,'STAFF',cmd);
+          if ('http' in decision) { continue; }
+          const fresh=await build(w,builder);
+          const label=`${labelPrefix}/${cmd}/allowed`;
+          const etag=(await view(fresh.target,actor,label)).etag;
+          await applyMutation(fresh.target,fresh.initial,cmd,actor,etag,decision,label);
+          observed++;
+        }
+        p.progress(`${role}-city-witness-complete`,observed);
+      }
+      expect(observed).toBe(window.length*byStaff.length);
+      return observed;
+    }
+
     if (p.phase==='roles') {
       // Repeat each operation and distinct create shape under the three other
       // authorized grant shapes. The state axis above is independent of RBAC;
