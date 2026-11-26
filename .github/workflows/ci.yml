@@ -59,7 +59,7 @@ jobs:
         id: linux-run
         run: |
           set -euo pipefail
-          node infra/ci/docker.mjs run --name fixlevelup-linux-proof-ci-${GITHUB_RUN_ID} --network none --cpus 2 --memory 4g fixlevelup-linux-proof:ci-${GITHUB_RUN_ID}
+          node infra/ci/docker.mjs run --name fixlevelup-linux-proof-ci-${GITHUB_RUN_ID} --network none --cpus 2 --memory 5g fixlevelup-linux-proof:ci-${GITHUB_RUN_ID}
       - name: Copy redacted Linux proof evidence
         id: evidence
         if: always()
