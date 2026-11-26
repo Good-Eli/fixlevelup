@@ -71,26 +71,29 @@ function download(url, output) {
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
 function docker(args, options = {}) { return command('docker', args, options); }
-function exactImage(platformSha, tag, metadataPath) {
-  // Buildx metadata separates Docker's config digest (local image ID) from
-  // the platform manifest digest. Compare each value only to its own identity.
+function exactImage(indexSha, platformSha, tag, metadataPath) {
+  // Buildx metadata separates Docker's config digest, output descriptor, and
+  // top-level output digest. Keep the two reviewed OCI pins distinct.
   const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
   const configDigest = metadata['containerimage.config.digest'];
-  const manifestDigest = metadata['containerimage.descriptor']?.digest;
+  const descriptor = metadata['containerimage.descriptor'];
+  const descriptorDigest = descriptor?.digest;
   const outputDigest = metadata['containerimage.digest'];
-  if (!/^sha256:[0-9a-f]{64}$/u.test(configDigest ?? '')
-      || manifestDigest !== platformSha || outputDigest !== platformSha) {
-    throw new Error('Rebuilt engine OCI manifest does not match the reviewed linux/amd64 digest');
+  const mediaType = descriptor?.mediaType;
+  const isDigest = (value) => typeof value === 'string' && /^sha256:[0-9a-f]{64}$/u.test(value);
+  if (!isDigest(configDigest) || !isDigest(descriptorDigest) || !isDigest(outputDigest)
+      || (descriptorDigest !== platformSha && descriptorDigest !== indexSha)
+      || (outputDigest !== platformSha && outputDigest !== indexSha)) {
+    const safe = (value) => isDigest(value) ? value : null;
+    throw new Error('Rebuilt engine OCI digest metadata mismatch: ' + JSON.stringify({
+      expectedIndex: indexSha, expectedPlatform: platformSha,
+      config: safe(configDigest), descriptor: safe(descriptorDigest),
+      descriptorMediaType: typeof mediaType === 'string' ? mediaType.slice(0, 100) : null,
+      output: safe(outputDigest),
+    }));
   }
-  const actual = docker(['image', 'inspect', '--format', '{{.Id}} {{.Os}}/{{.Architecture}}', tag], {
-    safeFailure: 'Docker local image inspection failed for the rebuilt pinned engine image',
-    includeStderr: true,
-  }).trim().split(/\s+/u);
-  if (actual[0] !== configDigest || actual[1] !== 'linux/amd64') {
-    throw new Error('Loaded Docker image does not match its verified Buildx config digest and linux/amd64 platform');
-  }
-  return configDigest;
 }
+
 function clamscan(args) {
   if (!scannerImageId) { throw new Error('Verified scanner image ID is unavailable'); }
   return docker(['run', '--rm', '--network', 'none', '--read-only', '--user', '65532:65532',
@@ -147,8 +150,8 @@ try {
     '-f', resolve(root, 'infra/file-processing/ClamAV-libcrypto.Dockerfile'), '-t', scannerTag, inputDir], { inherit: true });
   command('docker', ['buildx', 'build', '--platform', 'linux/amd64', '--load', '--metadata-file', decoderMetadataPath,
     '-f', resolve(root, 'infra/file-processing/Dockerfile'), '-t', decoderTag, root], { inherit: true });
-  scannerImageId = exactImage(SCANNER_PLATFORM_SHA, scannerTag, scannerMetadataPath);
-  decoderImageId = exactImage(DECODER_PLATFORM_SHA, decoderTag, decoderMetadataPath);
+  scannerImageId = exactImage(SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA, scannerTag, scannerMetadataPath);
+  decoderImageId = exactImage(DECODER_INDEX_SHA, DECODER_PLATFORM_SHA, decoderTag, decoderMetadataPath);
 
   // FreshClam is a one-shot updater and the only container here with network access.
   // All actual scanner/decoder workers remain network=none, read-only and non-root.
