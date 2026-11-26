@@ -260,19 +260,19 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
       restoreTestDiagnostic('archive-restore-failed', error);
       throw error;
     }
-    let epochResult: Awaited<ReturnType<typeof conn.query<{ db: string; namespace: string; epoch: string; mode: string; connect: boolean; primary: boolean; oid: string }>>>;
+    let epoch: { db: string; namespace: string; epoch: string; mode: string; connect: boolean; primary: boolean; oid: string } | undefined;
     try {
-      epochResult = await conn.query<{ db: string; namespace: string; epoch: string; mode: string; connect: boolean; primary: boolean; oid: string }>(`SELECT
+      const result = await conn.query<{ db: string; namespace: string; epoch: string; mode: string; connect: boolean; primary: boolean; oid: string }>(`SELECT
       current_database() AS db,namespace_id::text AS namespace,epoch::text,mode,
       NOT pg_is_in_recovery() AS primary,
       (SELECT oid::text FROM pg_database WHERE datname=current_database()) AS oid,
       has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT') AS connect
       FROM foundation.file_runtime_epochs WHERE singleton`);
+      epoch = result.rows[0];
     } catch (error) {
       restoreTestDiagnostic('target-epoch-query-failed', error);
       throw error;
     }
-    const epoch = epochResult.rows[0];
     const epochFailure = epoch === undefined ? 'missing' : !epoch.primary ? 'not-primary'
       : epoch.db !== manifest.destinationDatabase ? 'database-mismatch'
       : epoch.namespace !== old.namespace ? 'namespace-mismatch'
