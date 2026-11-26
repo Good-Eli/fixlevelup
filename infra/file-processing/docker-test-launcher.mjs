@@ -6,12 +6,13 @@ import { lstat, realpath, readdir } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// These two legacy evidence values were checked against Docker ImageInspect.Id
-// by the original launcher; they are config digests, despite the old JSON key
-// "indexSha256". Keep the reviewed bytes unchanged and verify them as config IDs.
-export const SCANNER_CONFIG_SHA = 'sha256:39f936f37a24b0b4658414230bcefa6b52de3a57c42ac88caed0ec6c09317883';
+// OCI index and platform-manifest digests are review pins. Docker ImageInspect.Id
+// is the image config digest; keep all three identities distinct and explicit.
+export const SCANNER_INDEX_SHA = 'sha256:39f936f37a24b0b4658414230bcefa6b52de3a57c42ac88caed0ec6c09317883';
+export const SCANNER_CONFIG_SHA = 'sha256:cad992035d8d21c23c7c15583ea1d01bf297eec3b64c909f9d66458e0227f1f4';
 export const SCANNER_PLATFORM_SHA = 'sha256:7c58440c10859ec126d4bba5a5f260cc467395d640c193a5197b1da12073e9f8';
-export const DECODER_CONFIG_SHA = 'sha256:7162306fb4f11234456de8471a3299267f020f7be64f4720c4c9586ca8ee5f68';
+export const DECODER_INDEX_SHA = 'sha256:7162306fb4f11234456de8471a3299267f020f7be64f4720c4c9586ca8ee5f68';
+export const DECODER_CONFIG_SHA = 'sha256:42087cc73f621602fe27be9125a5c735e963dd55bcf984f51630cb909ad52343';
 export const DECODER_PLATFORM_SHA = 'sha256:8a0b65bc02e28cab840ea184bc193862ac2806cf02184d6e79df25522d3e23fc';
 // Local infrastructure ceilings, not file-processing policy defaults.
 const controlRpcMs = 2500;
