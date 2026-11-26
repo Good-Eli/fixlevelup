@@ -45,6 +45,7 @@ describe('closed v1 file-ledger graph codec', () => {
 describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('isolated real PostgreSQL file ledger + independent floor', () => {
   const databases = { ledger: 'fixlevelup_file_ledger', floor: 'fixlevelup_file_floor' };
   const pools: Pool[] = [];
+  const backgroundPoolErrors: string[] = [];
   /** Disposable database names created by THIS run on the docker test containers:
    * pushed exactly when the run's CREATE DATABASE succeeded (CREATE is the reuse
    * guard, so a successful CREATE proves this run owns that database). */
@@ -60,6 +61,11 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
     if (!password || !/^[0-9a-f]{64}$/.test(password)) {throw new Error('INVALID_SYNTHETIC_LEDGER_CREDENTIAL_CONFIG');}
     const p = new Pool({ user, password, database, host: '127.0.0.1', port: kind === 'ledger' ? 55433 : 55434, max: 4,
       connectionTimeoutMillis: 5_000, statement_timeout: 10_000 });
+    // Idle-client socket errors must be observed and asserted during teardown,
+    // never escape Vitest as process-level unhandled errors.
+    p.on('error', (error) => {
+      backgroundPoolErrors.push(typeof error.code === 'string' ? error.code : 'PG_POOL_ERROR');
+    });
     pools.push(p);
     return p;
   };
@@ -102,11 +108,17 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
   const dropCreatedDatabases = async (): Promise<void> => {
     for (const db of createdLedgerDbs.splice(0)) {
       if (!/^file_ledger_proof_[a-f0-9]{24}$/.test(db)) { throw new Error('SYNTHETIC_LEDGER_REFUSING_NON_FIXTURE_DROP'); }
-      await ledgerAdmin.query(`DROP DATABASE IF EXISTS "${db}" WITH (FORCE)`);
+      const active = await ledgerAdmin.query<{ pid: number }>(
+        'SELECT pid FROM pg_stat_activity WHERE datname=$1', [db]);
+      if (active.rowCount !== 0) { throw new Error('SYNTHETIC_LEDGER_DISPOSABLE_DATABASE_HAS_OPEN_SESSIONS'); }
+      await ledgerAdmin.query(`DROP DATABASE IF EXISTS "${db}"`);
     }
     for (const db of createdFloorDbs.splice(0)) {
       if (!/^file_floor_proof_[a-f0-9]{24}$/.test(db)) { throw new Error('SYNTHETIC_LEDGER_REFUSING_NON_FIXTURE_DROP'); }
-      await floorAdmin.query(`DROP DATABASE IF EXISTS "${db}" WITH (FORCE)`);
+      const active = await floorAdmin.query<{ pid: number }>(
+        'SELECT pid FROM pg_stat_activity WHERE datname=$1', [db]);
+      if (active.rowCount !== 0) { throw new Error('SYNTHETIC_LEDGER_DISPOSABLE_DATABASE_HAS_OPEN_SESSIONS'); }
+      await floorAdmin.query(`DROP DATABASE IF EXISTS "${db}"`);
     }
   };
   beforeAll(() => {
@@ -117,23 +129,24 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
     ledger = makeLedger(writer, signer, operator);
   });
   afterAll(async () => {
-    // End every pool of this run except the two admin pools (they run the drops),
-    // then drop exactly the disposable databases this run created, then close them.
-    // The two standing databases of the docker test containers are never dropped.
+    // Close every non-admin pool completely before touching its disposable DB.
+    // If any pool fails to close, do not force-drop its DB: that would SIGTERM
+    // live clients and turn a cleanup defect into Vitest unhandled 57P01 errors.
     const droppers = [ledgerAdmin, floorAdmin];
-    const droppersEnded = [false, false];
     try {
-      await Promise.all(pools.map(async (p) => {
-        if (p !== ledgerAdmin && p !== floorAdmin) { await p.end(); }
-      }));
+      const closing = await Promise.allSettled(pools
+        .filter((p) => p !== ledgerAdmin && p !== floorAdmin).map((p) => p.end()));
+      if (closing.some((result) => result.status === 'rejected')) {
+        throw new Error('SYNTHETIC_LEDGER_POOL_CLOSE_FAILED');
+      }
+      if (backgroundPoolErrors.length > 0) {
+        throw new Error('SYNTHETIC_LEDGER_BACKGROUND_CONNECTION_ERROR');
+      }
+      await dropCreatedDatabases();
     } finally {
-      try {
-        await dropCreatedDatabases();
-      } finally {
-        // Idempotent end for the admin pools: pg throws on double end.
-        await Promise.all(droppers.map(async (p, index) => {
-          if (!droppersEnded[index]) { droppersEnded[index] = true; await p.end(); }
-        }));
+      const closingDroppers = await Promise.allSettled(droppers.map((p) => p.end()));
+      if (closingDroppers.some((result) => result.status === 'rejected')) {
+        throw new Error('SYNTHETIC_LEDGER_ADMIN_POOL_CLOSE_FAILED');
       }
     }
   });
