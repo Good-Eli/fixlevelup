@@ -29,8 +29,8 @@ const deny = (stage) => {
 
 // The inputs are an immutable reviewed SQL set, not arbitrary PostgreSQL SQL.
 // Handle nested parentheses and doubled SQL quote escapes; refuse ambiguity.
-function parenthesized(sql, start) {
-  if (sql[start] !== '(') { return deny('expression-open'); }
+function parenthesized(sql, start, stage = 'expression') {
+  if (sql[start] !== '(') { return deny(`${stage}-open`); }
   let depth = 0;
   let quote = '';
   for (let i = start; i < sql.length; i++) {
@@ -42,7 +42,7 @@ function parenthesized(sql, start) {
     else if (ch === '(') { depth++; }
     else if (ch === ')' && --depth === 0) { return sql.slice(start, i + 1); }
   }
-  return deny('expression-unclosed');
+  return deny(`${stage}-unclosed`);
 }
 
 export async function restoreReviewedExpressions(source, destination, expectedDatabase, legacyProfile, rehearsal) {
@@ -62,7 +62,9 @@ export async function restoreReviewedExpressions(source, destination, expectedDa
   const allFiles = migrations.map(name => readFileSync(resolve(dir, name, 'migration.sql'), 'utf8').replaceAll('\r\n','\n'));
   const manifest = migrations.map((name, i) => `${name}:${digest(allFiles[i])}`);
   const pinned = MANIFESTS.get(migrations.length);
-  if (pinned === undefined || digest(manifest.join('\n')) !== pinned) { deny('migration-manifest'); }
+  if (pinned === undefined) { deny(`migration-count-${migrations.length}`); }
+  const actualManifest = digest(manifest.join('\n'));
+  if (actualManifest !== pinned) { deny(`migration-manifest-${migrations.length}-${actualManifest}`); }
   if (legacy && (migrations[S0_COUNT - 1] !== S0_HEAD || digest(manifest.slice(0, S0_COUNT).join('\n')) !== S0_MANIFEST)) {
     deny('legacy-evidence-pin');
   }
@@ -80,7 +82,7 @@ export async function restoreReviewedExpressions(source, destination, expectedDa
   for (const sql of files) {
     for (const m of sql.matchAll(/\bCONSTRAINT\s+"?([a-z_][a-z0-9_]*)"?\s+CHECK\s*\(/giu)) {
       // Later reviewed migrations replace certain named CHECKs (notably role_permissions_scope_check).
-      reviewed.set(m[1], parenthesized(sql, m.index + m[0].length - 1));
+      reviewed.set(m[1], parenthesized(sql, m.index + m[0].length - 1, 'named-check-expression'));
     }
     // Associate every CHECK(...) in the reviewed SQL with the nearest preceding
     // CREATE TABLE / ALTER TABLE target; that is the table whose constraint list
@@ -92,7 +94,7 @@ export async function restoreReviewedExpressions(source, destination, expectedDa
       const body = sql.slice(from, to);
       for (const check of body.matchAll(/\bCHECK\s*(\()/gu)) {
         try {
-          addCandidate(statement[1], parenthesized(body, check.index + check[0].length - 1));
+          addCandidate(statement[1], parenthesized(body, check.index + check[0].length - 1, 'unnamed-check-expression'));
         } catch { /* not a plain parenthesised expression: ignored as a candidate */ }
       }
     }
@@ -112,7 +114,7 @@ export async function restoreReviewedExpressions(source, destination, expectedDa
   if (!legacy) {
     const waiting = waitingSql[0].match(/is_waiting_link boolean GENERATED ALWAYS AS\s*(\()/u);
     if (!waiting) { deny('waiting-expression'); }
-    expression = parenthesized(waitingSql[0], waiting.index + waiting[0].length - 1);
+    expression = parenthesized(waitingSql[0], waiting.index + waiting[0].length - 1, 'generated-expression');
   }
   // This extra contour repairs PostgreSQL's logical-restore deparse drift
   // on one closed synthetic rehearsal DB. It cannot open a file-restore target
