@@ -5,8 +5,8 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
-import { DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA,
-  syntheticSnapshotDigest } from './docker-test-launcher.mjs';
+import { DECODER_CONFIG_SHA, DECODER_INDEX_SHA, DECODER_PLATFORM_SHA, SCANNER_CONFIG_SHA,
+  SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA, syntheticSnapshotDigest } from './docker-test-launcher.mjs';
 
 const root = resolve(import.meta.dirname, '../..');
 const cacheRoot = resolve(root, 'node_modules/.cache/p0304cde');
@@ -121,9 +121,9 @@ try {
   
   // Preserve the exact Astra-reviewed pins; no image is rebuilt or repinned.
   const review = JSON.parse(readFileSync(resolve(root, 'infra/file-processing/oci-review-evidence.json'), 'utf8'));
-  if (review.scanner?.indexSha256 !== SCANNER_CONFIG_SHA.slice(7)
+  if (review.scanner?.indexSha256 !== SCANNER_INDEX_SHA.slice(7)
       || review.scanner?.linuxAmd64ManifestSha256 !== SCANNER_PLATFORM_SHA.slice(7)
-      || review.decoder?.indexSha256 !== DECODER_CONFIG_SHA.slice(7)
+      || review.decoder?.indexSha256 !== DECODER_INDEX_SHA.slice(7)
       || review.decoder?.linuxAmd64ManifestSha256 !== DECODER_PLATFORM_SHA.slice(7)
       || review.scanner?.libcrypto?.runtimeSha256 !== 'ffe3c003b7685b0d589c94b4ba58df70a1d6d792e3b08a85f17bbd9b97bd429a') {
     throw new Error('Pinned OCI identities/runtime do not match the reviewed OCI evidence');
@@ -144,9 +144,13 @@ try {
     const rootIndex = JSON.parse(readFileSync(join(layoutPath, 'index.json'), 'utf8'));
     if (layout.imageLayoutVersion !== '1.0.0' || rootIndex.schemaVersion !== 2
         || rootIndex.mediaType !== 'application/vnd.oci.image.index.v1+json'
-        || !Array.isArray(rootIndex.manifests)) throw new Error('Reviewed OCI archive root layout is invalid');
+        || !Array.isArray(rootIndex.manifests)) {
+      throw new Error('Reviewed OCI archive root layout is invalid');
+    }
     const blob = (digest, size, label) => {
-      if (!/^sha256:[0-9a-f]{64}$/u.test(digest)) throw new Error(label + ' digest invalid');
+      if (!/^sha256:[0-9a-f]{64}$/u.test(digest)) {
+        throw new Error(label + ' digest invalid');
+      }
       const bytes = readFileSync(join(layoutPath, 'blobs', 'sha256', digest.slice(7)));
       if (bytes.length !== size || 'sha256:' + createHash('sha256').update(bytes).digest('hex') !== digest) {
         throw new Error(label + ' blob digest/size mismatch');
@@ -155,25 +159,40 @@ try {
     };
     const nested = rootIndex.manifests.filter(x => x.digest === imageIdentity
       && x.mediaType === 'application/vnd.oci.image.index.v1+json');
-    if (nested.length !== 1) throw new Error('Reviewed nested OCI index descriptor missing/ambiguous');
+    if (nested.length !== 1) {
+      throw new Error('Reviewed nested OCI index descriptor missing/ambiguous');
+    }
     const inner = JSON.parse(blob(nested[0].digest, nested[0].size, 'nested OCI index').toString('utf8'));
     if (inner.schemaVersion !== 2 || inner.mediaType !== 'application/vnd.oci.image.index.v1+json'
-        || !Array.isArray(inner.manifests)) throw new Error('Nested OCI index is invalid');
+        || !Array.isArray(inner.manifests)) {
+      throw new Error('Nested OCI index is invalid');
+    }
     const manifests = inner.manifests.filter(x => x.digest === platform
       && x.mediaType === 'application/vnd.oci.image.manifest.v1+json'
       && x.platform?.os === 'linux' && x.platform?.architecture === 'amd64');
-    if (manifests.length !== 1) throw new Error('Reviewed linux/amd64 manifest missing/ambiguous');
+    if (manifests.length !== 1) {
+      throw new Error('Reviewed linux/amd64 manifest missing/ambiguous');
+    }
     const manifest = JSON.parse(blob(manifests[0].digest, manifests[0].size, 'platform manifest').toString('utf8'));
     if (manifest.schemaVersion !== 2 || manifest.mediaType !== 'application/vnd.oci.image.manifest.v1+json'
-        || !manifest.config || !Array.isArray(manifest.layers)) throw new Error('Platform manifest invalid');
+        || !manifest.config || !Array.isArray(manifest.layers)) {
+      throw new Error('Platform manifest invalid');
+    }
     const configBytes = blob(manifest.config.digest, manifest.config.size, 'image config');
     const config = JSON.parse(configBytes.toString('utf8'));
-    if (config.os !== 'linux' || config.architecture !== 'amd64') throw new Error('Image config platform mismatch');
-    for (const layer of manifest.layers) blob(layer.digest, layer.size, 'image layer');
+    if (config.os !== 'linux' || config.architecture !== 'amd64') {
+      throw new Error('Image config platform mismatch');
+    }
+    for (const layer of manifest.layers) {
+      blob(layer.digest, layer.size, 'image layer');
+    }
     return manifest.config.digest;
   };
-  const scannerConfigDigest = verifyArchive(SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA, scannerLayoutPath);
-  const decoderConfigDigest = verifyArchive(DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA, decoderLayoutPath);
+  const scannerConfigDigest = verifyArchive(SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA, scannerLayoutPath);
+  const decoderConfigDigest = verifyArchive(DECODER_INDEX_SHA, DECODER_PLATFORM_SHA, decoderLayoutPath);
+  if (scannerConfigDigest !== SCANNER_CONFIG_SHA || decoderConfigDigest !== DECODER_CONFIG_SHA) {
+    throw new Error('Reviewed OCI config digest does not match the pinned platform image config');
+  }
   docker(['load', '--input', scannerOciTarPath], { inherit: true });
   docker(['load', '--input', decoderOciTarPath], { inherit: true });
   docker(['tag', 'fixlevelup-file-processing-clamav:1.4.7-crypto-backport-v1', scannerTag]);
