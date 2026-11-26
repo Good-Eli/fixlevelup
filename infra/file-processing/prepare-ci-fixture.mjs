@@ -3,7 +3,7 @@
 // Fails closed on ANY image/platform digest drift; this script never changes pins.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { DECODER_IMAGE, DECODER_PLATFORM_SHA, SCANNER_IMAGE, SCANNER_PLATFORM_SHA,
   syntheticSnapshotDigest } from './docker-test-launcher.mjs';
