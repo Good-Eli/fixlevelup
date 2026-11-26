@@ -282,10 +282,9 @@ labIntegration('P05 S3 database boundary for request capability grants', () => {
     { timeout: 120_000 }, async () => {
       fixture = await createConfigurationFixture();
       const current = fixture;
-      const roleId = (await current.migrator.query<{ id: string }>(
-        "SELECT id FROM foundation.roles WHERE role_type='SYSTEM' AND code='MANAGER' AND status='ACTIVE'"))
-        .rows[0]?.id;
-      if (!roleId) { throw new Error('Missing active SYSTEM MANAGER role fixture'); }
+      const roleId = randomUUID();
+      await current.migrator.query('INSERT INTO foundation.roles(id,code,name) VALUES ($1,$2,$3)',
+        [roleId, `CUSTOM_F01_GRANT_${roleId.slice(0,8).toUpperCase()}`, 'F-01 request grant guard fixture']);
       await current.migrator.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type,enabled)
         VALUES ($1,'requests.review','CITY',true),($1,'requests.create','CITY',false)`, [roleId]);
 
