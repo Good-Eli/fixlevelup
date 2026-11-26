@@ -2,7 +2,8 @@ import type { Client, QueryResultRow } from 'pg';
 import { P04_CAPABILITIES } from '../../authz/capability.js';
 
 const S3_SETTINGS_PIN = '5d51e88aaf1d3b95476e6576d1fad431554816446dc5799445b03819e0599574';
-const S3_CATALOG_PIN = 'a91b68bb9bc9948f1183693186674b68adf643766337c9a1c97d780119ec2a57';
+// Includes the migration-024 request_role_grant_guard trigger/function measured in the isolated S3 lab.
+const S3_CATALOG_PIN = 'a1400f3e7e922fedeee48fac1cc409937869bd6311d4f451cf9fb78f7da6a9d0';
 
 export interface ReadinessRow {
   database: string;
