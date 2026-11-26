@@ -3,9 +3,9 @@
 // Fails closed on ANY image/platform digest drift; this script never changes pins.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
-import { DECODER_IMAGE, DECODER_PLATFORM_SHA, SCANNER_IMAGE, SCANNER_PLATFORM_SHA,
+import { DECODER_INDEX_SHA, DECODER_PLATFORM_SHA, SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA,
   syntheticSnapshotDigest } from './docker-test-launcher.mjs';
 
 const root = resolve(import.meta.dirname, '../..');
@@ -30,7 +30,11 @@ const descriptorDir = join(cacheRoot, 'engines-ci-' + runId);
 const descriptorPath = join(descriptorDir, 'worker-fixture-backport-v1.json');
 const scannerTag = 'fixlevelup-p05-clamav-ci:' + runId;
 const decoderTag = 'fixlevelup-p05-decoder-ci:' + runId;
+const scannerMetadataPath = join(work, 'scanner-build-metadata.json');
+const decoderMetadataPath = join(work, 'decoder-build-metadata.json');
 const updaterName = 'fixlevelup-p05-defs-' + runId;
+let scannerImageId;
+let decoderImageId;
 mkdirSync(inputDir, { recursive: true });
 mkdirSync(updateDir, { recursive: true });
 chmodSync(updateDir, 0o777); // FreshClam runs as UID 65534, not as root.
@@ -67,25 +71,32 @@ function download(url, output) {
   if (statSync(output).size < 1) { throw new Error('Empty pinned input download'); }
 }
 function docker(args, options = {}) { return command('docker', args, options); }
-function exactImage(imageId, platformSha, tag) {
-  const actualImageId = docker(['image', 'inspect', '--format', '{{.Id}}', tag], {
-    safeFailure: 'Docker image-ID inspection failed for the rebuilt pinned engine image',
-    includeStderr: true,
-  }).trim();
-  const platform = docker(['image', 'inspect', '--platform', 'linux/amd64',
-    '--format', '{{.Os}}/{{.Architecture}} {{.Descriptor.digest}}', tag], {
-    safeFailure: 'Docker platform-descriptor inspection failed for the rebuilt pinned engine image',
-    includeStderr: true,
-  }).trim();
-  if (actualImageId !== imageId || platform !== 'linux/amd64 ' + platformSha) {
-    throw new Error('Reviewed engine image identity mismatch; independent OCI review is required for a changed image');
+function exactImage(platformSha, tag, metadataPath) {
+  // Buildx metadata separates Docker's config digest (local image ID) from
+  // the platform manifest digest. Compare each value only to its own identity.
+  const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+  const configDigest = metadata['containerimage.config.digest'];
+  const manifestDigest = metadata['containerimage.descriptor']?.digest;
+  const outputDigest = metadata['containerimage.digest'];
+  if (!/^sha256:[0-9a-f]{64}$/u.test(configDigest ?? '')
+      || manifestDigest !== platformSha || outputDigest !== platformSha) {
+    throw new Error('Rebuilt engine OCI manifest does not match the reviewed linux/amd64 digest');
   }
+  const actual = docker(['image', 'inspect', '--format', '{{.Id}} {{.Os}}/{{.Architecture}}', tag], {
+    safeFailure: 'Docker local image inspection failed for the rebuilt pinned engine image',
+    includeStderr: true,
+  }).trim().split(/\s+/u);
+  if (actual[0] !== configDigest || actual[1] !== 'linux/amd64') {
+    throw new Error('Loaded Docker image does not match its verified Buildx config digest and linux/amd64 platform');
+  }
+  return configDigest;
 }
 function clamscan(args) {
+  if (!scannerImageId) { throw new Error('Verified scanner image ID is unavailable'); }
   return docker(['run', '--rm', '--network', 'none', '--read-only', '--user', '65532:65532',
     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
     '--mount', 'type=bind,source=' + snapshotDir + ',target=/defs,readonly',
-    '--entrypoint', '/usr/bin/clamscan', scannerTag, '--database=/defs', ...args]);
+    '--entrypoint', '/usr/bin/clamscan', scannerImageId, '--database=/defs', ...args]);
 }
 
 try {
@@ -122,14 +133,22 @@ try {
   copyFileSync(resolve(root, 'infra/file-processing/openssl-inputs.sha256'), join(inputDir, 'openssl-inputs.sha256'));
   command('sha256sum', ['--check', 'openssl-inputs.sha256'], { cwd: inputDir });
 
-  // Preserve the scoped Astra-reviewed identities. A changed build is NOT
-  // silently accepted and must get an independent audit before pin changes.
-  command('docker', ['build', '--platform', 'linux/amd64', '--load', '-f',
-    resolve(root, 'infra/file-processing/ClamAV-libcrypto.Dockerfile'), '-t', scannerTag, inputDir], { inherit: true });
-  command('docker', ['build', '--platform', 'linux/amd64', '--load', '-f',
-    resolve(root, 'infra/file-processing/Dockerfile'), '-t', decoderTag, root], { inherit: true });
-  exactImage(SCANNER_IMAGE, SCANNER_PLATFORM_SHA, scannerTag);
-  exactImage(DECODER_IMAGE, DECODER_PLATFORM_SHA, decoderTag);
+  // Preserve the scoped Astra-reviewed identities. The index and child-manifest
+  // pins remain fixed; Buildx metadata binds the child manifest to the loaded
+  // local config digest without relying on unsupported --platform inspection.
+  const review = JSON.parse(readFileSync(resolve(root, 'infra/file-processing/oci-review-evidence.json'), 'utf8'));
+  if (review.scanner?.indexSha256 !== SCANNER_INDEX_SHA.slice(7)
+      || review.scanner?.linuxAmd64ManifestSha256 !== SCANNER_PLATFORM_SHA.slice(7)
+      || review.decoder?.indexSha256 !== DECODER_INDEX_SHA.slice(7)
+      || review.decoder?.linuxAmd64ManifestSha256 !== DECODER_PLATFORM_SHA.slice(7)) {
+    throw new Error('Pinned OCI index/platform digests do not match the reviewed OCI evidence');
+  }
+  command('docker', ['buildx', 'build', '--platform', 'linux/amd64', '--load', '--metadata-file', scannerMetadataPath,
+    '-f', resolve(root, 'infra/file-processing/ClamAV-libcrypto.Dockerfile'), '-t', scannerTag, inputDir], { inherit: true });
+  command('docker', ['buildx', 'build', '--platform', 'linux/amd64', '--load', '--metadata-file', decoderMetadataPath,
+    '-f', resolve(root, 'infra/file-processing/Dockerfile'), '-t', decoderTag, root], { inherit: true });
+  scannerImageId = exactImage(SCANNER_PLATFORM_SHA, scannerTag, scannerMetadataPath);
+  decoderImageId = exactImage(DECODER_PLATFORM_SHA, decoderTag, decoderMetadataPath);
 
   // FreshClam is a one-shot updater and the only container here with network access.
   // All actual scanner/decoder workers remain network=none, read-only and non-root.
@@ -162,7 +181,7 @@ try {
     const info = docker(['run', '--rm', '--network', 'none', '--read-only', '--user', '65532:65532',
       '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--mount', 'type=bind,source=' + snapshotDir + ',target=/defs,readonly',
-      '--entrypoint', '/usr/bin/sigtool', SCANNER_IMAGE, '--info', '/defs/' + file]);
+      '--entrypoint', '/usr/bin/sigtool', scannerImageId, '--info', '/defs/' + file]);
     if (!/Verification OK\./u.test(info)) { throw new Error('ClamAV signature verification failed for ' + file); }
   }
   const version = clamscan(['--version']).trim();
@@ -175,11 +194,17 @@ try {
     snapshotDir,
     epoch: {
       engineVersion: '1.4.7',
+      engineIndexSha256: SCANNER_INDEX_SHA.slice(7),
       engineImageSha256: SCANNER_PLATFORM_SHA.slice(7),
+      engineConfigSha256: scannerImageId.slice(7),
+      decoderIndexSha256: DECODER_INDEX_SHA.slice(7),
+      decoderImageSha256: DECODER_PLATFORM_SHA.slice(7),
+      decoderConfigSha256: decoderImageId.slice(7),
       defsSha256,
       defsBuiltAt: new Date(builtAtMs).toISOString(),
     },
-    decoderImage: DECODER_IMAGE,
+    scannerImageId,
+    decoderImage: decoderImageId,
     scanner: {
       cpuMilli: 1000, memoryMiB: 1200, pids: 32, tmpfsMiB: 32, wallMs: 45000,
       maxFileBytes: 1048576, maxScanBytes: 8388608, maxFiles: 64, maxRecursion: 8,

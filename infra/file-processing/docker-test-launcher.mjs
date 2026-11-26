@@ -6,9 +6,9 @@ import { lstat, realpath, readdir } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const SCANNER_IMAGE = 'sha256:39f936f37a24b0b4658414230bcefa6b52de3a57c42ac88caed0ec6c09317883';
+export const SCANNER_INDEX_SHA = 'sha256:39f936f37a24b0b4658414230bcefa6b52de3a57c42ac88caed0ec6c09317883';
 export const SCANNER_PLATFORM_SHA = 'sha256:7c58440c10859ec126d4bba5a5f260cc467395d640c193a5197b1da12073e9f8';
-export const DECODER_IMAGE = 'sha256:7162306fb4f11234456de8471a3299267f020f7be64f4720c4c9586ca8ee5f68';
+export const DECODER_INDEX_SHA = 'sha256:7162306fb4f11234456de8471a3299267f020f7be64f4720c4c9586ca8ee5f68';
 export const DECODER_PLATFORM_SHA = 'sha256:8a0b65bc02e28cab840ea184bc193862ac2806cf02184d6e79df25522d3e23fc';
 // Local infrastructure ceilings, not file-processing policy defaults.
 const controlRpcMs = 2500;
@@ -17,6 +17,7 @@ const cleanupWallMs = 6500;
 const cache = fileURLToPath(new URL('../../node_modules/.cache/p0304cde/', import.meta.url));
 const entries = ['bytecode.cvd', 'daily.cvd', 'main.cvd'];
 const hex256 = /^[0-9a-f]{64}$/u;
+const imageIdPattern = /^sha256:[0-9a-f]{64}$/u;
 
 function check(ok) { if (!ok) { throw new Error('Synthetic worker unavailable or misconfigured'); } }
 const stopped = () => ({ reaped: true, exitCode: null, signal: null, stdinComplete: false, stdoutEof: false,
@@ -209,19 +210,30 @@ async function run(kind, config, command, frames, maxOutputBytes, signal) {
   throw new UnknownWorkerSettlementError();
 }
 
-export async function createFileProcessingTestLauncher({ snapshotDir, epoch, decoderImage, scanner, decoder }) {
+export async function createFileProcessingTestLauncher({ snapshotDir, epoch, scannerImageId, decoderImage, scanner, decoder }) {
   check(process.env.DOCKER_HOST === undefined);
-  check(decoderImage === undefined || decoderImage === DECODER_IMAGE);
-  const context = good(await control(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'])).trim();
-  check(/^unix:\/\/\//u.test(context) || /^npipe:\/\/\/\/\.\/pipe\//u.test(context));
-  const platformArgs = ['image', 'inspect', '--platform', 'linux/amd64', '--format', '{{.Os}}/{{.Architecture}} {{.Descriptor.digest}}'];
-  check(good(await control([...platformArgs, SCANNER_IMAGE])).trim() === `linux/amd64 ${SCANNER_PLATFORM_SHA}`);
+  check(imageIdPattern.test(scannerImageId));
+  check(decoderImage === undefined || imageIdPattern.test(decoderImage));
+  check(epoch?.engineIndexSha256 === SCANNER_INDEX_SHA.slice(7)
+    && epoch?.engineImageSha256 === SCANNER_PLATFORM_SHA.slice(7)
+    && epoch?.engineConfigSha256 === scannerImageId.slice(7)
+    && epoch.engineVersion === '1.4.7' && hex256.test(epoch.defsSha256));
   if (decoderImage !== undefined) {
-    check(good(await control(['image', 'inspect', '--format', '{{.Id}}', DECODER_IMAGE])).trim() === DECODER_IMAGE);
-    check(good(await control([...platformArgs, DECODER_IMAGE])).trim() === `linux/amd64 ${DECODER_PLATFORM_SHA}`);
+    check(epoch?.decoderIndexSha256 === DECODER_INDEX_SHA.slice(7)
+      && epoch?.decoderImageSha256 === DECODER_PLATFORM_SHA.slice(7)
+      && epoch?.decoderConfigSha256 === decoderImage.slice(7));
   }
-  check(epoch?.engineImageSha256 === SCANNER_PLATFORM_SHA.slice(7) && epoch.engineVersion === '1.4.7' && hex256.test(epoch.defsSha256));
   check(typeof epoch.defsBuiltAt === 'string' && Number.isFinite(Date.parse(epoch.defsBuiltAt)));
+  const context = good(await control(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'])).trim();
+  check(/^unix:\/\//u.test(context) || /^npipe:\/\/\/\.\/pipe\//u.test(context));
+  const scannerIdentity = good(await control(['image', 'inspect', '--format',
+    '{{.Id}} {{.Os}}/{{.Architecture}}', scannerImageId])).trim();
+  check(scannerIdentity === `${scannerImageId} linux/amd64`);
+  if (decoderImage !== undefined) {
+    const decoderIdentity = good(await control(['image', 'inspect', '--format',
+      '{{.Id}} {{.Os}}/{{.Architecture}}', decoderImage])).trim();
+    check(decoderIdentity === `${decoderImage} linux/amd64`);
+  }
   const pinned = Object.freeze({ ...epoch });
   const actualCache = await realpath(cache);
   const dir = await realpath(resolve(snapshotDir));
@@ -229,7 +241,7 @@ export async function createFileProcessingTestLauncher({ snapshotDir, epoch, dec
   check(await snapshotDigest(dir) === pinned.defsSha256);
   const scanLimits = limits(scanner);
   const decLimits = decoderImage === undefined ? undefined : limits(decoder);
-  const tool = ['--mount', `type=bind,source=${dir},target=/defs,readonly`, '--entrypoint', '/usr/bin/clamscan', SCANNER_IMAGE];
+  const tool = ['--mount', `type=bind,source=${dir},target=/defs,readonly`, '--entrypoint', '/usr/bin/clamscan', scannerImageId];
   const maxFile = integer(scanner.maxFileBytes, 1024, Math.min(16 * 1024 * 1024, scanLimits.tmpfsMiB * 1024 * 1024 / 2));
   const maxScan = integer(scanner.maxScanBytes, maxFile, 64 * 1024 * 1024);
   const maxFiles = integer(scanner.maxFiles, 1, 1024);
