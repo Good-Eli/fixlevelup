@@ -240,7 +240,11 @@ if (failureStage === undefined) {
     stage = 'evidence';
     requireCondition(!interrupted);
     await mkdir(resolve(evidencePath, '..'), { recursive: true });
-    await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
+    // This file contains only the bounded safe projection below (role, signal,
+    // exit status, timings and boolean assertions). The Docker container runs as
+    // root while the host evidence collector runs as the GitHub runner user;
+    // 0600 would make the bind-mounted file unreadable to that collector.
+    await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o644 });
   } catch { failureStage = stage; }
 }
 if (failureStage !== undefined) {
