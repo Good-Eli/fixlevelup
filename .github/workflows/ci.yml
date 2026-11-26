@@ -413,8 +413,10 @@ jobs:
       - name: Build current-tree P05 S3 image
         run: node infra/p05-lab/lab.mjs s3image --rebuild
       - name: Start this job's isolated PostgreSQL 18.7 lab
+        id: lab-up
         run: node infra/p05-lab/lab.mjs up --image=s3
       - name: Start isolated Garage and file ledger/trust-floor
+        id: deps-ready
         run: |
           set -euo pipefail
           node infra/p05-lab/lab.mjs garage up
@@ -427,9 +429,11 @@ jobs:
             --cmd env -u FIXLEVELUP_FILE_PROCESSING_TESTS corepack pnpm exec vitest run --maxWorkers 1 \
             --exclude apps/api/tests/p05-attachment-http.test.ts
       - name: Rebuild exact reviewed scanner/decoder and prepare signed engine fixture
+        if: ${{ always() && steps.lab-up.outcome == 'success' && steps.deps-ready.outcome == 'success' }}
         id: engine-fixture
         run: node infra/file-processing/prepare-ci-fixture.mjs
       - name: Run all four real isolated ClamAV/Sharp engine scenarios
+        if: ${{ always() && steps.engine-fixture.outcome == 'success' && steps.lab-up.outcome == 'success' && steps.deps-ready.outcome == 'success' }}
         id: engine-run
         run: |
           set -euo pipefail
