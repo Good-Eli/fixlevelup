@@ -276,7 +276,11 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
       restoreTestDiagnostic('target-epoch-query-failed', error);
       throw error;
     }
-    const epochFailure = epoch === undefined ? 'missing' : !epoch.primary ? 'not-primary'
+    if (epoch === undefined) {
+      restoreTestDiagnostic('target-epoch-invariant-missing');
+      refuseRestore('RESTORE_CLOSED');
+    }
+    const epochFailure = !epoch.primary ? 'not-primary'
       : epoch.db !== manifest.destinationDatabase ? 'database-mismatch'
       : epoch.namespace !== old.namespace ? 'namespace-mismatch'
       : epoch.epoch !== old.writerEpoch.toString() ? 'epoch-mismatch'
