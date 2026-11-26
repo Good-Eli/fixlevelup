@@ -5,7 +5,8 @@
  * expanded (024) profile.
  *
  * Scope rules for this file:
- *  - it is the only file changed by this task; no fixture or product source is edited;
+ *  - dedicated S3 bridge/profile integration tests; the F-01 case below uses only
+ *    the existing disposable configuration fixture and does not change product code;
  *  - every database is created by the reusable configuration fixture (owned lifecycle,
  *    pinned migration history) and capped exactly before the next P05 migration, so the
  *    admission preflight verifies the exact expected manifest through the cap;
