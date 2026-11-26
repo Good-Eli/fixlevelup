@@ -276,15 +276,16 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
       restoreTestDiagnostic('target-epoch-query-failed', error);
       throw error;
     }
-    if (epoch === undefined) {
+    const restoredEpoch = epoch;
+    if (restoredEpoch === undefined) {
       restoreTestDiagnostic('target-epoch-invariant-missing');
       refuseRestore('RESTORE_CLOSED');
     }
-    const epochFailure = !epoch.primary ? 'not-primary'
-      : epoch.db !== manifest.destinationDatabase ? 'database-mismatch'
-      : epoch.namespace !== old.namespace ? 'namespace-mismatch'
-      : epoch.epoch !== old.writerEpoch.toString() ? 'epoch-mismatch'
-      : epoch.mode !== 'RESTORE_CLOSED' ? 'mode-mismatch' : epoch.connect ? 'runtime-connect-enabled' : undefined;
+    const epochFailure = !restoredEpoch.primary ? 'not-primary'
+      : restoredEpoch.db !== manifest.destinationDatabase ? 'database-mismatch'
+      : restoredEpoch.namespace !== old.namespace ? 'namespace-mismatch'
+      : restoredEpoch.epoch !== old.writerEpoch.toString() ? 'epoch-mismatch'
+      : restoredEpoch.mode !== 'RESTORE_CLOSED' ? 'mode-mismatch' : restoredEpoch.connect ? 'runtime-connect-enabled' : undefined;
     if (epochFailure !== undefined) {
       restoreTestDiagnostic(`target-epoch-invariant-${epochFailure}`);
       refuseRestore('RESTORE_CLOSED');
@@ -365,7 +366,7 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
         AND current_database()=$4 AND NOT pg_is_in_recovery()
         AND (SELECT oid::text FROM pg_database WHERE datname=current_database())=$5
         AND NOT has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT')`,
-      [old.namespace, old.writerEpoch.toString(), nextScope.writerEpoch.toString(), manifest.destinationDatabase, epoch.oid]);
+      [old.namespace, old.writerEpoch.toString(), nextScope.writerEpoch.toString(), manifest.destinationDatabase, restoredEpoch.oid]);
       if (cas.rowCount !== 1) { refuseRestore('RESTORE_CLOSED'); }
       commitStarted = true;
       const completion = await client.query('COMMIT');
