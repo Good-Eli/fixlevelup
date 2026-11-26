@@ -173,8 +173,6 @@ function exactImage(configSha, platformSha, tag, metadataPath, ociTarPath, layou
   // not preserve a root OCI-index digest separately from the Docker config ID.
   return configDigest;
 }
-  return configDigest;
-}
 function clamscan(args) {
   if (!scannerImageId) { throw new Error('Verified scanner image ID is unavailable'); }
   return docker(['run', '--rm', '--network', 'none', '--read-only', '--user', '65532:65532',
