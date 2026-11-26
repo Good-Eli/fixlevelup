@@ -29,7 +29,58 @@ const deny = (stage) => {
   throw new Error('Unrecognised reviewed restore expression: ' + stage);
 };
 
+
 function currentMigrationBundle() {
+  const migrations = readdirSync(dir).filter(name => /^\d{14}_[a-z_]+$/u.test(name)).sort();
+  const allFiles = migrations.map(name => readFileSync(resolve(dir, name, 'migration.sql'), 'utf8').replaceAll('\r\n', '\n'));
+  const manifest = migrations.map((name, i) => name + ':' + digest(allFiles[i]));
+  return Object.freeze({ migrations, allFiles, manifest, sha256: digest(manifest.join('\n')) });
+}
+
+function assertReviewedMigrationBundle(bundle) {
+  const pinned = MANIFESTS.get(bundle.migrations.length);
+  if (pinned === undefined) { deny('migration-count-' + bundle.migrations.length); }
+  if (bundle.sha256 !== pinned) { deny('migration-manifest-' + bundle.migrations.length + '-' + bundle.sha256); }
+}
+
+/** Fast no-DB check for the exact SQL allowlist used by copy-only restore. */
+export function verifyReviewedMigrationManifest() {
+  const bundle = currentMigrationBundle();
+  assertReviewedMigrationBundle(bundle);
+  return Object.freeze({ count: bundle.migrations.length, sha256: bundle.sha256 });
+}
+
+// The inputs are an immutable reviewed SQL set, not arbitrary PostgreSQL SQL.
+// Handle nested parentheses and doubled SQL quote escapes; refuse ambiguity.
+function parenthesized(sql, start, stage = 'expression') {
+  if (sql[start] !== '(') { return deny(`${stage}-open`); }
+  let depth = 0;
+  let quote = '';
+  for (let i = start; i < sql.length; i++) {
+    const ch = sql[i];
+    if (quote) {
+      if (ch === quote && sql[i + 1] === quote) { i++; }
+      else if (ch === quote) { quote = ''; }
+    } else if (ch === "'" || ch === '"') { quote = ch; }
+    else if (ch === '(') { depth++; }
+    else if (ch === ')' && --depth === 0) { return sql.slice(start, i + 1); }
+  }
+  return deny(`${stage}-unclosed`);
+}
+
+export async function restoreReviewedExpressions(source, destination, expectedDatabase, legacyProfile, rehearsal) {
+  const slots = rehearsal === 'synthetic-key-rehearsal';
+  const cluster = process.env['FIXLEVELUP_CLUSTER_NAME'];
+  if (slots ? (!/^fixlevelup_configuration_test_[a-f0-9]{24}$/u.test(expectedDatabase)
+    || legacyProfile !== undefined || process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] !== '1'
+    || process.env['FIXLEVELUP_P05_KEY_SLOT_RECOVERY_TESTS'] !== '1' || process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1'
+    || !/^fixlevelup_p05s4_lab_[a-z0-9_]{1,40}$/u.test(cluster ?? ''))
+    : (rehearsal !== undefined || !/^fixlevelup_file_restore_[a-f0-9]{24}$/u.test(expectedDatabase))) {
+    deny('restore-expression-target');
+  }
+  const legacy = legacyProfile === 'S0';
+  if (legacyProfile !== undefined && (!legacy || process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] !== '1'
+    || process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] !== '1')) { deny('legacy-evidence-opt-in'); }
   const bundle = currentMigrationBundle();
   assertReviewedMigrationBundle(bundle);
   const { migrations, allFiles, manifest } = bundle;
