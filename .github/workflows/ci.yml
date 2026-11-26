@@ -93,7 +93,8 @@ jobs:
   linux-integration:
     name: Linux PostgreSQL and Garage integration
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    # The full HTTP proof includes nine serial CITY × state × command slices.
+    timeout-minutes: 180
     steps:
       - name: Checkout without credential persistence
         id: checkout
