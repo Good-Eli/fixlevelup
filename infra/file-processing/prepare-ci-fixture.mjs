@@ -247,7 +247,7 @@ try {
   command('docker', ['buildx', 'build', '--builder', buildxBuilderName, '--platform', 'linux/amd64',
     '--output', 'type=oci,dest=' + scannerOciTarPath, '--load', '--metadata-file', scannerMetadataPath,
     '-f', resolve(root, 'infra/file-processing/ClamAV-libcrypto.Dockerfile'), '-t', scannerTag, inputDir], { inherit: true });
-  command('docker', ['buildx', 'build', '--platform', 'linux/amd64',
+  command('docker', ['buildx', 'build', '--builder', buildxBuilderName, '--platform', 'linux/amd64',
     '--output', 'type=oci,dest=' + decoderOciTarPath, '--load', '--metadata-file', decoderMetadataPath,
     '-f', resolve(root, 'infra/file-processing/Dockerfile'), '-t', decoderTag, root], { inherit: true });
   scannerImageId = exactImage(SCANNER_INDEX_SHA, SCANNER_PLATFORM_SHA, scannerTag,
