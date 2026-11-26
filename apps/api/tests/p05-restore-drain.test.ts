@@ -218,7 +218,7 @@ const PHONE_TAMPER_REFUSAL: Readonly<Record<PhoneTamper,
 interface PhoneRefusal {
   readonly code: string;
   readonly message: string;
-  readonly stage: 'row-guard' | 'event-guard';
+  readonly stage: 'row-guard' | 'event-guard' | 'deferred';
 }
 
 interface CallbackEffectResult {
@@ -325,7 +325,10 @@ async function buildCallbackEffect(db: ConfigurationFixture, fixture: RequestFix
   };
   const sealed = seal(1);
   const otherSealed = seal(2);
-  const client = await db.migrator.connect();
+  // These are direct SQL attempts made with the actual application login, not
+  // the migration owner. The database must reject incomplete effects even when
+  // the writer bypasses every HTTP/service validation layer.
+  const client = await db.runtime.connect();
   let atDeferredChecks = false;
   const insertPermission = async (options: { readonly id: string; readonly contact: string;
     readonly action: 'GIVEN' | 'REVOKED'; readonly event: string; readonly evidence: string | null;
@@ -336,6 +339,9 @@ async function buildCallbackEffect(db: ConfigurationFixture, fixture: RequestFix
     [options.id, requestId, options.contact, options.action, options.supersedes, options.event, options.evidence]);
   };
   try {
+    const identity = await client.query<{ current_user: string; session_user: string }>(
+      'SELECT current_user::text AS current_user, session_user::text AS session_user');
+    expect(identity.rows[0]).toEqual({ current_user: 'fixlevelup_runtime', session_user: 'fixlevelup_runtime' });
     await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
     await client.query('INSERT INTO foundation.customers(id) VALUES ($1)', [customerId]);
     // The aggregate and its history are one unit: the current pointers are
@@ -450,6 +456,32 @@ async function buildCallbackEffect(db: ConfigurationFixture, fixture: RequestFix
   }
 }
 
+/** A direct UPDATE is allowed by the column ACL, but a type/version change
+ * without a matching durable command must fail at the deferred DB boundary. */
+async function rejectRuntimeRequestMutation(db: ConfigurationFixture, requestId: string): Promise<PhoneRefusal> {
+  const client = await db.runtime.connect();
+  let stage: PhoneRefusal['stage'] = 'row-guard';
+  try {
+    const identity = await client.query<{ current_user: string; session_user: string }>(
+      'SELECT current_user::text AS current_user, session_user::text AS session_user');
+    expect(identity.rows[0]).toEqual({ current_user: 'fixlevelup_runtime', session_user: 'fixlevelup_runtime' });
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+    expect((await client.query(`UPDATE foundation.requests SET type='REPAIR' WHERE id=$1`, [requestId])).rowCount).toBe(1);
+    stage = 'deferred';
+    await client.query('SET CONSTRAINTS ALL IMMEDIATE');
+    await client.query('COMMIT');
+    throw new Error('Runtime direct UPDATE committed without a command event');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    const code = (error as { code?: unknown }).code;
+    const message = (error as { message?: unknown }).message;
+    return { code: typeof code === 'string' ? code : 'UNKNOWN',
+      message: typeof message === 'string' ? message : 'UNKNOWN', stage };
+  } finally {
+    client.release();
+  }
+}
+
 /** The positive builder: a complete aggregate, or a hard failure. */
 async function commitCallbackEffect(db: ConfigurationFixture, fixture: RequestFixtures): Promise<string> {
   const built = await buildCallbackEffect(db, fixture);
@@ -498,6 +530,17 @@ live('024 PHONE completeness guard (real isolated PostgreSQL)', () => {
       expect((await db.migrator.query<{ n: number }>(
         `SELECT count(*)::int AS n FROM foundation.phone_permission_events
           WHERE request_id=$1 AND action='GIVEN'`, [requestId])).rows[0]?.n).toBe(1);
+
+      // A direct parent-row write with no matching command/effect is rejected by
+      // the deferred aggregate constraint. The caller has UPDATE(type), so this
+      // proves the DB boundary rather than a table ACL denial.
+      const requestBefore = (await db.migrator.query<{ status: string; row_version: number }>(
+        'SELECT status,row_version FROM foundation.requests WHERE id=$1', [requestId])).rows[0];
+      expect(requestBefore).toBeDefined();
+      const direct = await rejectRuntimeRequestMutation(db, requestId);
+      expect(direct).toEqual({ code: '23514', message: 'Request version requires a durable command', stage: 'deferred' });
+      expect((await db.migrator.query<{ status: string; row_version: number }>(
+        'SELECT status,row_version FROM foundation.requests WHERE id=$1', [requestId])).rows[0]).toEqual(requestBefore);
     } finally {
       await db.close();
     }
