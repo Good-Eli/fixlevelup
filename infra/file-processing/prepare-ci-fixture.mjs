@@ -164,7 +164,7 @@ function exactImage(indexSha, platformSha, tag, metadataPath, ociTarPath, layout
   const actual = docker(['image', 'inspect', '--format', '{{.Id}} {{.Os}}/{{.Architecture}}', tag], {
     safeFailure: 'Docker local image inspection failed for the rebuilt pinned engine image',
     includeStderr: true,
-  }).trim().split(/\\s+/u);
+  }).trim().split(/\s+/u);
   if (actual[0] !== configDigest || actual[1] !== 'linux/amd64') {
     failIdentity('loaded Docker image config differs from the verified OCI image', {
       config: configDigest, loadedConfig: actual[0] ?? null, loadedPlatform: actual[1] ?? null,
