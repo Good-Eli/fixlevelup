@@ -141,6 +141,21 @@ const ACTIVATION_STARTED = new WeakSet<object>();
 // eslint-disable-next-line @typescript-eslint/unbound-method
 const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get;
 const NONCE = (): string => randomBytes(32).toString('hex');
+
+/** Test-only restore diagnostics are deliberately categorical: never print SQL,
+ * database names, archive paths, row data, or raw driver/process messages. */
+function restoreTestDiagnostic(event: string, error?: unknown): void {
+  if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] !== '1'
+    || process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] !== '1') { return; }
+  const value = error !== null && typeof error === 'object'
+    ? error as { readonly name?: unknown; readonly message?: unknown; readonly code?: unknown } : undefined;
+  const name = typeof value?.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(value.name) ? value.name : 'UnknownError';
+  const pgCode = typeof value?.code === 'string' && /^[0-9A-Z]{5}$/.test(value.code) ? value.code : undefined;
+  const labStage = typeof value?.message === 'string'
+    ? /^Synthetic lab restore failed: ([a-z0-9:-]{1,48})$/.exec(value.message)?.[1] : undefined;
+  process.stderr.write(`[p05-restore-diagnostic] ${JSON.stringify({ event, name,
+    ...(pgCode === undefined ? {} : { pgCode }), ...(labStage === undefined ? {} : { labStage }) })}\\n`);
+}
 interface AliasFacts { readonly object: RestoreObject; readonly destination: StorageTarget }
 const ALIASES = new WeakMap<RestoreGateReceipt, { readonly database: string; readonly entries: ReadonlyMap<string, AliasFacts>;
   readonly destinations: readonly StorageTarget[] }>();
@@ -239,15 +254,34 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
     }
     abortCheck(signal);
     stage = 'RESTORE_CLOSED';
-    await ctx.restoreArchives(manifest, auth.record, signal);
-    const { rows: [epoch] } = await conn.query<{ db: string; namespace: string; epoch: string; mode: string; connect: boolean; primary: boolean; oid: string }>(`SELECT
+    try {
+      await ctx.restoreArchives(manifest, auth.record, signal);
+    } catch (error) {
+      restoreTestDiagnostic('archive-restore-failed', error);
+      throw error;
+    }
+    let epochResult: Awaited<ReturnType<typeof conn.query<{ db: string; namespace: string; epoch: string; mode: string; connect: boolean; primary: boolean; oid: string }>>>;
+    try {
+      epochResult = await conn.query<{ db: string; namespace: string; epoch: string; mode: string; connect: boolean; primary: boolean; oid: string }>(`SELECT
       current_database() AS db,namespace_id::text AS namespace,epoch::text,mode,
       NOT pg_is_in_recovery() AS primary,
       (SELECT oid::text FROM pg_database WHERE datname=current_database()) AS oid,
       has_database_privilege('fixlevelup_runtime',current_database(),'CONNECT') AS connect
       FROM foundation.file_runtime_epochs WHERE singleton`);
-    if (epoch === undefined || !epoch.primary || epoch.db !== manifest.destinationDatabase || epoch.namespace !== old.namespace
-      || epoch.epoch !== old.writerEpoch.toString() || epoch.mode !== 'RESTORE_CLOSED' || epoch.connect) {refuseRestore('RESTORE_CLOSED');}
+    } catch (error) {
+      restoreTestDiagnostic('target-epoch-query-failed', error);
+      throw error;
+    }
+    const epoch = epochResult.rows[0];
+    const epochFailure = epoch === undefined ? 'missing' : !epoch.primary ? 'not-primary'
+      : epoch.db !== manifest.destinationDatabase ? 'database-mismatch'
+      : epoch.namespace !== old.namespace ? 'namespace-mismatch'
+      : epoch.epoch !== old.writerEpoch.toString() ? 'epoch-mismatch'
+      : epoch.mode !== 'RESTORE_CLOSED' ? 'mode-mismatch' : epoch.connect ? 'runtime-connect-enabled' : undefined;
+    if (epochFailure !== undefined) {
+      restoreTestDiagnostic(`target-epoch-invariant-${epochFailure}`);
+      refuseRestore('RESTORE_CLOSED');
+    }
     stage = 'RESTORE_AUTHORITY';
     await requireP05AbsentForActivation(conn, manifest, carried);
     if (await readAuthorityInventory(conn, limits) !== auth.record.inventorySha256) {refuseRestore('RESTORE_AUTHORITY');}
