@@ -62,9 +62,10 @@ function download(url, output) {
 }
 function docker(args, options = {}) { return command('docker', args, options); }
 function exactImage(imageId, platformSha, tag) {
-  const value = docker(['image', 'inspect', '--format', '{{.Id}}|{{.Os}}/{{.Architecture}} {{.Descriptor.digest}}', tag]).trim();
-  const expected = imageId + '|linux/amd64 ' + platformSha;
-  if (value !== expected) {
+  const actualImageId = docker(['image', 'inspect', '--format', '{{.Id}}', tag]).trim();
+  const platform = docker(['image', 'inspect', '--platform', 'linux/amd64',
+    '--format', '{{.Os}}/{{.Architecture}} {{.Descriptor.digest}}', tag]).trim();
+  if (actualImageId !== imageId || platform !== 'linux/amd64 ' + platformSha) {
     throw new Error('Reviewed engine image identity mismatch; independent OCI review is required for a changed image');
   }
 }
