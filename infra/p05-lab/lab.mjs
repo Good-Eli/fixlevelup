@@ -935,6 +935,10 @@ async function engineRun(argv) {
   // Only this ticket's own directory is cleaned up afterwards; the shared parent
   // (and any other agent's ticket) is never touched.
   const exchange = ENGINE_EXCHANGE_PARENT;
+  // The host controller owns the one-use ticket directory, but its validated
+  // parent must exist before its realpath check. Create only this shared cache
+  // parent; never pre-create or clean another ticket's directory.
+  mkdirSync(exchange, { recursive: true, mode: 0o700 });
   const fixture = engineFixtureFile();
   const database = `fixlevelup_p05_s3tlab_${hex(6)}`;
   // Same opt-in contract as `s3test`: flags are validated against the lab's
