@@ -11,9 +11,11 @@ import { fileURLToPath } from 'node:url';
 // digest. A length outside the map is refused, never inferred.
 const MANIFESTS = new Map([
   [23, 'd93a19c4a6d013a9796412aec2c1f9d0c59630d99d77cc523808dbe17783708e'],
-  // Re-pinned after the reviewed 024 PHONE-completeness guard was added. Measured
-  // as the exact digest of the ordered names + LF-normalised SQL, never guessed.
-  [24, '4aee698201b5955496fffab5c402d9d499c3e332a3db9eb51fc1536e09a608e8'],
+  // Exact ordered 001-024 SQL set for the P05 current candidate. Migration 024
+  // was refreshed from the documented previous SHA b5e3856... to e84a60e...
+  // (docs/P05-EVIDENCE.md); the former 24-entry pin was therefore stale.
+  // This digest covers all 24 ordered names + LF-normalised SQL, not catalog rows.
+  [24, '8100b1e28364b446dc9aeed97ec8d7da30f54f51aaf50911c31ce577f8e215ff'],
 ]);
 // Evidence-only S0 prefix, pinned independently of the full checkout manifest.
 const S0_COUNT = 21;
