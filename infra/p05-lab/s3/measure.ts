@@ -47,7 +47,12 @@ async function main(): Promise<void> {
     application_name: 'p05lab-s3-measure' });
   await client.connect();
   try {
-    const identity = (await client.query(`SELECT current_database() AS db, current_user AS role,
+    const identity = (await client.query<{
+      db: string;
+      role: string;
+      search_path: string;
+      version: string;
+    }>(`SELECT current_database() AS db, current_user AS role,
       current_setting('search_path') AS search_path, current_setting('server_version_num') AS version`)).rows[0];
     const probes = new LegacyReadinessProbes(client, database, false, 'fixlevelup_migrator');
     const result: Record<string, unknown> = { identity };
