@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { request } from 'node:http';
-import { createConnection, createServer } from 'node:net';
+import { createConnection } from 'node:net';
 import { resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
@@ -54,32 +53,9 @@ function refusedDatabase() {
   });
 }
 
-function freePort() {
-  return new Promise((resolvePort, reject) => {
-    const server = createServer();
-    let settled = false;
-    const timer = setTimeout(() => finish(), 1500);
-    function finish(port) {
-      if (settled) {return;}
-      settled = true;
-      clearTimeout(timer);
-      // No clients can be accepted: close immediately after obtaining the port.
-      server.close(() => {
-        if (port === undefined) {reject(new Error('port allocation failed'));}
-        else {resolvePort(port);}
-      });
-    }
-    server.once('error', () => finish());
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      finish(typeof address === 'object' && address !== null ? address.port : undefined);
-    });
-  });
-}
-
-function startChild(role, port) {
-  const child = spawn(process.execPath, [resolve(root, `apps/api/dist/bootstrap/${role}.js`)], {
-    cwd: root, env: childEnvironment(port), stdio: ['ignore', 'pipe', 'pipe'],
+function startChild(role, entrypoint, args = []) {
+  const child = spawn(process.execPath, [entrypoint, ...args], {
+    cwd: root, env: childEnvironment(0), stdio: ['ignore', 'pipe', 'pipe'],
     shell: false,
   });
   const state = {
@@ -155,71 +131,32 @@ function startChild(role, port) {
   return state;
 }
 
-// Use a one-shot HTTP client, not a global fetch pool that can leave keepalive
-// handles. Both the response body and the whole request have absolute bounds.
-function health(port, path) {
-  return new Promise((resolveHealth, reject) => {
-    let settled = false;
-    let response;
-    const req = request({ host: '127.0.0.1', port, path, method: 'GET', agent: false,
-      headers: { Connection: 'close' } });
-    const timer = setTimeout(() => finish(), 3500);
-    function finish(result) {
-      if (settled) {return;}
-      settled = true;
-      clearTimeout(timer);
-      response?.destroy();
-      req.destroy();
-      if (result === undefined) {reject(new Error('health request failed'));}
-      else {resolveHealth(result);}
-    }
-    req.once('error', () => finish());
-    req.once('response', (incoming) => {
-      response = incoming;
-      let body = '';
-      let bytes = 0;
-      incoming.on('data', (chunk) => {
-        bytes += chunk.length;
-        if (bytes > 16 * 1024) { finish(); return; }
-        body += chunk.toString('utf8');
-      });
-      incoming.once('error', () => finish());
-      incoming.once('aborted', () => finish());
-      incoming.once('end', () => {
-        try { finish({ status: incoming.statusCode, body: JSON.parse(body) }); }
-        catch { finish(); }
-      });
-    });
-    req.end();
-  });
+async function assertAdmissionRefusal(role) {
+  stage = `${role}-admission-refusal`;
+  const entrypoint = resolve(root, `apps/api/dist/bootstrap/${role}.js`);
+  const state = startChild(role, entrypoint);
+  // No LAUNCH_* proof and no IPC channel are intentionally supplied. Production
+  // API/worker entrypoints must fail closed instead of starting DB consumers.
+  await state.wait(() => state.closed, 3000);
+  requireCondition(state.result.code === 1 && state.result.signal === null
+    && state.events.length === 1 && state.events[0] === 'admission_missing');
+  requireCondition(!state.fault && state.stderr === ''
+    && !state.stdout.includes(canary) && !state.stdout.includes(password));
 }
 
 async function runCase(role, signal) {
   const prefix = `${role}-${signal}`;
-  stage = `${prefix}-port`;
-  // The actual entrypoint does not expose the port chosen by APP_PORT=0. In
-  // this isolated container the listen(0)/close/rebind race is acceptable.
-  const port = role === 'api' ? await freePort() : 0;
-  requireCondition(!interrupted);
   stage = `${prefix}-startup`;
-  const state = startChild(role, port);
+  requireCondition(!interrupted);
+  // Exercise the exact compiled production registerShutdown hook in a small
+  // disposable child. This is separate from application admission: the real
+  // API/worker entrypoints above are tested to refuse without a signed proof.
+  const helper = resolve(root, 'infra/linux-proof/lifecycle-child.mjs');
+  const state = startChild(role, helper, [role]);
   await state.wait(() => state.events.includes('started') && !state.closed, 10000);
-  const http = {};
-  if (role === 'api') {
-    stage = `${prefix}-liveness`;
-    const live = await health(port, '/health/live');
-    requireCondition(live.status === 200 && live.body.status === 'ok');
-    http.live = { status: live.status, marker: live.body.status };
-    stage = `${prefix}-readiness`;
-    const ready = await health(port, '/health/ready');
-    requireCondition(ready.status === 503 && ready.body.code === 'NOT_READY'
-      && ready.body.status === 503);
-    http.ready = { status: ready.status, marker: ready.body.code };
-  }
   stage = `${prefix}-signal`;
   requireCondition(!state.closed && !state.fault && !interrupted);
   const beforeSignal = performance.now();
-  // This is an OS-delivered POSIX signal to the real compiled entrypoint.
   requireCondition(state.child.kill(signal));
   await state.wait(() => state.closed, 7500);
   const shutdownMs = Math.ceil(performance.now() - beforeSignal);
@@ -235,8 +172,7 @@ async function runCase(role, signal) {
     && !state.events.some((event) => /failed|timeout/.test(event)));
   return { role, signal, exitCode: state.result.code, exitSignal: state.result.signal,
     shutdownMs, started: 1, shutdownStarted: 1, shutdownCompleted: 1,
-    outputBytes: state.bytes, stderrBytes: 0, secretCanaryAbsent: true,
-    ...(role === 'api' ? { http } : {}) };
+    outputBytes: state.bytes, stderrBytes: 0, secretCanaryAbsent: true };
 }
 
 async function collectChildren() {
@@ -276,13 +212,14 @@ try {
   process.on('SIGINT', interrupt);
   stage = 'database-refused';
   await refusedDatabase();
+  for (const role of ['api', 'worker']) { await assertAdmissionRefusal(role); }
   const cases = [];
   for (const role of ['api', 'worker']) {
     for (const signal of ['SIGTERM', 'SIGINT']) {cases.push(await runCase(role, signal));}
   }
   requireCondition(!interrupted && children.size === 0);
   evidence = { node: process.versions.node, platform: process.platform, arch: process.arch,
-    databaseConnectionRefused: true, cases };
+    databaseConnectionRefused: true, admissionRefusalWithoutProof: true, cases };
 } catch {
   failureStage = interrupted ? 'interrupted' : stage;
 } finally {
