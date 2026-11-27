@@ -145,20 +145,24 @@ const NONCE = (): string => randomBytes(32).toString('hex');
 /** Test-only restore diagnostics are deliberately categorical: expose gate location and digests, never row values.
  * Never print SQL,
  * database names, archive paths, row data, or raw driver/process messages. */
-function restoreTestDiagnostic(event: string, error?: unknown): void {
+function restoreTestDiagnostic(event: string, error?: unknown,
+  facts?: Readonly<Record<string, string | number | boolean>>): void {
   if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] !== '1'
     || process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] !== '1') { return; }
   const value = error !== null && typeof error === 'object'
     ? error as { readonly name?: unknown; readonly message?: unknown; readonly code?: unknown } : undefined;
   const name = typeof value?.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(value.name) ? value.name : 'UnknownError';
-  const pgCode = typeof value?.code === 'string' && /^[0-9A-Z]{5}$/.test(value.code) ? value.code : undefined;
+  const rawCode = typeof value?.code === 'string' ? value.code : undefined;
+  const code = rawCode !== undefined && /^[A-Z0-9_]{1,48}$/.test(rawCode) ? rawCode : undefined;
+  const pgCode = rawCode !== undefined && /^[0-9A-Z]{5}$/.test(rawCode) ? rawCode : undefined;
   const labStage = typeof value?.message === 'string'
     ? /^Synthetic lab restore failed: ([a-z0-9:-]{1,48})$/.exec(value.message)?.[1] : undefined;
   const expressionStage = typeof value?.message === 'string'
-    ? /^Unrecognised reviewed restore expression: ([a-z0-9-]{1,96})(?:\s|$)/.exec(value.message)?.[1] : undefined;
+    ? /^Unrecognised reviewed restore expression: ([a-z0-9-]{1,96})(?:\\s|$)/.exec(value.message)?.[1] : undefined;
   process.stderr.write(`[p05-restore-diagnostic] ${JSON.stringify({ event, name,
-    ...(pgCode === undefined ? {} : { pgCode }), ...(labStage === undefined ? {} : { labStage }),
-    ...(expressionStage === undefined ? {} : { expressionStage }) })}\n`);
+    ...(code === undefined ? {} : { code }), ...(pgCode === undefined ? {} : { pgCode }),
+    ...(labStage === undefined ? {} : { labStage }), ...(expressionStage === undefined ? {} : { expressionStage }),
+    ...(facts === undefined ? {} : { facts }) })}\\n`);
 }
 interface AliasFacts { readonly object: RestoreObject; readonly destination: StorageTarget }
 const ALIASES = new WeakMap<RestoreGateReceipt, { readonly database: string; readonly entries: ReadonlyMap<string, AliasFacts>;
