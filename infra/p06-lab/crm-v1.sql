@@ -67,8 +67,8 @@ BEGIN
           AND web_session.auth_version = staff.auth_version AND web_session.channel = 'CRM'
           AND web_session.telegram_link_id IS NULL AND web_session.revoked_at IS NULL
           AND web_session.token_hash = NEW.auth_token_hash
-          AND web_session.idle_expires_at > statement_timestamp()
-          AND web_session.absolute_expires_at > statement_timestamp()
+          AND web_session.idle_expires_at > clock_timestamp()
+          AND web_session.absolute_expires_at > clock_timestamp()
         JOIN foundation.staff_role_assignments AS assignment
           ON assignment.staff_id = staff.id AND assignment.revoked_at IS NULL
         JOIN foundation.roles AS role
@@ -139,7 +139,7 @@ BEGIN
               AND EXISTS (
                 SELECT 1 FROM foundation.request_staff_evidence AS evidence
                 WHERE evidence.request_id = request.id AND evidence.purpose = 'MANUAL_INTAKE'
-                  AND evidence.valid_until > statement_timestamp()
+                  AND evidence.valid_until > clock_timestamp()
               )
             )
           )
@@ -193,9 +193,58 @@ BEGIN
       pg_catalog.sha256(pg_catalog.convert_to(p_session_token,'UTF8')),'hex'
     );
 
+    -- Match the P05 lock order: policy -> staff -> CRM session -> original
+    -- form anchor -> legal document -> request. Rechecking after each lock
+    -- wait prevents a concurrent role/session/consent/version change from
+    -- being accepted from a pre-wait READ COMMITTED snapshot.
     PERFORM pg_catalog.pg_advisory_xact_lock_shared(
         pg_catalog.hashtextextended('fixlevelup:admin-invariant',0)
     );
+
+    PERFORM 1 FROM foundation.staff AS staff
+      WHERE staff.id = p_author_id AND staff.employment_state = 'ACTIVE'
+        AND staff.role IN ('ADMIN','MANAGER')
+      FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Internal comment writer is not admitted' USING ERRCODE = '42501';
+    END IF;
+
+    PERFORM 1 FROM foundation.web_sessions AS web_session
+      WHERE web_session.id = p_auth_session_id AND web_session.staff_id = p_author_id
+        AND web_session.channel = 'CRM' AND web_session.telegram_link_id IS NULL
+        AND web_session.token_hash = v_token_hash AND web_session.revoked_at IS NULL
+        AND web_session.idle_expires_at > clock_timestamp()
+        AND web_session.absolute_expires_at > clock_timestamp()
+      FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Internal comment writer is not admitted' USING ERRCODE = '42501';
+    END IF;
+
+    -- For form-origin requests, serialize against consent revocation using the
+    -- same anchor -> document order as the P05 legal writer. Manual intake has
+    -- no request-session or legal-document anchor.
+    PERFORM 1
+      FROM foundation.request_session_submits AS submit
+      JOIN foundation.request_sessions AS request_session ON request_session.id = submit.session_id
+      WHERE submit.request_id = p_request_id
+      FOR UPDATE OF request_session;
+    IF FOUND THEN
+        PERFORM 1
+          FROM foundation.request_session_submits AS submit
+          JOIN foundation.legal_documents AS document ON document.id = submit.document_id
+          WHERE submit.request_id = p_request_id
+          FOR SHARE OF document;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Internal comment basis is unavailable' USING ERRCODE = '23514';
+        END IF;
+    END IF;
+
+    PERFORM 1 FROM foundation.requests AS request
+      WHERE request.id = p_request_id AND request.row_version = p_request_version
+      FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Internal comment request version is stale' USING ERRCODE = '23514';
+    END IF;
 
     INSERT INTO foundation.audit_logs(id,operation,correlation_id,details)
     VALUES (
