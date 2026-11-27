@@ -379,3 +379,44 @@ GPT‑6.2‑Astra провёл повторный адресный аудит с
 
 27.11.2026 владелец принял P06-04 и закрыл P06 в согласованных границах
 изолированной композиции T. Приняты все четыре подэтапа P06.
+
+
+## 5. Follow-up hardening after the owner acceptance (27.11.2026)
+
+The historical owner acceptance above remains bound to its original code snapshots
+and to the isolated T composition. A subsequent independent audit identified
+defence-in-depth and evidence-gate work; it does not retroactively alter that
+acceptance. The follow-up remediation branch
+`fix/p06-audit-findings-2026-11-27` contains these changes:
+
+1. **Internal-comment DB boundary:** runtime no longer has direct INSERT/UPDATE/
+   DELETE/TRUNCATE rights on `p06_crm.comments`. A narrow SECURITY DEFINER
+   operation inserts the audit and comment atomically. Its trigger independently
+   checks the exact CRM session bearer hash, active staff/role, `requests.read`,
+   CITY/GLOBAL authority, comment grant, request version and DB-resident
+   processing basis. The function takes the same policy → staff/session → form
+   anchor → legal document → request lock order as P05. The application still
+   verifies the external manual-evidence issuer and managed key slot.
+2. **Registry availability:** candidate scanning is capped at 512 rows per
+   request. If the requested page cannot be proven complete within that budget,
+   the API refuses with `503 NOT_READY`; it never returns a partial page.
+3. **Comment disclosure race:** after key-slot I/O, the service rechecks the
+   staff session and processing basis immediately before decrypting each
+   comment.
+4. **Mandatory CI evidence:** a P06 acceptance job now runs lint, typecheck,
+   builds, all P06 opt-in server/load tests and the isolated HTTPS Chromium CRM
+   scenario, and stores redacted evidence tied to the exact candidate SHA.
+
+**Follow-up status: implementation pending exact-SHA execution and review.**
+The PII audit implementation already writes a durable audit record before
+selecting/decrypting contact ciphertext and fails closed on audit errors. Its
+specific negative fault-injection tests (connect, INSERT, COMMIT failures,
+asserting no key-slot read/decrypt) are being added in the parallel test work;
+they must be present and pass in the final P06 Gate.
+
+**Restore boundary:** P06 remains T-only. The P05 managed-slot backup/rewrap
+primitives are not yet integrated into a complete P06 database-dump + comment
+slot inventory restore drill. This is not a defect in the currently accepted
+T scope, but it is a mandatory release blocker before P06 data or routes are
+moved into R or used with real personal data. No production restore readiness
+is claimed.
