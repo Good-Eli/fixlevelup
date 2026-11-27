@@ -108,6 +108,8 @@ export interface P05Context {
   readonly staffId: string;
   /** Exact locked web session row, for receipts that bind a staff actor. */
   readonly sessionId: string;
+  /** Raw bearer remains request-local; narrow DB operations hash it against this exact session. */
+  readonly sessionToken: string;
   readonly role: EffectiveRole;
   /** Null means every required grant is GLOBAL (exact SYSTEM ADMIN). */
   readonly cityIds: readonly string[] | null;
@@ -594,7 +596,7 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
           || (grant?.scope === 'CITY' && (initial.cityIds ?? await activeAdminCityIds(client, principal.staffId)).includes(cityId)));
       };
       const result = await callback(Object.freeze({ client, staffId: principal.staffId, sessionId: locked.sessionId,
-        role: initial.role, cityIds: initial.cityIds, authorizeCity, hasCityGrant, recheck }));
+        sessionToken: proof.token, role: initial.role, cityIds: initial.cityIds, authorizeCity, hasCityGrant, recheck }));
       // A command that never named its target has no authority over any row: fail closed
       // before COMMIT rather than after an effect.
       if (!checked.length) { throw new InternalServerErrorException(); }
