@@ -152,6 +152,16 @@ $$;
 
 CREATE TRIGGER check_comment_binding BEFORE INSERT ON p06_crm.comments
     FOR EACH ROW EXECUTE FUNCTION p06_crm.check_comment_binding();
+
+-- Re-run the same invariant at COMMIT. This catches time-based expiry of a
+-- manual intake issuer basis while a caller keeps the transaction open after
+-- the INSERT; the held staff/session/anchor/document/request locks keep the
+-- remaining mutable predicates stable until this deferred check completes.
+CREATE CONSTRAINT TRIGGER check_comment_binding_at_commit
+    AFTER INSERT ON p06_crm.comments
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION p06_crm.check_comment_binding();
+
 REVOKE ALL ON FUNCTION p06_crm.check_comment_binding() FROM PUBLIC,fixlevelup_runtime;
 
 -- There is intentionally no INSERT grant on comments. This narrow function
