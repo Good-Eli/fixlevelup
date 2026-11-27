@@ -273,8 +273,7 @@ jobs:
             FIXLEVELUP_P06_SEARCH_PROOF=1 \
             FIXLEVELUP_P06_DASHBOARD_PROOF=1 \
             FIXLEVELUP_P06_LOAD_PROOF=1 \
-            corepack pnpm exec vitest run --maxWorkers 1 --testNamePattern 'P06' \
-              apps/api/tests/p05-intake-http.test.ts apps/api/tests/p06-*.test.ts
+            sh -lc "corepack pnpm exec vitest run --maxWorkers 1 --testNamePattern 'P06' apps/api/tests/p05-intake-http.test.ts && corepack pnpm exec vitest run --maxWorkers 1 apps/api/tests/p06-*.test.ts"
       - name: Stop only this job's private PostgreSQL lab
         if: ${{ always() && steps.p06-lab-up.outcome == 'success' }}
         run: node infra/p05-lab/lab.mjs down
