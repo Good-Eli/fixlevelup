@@ -533,6 +533,16 @@ PASS. Это локальные результаты предыдущего на
 и все общие обязательные jobs. До такого прогона follow-up P06 остаётся
 verification pending; локальный результат не объявляет PASS.
 
+Exact-SHA run `46081315700` на `38c108f3a780e1c5cc080b3aaa4bd7928a953e59`
+подтвердил 149/149 unit/client, 11/11 принятых P06-сценариев и 133/133
+server gap-теста; `p06-server-gate` вывел `status: passed`. Job, однако,
+завершился Failure на последующей host-проверке: `server-summary.json`
+находился внутри удаляемого `s3test`-контейнера, а не в host workspace.
+P06 browser Gate поэтому был skipped. Это ошибка доставки CI evidence, не
+отрицательный результат этих тестов; общий PASS по-прежнему не заявлен.
+Workflow исправлен на сбор summary из stdout в host evidence directory.
+Повторный полный run на новом SHA обязателен.
+
 ### 6.7. Остаточные риски
 
 - **R1 — внешний key slot вне БД.** СУБД не может проверить существование
