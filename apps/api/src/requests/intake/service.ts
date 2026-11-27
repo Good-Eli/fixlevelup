@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import {
   decodeP05Body, p05DecodeStatus, P05DecodeError, P05_IF_MATCH_OPERATIONS, parseP05Etag,
@@ -145,6 +145,7 @@ const decidePrepared = <T>(fn: Decision<T>, clock: Date): T => fn(clock);
  * an admitted S3 process; no raw environment switch constructs a runtime here. */
 export class RequestIntake {
   private readonly config: RequestIntakeConfig;
+  private readonly staffAuth: WebAuthService;
   constructor(private readonly pool: GuardedPool, private readonly form: FormSessionService,
     private readonly staff: P05AuthorizationApi, config: RequestIntakeConfig) {
     requireRequestEffectsPool(pool);
@@ -156,14 +157,17 @@ export class RequestIntake {
       throw new Error('Invalid request policy metadata pins');
     }
     this.config = Object.freeze({ ...config, supportedPolicies: new Map(config.supportedPolicies) });
+    // P05 uses this service only for authenticate(); the independent throttle key is
+    // intentionally ephemeral and is never reused as a CSRF or encryption secret.
+    this.staffAuth = new WebAuthService(this.pool, { throttleSecret: randomBytes(32) });
   }
 
   /** Match the regular CRM guard at the isolated P05 HTTP boundary. This performs
    * the standard sliding-idle authentication in its own short transaction; the
    * subsequent P05 authorization transaction independently rechecks the same proof. */
-  async authenticateStaff(token: string, csrfSecret: string): Promise<void> {
+  async authenticateStaff(token: string): Promise<void> {
     try {
-      await new WebAuthService(this.pool, { throttleSecret: csrfSecret }).authenticate(token);
+      await this.staffAuth.authenticate(token);
     } catch (error) {
       if (error instanceof WebAuthError) {
         throw new AuthorizationError(error.code === 'UNAUTHORIZED' ? 'UNAUTHORIZED' : 'FAILED');
