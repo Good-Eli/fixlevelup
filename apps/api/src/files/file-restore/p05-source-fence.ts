@@ -154,8 +154,12 @@ export async function observeFencedSource(client: Client, expected: {
             return refuseRestore('RESTORE_AUTHORITY');
           }
         } else {
-          const cluster: ClusterFact = Object.freeze({ systemIdentifier: fence.system_identifier,
-            serverVersionNum: fence.server_version_num, postmasterStart: fence.postmaster_start });
+          const systemIdentifier = fence.system_identifier;
+          const serverVersionNum = fence.server_version_num;
+          const postmasterStart = fence.postmaster_start;
+          if (typeof systemIdentifier !== 'string' || typeof serverVersionNum !== 'string'
+            || typeof postmasterStart !== 'string') { return refuseRestore('RESTORE_AUTHORITY'); }
+          const cluster: ClusterFact = Object.freeze({ systemIdentifier, serverVersionNum, postmasterStart });
           stage = 'read-p05-drain-state';
           const drain = await readP05RestoreDrainState(client, expected.profile, carried);
           stage = 'read-authority-inventory';
