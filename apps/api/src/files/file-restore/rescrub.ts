@@ -230,25 +230,70 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
     }
     const source = Object.freeze({ database: manifest.sourceDatabase, databaseOid: ctx.sourceDatabaseOid,
       scope: old, profile: sourceProfile, manifestSha256: hash });
-    const drained = await observeFencedSource(observer, { ...source, challenge }, limits, carried);
-    requireP05ProfileFact(manifest, drained, undefined, new Date(), challenge);
-    if (drained.manifestSha256 !== hash) { refuseRestore('RESTORE_AUTHORITY'); }
+    let drained: FencedSourceObservation;
+    try { drained = await observeFencedSource(observer, { ...source, challenge }, limits, carried); }
+    catch (error) {
+      restoreTestDiagnostic('initial-source-observation-failed', error);
+      throw error;
+    }
+    try { requireP05ProfileFact(manifest, drained, undefined, new Date(), challenge); }
+    catch (error) {
+      restoreTestDiagnostic('initial-source-profile-fact-refused', error, { sourceProfile });
+      throw error;
+    }
+    if (drained.manifestSha256 !== hash) {
+      restoreTestDiagnostic('initial-source-manifest-mismatch');
+      refuseRestore('RESTORE_AUTHORITY');
+    }
     abortCheck(signal);
     const readCurrentAuthority = async (nonce: string) => {
-      const signed = await ctx.currentAuthority({ manifestSha256: hash, challenge: nonce }, signal);
-      if (carried === undefined) { return requireAuthorityV2(signed, ctx.authorityKey); }
-      const result = requireAuthorityV3(signed, ctx.authorityKey);
-      if (result.record.policySha256 !== drained.policySha256 || result.record.drainFact !== drained.fact) {refuseRestore('RESTORE_AUTHORITY');}
+      let signed: SignedSnapshotManifest;
+      try { signed = await ctx.currentAuthority({ manifestSha256: hash, challenge: nonce }, signal); }
+      catch (error) {
+        restoreTestDiagnostic('current-authority-callback-failed', error);
+        throw error;
+      }
+      if (carried === undefined) {
+        try { return requireAuthorityV2(signed, ctx.authorityKey); }
+        catch (error) {
+          restoreTestDiagnostic('current-authority-v2-signature-refused', error);
+          throw error;
+        }
+      }
+      let result: ReturnType<typeof requireAuthorityV3>;
+      try { result = requireAuthorityV3(signed, ctx.authorityKey); }
+      catch (error) {
+        restoreTestDiagnostic('current-authority-v3-signature-refused', error);
+        throw error;
+      }
+      if (result.record.policySha256 !== drained.policySha256 || result.record.drainFact !== drained.fact) {
+        restoreTestDiagnostic('current-authority-policy-or-drain-mismatch', undefined, {
+          policyMatches: result.record.policySha256 === drained.policySha256,
+          drainFactMatches: result.record.drainFact === drained.fact,
+        });
+        refuseRestore('RESTORE_AUTHORITY');
+      }
       return result;
     };
     const auth = await readCurrentAuthority(challenge);
     if (auth.record.challenge !== challenge || auth.record.head.namespace !== nextScope.namespace
       || auth.record.head.incarnation !== nextScope.incarnation || auth.record.head.writerEpoch !== nextScope.writerEpoch) {
+      restoreTestDiagnostic('current-authority-challenge-or-head-mismatch', undefined, {
+        challengeMatches: auth.record.challenge === challenge,
+        namespaceMatches: auth.record.head.namespace === nextScope.namespace,
+        incarnationMatches: auth.record.head.incarnation === nextScope.incarnation,
+        writerEpochMatches: auth.record.head.writerEpoch === nextScope.writerEpoch,
+      });
       refuseRestore('RESTORE_AUTHORITY');
     }
-    requireBoundAuthority(auth.record, { manifestSha256: hash, sourceDatabase: manifest.sourceDatabase,
-      destinationDatabase: manifest.destinationDatabase, sourceDatabaseOid: ctx.sourceDatabaseOid,
-      sourceProfile, oldNamespace: old.namespace, oldWriterEpoch: old.writerEpoch.toString(), observed: drained });
+    try {
+      requireBoundAuthority(auth.record, { manifestSha256: hash, sourceDatabase: manifest.sourceDatabase,
+        destinationDatabase: manifest.destinationDatabase, sourceDatabaseOid: ctx.sourceDatabaseOid,
+        sourceProfile, oldNamespace: old.namespace, oldWriterEpoch: old.writerEpoch.toString(), observed: drained });
+    } catch (error) {
+      restoreTestDiagnostic('current-authority-source-binding-refused', error, { sourceProfile });
+      throw error;
+    }
     abortCheck(signal);
     stage = 'RESTORE_LEDGER';
     const lineage = await ctx.verifier.verifyLineage(nextScope, manifest.base);
