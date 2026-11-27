@@ -125,12 +125,13 @@ The old S3 pins did not describe the changed SQL trigger function, and verifyClo
 
 ### Объём и точный источник истины
 
-P05-01…P05-04 реализованы в текущей ветке-кандидате. P05-01 принят владельцем
-исторически; P05-02/P05-03/P05-04 реализованы в соответствующих технических
-границах. Финальный full-stage technical verdict **ожидает исправленного
-exact-head CI Gate**. Этот раздел заменяет старые статусы `SOURCE ADDED / CI
+P05-01…P05-04 реализованы и приняты владельцем в synthetic scope. P05-01
+сохраняет историческую owner acceptance; P05-02/P05-03/P05-04 приняты
+владельцем 27.11.2026. ChatGPT `PASS — FULL P05` на точном candidate
+`0d7f60dbee1bddca63e9f1868a03ebf1230ec69f` владелец явно приравнял к
+`PASS — FULL ASTRA P05`. Run `45953489126`: 7 required jobs + freeze job =
+**8/8 success**. Этот раздел заменяет устаревшие статусы `SOURCE ADDED / CI
 PENDING` из предыдущего snapshot.
-
 Технический Gate относится только к HEAD PR #2. Не переносить его на другой
 SHA: точные `headSha`, tree, все tracked paths/modes/Git blobs/content SHA-256,
 manifest SHA-256, canonical tree inventory SHA-256 и redacted job evidence

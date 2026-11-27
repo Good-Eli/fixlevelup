@@ -50,7 +50,7 @@
 ### Актуальные границы P05
 
 - P05-01 ([контракт](P05-01-CONTRACT.md)) принят владельцем исторически и зафиксирован в `f2caab05`; P05-02 использует S2 / migration `023`; P05-03/P05-04 реализуют intake, commands и typed wire на S3 / migration `024`. Migrations `001…021` сохранены; migrations 023/024 подтверждаются fresh/populated upgrade/replay/drift на disposable PostgreSQL.
-- P05-02, P05-03 и P05-04 реализованы; отдельные контракты: [P05-03](P05-03-CONTRACT.md), [P05-04](P05-04-CONTRACT.md). Final full-stage Gate is pending corrected run because previous green job silently skipped both real attachment HTTP engine cases.
+- P05-02, P05-03 и P05-04 реализованы и приняты владельцем 27.11.2026; ChatGPT PASS — FULL P05 признан эквивалентом Astra PASS. Точный Gate 45953489126 — 8/8 на `0d7f60d…`; эта документационная редакция требует нового exact-head CI/freeze перед fast-forward. Контракты: [P05-03](P05-03-CONTRACT.md), [P05-04](P05-04-CONTRACT.md), [P05 evidence](P05-EVIDENCE.md).
 - F и staff HTTP surfaces, `FormSessionController` и `RequestIntakeController` существуют только в isolated test composition T. [Release composition proof](../apps/api/tests/p05-release-composition.test.ts) подтверждает, что обычный `AppModule` R не регистрирует P05 controllers и не публикует P05 routes.
 - 023/024 не применялись к рабочей/dev БД. Нет production migration/deploy, real PII, live manager/channel delivery, публичного сайта/файлового transport или готовности к коммерческому сбору данных.
 ## 1. Состояние, границы и Definition of Done
