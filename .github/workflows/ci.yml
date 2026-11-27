@@ -247,14 +247,46 @@ jobs:
           mkdir -p node_modules/.cache/ci-artifacts/p06
           git rev-parse HEAD > node_modules/.cache/ci-artifacts/p06/commit.txt
           node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/p06/context.json
-      - name: Install frozen dependencies and verify builds, lint and types
+      - name: Install frozen dependencies and verify lint, types and all builds
         id: quality
         run: |
           set -euo pipefail
           corepack pnpm install --frozen-lockfile --ignore-scripts --strict-peer-dependencies
           corepack pnpm run lint
           corepack pnpm run typecheck
+          # API, Web (Next) and Mini App production builds are part of the gate.
           corepack pnpm run build
+      - name: Verify P03, P04 and P05 OpenAPI/runtime/client wire
+        id: wire
+        run: |
+          set -euo pipefail
+          node packages/p03-contracts/verify.mjs
+          node packages/p03-contracts/p04-verify.mjs
+          node packages/p03-contracts/p05-verify.mjs
+          corepack pnpm exec vitest run apps/api/tests/p05-wire.test.ts
+      - name: Run database-free P06 unit and client suites with the gate checker
+        id: p06-unit
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/p06/results
+          corepack pnpm exec vitest run --maxWorkers 1 \
+            --reporter=json --outputFile=node_modules/.cache/ci-artifacts/p06/results/p06-unit.json \
+            apps/api/tests/p06-registry.test.ts apps/api/tests/p06-gap-unit.test.ts apps/web/tests/p06-client.test.ts
+          # 148 = 98 gap-unit + 12 registry + 38 web client. All three suites are
+          # database-free, so a skip or a shrunken suite fails here, not later.
+          node infra/ci/p06-results.mjs node_modules/.cache/ci-artifacts/p06/results/p06-unit.json 148 \
+            --total 148 --skipped 0 \
+            --require 'bounds the candidate scan and refuses instead of serving a partial page' \
+            --require 'binds the cursor to city, city version and every filter value, but accepts it unchanged' \
+            --require 'returns a complete page even when the candidate budget is exhausted later' \
+            --require 'derives a deterministic idempotency HMAC per key, namespace and intent' \
+            --require 'seals, opens and binds a managed DETAILS payload without exposing plaintext' \
+            --require 'issues a 90-second snapshot bound to the exact subject' \
+            --require 'decodes a valid registry page' \
+            --require 'rejects malformed registry pages with RegistryError' \
+            --require 'posts an exact registry search and decodes the bounded result' \
+            --require 'gates startReview and addComment proofs on headers and section state'
+          node --test infra/ci/p06-results.test.mjs
       - name: Build current-tree PostgreSQL 18.7 P06 lab image
         id: p06-image
         if: ${{ !cancelled() && steps.quality.outcome == 'success' }}
@@ -268,12 +300,18 @@ jobs:
         if: ${{ !cancelled() && steps.p06-lab-up.outcome == 'success' }}
         run: |
           set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/p06/results
+          # The script runs INSIDE the lab container (snapshot of this exact tree,
+          # disposable PostgreSQL 18.7) and applies the strict report gate.
           node infra/p05-lab/lab.mjs s3test -- --cmd env \
             FIXLEVELUP_P06_COMMENT_PROOF=1 \
             FIXLEVELUP_P06_SEARCH_PROOF=1 \
             FIXLEVELUP_P06_DASHBOARD_PROOF=1 \
             FIXLEVELUP_P06_LOAD_PROOF=1 \
-            sh -lc "corepack pnpm exec vitest run --maxWorkers 1 --testNamePattern 'P06' apps/api/tests/p05-intake-http.test.ts && corepack pnpm exec vitest run --maxWorkers 1 apps/api/tests/p06-*.test.ts"
+            FIXLEVELUP_P06_GAP_PROOF=1 \
+            node infra/ci/p06-server-gate.mjs
+          test -s node_modules/.cache/ci-artifacts/p06/results/server-summary.json
+          grep -q '"status": "passed"' node_modules/.cache/ci-artifacts/p06/results/server-summary.json
       - name: Stop only this job's private PostgreSQL lab
         if: ${{ always() && steps.p06-lab-up.outcome == 'success' }}
         run: node infra/p05-lab/lab.mjs down
@@ -321,9 +359,22 @@ jobs:
             node_modules/.cache/ci-artifacts/p06/context.json
             node_modules/.cache/ci-artifacts/p06/execution.json
             node_modules/.cache/ci-artifacts/p06/commit.txt
+            node_modules/.cache/ci-artifacts/p06/results/
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 14
+      - name: Fail unless every P06 Gate stage passed
+        if: always()
+        run: |
+          set -euo pipefail
+          test "${{ steps.quality.outcome }}" = success
+          test "${{ steps.wire.outcome }}" = success
+          test "${{ steps.p06-unit.outcome }}" = success
+          test "${{ steps.p06-image.outcome }}" = success
+          test "${{ steps.p06-lab-up.outcome }}" = success
+          test "${{ steps.p06-server.outcome }}" = success
+          test "${{ steps.p06-browser-image.outcome }}" = success
+          test "${{ steps.p06-browser.outcome }}" = success
 
   browser-proof:
     name: Browser proof

@@ -407,12 +407,12 @@ acceptance. The follow-up remediation branch
    builds, all P06 opt-in server/load tests and the isolated HTTPS Chromium CRM
    scenario, and stores redacted evidence tied to the exact candidate SHA.
 
-**Follow-up status: implementation pending exact-SHA execution and review.**
-The PII audit implementation already writes a durable audit record before
-selecting/decrypting contact ciphertext and fails closed on audit errors. Its
-specific negative fault-injection tests (connect, INSERT, COMMIT failures,
-asserting no key-slot read/decrypt) are being added in the parallel test work;
-they must be present and pass in the final P06 Gate.
+**Follow-up status: test-coverage gap closed on the candidate branch; exact-SHA CI
+Gate run still outstanding.** The PII audit implementation already writes a
+durable audit record before selecting/decrypting contact ciphertext and fails
+closed on audit errors. The negative fault-injection tests (connect, INSERT,
+COMMIT failures, asserting no key-slot read/decrypt) now exist and pass; §6
+records their commands, results and the one recorded defect.
 
 **Restore boundary:** P06 remains T-only. The P05 managed-slot backup/rewrap
 primitives are not yet integrated into a complete P06 database-dump + comment
@@ -420,3 +420,125 @@ slot inventory restore drill. This is not a defect in the currently accepted
 T scope, but it is a mandatory release blocker before P06 data or routes are
 moved into R or used with real personal data. No production restore readiness
 is claimed.
+
+## 6. Закрытие пробелов тестирования (27.11.2026)
+
+Поручение: закрыть пробелы покрытия P06 **не переписывая реализацию без
+доказанного дефекта**. Работа выполнена на ветке `p06/gap-tests`, созданной от
+`fix/p06-audit-findings-2026-11-27` (`88eeaebd6889ffc3697f12e9cd3abc35c44e3460`).
+Исходный кандидат задания `audit/p06-candidate-2026-11-27`
+(`e65583606c45d147e49cd7ebdd7463f0c5f4a8df`) сохранён как отдельная ветка;
+свежая ветка владельца выбрана перед запуском тестов, потому что она содержит
+DB-boundary комментариев, которой в исходном кандидате не было.
+
+### 6.1. Что добавлено
+
+| Файл | Тестов | Область |
+|---|---|---|
+| `apps/api/tests/p06-gap-unit.test.ts` | 98 | границы курсора/фильтров, bounded scan реестра, контракт поиска, снимки дашборда, HMAC идемпотентности, managed payload |
+| `apps/api/tests/p06-gap-db.test.ts` | 8 | прямые SQL-проверки от `fixlevelup_runtime`: реальные DB grants и триггеры, отказ самой СУБД, отсутствие частичной записи |
+| `apps/api/tests/p06-gap-http.test.ts` | 14 (13 pass + 1 `it.fails`) | PII до decrypt, RBAC-матрица, конкурентные idempotency keys, гонки поиска, инвалидация снимка, неопределённый COMMIT |
+| `apps/web/tests/p06-client.test.ts` | 38 | все web-декодеры P06, включая документированный KNOWN GAP |
+| `infra/ci/p06-results.mjs` + `.test.mjs` | 9 | строгий гейт по Vitest JSON: ни одного skip, точные счётчики и обязательные заголовки |
+| `infra/ci/p06-server-gate.mjs` | — | единая точка решения server-части Gate внутри лаборатории |
+
+Расширены существующие файлы: `apps/api/tests/p05-intake-http.test.ts`
+(browser-сценарий получил реальные колбэки `bumpVersion`/`revokeContact`) и
+`packages/browser-tooling/fixtures/p06-live.ts` (второй комментарий,
+stale-ETag → 412 → refresh → retry, отзыв PII-права с проверкой очистки экрана).
+
+### 6.2. Доказанные факты о БД
+
+Проверки выполняются прямым SQL от `fixlevelup_runtime` на изолированной
+PostgreSQL 18.7 (`server_version_num=180007`), а не через NestJS:
+
+- у runtime отозваны `INSERT/UPDATE/DELETE/TRUNCATE` на `p06_crm.comments`;
+  прямой `INSERT`, даже вместе с валидной audit-строкой, отклоняется СУБД
+  (`42501`), а не приложением;
+- SECURITY DEFINER `p06_crm.insert_internal_comment(...)` пишет ровно один
+  комментарий и ровно одну audit-строку; bearer хранится только как SHA-256;
+- без живого CRM-bearer, `requests.read`, comment grant, CITY/GLOBAL authority
+  или действующего основания функция отклоняет (`42501`/`23514`);
+- deferred-проверка основания срабатывает на `COMMIT` (`23514`) с полным
+  откатом вставки;
+- при сбое audit-вставки не остаётся ни комментария, ни audit-строки.
+
+### 6.3. Найденный дефект F-2 (зафиксирован, не замаскирован)
+
+Определённый отказ БД при записи audit-строки комментария классифицируется как
+`500 INTERNAL_ERROR`, а не `503 NOT_READY` из закрытого словаря. Инварианты
+безопасности при этом держатся: нет частичного комментария, нет audit-строки,
+нет plaintext в ответе. Это дефект маппинга ошибок, а не утечки.
+
+Воспроизведение: наложить `CHECK (operation <> 'P06_COMMENT_ADD') NOT VALID` на
+`foundation.audit_logs`, затем `POST /api/v1/requests/{id}/comments`; ответ —
+`500 INTERNAL_ERROR`. Строгое ожидание сохранено в `it.fails` (тест
+`F-2: a definite comment-audit DB failure maps to 503 NOT_READY`), поэтому
+будущее исправление уронит маркер и потребует его снять. Рядом лежит отдельный
+зелёный тест на инварианты (нет частичных эффектов и plaintext).
+
+### 6.4. Изменение production-кода
+
+Единственная правка реализации — `apps/api/src/requests/card/comments.ts`:
+чтение внутренних комментариев оборачивает `keySlots.read` + `beforeOpen()` +
+`openManagedPayload` в `try/catch` и отдаёт `deny('NOT_READY')` вместо `500`
+при отсутствующем, чужом или подменённом внешнем слоте. Дефект доказан тестом
+`fails the read path closed when the external key slot is missing` (до правки —
+500, после — 503). Это не переписывание логики: изменилась только
+классификация уже существующего отказа.
+
+### 6.5. Обязательный P06 Gate
+
+Job `p06-acceptance` в `.github/workflows/ci.yml` теперь состоит из 16 шагов и
+падает, если любой из них не `success`:
+
+1. lint, typecheck, production-сборки API, Web и Mini App;
+2. wire P03/P04/P05 (`verify.mjs`, `p04-verify.mjs`, `p05-verify.mjs`,
+   `p05-wire.test.ts`);
+3. database-free unit/client-суиты под строгим гейтом (148 тестов, 0 skip);
+4. сборка образа лаборатории и запуск приватной PostgreSQL 18.7;
+5. `infra/ci/p06-server-gate.mjs` внутри контейнера: принятые P06-сценарии
+   (11 pass, 31 ожидаемый skip по фильтру имени) и все четыре `p06-*.test.ts`
+   (132 pass, 0 skip), каждая группа проверена `p06-results.mjs` с точными
+   счётчиками и обязательными заголовками;
+6. образ Chromium из чистого архива точного SHA и живой HTTPS-браузерный
+   сценарий CRM;
+7. redacted evidence с SHA кандидата.
+
+`p06-results.mjs` существует потому, что opt-in-суиты при отсутствии флага
+**пропускаются**, а не падают: зелёный job без гейта не доказывал бы ничего.
+Гейт запрещает любой неожиданный skip и фиксирует точное число собранных
+тестов, поэтому изменение фильтра или потерянный флаг валят сборку.
+
+### 6.6. Локальный прогон
+
+Все команды выполнены в изолированном контуре `infra/p05-lab/lab.mjs` на
+PostgreSQL 18.7 с `--network none`. Результаты:
+
+- `p06-server-gate.mjs`: **PASS** — принятые сценарии 11/11, gap-суиты 132/132,
+  0 failed, 0 неожиданных skip;
+- браузерный proof: **1 passed** (`P06 browser renders and filters the live CRM
+  registry and opens its card`), 19,3 с, 0 console errors, 0 unexpected routes;
+- `p06-results.test.mjs`: 9/9;
+- lint, typecheck, wire: PASS; сборки API/Web/Mini: PASS (API release-сборка
+  проверена в чистом временном каталоге, потому что `build-release.mjs`
+  намеренно отказывается сертифицировать непустое дерево `dist/`).
+
+**Статус: P06 PASS не объявляется.** Локальный прогон доказывает, что гейт
+работает и что все сценарии выполняются на реальной PostgreSQL 18.7, но
+приёмка требует зелёного exact-SHA прогона job `p06-acceptance` в GitHub
+Actions на кандидатном коммите; локальные результаты привязаны к рабочему
+дереву, а не к опубликованному SHA.
+
+### 6.7. Остаточные риски
+
+- **R1 — внешний key slot вне БД.** СУБД не может проверить существование
+  managed-слота; осиротевший слот ловится только приложением (теперь как
+  `NOT_READY`). Полная гарантия требует restore drill.
+- **R2 — restore drill.** Дамп БД + инвентарь comment-слотов не сведены в
+  единый прогон; P06 остаётся T-only.
+- **R3 — композиция.** P06 по-прежнему не входит в release composition R.
+- **R4 — F-2.** Классификация отказа audit-записи комментария остаётся 500 до
+  отдельного исправления маппинга.
+- **R5 — KNOWN GAP web-декодера.** `readRegistryItem` кидает `P05DecodeError`,
+  а не `RegistryError`, на невалидных полях item; задокументировано тестом.

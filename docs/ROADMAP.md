@@ -290,6 +290,26 @@ GPT-6.2-Astra, затем отдельный полный статический
 реализованы. Показатели дашборда, зависящие от назначений, визитов, смет и
 доступности мастеров, помечены `not_ready` до P09/P11/P12 и не подменяются нулём.
 
+**Follow-up hardening и закрытие пробелов тестирования (27.11.2026).** После
+owner acceptance независимый аудит открыл ветку
+`fix/p06-audit-findings-2026-11-27`: запись внутренних комментариев перенесена
+в узкую DB-функцию с атомарным аудитом (прямой DML runtime запрещён), скан
+реестра ограничен 512 кандидатами с отказом `503 NOT_READY` без частичной
+страницы, staff session и основание перепроверяются перед расшифровкой. На
+ветке `p06/gap-tests` (от `88eeaeb`) закрыты пробелы покрытия: 158 новых
+тестов — 98 unit, 8 прямых SQL от `fixlevelup_runtime` (реальные grants и
+триггеры, отказ самой СУБД, отсутствие частичной записи), 14 HTTPS (PII до
+decrypt, RBAC-матрица, конкурентные idempotency keys, гонки поиска,
+инвалидация снимка, неопределённый COMMIT) и 38 web-декодеров; плюс строгий
+гейт `infra/ci/p06-results.mjs`, запрещающий пропуск opt-in-суитов. Job
+`p06-acceptance` расширен до 16 шагов: lint, typecheck, сборки API/Web/Mini,
+wire P03/P04/P05, unit-гейт, server-гейт внутри PostgreSQL 18.7 и живой
+HTTPS-браузерный сценарий. Локальный прогон зелёный (11/11 принятых сценариев,
+132/132 gap, 1/1 browser). Зафиксирован дефект F-2: отказ audit-записи
+комментария классифицируется как 500 вместо 503 при сохранённых инвариантах
+безопасности; ожидание не ослаблено. Статус — **verification pending** до
+зелёного exact-SHA прогона Gate. Детали — [P06-PLAN §6](P06-PLAN.md).
+
 - **Результат/модули:** protected registry/card/history/internal/staff comments/customer conversation, dashboard server DTO/asOf/definitionsVersion/filter links, search POST PII-safe; Web CRM/Requests/Analytics queries.
 - **Зависимости:** P05, UX; scheduling-derived live availability до P09A возвращает честное unknown/not_ready, не нулевую выдуманную свободу; полная dashboard приёмка после P09A.
 - **Тесты:** каждый счётчик dashboard равен соответствующему фильтру registry на одном snapshot, нормальный/empty/large synthetic dataset, cursor stability, internal comment isolation, pii capability redaction, no-call call task denied.

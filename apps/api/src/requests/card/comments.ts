@@ -73,11 +73,17 @@ export async function readInternalComments(staff: P05Context, request: RequestRo
   const items = [];
   for (const comment of rows) {
     const ref = slot(request.id,comment);
-    const wrap = await config.keySlots.read(ref);
-    // Revalidate the external manual-evidence issuer and the locked staff proof
-    // after key-slot I/O, immediately before plaintext can enter process memory.
-    await beforeOpen?.();
-    const plaintext = openManagedPayload(ref,config.ring,comment,wrap);
+    // A missing, foreign or tampered external slot is a domain-level availability
+    // failure, not an internal error: refuse the whole list as NOT_READY so no
+    // partial page and no driver/cipher diagnostics reach the caller.
+    let plaintext: Buffer;
+    try {
+      const wrap = await config.keySlots.read(ref);
+      // Revalidate the external manual-evidence issuer and the locked staff proof
+      // after key-slot I/O, immediately before plaintext can enter process memory.
+      await beforeOpen?.();
+      plaintext = openManagedPayload(ref,config.ring,comment,wrap);
+    } catch { return deny('NOT_READY'); }
     try {
       items.push({ id:comment.id,version:comment.version,createdAt:comment.createdAt,text:utf8.decode(plaintext).trimEnd() });
     } finally { plaintext.fill(0); }
