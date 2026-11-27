@@ -73,14 +73,20 @@ export async function readInternalComments(staff: P05Context, request: RequestRo
   const items = [];
   for (const comment of rows) {
     const ref = slot(request.id,comment);
-    const wrap = await config.keySlots.read(ref);
-    // Revalidate the external manual-evidence issuer and the locked staff proof
-    // after key-slot I/O, immediately before plaintext can enter process memory.
+    // Missing, foreign or tampered external slots are availability failures.
+    // Keep beforeOpen outside this catch: authorization/basis denials must retain
+    // their 401/403/409 semantics rather than becoming NOT_READY.
+    const wrap = await config.keySlots.read(ref).catch(() => deny('NOT_READY'));
+    // Revalidate the external evidence issuer and locked staff proof after slot I/O,
+    // immediately before plaintext can enter process memory.
     await beforeOpen?.();
-    const plaintext = openManagedPayload(ref,config.ring,comment,wrap);
+    let plaintext: Buffer;
+    try { plaintext = openManagedPayload(ref,config.ring,comment,wrap); }
+    catch { return deny('NOT_READY'); }
     try {
       items.push({ id:comment.id,version:comment.version,createdAt:comment.createdAt,text:utf8.decode(plaintext).trimEnd() });
-    } finally { plaintext.fill(0); }
+    } catch { return deny('NOT_READY'); }
+    finally { plaintext.fill(0); }
   }
   return { items };
 }
@@ -121,7 +127,8 @@ export async function writeInternalComment(staff: P05Context, row: RequestRow, c
       to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"
     FROM p06_crm.insert_internal_comment($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
   [id,row.id,staff.staffId,staff.sessionId,sessionToken,row.row_version,input.key,fingerprint.keyId,fingerprint.digest,
-    sealed.nonce,sealed.ciphertext,sealed.authTag,sealed.aadContext,randomUUID()]);
+    sealed.nonce,sealed.ciphertext,sealed.authTag,sealed.aadContext,randomUUID()])
+    .catch(() => deny('NOT_READY'));
   if (!data) { return deny('NOT_READY'); }
   return { data,replayed:false };
 }

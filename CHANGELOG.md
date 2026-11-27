@@ -2,6 +2,38 @@
 
 Техническая история репозитория по состоянию на 27.11.2026. Дата — дата коммитов в их локальном часовом поясе; номера релизов не назначались. Актуальные статусы P01 — в [Preflight](docs/PREFLIGHT_P01.md); контур P02 — в [RBAC](docs/RBAC.md); прогресс, трудоёмкость и все подэтапы — в [журнале подэтапов](docs/SUBTASKS.md), подробные доказательства приёмок — в [SUBTASKS-EVIDENCE](docs/SUBTASKS-EVIDENCE.md); остальные документы R3.2 сохраняют исторические формулировки этапа 0.
 
+## 27.11.2026 — P06: объединённое gap-покрытие и строгий CI Gate
+
+В единую ветку fix/p06-audit-findings-2026-11-27 объединены DB-boundary
+follow-up и независимое расширение тестов. Добавлено 159 тестов: unit — 99,
+DB/runtime-role — 8, HTTPS/races — 14, web client — 38. Реальные PostgreSQL
+проверки доказывают запрет прямого DML, атомарность comment+audit, basis
+recheck на COMMIT, PII audit-before-decrypt, role/scope/state, конкурентные
+idempotency keys, mid-read revocation, rollback и uncertain COMMIT.
+
+Существующий браузерный сценарий расширен: второй комментарий,
+stale-ETag → 412 → refresh → retry, отзыв PII-права с проверкой очистки
+экрана. Job p06-acceptance содержит строгие точные счётчики:
+149 database-free unit/client tests и 133 server gap tests, 0 неожиданных
+skip; плюс exact-SHA builds, wire, PostgreSQL 18.7, HTTPS/browser proof и
+redacted evidence. p06-results.mjs фиксирует totals и обязательные названия
+тестов, не позволяя зелёному job пропустить opt-in suites.
+
+Исправлены два error-mapping дефекта в apps/api/src/requests/card/comments.ts:
+ошибка read/decrypt slot остаётся 503 NOT_READY, но отказ final beforeOpen()
+не поглощается и сохраняет авторизационный статус; определённый отказ DB/audit
+при записи комментария также даёт 503 NOT_READY. F-2 теперь обычный
+обязательный passing test, без it.fails; рядом подтверждены полный rollback
+и отсутствие plaintext. Дополнительный unit test отдельно проверяет проброс
+FORBIDDEN из final pre-decrypt recheck.
+
+Локальные результаты DeepSeek для предыдущего набора были 148 unit/client,
+132/132 server gap и browser 1/1. Новый объединённый набор содержит по одному
+добавленному unit test и исправлению F-2; он требует повторного exact-SHA
+прогона с totals 149/133. P06 PASS не объявляется до зелёного нового
+GitHub Actions run на опубликованном SHA. P06 остаётся T-only; полный DB dump
++ managed comment-slot restore — отдельный blocker до R/реальных ПД.
+
 ## 27.11.2026 — P06 follow-up audit remediation (verification pending)
 
 Отдельная ветка `fix/p06-audit-findings-2026-11-27` закрывает найденные

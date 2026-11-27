@@ -1,14 +1,13 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import {
   decodeP05Body, p05DecodeStatus, P05DecodeError, P05_IF_MATCH_OPERATIONS, parseP05Etag,
 } from '@fixlevelup/p03-contracts/p05';
 import type { P05BodyOperation, P05Bodies, P05CallbackRequest, P05ManualRequest, P05RepairRequest, P05ChannelSelection, P05FContact } from '@fixlevelup/p03-contracts/p05';
 import type { P05AuthorizationApi, P05Context, SessionProof } from '../../authz/authorization.service.js';
-import { AuthorizationError, P05CommitUnknown } from '../../authz/authorization.service.js';
+import { P05CommitUnknown } from '../../authz/authorization.service.js';
 import type { P05Capability } from '../../authz/capability.js';
 import { requireRequestEffectsPool } from '../../infrastructure/admission/pool-guard.js';
-import { WebAuthError, WebAuthService } from '../../auth/web-auth.service.js';
 import type { GuardedPool } from '../../infrastructure/admission/pool-guard.js';
 import { canonicalJson } from '../../infrastructure/admission/proof.js';
 import type { FormSessionSelectorInput, FormSessionService } from '../../form-session/service.js';
@@ -145,7 +144,6 @@ const decidePrepared = <T>(fn: Decision<T>, clock: Date): T => fn(clock);
  * an admitted S3 process; no raw environment switch constructs a runtime here. */
 export class RequestIntake {
   private readonly config: RequestIntakeConfig;
-  private readonly staffAuth: WebAuthService;
   constructor(private readonly pool: GuardedPool, private readonly form: FormSessionService,
     private readonly staff: P05AuthorizationApi, config: RequestIntakeConfig) {
     requireRequestEffectsPool(pool);
@@ -157,23 +155,6 @@ export class RequestIntake {
       throw new Error('Invalid request policy metadata pins');
     }
     this.config = Object.freeze({ ...config, supportedPolicies: new Map(config.supportedPolicies) });
-    // P05 uses this service only for authenticate(); the independent throttle key is
-    // intentionally ephemeral and is never reused as a CSRF or encryption secret.
-    this.staffAuth = new WebAuthService(this.pool, { throttleSecret: randomBytes(32) });
-  }
-
-  /** Match the regular CRM guard at the isolated P05 HTTP boundary. This performs
-   * the standard sliding-idle authentication in its own short transaction; the
-   * subsequent P05 authorization transaction independently rechecks the same proof. */
-  async authenticateStaff(token: string): Promise<void> {
-    try {
-      await this.staffAuth.authenticate(token);
-    } catch (error) {
-      if (error instanceof WebAuthError) {
-        throw new AuthorizationError(error.code === 'UNAUTHORIZED' ? 'UNAUTHORIZED' : 'FAILED');
-      }
-      throw error;
-    }
   }
 
   private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {

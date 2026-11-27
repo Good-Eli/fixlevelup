@@ -32,6 +32,10 @@ interface Fixture {
   readonly checkPanels: boolean;
   readonly checkSearch: boolean;
   readonly checkDashboard: boolean;
+  /** Optional: bump the request version through the real API (stale-ETag race). */
+  readonly bumpVersion?: () => Promise<void>;
+  /** Optional: revoke the caller's PII authority through the real API/policy. */
+  readonly revokeContact?: () => Promise<void>;
 }
 
 export async function proveLiveRegistry(fixture: Fixture) {
@@ -238,6 +242,46 @@ export async function proveLiveRegistry(fixture: Fixture) {
         ]);
         expect(added.status()).toBe(201);
         await expect(comments.getByText('Проверить наличие детали.',{exact:true})).toBeVisible();
+        // A second, distinct comment is a separate idempotency key: both are
+        // rendered, newest first, and neither is duplicated.
+        await comments.getByRole('textbox',{name:'Текст комментария'}).fill('Согласовать с клиентом.');
+        const [second] = await Promise.all([
+          page.waitForResponse(response => new URL(response.url()).pathname === commentApi && response.request().method() === 'POST'),
+          comments.getByRole('button',{name:'Добавить комментарий'}).click(),
+        ]);
+        expect(second.status()).toBe(201);
+        expect(second.request().postDataJSON()).toEqual({text:'Согласовать с клиентом.'});
+        await expect(comments.getByText('Согласовать с клиентом.',{exact:true})).toBeVisible();
+        const rendered = await comments.locator('li').allInnerTexts();
+        expect(rendered.filter(text => text.includes('Проверить наличие детали.'))).toHaveLength(1);
+        expect(rendered.filter(text => text.includes('Согласовать с клиентом.'))).toHaveLength(1);
+        expect(rendered[0]).toContain('Согласовать с клиентом.');
+        if (fixture.bumpVersion) {
+          // A concurrent committed change makes the retained ETag stale: the UI
+          // must refuse, explain, and only then allow an explicit refresh + retry.
+          await fixture.bumpVersion();
+          await comments.getByRole('textbox',{name:'Текст комментария'}).fill('После параллельного изменения.');
+          const [stale] = await Promise.all([
+            page.waitForResponse(response => new URL(response.url()).pathname === commentApi && response.request().method() === 'POST'),
+            comments.getByRole('button',{name:'Добавить комментарий'}).click(),
+          ]);
+          expect(stale.status()).toBe(412);
+          await expect(comments.getByRole('alert')).toHaveText('Заявка изменилась. Обновите карточку перед отправкой комментария.');
+          // Nothing was committed: the list still holds exactly the two comments.
+          expect(await comments.locator('li').count()).toBe(2);
+          const [refreshed] = await Promise.all([byPath(cardApi),comments.getByRole('button',{name:'Обновить карточку'}).click()]);
+          expect(refreshed.status()).toBe(200);
+          // The refresh re-issues the card proof and keeps the drafted text; the
+          // retry must then commit exactly once with the fresh ETag/CSRF pair.
+          const retryText = comments.getByRole('textbox',{name:'Текст комментария'});
+          await expect(retryText).toHaveValue('После параллельного изменения.');
+          const [retried] = await Promise.all([
+            page.waitForResponse(response => new URL(response.url()).pathname === commentApi && response.request().method() === 'POST'),
+            comments.getByRole('button',{name:'Добавить комментарий'}).click(),
+          ]);
+          expect(retried.status()).toBe(201);
+          await expect(comments.getByText('После параллельного изменения.',{exact:true})).toBeVisible();
+        }
         const contacts = page.getByRole('region',{name:'Контактные данные'});
         const [revealed] = await Promise.all([byPath(contactApi),contacts.getByRole('button',{name:'Показать контактные данные'}).click()]);
         expect(revealed.status()).toBe(200);
@@ -245,6 +289,19 @@ export async function proveLiveRegistry(fixture: Fixture) {
         await expect(contacts).toContainText('+15550100001');
         await contacts.getByRole('button',{name:'Скрыть контактные данные'}).click();
         await expect(contacts).not.toContainText('+15550100001');
+        if (fixture.revokeContact) {
+          // After the authority is revoked the panel must fail closed and must not
+          // leave the previously revealed plaintext on screen.
+          await fixture.revokeContact();
+          const [denied] = await Promise.all([
+            page.waitForResponse(response => new URL(response.url()).pathname === contactApi),
+            contacts.getByRole('button',{name:'Показать контактные данные'}).click(),
+          ]);
+          expect([403,404]).toContain(denied.status());
+          await expect(contacts.getByRole('alert')).toHaveText('Контактные данные сейчас недоступны.');
+          await expect(contacts).not.toContainText('+15550100001');
+          await expect(page.getByRole('main')).not.toContainText('+15550100001');
+        }
       }
       expect(consoleErrors).toHaveLength(0);
       expect(unexpected).toBe(0);

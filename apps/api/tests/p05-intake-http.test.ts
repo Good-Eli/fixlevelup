@@ -746,13 +746,33 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     if (commentProof || searchProof) {
       await grantContactFixture(db(),db().admin.id,fixture.cityId);
     }
+    const requestId = text(created,'id');
+    // A real committed staff change from outside the browser: the browser proof
+    // uses it to exercise the stale-ETag comment path end to end.
+    const bumpVersion = async () => {
+      const latest = accepted(await https('GET',`/requests/${requestId}`,undefined,staff()),200);
+      const latestVersion = Number(latest.data()['version']);
+      const changed = accepted(await https('POST',`/requests/${requestId}/commands/change-details`,
+        {section:'PREFERENCE',urgency:'WITHIN_DAY'},staffMutation(undefined,tag(latest))),200);
+      // The staff receipt carries the new version, not the effect pplied flag.
+      expect(changed.data()).toMatchObject({ id:requestId, version:latestVersion + 1 });
+    };
+    const revokeContact = async () => {
+      const client = await db().db.connect();
+      try {
+        await client.query('BEGIN');
+        await lockAccessPolicy(client,'write');
+        expect((await client.query('DELETE FROM p06_crm.contact_grants WHERE staff_id=$1 AND city_id=$2',
+          [db().admin.id,fixture.cityId])).rowCount).toBe(1);
+        await client.query('COMMIT');
+      } finally { try { await client.query('ROLLBACK'); } finally { client.release(); } }
+    };
     const browserFixture = { origin,apiPort:port,key:staffTlsKey,cert,sessionToken:db().admin.token,
-      publicNumber:text(created,'publicNumber'),requestId:text(created,'id'),checkPanels:commentProof,checkSearch:searchProof,
-      checkDashboard:dashboardProof };
+      publicNumber:text(created,'publicNumber'),requestId,checkPanels:commentProof,checkSearch:searchProof,
+      checkDashboard:dashboardProof,bumpVersion,revokeContact };
     const helper = new URL('../../../packages/browser-tooling/fixtures/p06-live.ts', import.meta.url);
     const { proveLiveRegistry } = await import(helper.href) as { proveLiveRegistry: (input: typeof browserFixture) => Promise<void> };
-    await proveLiveRegistry(browserFixture);
-  },75000);
+    await proveLiveRegistry(browserFixture);  },90000);
 
   it('P06 card and timeline use the request authority and the existing command validator', async () => {
     const manual = await manualPrepared(fixture.districtId);
@@ -1652,11 +1672,20 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   },90000);
 
   it('conceals a fresh manual target before decoding an unauthorized CITY actor’s body', async () => {
-    const manager = await db().webStaff();
+    // P05 grants are intentionally not delegable through the staff HTTP API.
+    // Create this isolated matrix actor as a DB fixture instead of weakening the
+    // production requireDelegable policy just to obtain a synthetic MANAGER.
+    const managerId = randomUUID();
+    await db().db.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES ($1,'MANAGER','ACTIVE',0)",
+      [managerId]);
+    const managerCredentials = await db().credentials(managerId);
+    const managerRoleId = await db().systemRole('MANAGER');
     const provision = await db().db.connect();
     try {
       await provision.query('BEGIN');
       await lockAccessPolicy(provision,'write');
+      await provision.query('INSERT INTO foundation.staff_role_assignments(id,staff_id,role_id) VALUES ($1,$2,$3)',
+        [randomUUID(),managerId,managerRoleId]);
       await provision.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type)
         SELECT r.id,p,'CITY' FROM foundation.roles r CROSS JOIN unnest($1::text[]) p
         WHERE r.role_type='SYSTEM' AND r.code='MANAGER'`, [['requests.read','requests.create']]);
@@ -1665,6 +1694,7 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       await provision.query('ROLLBACK');
       throw error;
     } finally { provision.release(); }
+    const manager = await db().login(managerId,managerCredentials.login,managerCredentials.password);
     const mutateAsManager = (key: string) => ({ Cookie:manager.cookie, 'Idempotency-Key':key,
       'X-CSRF-Token':createHmac('sha256',staffCsrf).update('web-auth-csrf\0').update(manager.token).digest('base64url') });
     const manual = await manualPrepared();

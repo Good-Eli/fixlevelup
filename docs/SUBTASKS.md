@@ -17,14 +17,19 @@ scope: P05-01 исторически (`f2caab05`), P05-02…P05-04 — 27.11.202
 
 
 **Примечание к P06 после owner acceptance:** исторический статус 4/4 относится
-к исходным SHA и изолированному контуру T. На отдельной ветке
-`fix/p06-audit-findings-2026-11-27` выполняется follow-up hardening: DB-boundary
-комментариев, ограничение сканирования реестра, повторная проверка перед
-decrypt и обязательный exact-SHA P06 CI Gate. Его статус остаётся
-**verification pending** до зелёного Gate и независимой проверки; это не
-переписывает исторические записи. Отказные тесты PII audit выполняются
-параллельным тестовым потоком. Полный P06 backup/restore обязателен только до
-выхода за границы T в R/реальные ПД.
+к исходным SHA и изолированному контуру T. В единой ветке
+fix/p06-audit-findings-2026-11-27 объединены DB-boundary hardening, bounded
+registry scan, recheck перед decrypt, проверка P05 partial receipt и обязательный
+exact-SHA P06 Gate. Добавлены 159 тестов: 99 unit, 8 прямых SQL от
+fixlevelup_runtime, 14 HTTPS/race и 38 web client. Gate фиксирует точные
+пороги 149 database-free unit/client и 133 server gap tests, 0 неожиданных
+skip. Удалён per-route authenticateStaff, вызвавший lock timeout в race
+сценариях; F-2 исправлен: DB audit failure → 503 NOT_READY, а отказ final
+pre-decrypt authorization recheck не маскируется под 503. Показанные DeepSeek
+локальные прогоны 148/132/132 относятся к предыдущему набору; новый merged
+SHA требует полного exact-SHA прогона. Статус остаётся **verification pending**
+до зелёного GitHub Actions p06-acceptance и полного required Gate. Полный P06
+backup/restore обязателен только до выхода за границы T в R/реальные ПД.
 
 Release composition R не регистрирует ни P05, ни P06-маршруты: всё это
 изолированный контур T. Рабочая БД не мигрировалась, реальных ПД нет.
@@ -53,7 +58,7 @@ P02 ██████████ 100%   (сотрудники, Auth, capabilit
 P03 ██████████ 100%   (настройки, география, файлы; 2,3 балла — 7%)
 P04 ██████████ 100%   (каталог, цены, CRM; 1,4 балла — 4%)
 P05 ██████████ 100%   (реализация и owner acceptance 4/4; 2,4 балла — 7%; ChatGPT FULL P05 PASS, owner-equivalent to Astra)
-P06 ██████████ 100%   (CRM: реестр, карточка, дашборд; 4 из 4, ASTRA PASS P06)
+P06 ██████████ 100%   (CRM: реестр, карточка, дашборд; 4 из 4, ASTRA PASS P06; follow-up Gate — verification pending)
 P07 ░░░░░░░░░░   0%   (каналы TG/VK/MAX; 5,5 балла — 17%)
 P08 ░░░░░░░░░░   0%   (сайт и публичные формы; 2,3 балла — 7%)
 P09 ░░░░░░░░░░   0%   (расписание, визиты, подтверждение; 4,9 балла — 15%)
