@@ -278,13 +278,23 @@ jobs:
       - name: Stop only this job's private PostgreSQL lab
         if: ${{ always() && steps.p06-lab-up.outcome == 'success' }}
         run: node infra/p05-lab/lab.mjs down
-      - name: Build pinned Chromium proof image for the P06 live CRM scenario
+      - name: Build pinned Chromium proof image from clean exact-SHA source
         id: p06-browser-image
         if: ${{ !cancelled() && steps.p06-server.outcome == 'success' }}
         run: |
           set -euo pipefail
-          node infra/ci/docker.mjs build --builder default --file infra/browser-proof/Dockerfile \
-            --tag fixlevelup-browser-proof:ci-${GITHUB_RUN_ID} .
+          # Previous integration steps deliberately create ignored local lab state.
+          # Build the browser image from a clean archive of this exact checked-out
+          # commit so no local state, credentials or test artifacts can enter COPY.
+          P06_CONTEXT="$RUNNER_TEMP/p06-browser-source"
+          mkdir -p "$P06_CONTEXT"
+          git archive --format=tar HEAD | tar -xf - -C "$P06_CONTEXT"
+          (
+            cd "$P06_CONTEXT"
+            node "$GITHUB_WORKSPACE/infra/ci/docker.mjs" build --builder default \
+              --file infra/browser-proof/Dockerfile \
+              --tag fixlevelup-browser-proof:ci-${GITHUB_RUN_ID} .
+          )
       - name: Run P06 live CRM browser proof over HTTPS and PostgreSQL
         id: p06-browser
         if: ${{ !cancelled() && steps.p06-browser-image.outcome == 'success' }}
