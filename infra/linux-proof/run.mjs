@@ -57,6 +57,6 @@ try {
   } catch {
     console.error('Linux proof redacted evidence could not be written.');
   }
-  console.error(\`Linux proof failed at \${activeStage}; details suppressed.\`);
+  console.error('Linux proof failed at ' + activeStage + '; details suppressed.');
   process.exitCode=1;
 }

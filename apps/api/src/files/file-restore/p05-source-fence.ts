@@ -118,7 +118,7 @@ export async function observeFencedSource(client: Client, expected: {
           && fence.default_read_only && fence.transaction_read_only
           && fence.runtime_connect_revoked && !fence.no_other_backends
           && Number.isSafeInteger(fence.other_backend_count) && fence.other_backend_count > 0
-          && fence.no_prepared_xacts === true && fence.matching_fenced_epoch === true
+          && fence.no_prepared_xacts && fence.matching_fenced_epoch
           && backendPidMatches && clusterIdentityPresent;
         if (fence?.valid !== true || !backendPidMatches || !clusterIdentityPresent) {
           if (onlyBackendDrainPending) {
