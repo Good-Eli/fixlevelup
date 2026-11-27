@@ -2,7 +2,7 @@ name: P01 technical CI
 
 on:
   push:
-    branches: [main, fix/p05-db-boundary-city-state-2026-11-26]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -22,7 +22,6 @@ env:
 
 jobs:
   linux-proof:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     name: Linux proof
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -93,7 +92,6 @@ jobs:
         run: test "${{ steps.linux-run.outcome }}" = success
 
   linux-integration:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     name: Linux PostgreSQL and Garage integration
     runs-on: ubuntu-24.04
     # The full HTTP proof includes nine serial CITY × state × command slices.
@@ -182,7 +180,6 @@ jobs:
         run: test "${{ steps.integration-run.outcome }}" = success && test "${{ steps.persistence-run.outcome }}" = success
 
   p05-acceptance:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     name: P05 F-01 and CITY-RBAC × state acceptance
     runs-on: ubuntu-24.04
     # This gate owns its own isolated S3 lab and must report independently of
@@ -222,7 +219,6 @@ jobs:
         run: node infra/p05-lab/lab.mjs down
 
   browser-proof:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     name: Browser proof
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -299,7 +295,6 @@ jobs:
         run: test "${{ steps.browser-run.outcome }}" = success
 
   security:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     name: Dependency, license, lockfile and secret gates
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -438,175 +433,9 @@ jobs:
         id: opt-in-run
         run: |
           set -euo pipefail
-          # Temporary focused restore diagnosis; restore the complete suite after fixing the S0 gate.
           node infra/p05-lab/lab.mjs s3test --old-binary --privacy --ledger --s3 --restore -- \
             --cmd env -u FIXLEVELUP_FILE_PROCESSING_TESTS corepack pnpm exec vitest run --maxWorkers 1 \
-            --exclude apps/api/tests/p05-attachment-http.test.ts -t 'legacy-s0
-      - name: Run all four real isolated ClamAV/Sharp engine scenarios
-        if: ${{ always() && steps.engine-fixture.outcome == 'success' && steps.lab-up.outcome == 'success' && steps.deps-ready.outcome == 'success' }}
-        id: engine-run
-        run: |
-          set -euo pipefail
-          node infra/p05-lab/lab.mjs engine -- apps/api/tests/file-lifecycle-s3.test.ts
-          node infra/p05-lab/lab.mjs engine -- apps/api/tests/p05-ready-attach-live.test.ts -t "admits exactly the published READY file"
-          node infra/p05-lab/lab.mjs engine -- apps/api/tests/p05-attachment-http.test.ts -t "creates the real request"
-          node infra/p05-lab/lab.mjs engine -- apps/api/tests/p05-attachment-http.test.ts -t "refuses the HTTP create"
-      - name: Stop only this job's isolated services
-        if: always()
-        run: |
-          node infra/p05-lab/lab.mjs ledger down || true
-          node infra/p05-lab/lab.mjs garage down || true
-          node infra/p05-lab/lab.mjs down || true
-      - name: Summarize P05 full integration
-        if: always()
-        env:
-          CI_STEPS: ${{ toJSON(steps) }}
-          CI_JOB_STATUS: ${{ job.status }}
-        run: node infra/ci/evidence.mjs summary "P05 full opt-in integration" node_modules/.cache/ci-artifacts/p05-full
-      - name: Publish redacted P05 full integration evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: p05-full-integration-${{ github.run_id }}
-          path: |
-            node_modules/.cache/ci-artifacts/p05-full/context.json
-            node_modules/.cache/ci-artifacts/p05-full/execution.json
-          if-no-files-found: warn
-          retention-days: 30
-      - name: Fail unless opt-in and real-engine suites passed
-        if: always()
-        run: |
-          test "${{ steps.opt-in-run.outcome }}" = success
-          test "${{ steps.engine-run.outcome }}" = success
-
-  p05-migration-wire:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
-    name: P05 migration history + API/Web/Mini + P03/P04/P05 wire
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    steps:
-      - name: Checkout exact PR head with full history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Set up Node 24.22.3
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.22.3
-          check-latest: false
-          package-manager-cache: false
-      - name: Verify pinned pnpm and install frozen workspace
-        run: |
-          set -euo pipefail
-          corepack enable
-          test "$(node --version)" = "v24.22.3"
-          test "$(corepack pnpm --version)" = "12.21.0"
-          corepack pnpm install --frozen-lockfile --strict-peer-dependencies
-      - name: Build current-tree migration lab image
-        run: node infra/p05-lab/lab.mjs s3image --rebuild
-      - name: Run isolated migration history suite
-        id: migration-run
-        env:
-          FIXLEVELUP_LAB_INSTANCE: migration
-        run: |
-          set -euo pipefail
-          node infra/p05-lab/lab.mjs up --image=s3
-          node infra/p05-lab/lab.mjs s3run -- sh -lc 'corepack pnpm run db:test-migrations'
-      - name: Stop only migration lab
-        if: always()
-        env:
-          FIXLEVELUP_LAB_INSTANCE: migration
-        run: node infra/p05-lab/lab.mjs down || true
-      - name: Build API, Web and Mini App
-        id: builds
-        run: corepack pnpm run build
-      - name: Typecheck all packages
-        id: typecheck
-        run: corepack pnpm run typecheck
-      - name: Verify P03, P04 and P05 OpenAPI/runtime/client wire
-        id: wire
-        run: |
-          set -euo pipefail
-          node packages/p03-contracts/verify.mjs
-          node packages/p03-contracts/p04-verify.mjs
-          node packages/p03-contracts/p05-verify.mjs
-          corepack pnpm exec vitest run apps/api/tests/p05-wire.test.ts
-      - name: Publish migration/build/wire step summary
-        if: always()
-        env:
-          CI_STEPS: ${{ toJSON(steps) }}
-          CI_JOB_STATUS: ${{ job.status }}
-        run: |
-          mkdir -p node_modules/.cache/ci-artifacts/p05-migration-wire
-          node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/p05-migration-wire/context.json
-          node infra/ci/evidence.mjs summary "P05 migration/build/wire" node_modules/.cache/ci-artifacts/p05-migration-wire
-      - name: Upload redacted migration/build/wire evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: p05-migration-wire-${{ github.run_id }}
-          path: |
-            node_modules/.cache/ci-artifacts/p05-migration-wire/context.json
-            node_modules/.cache/ci-artifacts/p05-migration-wire/execution.json
-          if-no-files-found: warn
-          retention-days: 30
-      - name: Fail unless all migration, build, type and wire gates passed
-        if: always()
-        run: |
-          test "${{ steps.migration-run.outcome }}" = success
-          test "${{ steps.builds.outcome }}" = success
-          test "${{ steps.typecheck.outcome }}" = success
-          test "${{ steps.wire.outcome }}" = success
-
-  p05-candidate-freeze:
-    name: Freeze exact P05 candidate manifest and redacted evidence
-    runs-on: ubuntu-24.04
-    needs:
-      - linux-proof
-      - linux-integration
-      - p05-acceptance
-      - browser-proof
-      - security
-      - p05-full-integration
-      - p05-migration-wire
-    if: always() && (github.event_name != 'push' || github.ref == 'refs/heads/main')
-    timeout-minutes: 10
-    steps:
-      - name: Checkout exact PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Set up Node 24.22.3
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24.22.3
-          check-latest: false
-          package-manager-cache: false
-      - name: Freeze manifest only when every required job succeeded
-        id: freeze
-        env:
-          P05_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          P05_GATE_NEEDS_JSON: ${{ toJSON(needs) }}
-        run: node infra/ci/p05-freeze.mjs node_modules/.cache/ci-artifacts/p05-candidate
-      - name: Upload exact manifest, SHA-256 and redacted gate evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: p05-exact-candidate-${{ github.run_id }}
-          path: |
-            node_modules/.cache/ci-artifacts/p05-candidate/candidate-manifest.json
-            node_modules/.cache/ci-artifacts/p05-candidate/candidate-manifest.sha256
-            node_modules/.cache/ci-artifacts/p05-candidate/candidate-tree.sha256
-            node_modules/.cache/ci-artifacts/p05-candidate/redacted-gate-evidence.json
-          if-no-files-found: error
-          retention-days: 90
-      - name: Fail if candidate freeze did not complete
-        if: always()
-        run: test "${{ steps.freeze.outcome }}" = success
-
+            --exclude apps/api/tests/p05-attachment-http.test.ts
       - name: Run all four real isolated ClamAV/Sharp engine scenarios
         if: ${{ always() && steps.engine-fixture.outcome == 'success' && steps.lab-up.outcome == 'success' && steps.deps-ready.outcome == 'success' }}
         id: engine-run
