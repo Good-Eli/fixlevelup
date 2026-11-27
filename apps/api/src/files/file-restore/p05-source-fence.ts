@@ -90,10 +90,8 @@ export async function observeFencedSource(client: Client, expected: {
   }
   const deadline = Date.now() + SOURCE_FENCE_BACKEND_DRAIN_TIMEOUT_MS;
   let loggedBackendWait = false;
-  let lastBackendCount = 0;
-  let lastBackendUsers: string[] = [];
+  let lastBackendDrain: { readonly count: number; readonly users: string[] } | undefined;
   for (;;) {
-    let retryForBackendDrain = false;
     let stage = 'begin-read-only-transaction';
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
@@ -114,19 +112,17 @@ export async function observeFencedSource(client: Client, expected: {
           && typeof fence.postmaster_start === 'string' && fence.postmaster_start.length >= 10;
         const backendPidMatches = fence !== undefined && Number.isSafeInteger(fence.pid)
           && (expected.backendPid === undefined || expected.backendPid === fence.pid);
-        const onlyBackendDrainPending = fence !== undefined && fence.valid === false
-          && fence.is_primary === true && fence.database_matches === true && fence.database_oid_matches === true
-          && fence.database_connections_disabled === true && fence.migrator_identity === true
-          && fence.default_read_only === true && fence.transaction_read_only === true
-          && fence.runtime_connect_revoked === true && fence.no_other_backends === false
+        const onlyBackendDrainPending = fence !== undefined && !fence.valid
+          && fence.is_primary && fence.database_matches && fence.database_oid_matches
+          && fence.database_connections_disabled && fence.migrator_identity
+          && fence.default_read_only && fence.transaction_read_only
+          && fence.runtime_connect_revoked && !fence.no_other_backends
           && Number.isSafeInteger(fence.other_backend_count) && fence.other_backend_count > 0
           && fence.no_prepared_xacts === true && fence.matching_fenced_epoch === true
           && backendPidMatches && clusterIdentityPresent;
         if (fence?.valid !== true || !backendPidMatches || !clusterIdentityPresent) {
           if (onlyBackendDrainPending) {
-            retryForBackendDrain = true;
-            lastBackendCount = fence.other_backend_count;
-            lastBackendUsers = fence.other_backend_users;
+            lastBackendDrain = { count: fence.other_backend_count, users: fence.other_backend_users };
             if (!loggedBackendWait && process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
               && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
               loggedBackendWait = true;
@@ -186,14 +182,14 @@ export async function observeFencedSource(client: Client, expected: {
       }
       return refuseRestore('RESTORE_AUTHORITY');
     }
-    if (!retryForBackendDrain) { return refuseRestore('RESTORE_AUTHORITY'); }
     if (Date.now() >= deadline) {
       if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
         && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
         process.stderr.write('[p05-source-fence-diagnostic] '
           + JSON.stringify({ event: 'source-fence-backend-drain-timeout', facts: {
             timeoutMs: SOURCE_FENCE_BACKEND_DRAIN_TIMEOUT_MS,
-            otherBackendCount: lastBackendCount, otherBackendUsers: lastBackendUsers,
+            otherBackendCount: lastBackendDrain?.count ?? 0,
+            otherBackendUsers: lastBackendDrain?.users ?? [],
           } }) + String.fromCharCode(10));
       }
       return refuseRestore('RESTORE_AUTHORITY');

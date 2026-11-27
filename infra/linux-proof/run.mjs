@@ -6,7 +6,16 @@ const evidence = '/workspace/node_modules/.cache/linux-proof';
 const hash = () => createHash('sha256').update(readFileSync('pnpm-lock.yaml')).digest('hex');
 const initial = hash();
 const steps = [];
+let activeStage = 'runtime preflight';
+function writeEvidence(overallStatus, failedStage) {
+  mkdirSync(evidence,{recursive:true});
+  writeFileSync(`${evidence}/result.json`,JSON.stringify({
+    platform:process.platform,arch:process.arch,node:process.version,lockSha256:initial,
+    steps,network:'none',status:overallStatus,overallStatus,failedStage,
+  },null,2)+'\n');
+}
 function run(name, args) {
+  activeStage = name;
   console.log(`Linux proof: ${name}`);
   // The whole-repository ESLint pass exceeds Node's default heap in the 4 GiB
   // sandbox. Give only the lint child a bounded 3.5 GiB V8 heap; CI allocates 5 GiB.
@@ -35,13 +44,19 @@ try {
   ];
   run('service-independent tests', ['exec','vitest','run',...tests]);
   run('API runtime graph isolation', ['run','db:runtime-check']);
+  const posixStage = 'admission fail-closed + real OS SIGTERM/SIGINT production lifecycle hook (API/worker roles)';
+  activeStage = posixStage;
   const posix = spawnSync(process.execPath,['infra/linux-proof/posix-smoke.mjs'],{stdio:'inherit',timeout:60_000});
   if (posix.error || posix.status !== 0 || posix.signal) { throw new Error('Linux POSIX signal smoke failed'); }
-  steps.push('admission fail-closed + real OS SIGTERM/SIGINT production lifecycle hook (API/worker roles)');
-  mkdirSync(evidence,{recursive:true});
-  writeFileSync(`${evidence}/result.json`,JSON.stringify({platform:process.platform,arch:process.arch,node:process.version,lockSha256:initial,steps,network:'none',credentials:'synthetic only',limitations:['no Linux DB/S3 integration','no remote CI','no browser/image security scan','local Docker proof only']},null,2)+'\n');
+  steps.push(posixStage);
+  writeEvidence('passed', null);
   console.log('Linux reproducibility and OS signal proof: PASS');
-} catch (error) {
-  console.error(error instanceof Error ? error.message : 'Linux proof failed');
+} catch {
+  try {
+    writeEvidence('failed', activeStage);
+  } catch {
+    console.error('Linux proof redacted evidence could not be written.');
+  }
+  console.error(\`Linux proof failed at \${activeStage}; details suppressed.\`);
   process.exitCode=1;
 }
