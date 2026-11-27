@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   legacy-s0:
-    name: Focused legacy S0 restore proof
+    name: Focused complete file-restore proof
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -50,11 +50,11 @@ jobs:
           node infra/p05-lab/lab.mjs garage up
           node infra/p05-lab/lab.mjs ledger up
 
-      - name: Run only the legacy S0 restore integration case
+      - name: Run the complete file-restore integration test file
         id: restore
         run: |
           set -euo pipefail
-          node infra/p05-lab/lab.mjs s3test --old-binary --privacy --ledger --s3 --restore -- --cmd env -u FIXLEVELUP_FILE_PROCESSING_TESTS corepack pnpm exec vitest run --maxWorkers 1 --exclude apps/api/tests/p05-attachment-http.test.ts -t 'legacy-s0$'
+          node infra/p05-lab/lab.mjs s3test --old-binary --privacy --ledger --s3 --restore -- --cmd env -u FIXLEVELUP_FILE_PROCESSING_TESTS corepack pnpm exec vitest run --maxWorkers 1 apps/api/tests/file-restore.test.ts
 
       - name: Stop only this job's isolated services
         if: always()
