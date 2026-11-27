@@ -441,10 +441,10 @@ jobs:
         id: engine-run
         run: |
           set -euo pipefail
-          node infra/p05-lab/lab.mjs engine -- apps/api/tests/file-lifecycle-s3.test.ts
-          node infra/p05-lab/lab.mjs engine -- apps/api/tests/p05-ready-attach-live.test.ts -t "admits exactly the published READY file"
-          node infra/p05-lab/lab.mjs engine -- apps/api/tests/p05-attachment-http.test.ts -t "creates the real request"
-          node infra/p05-lab/lab.mjs engine -- apps/api/tests/p05-attachment-http.test.ts -t "refuses the HTTP create"
+          node infra/p05-lab/lab.mjs engine --privacy --ledger --s3 --restore -- apps/api/tests/file-lifecycle-s3.test.ts
+          node infra/p05-lab/lab.mjs engine --privacy --ledger --s3 --restore -- apps/api/tests/p05-ready-attach-live.test.ts -t "admits exactly the published READY file"
+          node infra/p05-lab/lab.mjs engine --privacy --ledger --s3 --restore -- apps/api/tests/p05-attachment-http.test.ts -t "creates the real request"
+          node infra/p05-lab/lab.mjs engine --privacy --ledger --s3 --restore -- apps/api/tests/p05-attachment-http.test.ts -t "refuses the HTTP create"
       - name: Stop only this job's isolated services
         if: always()
         run: |

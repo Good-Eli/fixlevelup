@@ -121,21 +121,73 @@ The old S3 pins did not describe the changed SQL trigger function, and verifyClo
 | **F** — нормативная матрица role × state × command | Независимый [oracle](<../apps/api/tests/p05-http-matrix-oracle.ts>), не читающий controller/dispatcher/X01. Девять HTTPS phases: `city-admin-{0..2}`, `city-manager-{0..2}`, `city-custom-{0..2}`. Они покрывают 18 lawful states × 8 staff commands × три разрешающие CITY role shapes = **432 oracle cells**; каждая ячейка проверяет точный эффект/отказ, fresh aggregate, receipt/audit/outbox/replay и неизменность inventories при deny. | **PASS — 432/432, run 45799842651**, parent SHA `2c2b54abe69c678a23406bf71a385fc2fdac9200`; на более новом SHA `153fb6a...` требуется повтор CI |
 | Регрессия | [Офлайн 153/153](<../test-results/p05-release-20261125/p05-regression-offline.log>), [живая PG](<../test-results/p05-release-20261125/p05-regression-live.log>), [tsc + ESLint](<../test-results/p05-release-20261125/static-five-phase.log>) | [lint 2 ошибки](<../test-results/p05-release-20261125/static-full.log>) | **PASS** |
 
-## Полный P05 Gate и freeze-контракт — 26.11.2026
+## Полный P05 Gate и freeze-контракт — актуализация 27.11.2026
 
-Parent CI на SHA `2c2b54abe69c678a23406bf71a385fc2fdac9200` подтвердил пять действующих jobs: Linux proof, PostgreSQL/Garage integration, F-01 + 432/432 CITY, browser, dependency/license/lockfile/secret. Эти результаты относятся к parent candidate и не считаются результатом последующих правок.
+### Объём и точный источник истины
 
-| Требование / job | Что исполняется и какое доказательство требуется | Статус на момент добавления |
+P05-01…P05-04 реализованы в текущей ветке-кандидате. P05-01 принят владельцем
+исторически; P05-02/P05-03/P05-04 реализованы в соответствующих технических
+границах. Финальный full-stage technical verdict **ожидает исправленного
+exact-head CI Gate**. Этот раздел заменяет старые статусы `SOURCE ADDED / CI
+PENDING` из предыдущего snapshot.
+
+Технический Gate относится только к HEAD PR #2. Не переносить его на другой
+SHA: точные `headSha`, tree, все tracked paths/modes/Git blobs/content SHA-256,
+manifest SHA-256, canonical tree inventory SHA-256 и redacted job evidence
+фиксируются в артефакте `p05-exact-candidate-<run_id>` freeze job текущего
+[PR #2](https://github.com/Good-Eli/fixlevelup/pull/2). Артефакт должен
+соответствовать текущему HEAD; freeze job завершается success только после
+всех required jobs.
+
+### Сводка реализации и полного Gate
+
+| Требование / job | Что подтверждается | Что требуется для итогового PASS |
 |---|---|---|
-| **MUST 2 — role/scope before decrypt** | В `apps/api/tests/p05-intake-http.test.ts` добавлены реальные HTTPS + PostgreSQL попытки `RecordCoverageAssessment` для SYSTEM ADMIN CITY, SYSTEM MANAGER CITY, CUSTOM CITY, wrong/missing CITY assignment, read-only и action-only roles. Каждый запрещённый случай проверяет точный HTTP отказ, ноль audit attempts, ноль ciphertext SELECT и неизменный durable snapshot. | **SOURCE ADDED / CI PENDING** |
-| **MUST 3/15 — role × state × command** | Существующие девять CITY phases исполняют 18 lawful states × 8 staff commands × 3 разрешающие role shapes = 432 клетки независимого oracle. Parent result PASS; новый PII-role proof включён в ту же полную T HTTPS suite. | **Parent PASS; exact new SHA PENDING** |
-| **MUST 14 — partial effects / recovery** | Полный opt-in suite включает HTTPS/PG partial receipt, скрытый submit edge, повреждённые audit/outbox projections, fail-closed 503, exact replay/reconciliation и rollback при отказе после доменных записей. | **SOURCE ADDED / CI PENDING** |
-| **Restore / bridge / old binary** | Приватные PG 18.7, Garage, ledger и trust-floor; явные `--privacy --ledger --s3 --restore --old-binary`; отдельная migration-history job; `db:test-constraints` исполняется основным Linux PostgreSQL/Garage runner, который готовит собственную временную credentials file; четыре one-ticket ClamAV/Sharp сценария. Каждый engine run — отдельный ticket, host controller без Docker socket у runner, workers network-isolated. | **SOURCE ADDED / CI PENDING** |
-| **Build / wire / browser** | Отдельный job строит API/Web/Mini App, исполняет typecheck и сверяет P03/P04/P05 wire. Existing browser job использует шесть Playwright projects: Chromium/Firefox/WebKit × desktop/mobile. | **SOURCE ADDED / CI PENDING на новом SHA** |
-| **Exact candidate freeze** | Последний job требует `success` у каждого из семи CI jobs и чистого tracked worktree. Внешний workflow artifact содержит commit SHA, tree SHA, список всех tracked paths/modes/Git blobs/content SHA-256, SHA-256 файла manifest, SHA-256 canonical source inventory и redacted job evidence. Manifest не включается в сам хешируемый source tree. | **SOURCE ADDED / CI PENDING** |
+| **P05 F-01 / DB boundary** | Прямой DML от имени `fixlevelup_runtime` не может выпускать, резервировать, повторно включать, расширять или удалять request capability grant; negative tests и revoke proof. | Success на точном HEAD |
+| **CITY-RBAC × state × command** | Независимый HTTPS oracle: 3 разрешающие role shapes × 18 lawful states × 8 staff commands = **432 клетки**; allow-пути проверяют effects/receipt/audit/outbox/replay, deny-пути — отсутствие durable effects. | 432/432 и success на точном HEAD |
+| **PII / decrypt boundary** | Реальный HTTPS + PG: scope/role/evidence проверяются до audit/ciphertext read; denied cases имеют ноль ciphertext SELECT/audit attempts и неизменный snapshot. | Full opt-in suite success |
+| **Partial effects / rollback** | Неполные receipt/audit/outbox, отсутствующий submit edge и rollback после доменных записей дают fail-closed результат; exact replay/reconciliation не дублирует effect. | Full opt-in suite success |
+| **Restore / ledger / old binary** | Приватные PG 18.7, Garage, ledger и trust-floor; restore, migration history, старый бинарник, persistence/restart и teardown изолированных ресурсов. | Full integration/migration jobs success |
+| **Real file engine / READY attachment** | Закреплённые ClamAV/Sharp сценарии с one-ticket bridge; READY attachment проходит реальный HTTP/PG/Garage path, digest/inventory сохраняются, retention race закрывается FK interlock. | Оба `p05-attachment-http` engine cases executed и passed, не skipped |
+| **Build / wire / browser** | API, Web и Mini App builds; workspace typecheck; P03/P04/P05 OpenAPI/runtime/client parity; Chromium/Firefox/WebKit desktop/mobile. | Required migration-wire и browser jobs success |
+| **Security / lockfile / freeze** | Dependency/license/secret gates, clean tracked tree; manifest включает полный tracked source inventory. | Security и freeze jobs success |
 
-Engine fixture preparation пересобирает scanner/decoder и требует строгого совпадения с ранее reviewed OCI index + platform digests. Любой drift прекращает Gate; pins не обновляются автоматически, а новый digest потребует отдельной независимой OCI review. FreshClam запускается только как отдельный одноразовый updater; каждый из трёх CVD проходит проверку pinned `sigtool`. Production deployment, live migrations, production restore, push в `main` не выполняются.
+### Исправление пропуска в прежнем CI run
 
-Новая migration job выполняет только migration-history suite в отдельном изолированном кластере; `db:test-constraints` не исключён и остаётся в основном Linux PostgreSQL/Garage integration runner, где bootstrap создаёт собственный локальный `.env` в одноразовом workspace. Ошибка пути `/workspace/infra/dev-postgres/.env` в дополнительном job на parent run не является основанием убрать constraint suite из общего Gate.
+Предыдущий run [45942722310](https://github.com/Good-Eli/fixlevelup/actions/runs/45942722310)
+на SHA `66e331c118d34947cd4f24570ee5f489af8fe5b2` имел зелёный job, но его
+engine invocation пропускали оба теста `p05-attachment-http.test.ts`:
+workflow не передавал обязательные `--privacy --ledger --s3 --restore` flags,
+поэтому suite-level opt-in gate отключал файл; Vitest возвращал exit 0 при
+двух skipped. Этот run **не** считается доказательством attachment HTTP
+acceptance и не является основанием для FULL P05 PASS.
 
-Технический Gate и manifest не равны FULL P05. Перед действием по §9 всё ещё нужны отдельный независимый явный `PASS — FULL ASTRA P05` на точном замороженном SHA и owner acceptance. Только после них возможен отдельный согласованный fast-forward; это не deployment authorization.
+Исправление включено в workflow и тест: каждый engine invocation передаёт все
+четыре isolated opt-ins; если файл запущен с `FILE_PROCESSING_TESTS=1`, но
+прочие обязательные flags отсутствуют, suite завершается ошибкой; повторное
+использование one-ticket bridge в одном invocation также завершается ошибкой,
+не `ctx.skip`. Два attachment HTTP case исполняются отдельными one-ticket
+invocations. В новом exact-head run оба должны быть видны в log как
+**passed**, иначе полный P05 verdict не выдаётся.
+
+### Migration, build и integration facts
+
+- Цепочка **24 migrations** проходит fresh, populated upgrade, replay,
+  drift/restoration and catalog checks; measured inventory — **370 CHECKs**.
+- Migration 024 adds the request-intake effects profile (10 tables, 30 new
+  CHECKs, exact ACL and immutability) over the existing S2 profile.
+- Full opt-in run uses an isolated PostgreSQL 18.7 lab, Garage, private ledger
+  and trust floor; the old-binary archive is read-only and hash-pinned.
+- The engine host controller alone owns Docker access; the test runner receives
+  one-use ticketed JSON exchange, not the Docker socket. Engine workers run
+  network-isolated and are reaped per ticket.
+- Test runs create/drop their own disposable database by OID; they do not
+  migrate or reset the developer database. No live deployment, production
+  migration or production restore was executed.
+
+### Publication boundary
+
+Existing [P05-PLAN §9](P05-PLAN.md) remains unchanged: a separate independent
+`PASS — FULL ASTRA P05` and owner acceptance are still required by the
+repository's existing publication procedure before fast-forward to `main`.
+No production deployment authorization is granted.

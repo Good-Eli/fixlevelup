@@ -51,7 +51,7 @@ Refusals are RFC 7807 `application/problem+json` with a closed five-key body and
     - `apps/api/tests/file-restore-p05.test.ts` (**17/17 passed** на той ревизии) and `apps/api/tests/file-restore.test.ts` (**1/1 passed** на той ревизии) prove the §5.3 file-only restore guard for `S0`, `S1` and `S2`, including exact physical shape verification, challenge-bound attestation nonces, profile mismatch refusal (`S1↔S2`, `S0↔S1`, `S0↔S2`), physically drifted empty targets and unavailable target inventory refusal (`RESTORE_AUTHORITY`, epoch stays `RESTORE_CLOSED`, runtime `CONNECT` withheld).
     - `corepack pnpm run typecheck` and `npx eslint` on all P05-02 touched files — **PASS** (exit 0, 0 warnings) на той ревизии.
 
-5.  **Verification of the current revision (25.11.2026)**:
+5.  **Historical verification snapshot (25.11.2026; superseded by current full P05 Gate):**
     - Full workspace suite, opt-in `FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1` on isolated PostgreSQL 18.7: **1146 passed / 0 failed / 78 skipped, 88 files passed** — two consecutive runs with identical totals. The skips are the S3/Garage and compiled-binary suites that need their own opt-in flags, plus the three lab proofs below.
     - `packages/database-tooling/scripts/test-form-session-migration.mjs` through `corepack pnpm run db:test-migrations` — **PASS, exit 0** on the current tree: 23 migrations, 340 CHECKs, `023 populated upgrade`, `023 form session foundation: populated upgrade guards`, `023 runtime grants: exact column ACL`.
     - `corepack pnpm run typecheck` — **exit 0** for every workspace. ESLint — **exit 0** with `--ignore-pattern 'test-results/**'`; the unmodified `corepack pnpm run lint` cannot pass while the gitignored local QA directory `test-results/` exists (67 550 files, 1.68 GB, including a foreign `node_modules` that raises `EACCES`), because `eslint.config.mjs` does not ignore it.
@@ -61,29 +61,33 @@ Refusals are RFC 7807 `application/problem+json` with a closed five-key body and
     - Two flaky timeouts were observed and are **not** attributed to this revision: `staff-authz-e2e.test.ts` (10 s default timeout under two concurrent workers; passes standalone at 10.5 s and passed in both subsequent full runs) and one earlier 10 s timeout in the same family. They are recorded here as an open test-stability observation, not as a closed finding.
 
 ## Status
-**РАБОЧИЙ КАНДИДАТ — НЕ ПРИНЯТ.** P05-02 реализован в рабочем кандидате поверх
-preflight-коммита `8a3e316`, но владельцем не принят и имеет **открытые
-замечания аудита**. Полного P05 FULL PASS нет. Это не production/deployment claim
-и не owner acceptance.
 
-Зелёный прогон текущей ревизии (§5) доказывает, что заявленный код исполняется на
-isolated PostgreSQL, но **не** заменяет аудит, приёмку владельцем или разрешение на
-развёртывание: открытые замечания аудита этим прогоном не закрыты.
+**P05-02 — IMPLEMENTED / COMPLETE (S2).** Migration 023 and the seven
+canonical public F routes are implemented. The slice is integrated with
+P05-03/P05-04; its earlier working-candidate wording and the 25.11.2026 local
+verification snapshot above are historical, not the current status. Current
+exact-head evidence is maintained in [P05-EVIDENCE](P05-EVIDENCE.md).
 
-**Прошлые (зафиксированные) результаты — отдельно от текущего статуса.** Числа
-`21/21` (`form-session-http.test.ts`), `12/12` (`runtime-database.test.ts`),
-`17/17` (`file-restore-p05.test.ts`), `1/1` (`file-restore.test.ts`), `22/22`
-(`legal-db.test.ts`), `10/10` (`requests-admission-wiring.test.ts`) и
-23-миграционный оркестратор (`340 CHECKs`) относятся к прогонам **предыдущей
-ревизии** кандидата на isolated PostgreSQL 18.7. Они сохранены как история
-среза и **не подтверждают** текущий кандидат, не закрывают открытые замечания
-и не являются приёмочным evidence. Подробности — в §4 с явной пометкой.
+The final full-stage technical Gate is pending the corrected exact-head CI run.
+The previous green run skipped both real attachment HTTP tests and is not
+accepted as full-stage evidence. The corrected workflow explicitly enables
+the isolated PostgreSQL, privacy, Garage, ledger and restore contours; those
+tests now fail closed on missing opt-ins or a consumed one-ticket engine
+bridge.
 
-Проверка текущей ревизии разделяет исходные 41 незакоммиченный файл, собственно исправления и полный исходный снимок; результаты прогонов — в §5. Успешный тест, независимый аудит, приёмка владельцем и разрешение на развёртывание — разные события. Рабочее окружение не является стендом для проверки.
+**Boundaries retained:**
 
-Границы текущего кандидата:
-
-- `FormSessionController` is composed only in the isolated test composition T (P05-PLAN §8) and is **not** registered in `AppModule` (release composition R serves no P05 routes).
-- Migration 023 has not been applied to the working dev database; only isolated disposable test databases were migrated and dropped on teardown.
-- TTLs, quotas and the source address are synthetic test values (the source is the socket peer address, never `X-Forwarded-For`), not production tuning; real PII handling, customer/request creation, submit-edge and staff bridge belong to P05-03/P05-04.
-- P05-01 остаётся принятым исторически и зафиксирован в `f2caab05`; P05-03/P05-04 не начаты. Итого по P05: 1 из 4 принят (25%).
+- `FormSessionController` and `RequestIntakeController` are composed only in
+  isolated test composition T. They are not registered in `AppModule`;
+  release composition R has no P05 routes.
+- Migration 023 (and P05 migration 024) is verified on fresh disposable
+  PostgreSQL 18.7 databases in CI. The working/dev database has not been
+  migrated by these proofs.
+- TTLs, quotas, source addresses, legal documents, contacts and keys in the
+  tests are synthetic fixtures. The socket peer is used, never
+  `X-Forwarded-For`; this is not production tuning or permission to process
+  real PII.
+- The P05 result does not activate channel delivery, live Telegram/VK/MAX
+  accounts, public site/file transport, CRM card/search, scheduling or
+  operational retention/erasure. Those remain separate P06/P07/P08/P09/P13P
+  scopes.

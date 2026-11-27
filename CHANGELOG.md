@@ -1,6 +1,6 @@
 # История изменений
 
-Техническая история репозитория по состоянию на 24.11.2026. Дата — дата коммитов в их локальном часовом поясе; номера релизов не назначались. Актуальные статусы P01 — в [Preflight](docs/PREFLIGHT_P01.md); контур P02 — в [RBAC](docs/RBAC.md); прогресс, трудоёмкость и все подэтапы — в [журнале подэтапов](docs/SUBTASKS.md), подробные доказательства приёмок — в [SUBTASKS-EVIDENCE](docs/SUBTASKS-EVIDENCE.md); остальные документы R3.2 сохраняют исторические формулировки этапа 0.
+Техническая история репозитория по состоянию на 27.11.2026. Дата — дата коммитов в их локальном часовом поясе; номера релизов не назначались. Актуальные статусы P01 — в [Preflight](docs/PREFLIGHT_P01.md); контур P02 — в [RBAC](docs/RBAC.md); прогресс, трудоёмкость и все подэтапы — в [журнале подэтапов](docs/SUBTASKS.md), подробные доказательства приёмок — в [SUBTASKS-EVIDENCE](docs/SUBTASKS-EVIDENCE.md); остальные документы R3.2 сохраняют исторические формулировки этапа 0.
 
 ## 22.11.2026 — P04 принят полностью (4 из 4), FULL ASTRA P04 — PASS
 
@@ -12,13 +12,31 @@
 - **Исправления FULL ASTRA P04** (`7a60d4c`) — пять межсрезовых замечаний закрыты адресно, без переписывания принятых коммитов.
 - Границы: реальный [прайс](info/Прайс.txt) не читается и не импортируется, доменных сидов нет, Q06/Q09/Q10 открыты. Нет заявок, планирования, смет, оплат, публичных маршрутов и production.
 
-## P05 — 1 из 4 принят: P05-01 зафиксирован, P05-02 — рабочий кандидат
+## 27.11.2026 — P05-01…P05-04 реализованы; финальный Gate повторяется
 
-- **Статус:** P05 открыт отдельным поручением владельца 23.11.2026 по [плану v0.4](docs/P05-PLAN.md). **P05-01** ([контракт](docs/P05-01-CONTRACT.md)) **принят владельцем исторически** и зафиксирован в `f2caab05`; preflight-коммит — `8a3e316`. Реализованы модель заявки и клиента, типизированная история контакта/адреса/техники, неизменяемые workflow и policy, отдельный зашифрованный payload, защита от обхода проверок (admission fence) и инфраструктурный wiring всех runtime-потребителей БД. **P05-02** (F-сессия, согласие, покрытие; миграция `023`) — **рабочий кандидат**: не принят, имеет открытые замечания аудита; его прогоны относятся к предыдущей ревизии кандидата и не подтверждают текущую. **P05-03/P05-04** не начаты. Итого по P05: 1 из 4 принят (25%).
-- Миграция `022` `request_intake_foundation` — additive surface поверх `021`, закоммичена в `f2caab05`; миграции `001…021` побайтно неизменны. Миграция `023` `form_session_foundation` — рабочая кандидатная миграция P05-02, не принята.
-- Модули: `apps/api/src/requests/` (`crypto/keyring`, `crypto/payload-cipher`, `workflow/registry`) и `apps/api/src/infrastructure/admission/` (`admission`, `control-contour`, `launcher`, `physical-profile`, `pool-guard`, `process-admission`, `proof`, `registry`, `runtime-admission`, `witness`).
-- **Проверено (P05-01, исторический прогон до приёмки):** миграционный оркестратор — вся цепочка `001–022` fresh/upgrade/replay/drift и 334 CHECK; readiness-гейт с 14 негативами по ACL и триггерам; юнит-матрица workflow; 35 криптотестов; 16 тестов admission на отдельной одноразовой control-БД; baseline-локи 6/6. Подробности — в контракте среза. Для рабочего кандидата P05-02 эти числа не являются evidence.
-- Границы: HTTP-маршрутов приёма, callback, ручного ввода и staff bridge нет — это P05-03/P05-04; F-сессия существует только в рабочем кандидате P05-02 (не принят, не входит в release composition). Реальных ПД, публичных форм и production нет.
+- **Статус реализации:** все четыре подэтапа P05 реализованы. P05-01
+  ([контракт](docs/P05-01-CONTRACT.md)) принят владельцем исторически
+  (`f2caab05`). P05-02 (F sessions, consent, coverage; migration 023),
+  P05-03 (callback/repair/manual intake, READY attachment and staff bridge;
+  migration 024) и P05-04 (early commands, bounded read, OpenAPI 3.1, typed
+  client) реализованы и интегрированы.
+- **Почему повторяется Gate:** run 45942722310 был зелёным, но его engine job
+  не передавал `--privacy --ledger --s3 --restore`; из-за этого оба реальных
+  теста `p05-attachment-http.test.ts` завершились как skipped при exit 0.
+  Этот run не считается доказательством этих двух сценариев. В новом workflow
+  все четыре opt-in передаются явно, а тесты завершаются ошибкой при неполном
+  opt-in или повторном использовании one-ticket bridge.
+- **Технические доказательства:** см. [P05-EVIDENCE](docs/P05-EVIDENCE.md),
+  [P05-03](docs/P05-03-CONTRACT.md), [P05-04](docs/P05-04-CONTRACT.md).
+  Полный технический Gate и exact candidate freeze будут считаться успешными
+  только по новому завершённому CI run на точном HEAD PR #2 с обоими
+  attachment HTTP tests в статусе passed.
+- **Границы:** P05 controllers run only in isolated test composition T; release
+  composition R does not register P05 routes. 023/024 run only on disposable
+  PostgreSQL; no working DB migration, production deployment, real PII, public
+  site, file byte transport, live channel/account or manager delivery occurred.
+  Existing [P05-PLAN §9](docs/P05-PLAN.md) still requires separate Astra FULL
+  P05 and owner acceptance before publication/fast-forward.
 
 ## 22.11.2026 — P03-05 принят владельцем в synthetic scope, Astra Gate 2 PASS
 

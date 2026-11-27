@@ -32,8 +32,8 @@
  * decode, output-scan). Each test below therefore creates exactly one real READY
  * file, and the suite is executed as TWO invocations, one per test:
  *
- *   node infra/p05-lab/lab.mjs engine -- apps/api/tests/p05-attachment-http.test.ts -t "creates the real request"
- *   node infra/p05-lab/lab.mjs engine -- apps/api/tests/p05-attachment-http.test.ts -t "refuses the HTTP create"
+ *   node infra/p05-lab/lab.mjs engine --privacy --ledger --s3 --restore -- apps/api/tests/p05-attachment-http.test.ts -t "creates the real request"
+ *   node infra/p05-lab/lab.mjs engine --privacy --ledger --s3 --restore -- apps/api/tests/p05-attachment-http.test.ts -t "refuses the HTTP create"
  *
  * Running both tests in one invocation would ask the single-use bridge for a second
  * file and be refused; that is a property of the reviewed bridge, not of the
@@ -77,8 +77,15 @@ const pub = '/public';
 const enabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
   && process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1'
   && process.env['FIXLEVELUP_STORAGE_S3_TESTS'] === '1'
+  && process.env['FIXLEVELUP_FILE_PRIVACY_TESTS'] === '1'
   && process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] === '1'
   && process.env['FIXLEVELUP_FILE_PROCESSING_TESTS'] === '1';
+
+// An engine invocation is an explicit request to execute this suite, not a reason
+// to let describe.runIf silently turn missing opt-ins into a successful skipped file.
+if (process.env['FIXLEVELUP_FILE_PROCESSING_TESTS'] === '1' && !enabled) {
+  throw new Error('P05 attachment HTTP suite requires the isolated PG, privacy, Garage, ledger and engine opt-ins');
+}
 
 interface Reply {
   readonly status: number;
@@ -551,7 +558,7 @@ describe.runIf(enabled)('P05 real HTTP attachments and both retention orders', (
   }
   const spyOnS3 = () => vi.spyOn(S3Client.prototype, 'send');
 
-  it('creates the real request with a real READY attachment and preserves every digest', async (ctx) => {
+  it('creates the real request with a real READY attachment and preserves every digest', async () => {
     const form = await issue();
     const evidenceId = await given(form);
     const anchor = { sessionId: form.sid, token: rawToken(form), evidenceId,
@@ -560,10 +567,7 @@ describe.runIf(enabled)('P05 real HTTP attachments and both retention orders', (
     // output-scan triple per ticket), so this suite produces exactly one real READY
     // file per run. That file is the attachment under test.
     const ready = await readyFile(anchor, await engineFixtureImage());
-    if (ready === undefined) {
-      ctx.skip('single-use engine bridge already spent: run this test in its own invocation');
-      return;
-    }
+    if (ready === undefined) { throw new Error('The one-ticket engine bridge was already consumed in this invocation'); }
     const key = randomUUID();
     const body = repairBody(evidenceId, [ready.publicationFileId]);
     try {
@@ -636,16 +640,13 @@ describe.runIf(enabled)('P05 real HTTP attachments and both retention orders', (
     }
   }, 240_000);
 
-  it('refuses the HTTP create once the real retention decision moved the control', async (ctx) => {
+  it('refuses the HTTP create once the real retention decision moved the control', async () => {
     const form = await issue();
     const evidenceId = await given(form);
     const anchor = { sessionId: form.sid, token: rawToken(form), evidenceId,
       documentId: fixture.consentDocumentId, documentVersionId: fixture.consentDocumentVersionId };
     const ready = await readyFile(anchor, await engineFixtureImage());
-    if (ready === undefined) {
-      ctx.skip('single-use engine bridge already spent: run this test in its own invocation');
-      return;
-    }
+    if (ready === undefined) { throw new Error('The one-ticket engine bridge was already consumed in this invocation'); }
     try {
       const intent = ready.file.intentId;
       const exact = await exactObjects(intent);
