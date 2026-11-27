@@ -3,3 +3,4 @@
 .registry-table th, .registry-table td { padding: .65rem; text-align: start; border-bottom: 1px solid #afc2c7; }
 .registry-table time { white-space: nowrap; }
 .registry-table th { background: #edf6f3; }
+.request-comments p { white-space: pre-wrap; }

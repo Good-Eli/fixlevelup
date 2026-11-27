@@ -24,6 +24,8 @@ interface Fixture {
   readonly cert: Buffer;
   readonly sessionToken: string;
   readonly publicNumber: string;
+  readonly requestId: string;
+  readonly checkPanels: boolean;
 }
 
 export async function proveLiveRegistry(fixture: Fixture) {
@@ -39,11 +41,20 @@ export async function proveLiveRegistry(fixture: Fixture) {
   });
   const stopped = once(child, 'exit');
   let unexpected = 0;
+  const cardPage = `${registryPath}/${fixture.requestId}`;
+  const cardApi = `${list}/${fixture.requestId}/card`;
+  const eventApi = `${list}/${fixture.requestId}/events`;
+  const reviewApi = `${list}/${fixture.requestId}/commands/start-review`;
+  const commentApi = `${list}/${fixture.requestId}/comments`;
+  const contactApi = `${list}/${fixture.requestId}/contact-details`;
   const ingress = createServer({ key: fixture.key, cert: fixture.cert }, (req, res) => {
     const path = new URL(req.url ?? '/', fixture.origin).pathname;
-    const api = path === list || path === optionsPath;
-    if (req.headers.host !== new URL(fixture.origin).host || req.method !== 'GET'
-      || (!api && path !== registryPath && !path.startsWith('/_next/static/') && path !== '/favicon.ico')) {
+    const api = path === list || path === optionsPath || path === cardApi || path === eventApi || path === reviewApi
+      || (fixture.checkPanels && (path === commentApi || path === contactApi));
+    const methodOk = path === reviewApi ? req.method === 'POST'
+      : req.method === 'GET' || (fixture.checkPanels && path === commentApi && req.method === 'POST');
+    if (req.headers.host !== new URL(fixture.origin).host || !methodOk
+      || (!api && path !== registryPath && path !== cardPage && !path.startsWith('/_next/static/') && path !== '/favicon.ico')) {
       unexpected++;
       res.writeHead(404).end();
       return;
@@ -137,6 +148,40 @@ export async function proveLiveRegistry(fixture: Fixture) {
       await expect(category).toHaveValue('');
       await expect(district).toHaveValue('');
       await expect(source).toHaveValue('');
+      const [card, timeline] = await Promise.all([
+        byPath(cardApi), byPath(eventApi), row.getByRole('link', { name:fixture.publicNumber }).click(),
+      ]);
+      expect(card.status()).toBe(200);
+      expect(timeline.status()).toBe(200);
+      expect(card.headers()['cache-control']).toMatch(/^no-store\b/u);
+      await expect(page.getByRole('heading', { name:`Заявка № ${fixture.publicNumber}` })).toBeVisible();
+      const details = page.getByRole('region',{name:'Основные сведения'});
+      await expect(details.getByText('Synthetic category',{exact:true})).toBeVisible();
+      await expect(details.getByText('Synthetic district',{exact:true})).toBeVisible();
+      await expect(page.getByRole('region',{name:'Пока недоступно'}).getByText('Отчёты',{exact:true})).toBeVisible();
+      await expect(page.getByRole('region', { name:'Последние события заявки' }).getByRole('table')).toContainText('Сотрудник');
+      const [review] = await Promise.all([byPath(reviewApi),page.getByRole('button',{name:'Начать проверку'}).click()]);
+      expect(review.status()).toBe(200);
+      await expect(page.getByText('Проверка заявки начата.')).toBeVisible();
+      await expect(page.getByRole('cell',{name:'Начата проверка менеджером'})).toBeVisible();
+      await expect(page.getByRole('main')).not.toContainText('+15550100001');
+      if (fixture.checkPanels) {
+        const comments = page.getByRole('region',{name:'Внутренние комментарии'});
+        await comments.getByRole('textbox',{name:'Текст комментария'}).fill('Проверить наличие детали.');
+        const [added] = await Promise.all([
+          page.waitForResponse(response => new URL(response.url()).pathname === commentApi && response.request().method() === 'POST'),
+          comments.getByRole('button',{name:'Добавить комментарий'}).click(),
+        ]);
+        expect(added.status()).toBe(201);
+        await expect(comments.getByText('Проверить наличие детали.',{exact:true})).toBeVisible();
+        const contacts = page.getByRole('region',{name:'Контактные данные'});
+        const [revealed] = await Promise.all([byPath(contactApi),contacts.getByRole('button',{name:'Показать контактные данные'}).click()]);
+        expect(revealed.status()).toBe(200);
+        expect(revealed.headers()['cache-control']).toMatch(/^no-store\b/u);
+        await expect(contacts).toContainText('+15550100001');
+        await contacts.getByRole('button',{name:'Скрыть контактные данные'}).click();
+        await expect(contacts).not.toContainText('+15550100001');
+      }
       expect(consoleErrors).toHaveLength(0);
       expect(unexpected).toBe(0);
     } finally {

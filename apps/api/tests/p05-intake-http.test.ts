@@ -37,6 +37,9 @@ import { withHttpMatrixActors } from './p05-http-matrix-actors.js';
 import type { StaffProof } from './p05-http-matrix-actors.js';
 import { noP05CommandRoutes, witnesses } from './p05-http-matrix-oracle.js';
 import { createSyntheticKeySlots } from './p05-key-slot-fixture.js';
+import { COMMENT_KEY_ENVIRONMENT } from '../src/requests/card/comments.js';
+import { installCommentFixture, grantCommentFixture, grantContactFixture } from './p06-comment-fixture.js';
+import { createContactAudit } from '../src/requests/card/contacts.js';
 
 const origin = 'https://crm.example.test';
 const enabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
@@ -44,6 +47,7 @@ const enabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
 const contact = Object.freeze({ name:'Synthetic intake sentinel',phone:'+15550100001' });
 const address = Object.freeze({ street:'Synthetic comparison sentinel',building:'12' });
 const pub = '/public';
+const commentProof = process.env['FIXLEVELUP_P06_COMMENT_PROOF'] === '1';
 
 interface Reply {
   readonly status: number;
@@ -64,12 +68,14 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   let historical: PolicyPackage;
   let keyring: KeyringConfig;
   let managed: Awaited<ReturnType<typeof createSyntheticKeySlots>> | undefined;
+  let managedComments: Awaited<ReturnType<typeof createSyntheticKeySlots>> | undefined;
   let launchWithPolicy: (id: string, pins?: ReadonlyMap<string,string>, anchorTtlMs?: number,
     matrixOffers?: RequestOffers) => ReturnType<typeof startIsolatedIntake>;
   const historicalDigest = '3799c7e532579641d010675a229541c998f4d02bf85c3156fe167f79d33631cf';
   const evidence = new Map<string, NonNullable<Awaited<ReturnType<StaffEvidencePort['verify']>>> & Parameters<StaffEvidencePort['verify']>[1]>();
   const review = new Map<string,CoverageReviewEvidence>();
   const evidenceClockHooks = new Map<string,(client: import('pg').PoolClient, proof: StaffEvidence) => Promise<void>>();
+  const evidenceSnapshotHooks = new Map<string,() => void>();
   const registryEvidenceHooks = new Map<string,() => void>();
   let registryOpenHook: ((client: import('pg').PoolClient) => Promise<void>) | undefined;
   const evidencePort: StaffEvidencePort = {
@@ -81,7 +87,9 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     },
     async isCurrent(client, proof) {
       await evidenceClockHooks.get(proof.id)?.(client,proof);
-      return evidence.get(proof.id)?.procedureRevision === proof.procedureRevision;
+      const current = evidence.get(proof.id)?.procedureRevision === proof.procedureRevision;
+      evidenceSnapshotHooks.get(proof.id)?.();
+      return current;
     },
     async openRegistry(client) {
       await registryOpenHook?.(client);
@@ -120,6 +128,10 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       hmac:[{keyId:'test-hmac-1',secretHex:randomBytes(32).toString('hex')}] });
     const keys=await createSyntheticKeySlots('p05-isolated');
     managed=keys;
+    if (commentProof) {
+      await installCommentFixture(lab);
+      managedComments = await createSyntheticKeySlots(COMMENT_KEY_ENVIRONMENT);
+    }
     const supportedPolicies = new Map(supportedFixturePolicies());
     supportedPolicies.set(policyPairKey(historical.workflowVersion,historical.policyRevision),historicalDigest);
     const csrf = randomBytes(32).toString('hex');
@@ -135,7 +147,9 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
           groupTtlMs:matrix ? 1800000 : 900000,anchorTtlMs,csrfTtlMs:matrix ? anchorTtlMs : Math.min(300000,anchorTtlMs),
           throttles:{ source:{windowSeconds:600,maxHits:matrix ? 3000 : 300},global:{windowSeconds:600,maxHits:matrix ? 3000 : 300},
             anchor:{windowSeconds:600,maxHits:60} } },
-        configure:audit=>({...settings,offers:matrixOffers ?? offers,staffEvidence:evidencePort,coverage:coverageEffects(settings,audit,{
+        configure:audit=>({...settings,offers:matrixOffers ?? offers,staffEvidence:evidencePort,
+          ...(managedComments ? {comments:{ring:keyring,keySlots:managedComments.slots},contactAudit:createContactAudit(audit)} : {}),
+          coverage:coverageEffects(settings,audit,{
           async verify(input) { return await Promise.resolve(review.get(input.evidenceId)); },
         },64)}),
       });
@@ -148,7 +162,10 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   let staffCsrf: string;
   afterAll(async () => {
     try { await testApp?.app.close(); }
-    finally { try { await managed?.close(); } finally { await base?.close(); } }
+    finally {
+      try { await managed?.close(); }
+      finally { try { await managedComments?.close(); } finally { await base?.close(); } }
+    }
   },20000);
 
   function portOf(instance: Awaited<ReturnType<typeof startIsolatedIntake>>): number {
@@ -222,6 +239,16 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   function mintEvidence(id: string, purpose: Parameters<StaffEvidencePort['verify']>[1]['purpose'], target: string, body: unknown) {
     evidence.set(id,{id,purpose,staffId:db().admin.id,target,canonicalIntent:canonicalJson(body),procedureRevision:'fixture-v1',
       validUntil:new Date(Date.now()+300000)});
+  }
+
+  async function withdrawAtEvidenceSnapshot<T>(id: string, target: number, read: () => Promise<T>): Promise<T> {
+    let checks = 0;
+    evidenceSnapshotHooks.set(id,() => { if (++checks === target) { evidence.delete(id); } });
+    try {
+      const result = await read();
+      expect(checks).toBe(target);
+      return result;
+    } finally { evidenceSnapshotHooks.delete(id); }
   }
 
   async function manualPrepared(districtId?: string) {
@@ -469,16 +496,165 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     });
   },45000);
 
-  it.runIf(process.env['FIXLEVELUP_P06_BROWSER'] === '1')('P06 browser renders and filters the live CRM registry', async () => {
+  it.runIf(process.env['FIXLEVELUP_P06_BROWSER'] === '1')('P06 browser renders and filters the live CRM registry and opens its card', async () => {
     const manual = await manualPrepared(fixture.districtId);
     manual.authorize();
     const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    if (commentProof) {
+      await grantCommentFixture(db(),db().admin.id,fixture.cityId,true);
+      await grantContactFixture(db(),db().admin.id,fixture.cityId);
+    }
     const browserFixture = { origin,apiPort:port,key:staffTlsKey,cert,sessionToken:db().admin.token,
-      publicNumber:text(created,'publicNumber') };
+      publicNumber:text(created,'publicNumber'),requestId:text(created,'id'),checkPanels:commentProof };
     const helper = new URL('../../../packages/browser-tooling/fixtures/p06-live.ts', import.meta.url);
     const { proveLiveRegistry } = await import(helper.href) as { proveLiveRegistry: (input: typeof browserFixture) => Promise<void> };
     await proveLiveRegistry(browserFixture);
   },75000);
+
+  it('P06 card and timeline use the request authority and the existing command validator', async () => {
+    const manual = await manualPrepared(fixture.districtId);
+    manual.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const path = `/requests/${text(created,'id')}`;
+    const cardPath = `${path}/card`;
+    const timelinePath = `${path}/events`;
+    failure(await https('GET',cardPath),401,'UNAUTHORIZED');
+    const card = closed(await https('GET',cardPath,undefined,staff()),200,
+      ['id','publicNumber','type','status','version','createdAt','contactMode','provider','facts','unavailable','canStartReview']);
+    expect(card.data()).toMatchObject({ ...created,type:'REPAIR',contactMode:'PHONE',provider:null,canStartReview:true });
+    expect(card.data()['facts']).toEqual({source:'Synthetic REQUEST_SOURCE',category:'Synthetic category',district:'Synthetic district',
+      urgency:null,coverage:null});
+    expect(card.data()['unavailable']).toMatchObject({appointments:'not_ready',quotes:'not_ready',reports:'not_ready',payments:'not_ready'});
+    const commandTag = card.headers['x-command-etag'];
+    expect(card.headers['x-command-csrf']).toBeUndefined();
+    const armed = accepted(await https('GET',cardPath,undefined,{...staff(),'X-Auth-Request':'1'}),200);
+    const commandCsrf = armed.headers['x-command-csrf'];
+    expect(commandCsrf).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(commandTag).toBe(tag(accepted(await https('GET',path,undefined,staff()),200)));
+    if (typeof commandTag !== 'string' || typeof commandCsrf !== 'string') { throw new Error('Missing command proof'); }
+
+    await withHttpMatrixActors(db(), fixture.cityId, async actors => {
+      const reader = {Cookie:actors.reader.cookie,'X-Auth-Request':'1'};
+      const readOnly = accepted(await https('GET',cardPath,undefined,reader),200);
+      expect(readOnly.data()['canStartReview']).toBe(false);
+      expect(readOnly.headers['x-command-csrf']).toBeUndefined();
+      for (const route of [cardPath,timelinePath]) {
+        failure(await https('GET',route,undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+      }
+    });
+    const key = randomUUID();
+    const headers = {...staffMutation(key,commandTag),'X-CSRF-Token':commandCsrf};
+    const started = accepted(await https('POST',`${path}/commands/start-review`,{},headers),200);
+    expect(accepted(await https('POST',`${path}/commands/start-review`,{},headers),200).bytes).toBe(started.bytes);
+    failure(await https('POST',`${path}/commands/start-review`,{},staffMutation(undefined,commandTag)),412,'VERSION_MISMATCH');
+    const history = closed(await https('GET',timelinePath,undefined,staff()),200,['items']).data()['items'];
+    if (!Array.isArray(history)) { throw new Error('Invalid timeline'); }
+    expect(history.map(item => {
+      const { createdAt,...fields } = record(item);
+      expect(String(createdAt)).toMatch(/\.\d{6}Z$/);
+      return fields;
+    })).toEqual([{version:2,command:'StartReview',actorKind:'STAFF'},{version:1,command:'CreateRepair',actorKind:'STAFF'}]);
+
+    const restricted = closed(await withdrawAtEvidenceSnapshot(manual.body.evidenceId,2,
+      () => https('GET',cardPath,undefined,staff())),200,['version']);
+    expect(restricted.data()).toEqual({version:2});
+    expect(restricted.headers['x-command-etag']).toBeUndefined();
+    expect(closed(await https('GET',timelinePath,undefined,staff()),200,['items']).data()).toEqual({items:[]});
+  },60000);
+
+  it.runIf(commentProof)('P06 comments are private, encrypted, versioned and idempotent over HTTPS', async () => {
+    const manual = await manualPrepared();
+    manual.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const id = text(created,'id');
+    const path = `/requests/${id}/comments`;
+    const initial = tag(accepted(await https('GET',`/requests/${id}`,undefined,staff()),200));
+    const note = {text:'Проверить наличие детали.'};
+    failure(await https('GET',path,undefined,staff()),403,'FORBIDDEN');
+    failure(await https('POST',path,note,staffMutation(undefined,initial)),403,'FORBIDDEN');
+    await grantCommentFixture(db(),db().admin.id,fixture.cityId,true);
+    const card = accepted(await https('GET',`/requests/${id}/card`,undefined,{...staff(),'X-Auth-Request':'1'}),200);
+    expect(card.headers['x-comment-csrf']).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(card.data()['unavailable']).toMatchObject({comments:'available',contactDetails:'not_ready'});
+    await withHttpMatrixActors(db(),fixture.cityId,async actors => {
+      await grantCommentFixture(db(),actors.reader.id,fixture.cityId,false);
+      const headers = {Cookie:actors.reader.cookie,'X-Auth-Request':'1'};
+      const readerCard = accepted(await https('GET',`/requests/${id}/card`,undefined,headers),200);
+      expect(readerCard.data()['unavailable']).toMatchObject({comments:'available'});
+      expect(readerCard.headers['x-comment-csrf']).toBeUndefined();
+      expect(accepted(await https('GET',path,undefined,headers),200).data()).toEqual({items:[]});
+      const csrf = createHmac('sha256',staffCsrf).update('web-auth-csrf\0').update(actors.reader.token).digest('base64url');
+      failure(await https('POST',path,note,{...headers,'X-CSRF-Token':csrf,'Idempotency-Key':randomUUID(),'If-Match':initial}),403,'FORBIDDEN');
+      await grantCommentFixture(db(),actors.wrong.id,fixture.cityId,true);
+      failure(await https('GET',path,undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+    });
+    failure(await https('POST',path,note,staffMutation()),428,'PRECONDITION_REQUIRED');
+    const key = randomUUID();
+    const submitted = closed(await https('POST',path,note,staffMutation(key,initial)),201,['id','version','createdAt']);
+    const commentId = text(submitted.data(),'id');
+    expect(accepted(await https('POST',path,note,staffMutation(key,initial)),200).bytes).toBe(submitted.bytes);
+    failure(await https('POST',path,{text:'Другая запись'},staffMutation(key,initial)),409,'IDEMPOTENCY_KEY_REUSED');
+    const listed = closed(await https('GET',path,undefined,staff()),200,['items']).data();
+    expect(listed).toEqual({items:[{...submitted.data(),...note}]});
+    expect(await db().count(`SELECT count(*)::int n FROM p06_crm.comments
+      WHERE id=$1 AND position(convert_to($2,'UTF8') IN ciphertext)=0`,[commentId,note.text])).toBe(1);
+    expect(await db().count(`SELECT count(*)::int n FROM foundation.audit_logs
+      WHERE correlation_id=$1 AND operation='P06_ADD_INTERNAL_COMMENT' AND position($2 IN details::text)=0`,[commentId,note.text])).toBe(1);
+    accepted(await https('POST',`/requests/${id}/commands/start-review`,{},staffMutation(undefined,initial)),200);
+    failure(await https('POST',path,note,staffMutation(undefined,initial)),412,'VERSION_MISMATCH');
+    const latest = tag(accepted(await https('GET',`/requests/${id}`,undefined,staff()),200));
+    failure(await withdrawAtEvidenceSnapshot(manual.body.evidenceId,2,
+      () => https('POST',path,note,staffMutation(undefined,latest))),409,'CONSENT_REQUIRED');
+    expect(await db().count('SELECT count(*)::int n FROM p06_crm.comments WHERE request_id=$1',[id])).toBe(1);
+    expect(accepted(await https('GET',path,undefined,staff()),200).data()).toEqual({items:[]});
+    failure(await https('POST',path,note,staffMutation(key,initial)),409,'CONSENT_REQUIRED');
+  },60000);
+
+  it.runIf(commentProof)('P06 contact details require explicit CITY authority and audit, and hide no-call phone', async () => {
+    const manual = await manualPrepared();
+    manual.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const id = text(created,'id');
+    const path = `/requests/${id}/contact-details`;
+    const headers = {...staff(),'X-Auth-Request':'1'};
+    failure(await https('GET',path,undefined,headers),403,'FORBIDDEN');
+    const count = () => db().count(`SELECT count(*)::int n FROM foundation.audit_logs
+      WHERE operation='P06_READ_REQUEST_CONTACT' AND details->>'requestId'=$1`,[id]);
+    expect(await count()).toBe(0);
+    await grantContactFixture(db(),db().admin.id,fixture.cityId);
+    failure(await https('GET',path,undefined,staff()),403,'FORBIDDEN');
+    await withHttpMatrixActors(db(),fixture.cityId,async actors => {
+      await grantContactFixture(db(),actors.wrong.id,fixture.cityId);
+      failure(await https('GET',path,undefined,{Cookie:actors.wrong.cookie,'X-Auth-Request':'1'}),404,'NOT_FOUND');
+      failure(await https('GET',path,undefined,{Cookie:actors.reader.cookie,'X-Auth-Request':'1'}),403,'FORBIDDEN');
+    });
+    expect(await count()).toBe(0);
+    const read = await https('GET',path,undefined,headers);
+    expect(read.status).toBe(200);
+    expect(read.headers['cache-control']).toBe('no-store, no-transform');
+    expect(read.data()).toEqual(contact);
+    expect(await count()).toBe(1);
+    expect(await db().count(`SELECT count(*)::int n FROM foundation.audit_logs WHERE operation='P06_READ_REQUEST_CONTACT'
+      AND details->>'requestId'=$1 AND position($2 IN details::text)=0 AND position($3 IN details::text)=0`,[id,contact.name,contact.phone])).toBe(1);
+    failure(await withdrawAtEvidenceSnapshot(manual.body.evidenceId,6,
+      () => https('GET',path,undefined,headers)),409,'CONSENT_REQUIRED');
+    expect(await count()).toBe(2);
+    failure(await https('GET',path,undefined,headers),409,'CONSENT_REQUIRED');
+    expect(await count()).toBe(2);
+
+    const form = await issue();
+    const evidenceId = await given(form);
+    const channel = accepted(await https('POST',`${pub}/repair-requests`,{
+      contact,address,appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]},channelSelection:offers.ids,
+      consent:{evidenceId,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(form,randomUUID())),201).data();
+    const {rows:[target]} = await db().db.query<{id: string}>('SELECT id FROM foundation.requests WHERE public_number=$1',[channel['publicNumber']]);
+    if (!target) { throw new Error('Missing isolated channel request'); }
+    const noCall = await https('GET',`/requests/${target.id}/contact-details`,undefined,headers);
+    expect(noCall.status).toBe(200);
+    expect(noCall.data()).toEqual({name:contact.name,phone:null});
+    failure(await https('POST',`/requests/${target.id}/commands/create-call-task`,{},staffMutation()),404,'NOT_FOUND');
+  },60000);
 
   it('callback is consent-bound, single effect and exact replay; revoke changes both GET validators without changing row_version', async () => {
     const f=await issue();
@@ -736,6 +912,8 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     wrongPins.set(policyPairKey(historical.workflowVersion,historical.policyRevision),REQUEST_POLICY_METADATA_SHA256);
     const wrong = await launchWithPolicy(fixture.policyId,wrongPins);
     try {
+      const card = accepted(await https('GET',`${path}/card`,undefined,staff(),portOf(wrong)),200);
+      expect(card.data()).toMatchObject({id,version:1,canStartReview:false});
       failure(await https('POST',`${path}/commands/start-review`,{},staffMutation(key,etag),portOf(wrong)),503,'REQUEST_RULES_UNAVAILABLE');
     } finally { await wrong.app.close(); }
     expect(await db().count('SELECT count(*)::int n FROM foundation.request_events WHERE idempotency_key=$1',[key])).toBe(0);

@@ -112,10 +112,11 @@ describe('P05 release composition boundary (static, clean override build)', () =
     expect(relativeEmitted.some((file) => /test-only-issuer|fixture|synthetic/i.test(file))).toBe(false);
   });
 
-  it('contains no P05 or S2 route literal anywhere in the emitted artifact', () => {
+  it('contains no isolated P05, S2 or CRM route literal anywhere in the emitted artifact', () => {
     const sources = emitted.map((path) => ({ path: relative(outDir, path).split('\\').join('/'),
       text: readFileSync(path, 'utf8') }));
-    for (const route of [...P05_PATHS, ...S2_PATHS]) {
+    for (const route of [...P05_PATHS, ...S2_PATHS, '/api/v1/requests/filters', 'requests/:id/card',
+      'requests/:id/events', 'requests/:id/comments', 'requests/:id/contact-details']) {
       const hits = sources.filter(({ text }) => text.includes(route)).map(({ path }) => path);
       expect({ route, hits }).toEqual({ route, hits: [] });
     }

@@ -66,8 +66,12 @@ export function expectExactOrigin(req: StaffRequest, origin: string): void {
  * HMAC-SHA256 over the 'web-auth-csrf\0' domain and the session token, so the csrfToken
  * returned by /auth/login and /auth/me works for staff routes unchanged.
  */
+export function staffSessionCsrf(token: string, csrfSecret: string): string {
+  return createHmac('sha256', csrfSecret).update('web-auth-csrf\0').update(token).digest('base64url');
+}
+
 export function requireSessionCsrf(req: StaffRequest, token: string, csrfSecret: string): void {
-  const expected = createHmac('sha256', csrfSecret).update('web-auth-csrf\0').update(token).digest('base64url');
+  const expected = staffSessionCsrf(token, csrfSecret);
   const supplied = header(req, 'x-csrf-token');
   if (!supplied || !/^[A-Za-z0-9_-]+$/.test(supplied) || supplied.length !== expected.length
     || !timingSafeEqual(Buffer.from(supplied, 'utf8'), Buffer.from(expected, 'utf8'))) {

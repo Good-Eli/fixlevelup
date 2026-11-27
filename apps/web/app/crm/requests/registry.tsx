@@ -2,20 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import type { SubmitEvent } from 'react';
+import Link from 'next/link';
 import { P05_STATUSES } from '@fixlevelup/p03-contracts/p05';
-import type { P05Status } from '@fixlevelup/p03-contracts/p05';
 import { readRegistry, readRegistryOptions, RegistryError } from './client';
-
-const statuses: Record<P05Status, string> = {
-  NEW: 'Новая', CALLBACK_REQUIRED: 'Нужен звонок', WAITING_TELEGRAM_LINK: 'Ожидает привязки Telegram',
-  WAITING_CHANNEL_LINK: 'Ожидает привязки канала', MANAGER_REVIEW: 'На проверке менеджера',
-  WAITING_ASSIGNMENT: 'Ожидает назначения', ASSIGNED: 'Мастер назначен', TECHNICIAN_ACCEPTED: 'Мастер принял',
-  ON_THE_WAY: 'Мастер в пути', ARRIVED: 'Мастер прибыл', DIAGNOSTICS: 'Диагностика',
-  WAITING_ESTIMATE_APPROVAL: 'Ожидает согласования сметы', IN_PROGRESS: 'В работе', WAITING_PARTS: 'Ожидает запчастей',
-  PAUSED: 'На паузе', TECHNICIAN_COMPLETED: 'Работа мастера завершена', REVISIT_REQUIRED: 'Нужен повторный визит',
-  CLOSED: 'Закрыта', CANCELLED: 'Отменена',
-};
-const date = new Intl.DateTimeFormat('ru', { dateStyle: 'short', timeStyle: 'short', timeZone: 'UTC' });
+import { date, requestTypes, statuses } from './format';
 type Page = Awaited<ReturnType<typeof readRegistry>>;
 type View = { page: Page } | { error: string } | null;
 type Options = Awaited<ReturnType<typeof readRegistryOptions>>;
@@ -116,9 +106,9 @@ export default function Registry() {
       {page?.items.length === 0 && <p role="status">Заявок по выбранным фильтрам нет.</p>}
       {page && page.items.length > 0 && <div className="registry-table"><table>
         <thead><tr><th scope="col">Номер</th><th scope="col">Создана (UTC)</th><th scope="col">Тип</th><th scope="col">Статус</th></tr></thead>
-        <tbody>{page.items.map(row => <tr key={row.id}><td>{row.publicNumber}</td>
+        <tbody>{page.items.map(row => <tr key={row.id}><td><Link href={`/crm/requests/${row.id}`}>{row.publicNumber}</Link></td>
           <td><time dateTime={row.createdAt}>{date.format(new Date(row.createdAt))}</time></td>
-          <td>{row.type === 'REPAIR' ? 'Ремонт' : 'Обратный звонок'}</td><td>{statuses[row.status]}</td></tr>)}</tbody>
+          <td>{requestTypes[row.type]}</td><td>{statuses[row.status]}</td></tr>)}</tbody>
       </table></div>}
       {nextCursor && <button onClick={() => {
         const next = new URLSearchParams(filters);
