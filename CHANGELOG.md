@@ -12,31 +12,41 @@
 - **Исправления FULL ASTRA P04** (`7a60d4c`) — пять межсрезовых замечаний закрыты адресно, без переписывания принятых коммитов.
 - Границы: реальный [прайс](info/Прайс.txt) не читается и не импортируется, доменных сидов нет, Q06/Q09/Q10 открыты. Нет заявок, планирования, смет, оплат, публичных маршрутов и production.
 
-## 27.11.2026 — P05-01…P05-04 реализованы; финальный Gate повторяется
+## 27.11.2026 — FULL P05 PASS; owner acceptance 4/4
 
-- **Статус реализации:** все четыре подэтапа P05 реализованы. P05-01
-  ([контракт](docs/P05-01-CONTRACT.md)) принят владельцем исторически
-  (`f2caab05`). P05-02 (F sessions, consent, coverage; migration 023),
-  P05-03 (callback/repair/manual intake, READY attachment and staff bridge;
-  migration 024) и P05-04 (early commands, bounded read, OpenAPI 3.1, typed
-  client) реализованы и интегрированы.
-- **Почему повторяется Gate:** run 45942722310 был зелёным, но его engine job
-  не передавал `--privacy --ledger --s3 --restore`; из-за этого оба реальных
-  теста `p05-attachment-http.test.ts` завершились как skipped при exit 0.
-  Этот run не считается доказательством этих двух сценариев. В новом workflow
-  все четыре opt-in передаются явно, а тесты завершаются ошибкой при неполном
-  opt-in или повторном использовании one-ticket bridge.
-- **Технические доказательства:** см. [P05-EVIDENCE](docs/P05-EVIDENCE.md),
-  [P05-03](docs/P05-03-CONTRACT.md), [P05-04](docs/P05-04-CONTRACT.md).
-  Полный технический Gate и exact candidate freeze будут считаться успешными
-  только по новому завершённому CI run на точном HEAD PR #2 с обоими
-  attachment HTTP tests в статусе passed.
-- **Границы:** P05 controllers run only in isolated test composition T; release
-  composition R does not register P05 routes. 023/024 run only on disposable
-  PostgreSQL; no working DB migration, production deployment, real PII, public
-  site, file byte transport, live channel/account or manager delivery occurred.
-  Existing [P05-PLAN §9](docs/P05-PLAN.md) still requires separate Astra FULL
-  P05 and owner acceptance before publication/fast-forward.
+- **Приёмка:** P05-01…P05-04 реализованы и приняты владельцем (4/4) в
+  synthetic scope. P05-01 сохраняет ранее зафиксированную историческую
+  acceptance (`f2caab05`); P05-02/P05-03/P05-04 приняты владельцем
+  27.11.2026.
+- **Эквивалентность ревью:** владелец прямо признал ChatGPT
+  `PASS — FULL P05` эквивалентом требуемого `PASS — FULL ASTRA P05`.
+  Это owner-authorized equivalence, а не заявление о проведённом отдельном
+  Astra-run.
+- **Точный technical Gate:** run [45953489126](https://github.com/Good-Eli/fixlevelup/actions/runs/45953489126),
+  candidate SHA `0d7f60dbee1bddca63e9f1868a03ebf1230ec69f`; семь required jobs
+  плюс freeze job — **8/8 success**. Freeze artifact
+  `p05-exact-candidate-45953489126`, 681 tracked files, manifest SHA-256
+  `f781b1facbbb2c8117e464ec4a8d24dfbaf2f9c38353a6cbc60f70a44b39dd5e`,
+  canonical tree SHA-256
+  `3c6ab92f01f6b1c2c5f379f60aa529da62221365f356e15e31124801f53ed8b5`.
+- **Targeted proof:** CITY-RBAC × state × command — 432 cells across 9 HTTPS
+  phases; both one-ticket real-engine HTTP attachment cases passed (READY
+  attach+digest and refuse after retention decision); F-01 direct-DML boundary,
+  PII/decrypt, partial effects/rollback, restore, migration 24/370 CHECKs,
+  builds, wire and browser gates all passed.
+- **P05-03:** F callback/repair submit, staff manual intake with separate
+  staff evidence, channel readiness/offers (without live delivery), READY
+  attachment, retention interlock and staff bridge; migration 024.
+- **P05-04:** allowlisted early F/staff commands, PHONE withdrawal/cancel,
+  bounded non-PII staff read, read-only waiting/cleanup selectors, OpenAPI 3.1
+  and typed client.
+- **Boundaries:** P05 HTTP controllers remain in isolated test composition T;
+  release composition R does not register P05 routes. Migrations 023/024 were
+  tested only on disposable PostgreSQL. No working DB migration, production
+  deployment, real PII, public site/file byte transport, live channel delivery
+  or manager notification was activated. After this documentation/policy
+  amendment, run full CI and freeze again on the resulting exact SHA before
+  fast-forward to `main`; no production action is authorized.
 
 ## 22.11.2026 — P03-05 принят владельцем в synthetic scope, Astra Gate 2 PASS
 

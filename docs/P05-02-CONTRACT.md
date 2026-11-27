@@ -62,18 +62,7 @@ Refusals are RFC 7807 `application/problem+json` with a closed five-key body and
 
 ## Status
 
-**P05-02 — IMPLEMENTED / COMPLETE (S2).** Migration 023 and the seven
-canonical public F routes are implemented. The slice is integrated with
-P05-03/P05-04; its earlier working-candidate wording and the 25.11.2026 local
-verification snapshot above are historical, not the current status. Current
-exact-head evidence is maintained in [P05-EVIDENCE](P05-EVIDENCE.md).
-
-The final full-stage technical Gate is pending the corrected exact-head CI run.
-The previous green run skipped both real attachment HTTP tests and is not
-accepted as full-stage evidence. The corrected workflow explicitly enables
-the isolated PostgreSQL, privacy, Garage, ledger and restore contours; those
-tests now fail closed on missing opt-ins or a consumed one-ticket engine
-bridge.
+**P05-02 — IMPLEMENTED / OWNER ACCEPTED (S2), 27.11.2026.** Migration 023 and the seven canonical public F routes are implemented and accepted as part of P05 (4/4). The owner explicitly recognizes ChatGPT `PASS — FULL P05` as equivalent to the required Astra full-stage verdict. Exact candidate `0d7f60dbee1bddca63e9f1868a03ebf1230ec69f`, run `45953489126`: 8/8 checks and freeze success; both real attachment HTTP engine cases passed. Subsequent documentation amendment receives a new exact-head CI/freeze before fast-forward.
 
 **Boundaries retained:**
 

@@ -1,13 +1,15 @@
 # Подэтапы проекта: прогресс, трудоёмкость и состав
 
 **Статус на 27.11.2026.** P00–P04 сохраняют ранее зафиксированные статусы.
-**P05-01…P05-04 реализованы (4/4)**. P05-01 принят владельцем исторически
-(`f2caab05`); количество формально принятых владельцем подэтапов поэтому не
-подменяется количеством реализованных. Финальный P05 technical Gate ожидает
-повторный exact-head CI после исправления пропуска real attachment HTTP tests.
-P05 остаётся isolated test composition T; release composition R не включает
-P05 HTTP routes. Текущий candidate и доказательства: [GitHub PR #2](https://github.com/Good-Eli/fixlevelup/pull/2),
-[P05-EVIDENCE](P05-EVIDENCE.md).
+**P05-01…P05-04 реализованы и приняты владельцем (4/4)** в synthetic scope.
+P05-01 был принят владельцем исторически (`f2caab05`); P05-02/P05-03/P05-04
+владелец принял 27.11.2026. Владелец явно приравнял ChatGPT
+`PASS — FULL P05` к требуемому `PASS — FULL ASTRA P05`. Exact candidate
+`0d7f60dbee1bddca63e9f1868a03ebf1230ec69f`, run `45953489126`: 8/8 checks
+success, включая freeze; manifest 681 files, оба real attachment HTTP tests
+passed, CITY matrix 432/432. Эта документационная редакция получает новый
+exact-head Gate/freeze до fast-forward по §9. Release composition R не включает
+P05 HTTP routes. См. [P05-EVIDENCE](P05-EVIDENCE.md).
 Как читать этот файл:
 
 | Раздел | Что внутри |
@@ -32,7 +34,7 @@ P01 ██████████ 100%   (foundation; F06 → PARTIAL; труд
 P02 ██████████ 100%   (сотрудники, Auth, capabilities; 1,0 балл — 3%)
 P03 ██████████ 100%   (настройки, география, файлы; 2,3 балла — 7%)
 P04 ██████████ 100%   (каталог, цены, CRM; 1,4 балла — 4%)
-P05 ██████████ 100%   (реализация клиентов и заявок; 2,4 балла — 7%; 4/4 реализованы; exact-head Gate pending)
+P05 ██████████ 100%   (реализация и owner acceptance 4/4; 2,4 балла — 7%; ChatGPT FULL P05 PASS, owner-equivalent to Astra)
 P06 ░░░░░░░░░░   0%   (CRM: реестр, карточка, дашборд; 1,5 балла — 5%)
 P07 ░░░░░░░░░░   0%   (каналы TG/VK/MAX; 5,5 балла — 17%)
 P08 ░░░░░░░░░░   0%   (сайт и публичные формы; 2,3 балла — 7%)
@@ -52,7 +54,7 @@ P15 ░░░░░░░░░░   0%   (production и передача; 1,0 �
 | **P02** | Сотрудники, Auth, capabilities | 6 | 6 | 1,0 балл | 3% | ✅ принят в согласованных границах |
 | **P03** | Настройки, география, файлы | 5 | 5 | 2,3 балла | 7% | ✅ полный аудит Astra P03 — PASS |
 | **P04** | Каталог, цены, CRM | 4 | 4 | 1,4 балла | 4% | ✅ FULL ASTRA P04 — PASS 22.11.2026 |
-| **P05** | Клиенты и заявки | 4 | 1 | 2,4 балла | 7% | ✅ реализация 4/4; P05-01 — owner accepted historically; final Gate pending |
+| **P05** | Клиенты и заявки | 4 | 4 | 2,4 балла | 7% | ✅ принято владельцем 4/4; ChatGPT PASS — FULL P05 признан эквивалентом Astra |
 | **P06** | CRM: реестр и карточка | 1 | 0 | 1,5 балла | 5% | ⬜ не начат |
 | **P07** | Каналы TG/VK/MAX | 6 | 0 | 5,5 балла | **17%** | ⬜ не начат |
 | **P08** | Сайт и формы | 2 | 0 | 2,3 балла | 7% | ⬜ не начат |
@@ -232,9 +234,9 @@ API, права, тесты, без экзотики. Остальные оце�
 | № | Название | Что это и зачем в общей картине | Статус |
 |---|---|---|---|
 | **P05-01** | Модель, версии, криптография, базовый fence | Появляются клиент и сама заявка: контакт, адрес, техника и выбранные симптомы хранятся как история версий, а чувствительные данные — отдельным зашифрованным блоком. Плюс защита от одновременной записи: миграции и код не могут писать в обход проверок. Зачем: заявка должна быть воспроизводимой и не терять данные при правках справочников. | ✅ принят исторически (`f2caab05`) |
-| **P05-02** | F-сессия, согласие, покрытие | F browser group и anchor на существующем P03 session; одноразовые proof/CSRF, DB-clock expiry, caps, точное согласие, current legal policy и advisory coverage без выдачи IN_ZONE. | ✅ реализован; интегрирован с P05-03/04 |
-| **P05-03** | Callback, repair/manual intake, READY attachments и staff bridge | F callback/repair submit, staff manual intake с отдельным evidence, channel offers/readiness без доставки, безопасная привязка READY-файла, CITY staff authority и DB guard против delete/attach race. | ✅ реализован; migration 024; real HTTPS/PG + Garage/ledger/engine proof |
-| **P05-04** | Ранние команды, safe read и wire | Allowlist ранних F/staff commands, PHONE withdrawal/cancel, non-PII staff projection, current scope/state checks, read-only selectors, OpenAPI 3.1 и typed client with exact DTO/ETag/error contract. | ✅ реализован; wire and build proof in CI |
+| **P05-02** | F-сессия, согласие, покрытие | F browser group и anchor на существующем P03 session; одноразовые proof/CSRF, DB-clock expiry, caps, точное согласие, current legal policy и advisory coverage без выдачи IN_ZONE. | ✅ реализован и принят владельцем 27.11.2026 |
+| **P05-03** | Callback, repair/manual intake, READY attachments и staff bridge | F callback/repair submit, staff manual intake с отдельным evidence, channel offers/readiness без доставки, безопасная привязка READY-файла, CITY staff authority и DB guard против delete/attach race. | ✅ реализован и принят владельцем 27.11.2026 |
+| **P05-04** | Ранние команды, safe read и wire | Allowlist ранних F/staff commands, PHONE withdrawal/cancel, non-PII staff projection, current scope/state checks, read-only selectors, OpenAPI 3.1 и typed client with exact DTO/ETag/error contract. | ✅ реализован и принят владельцем 27.11.2026 |
 
 ### P06 — CRM: реестр, карточка, дашборд (1,5 балла)
 
@@ -350,7 +352,7 @@ API, права, тесты, без экзотики. Остальные оце�
 
 | Дата | Что сделано |
 |---|---|
-| 27.11.2026 | **Актуализация P05.** P05-01…P05-04 реализованы (4/4). P05-01 сохраняет историческую owner acceptance; exact-head full P05 Gate ожидает исправленного CI run, так как run 45942722310 не выполнил два attachment HTTP engine cases. Миграции 022–024: проверка цепочки 24 migrations / 370 CHECKs на disposable PostgreSQL. P05 HTTP routes остаются в T, release R их не включает. |
+| 27.11.2026 | **FULL P05 PASS и owner acceptance.** P05-01…P05-04 реализованы и приняты владельцем (4/4) в synthetic scope. Владелец признал ChatGPT PASS — FULL P05 эквивалентом Astra PASS. Точный candidate `0d7f60d…`, run 45953489126: 8/8, manifest 681 files, оба real attachment HTTP tests passed, CITY matrix 432/432. Production/live остаются запрещены; эта документационная редакция требует нового exact-head CI/freeze до fast-forward. |
 | 24.11.2026 | **Реорганизация файла.** Сводка перестроена: сверху блок прогресса и таблица трудоёмкости по всем 16 этапам, затем методика расчёта, сводная таблица «что это и зачем», все 66 подэтапов простыми словами и открытые gates. Подробные доказательства прошлых приёмок вынесены в [SUBTASKS-EVIDENCE](SUBTASKS-EVIDENCE.md) без потери текста. Данные актуализированы: P04 принят (4 из 4, FULL ASTRA P04 — PASS 22.11.2026, `7a60d4c`), P05 открыт, P05-01 реализован в дереве (не закоммичен, не принят), в репозитории 22 миграции. |
 | 22.11.2026 | Исправлены подписи в блоке «Прогресс по этапам» по заголовкам [ROADMAP §3](ROADMAP.md#3-малые-подэтапы-с-приёмкой): P06, P11, P12, P13, P14, P15. Пояснения приведены к формату «в скобках» из [AGENTS](../AGENTS.md). |
 | 22.11.2026 | Актуализация на 22.11.2026: HEAD `e44fae8` (49 коммитов). Зафиксировано, что в P03-04 приняты A и B1+B2, а C/D/E в дереве и не приняты. Добавлен раздел P04 с таблицей по P04-01…P04-04 и честным состоянием P04-01. |

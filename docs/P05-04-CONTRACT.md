@@ -2,10 +2,7 @@
 
 ## Status
 
-**IMPLEMENTED / COMPLETE.** P05-04 implements the early P05 command/read
-surface and closes the shared P05 wire contract. Final full-stage technical
-acceptance is pending the corrected exact-head CI run; see
-[P05-EVIDENCE](P05-EVIDENCE.md).
+**IMPLEMENTED / OWNER ACCEPTED — 27.11.2026.** P05-04 implements the early P05 command/read surface and closes the shared P05 wire contract. The owner accepted all four P05 slices and explicitly equated ChatGPT `PASS — FULL P05` with the required Astra full-stage verdict. Exact technical evidence: run `45953489126`, SHA `0d7f60dbee1bddca63e9f1868a03ebf1230ec69f`, 8/8 success and frozen candidate. Acceptance is synthetic-scope only.
 
 P05 HTTP controllers are present only in isolated test composition T;
 release composition R remains free of P05 controllers and routes.

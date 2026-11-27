@@ -2,10 +2,7 @@
 
 ## Status
 
-**IMPLEMENTED / COMPLETE.** P05-03 is implemented in the current P05 candidate
-as the S3 request-effects profile (migration 024), integrated with the F
-foundation from P05-02. Final full-stage technical acceptance is pending the
-corrected exact-head CI run described in [P05-EVIDENCE](P05-EVIDENCE.md).
+**IMPLEMENTED / OWNER ACCEPTED — 27.11.2026.** P05-03 is implemented in the current P05 candidate as the S3 request-effects profile (migration 024), integrated with the F foundation from P05-02. The owner accepted all four P05 slices and explicitly equated ChatGPT `PASS — FULL P05` with the required Astra full-stage verdict. Exact technical evidence: run `45953489126`, SHA `0d7f60dbee1bddca63e9f1868a03ebf1230ec69f`, 8/8 success and frozen candidate. Acceptance is synthetic-scope only.
 
 All P05 HTTP endpoints are constructed only in isolated test composition T;
 release composition R does not register them. This is not a production or
