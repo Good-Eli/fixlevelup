@@ -142,7 +142,8 @@ const ACTIVATION_STARTED = new WeakSet<object>();
 const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get;
 const NONCE = (): string => randomBytes(32).toString('hex');
 
-/** Test-only restore diagnostics are deliberately categorical: never print SQL,
+/** Test-only restore diagnostics are deliberately categorical: expose gate location and digests, never row values.
+ * Never print SQL,
  * database names, archive paths, row data, or raw driver/process messages. */
 function restoreTestDiagnostic(event: string, error?: unknown): void {
   if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] !== '1'
