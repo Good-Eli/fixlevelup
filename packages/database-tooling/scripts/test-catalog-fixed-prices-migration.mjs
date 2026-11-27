@@ -153,10 +153,19 @@ export async function proveCatalogMigrationRejections(owner, db, reviewer, kind 
   await identity(db, 'fixlevelup_runtime', kind);
   const cityA = randomUUID(), cityB = randomUUID(), cityAV = randomUUID(), cityBV = randomUUID();
   for (const [id, version, code] of [[cityA, cityAV, 'p04-proof-a'], [cityB, cityBV, 'p04-proof-b']]) {
-    await owner.query('INSERT INTO foundation.service_cities(id,code) VALUES($1,$2)', [id,code]);
-    await owner.query(`INSERT INTO foundation.service_city_versions(id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
-      VALUES($1,$2,1,'Synthetic city','UTC','office@example.test',$3::jsonb,$4)`, [version,id,JSON.stringify(Array.from({ length: 7 }, () => [])),reviewer]);
-    await owner.query(`UPDATE foundation.service_cities SET current_version_id=$2,lifecycle='ACTIVE' WHERE id=$1`, [id,version]);
+    // The guarded geography basis requires the unified writer fence from S1.
+    await owner.query('BEGIN');
+    try {
+      await owner.query('SELECT pg_advisory_xact_lock(734305,1)');
+      await owner.query('INSERT INTO foundation.service_cities(id,code) VALUES($1,$2)', [id,code]);
+      await owner.query(`INSERT INTO foundation.service_city_versions(id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
+        VALUES($1,$2,1,'Synthetic city','UTC','office@example.test',$3::jsonb,$4)`, [version,id,JSON.stringify(Array.from({ length: 7 }, () => [])),reviewer]);
+      await owner.query(`UPDATE foundation.service_cities SET current_version_id=$2,lifecycle='ACTIVE' WHERE id=$1`, [id,version]);
+      await owner.query('COMMIT');
+    } catch (error) {
+      await owner.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    }
   }
   const category = randomUUID(), categoryVersion = randomUUID(), part = randomUUID(), partVersion = randomUUID();
   await transaction(db, async () => {

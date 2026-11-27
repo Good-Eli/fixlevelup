@@ -6,6 +6,9 @@
  * the migrator, the real migration chain applied by `migrateAuthFixture`, and all
  * writes of the port under test executed through the real `fixlevelup_runtime`
  * role. Nothing here touches the dev database and no production fake is used.
+ * The database lifecycle, credentials and maintenance binding come from
+ * `owned-test-database.ts`: dev reads the local ignored env files, synthetic lab
+ * mode reads only the lab process env and the attested lab maintenance binding.
  *
  * The fixture also builds the *synthetic* staff/city rows the ports need. Those
  * rows are written by the migration owner exactly as reviewed data would be, never
@@ -15,14 +18,17 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
+import type { PoolClient } from 'pg';
 import { describe } from 'vitest';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
-import { migrateAuthFixture } from './auth-db-fixture.js';
+import { authFixtureMigrations, installPinnedMigrationHistory, migrateAuthFixture } from './auth-db-fixture.js';
+import { fixtureCredentials, maintenanceOpener, OwnedTestDatabase } from './owned-test-database.js';
 
 export const configurationIntegration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1'
   ? describe : describe.skip;
 
 const root = resolve(import.meta.dirname, '../../..');
+const migrationRoot = resolve(root, 'prisma/migrations');
 const connection = { host: '127.0.0.1' as const, port: 55432 };
 
 export interface ConfigurationFixture {
@@ -38,78 +44,118 @@ export interface ConfigurationFixture {
   close(): Promise<void>;
 }
 
-function credentials(): { admin: string; migrator: string; runtime: string } {
-  const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-  const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  const admin = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-  const migrator = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-  const runtime = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-  if (!admin || !migrator || !runtime) {
-    throw new Error('Local isolated PostgreSQL test credentials are required');
+/**
+ * Connected maintenance client on the `postgres` database, for lifecycle proofs
+ * that must inspect `pg_database`/`pg_stat_activity` around a fixture whose
+ * provisioning is expected to fail. Uses the same opener as the fixture itself:
+ * dev role on `postgres`, or the attested lab binding in synthetic mode. The
+ * caller always closes it.
+ */
+export async function openConfigurationMaintenanceClient(): Promise<Client> {
+  if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') {
+    throw new Error('Configuration fixture requires FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1');
   }
-  return { admin, migrator, runtime };
+  return await maintenanceOpener()();
 }
 
 /**
- * Creates one isolated database and applies the whole migration chain. The
+ * Creates one isolated database and applies the migration chain. The
  * `database` name matches the auth-fixture guard pattern so `migrateAuthFixture`
- * accepts it.
+ * accepts it. `capBefore` optionally stops the chain before the named migration
+ * (exclusive), reproducing an older schema profile for baseline proofs.
  */
-export async function createConfigurationFixture(): Promise<ConfigurationFixture> {
+export async function createConfigurationFixture(options: { readonly capBefore?: string } = {}): Promise<ConfigurationFixture> {
   // Explicit opt-in is checked before any database is created, so an accidental
   // call in a normal test run cannot provision anything.
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') {
     throw new Error('Configuration fixture requires FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1');
   }
-  const { admin: adminPassword, migrator: migratorPassword, runtime: runtimePassword } = credentials();
+  const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
+  const capIndex = options.capBefore === undefined ? -1 : authFixtureMigrations.indexOf(options.capBefore);
+  if (options.capBefore !== undefined && capIndex < 0) { throw new Error(`Unknown cap migration: ${options.capBefore}`); }
+  const chain = capIndex >= 0 ? authFixtureMigrations.slice(0, capIndex) : null;
   const database = `fixlevelup_configuration_test_${randomBytes(12).toString('hex')}`;
-  const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-  await admin.connect();
-  try {
-    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-  } finally {
-    await admin.end();
+  if (!/^fixlevelup_configuration_test_[a-f0-9]{24}$/.test(database)) {
+    throw new Error('Refusing non-isolated configuration fixture');
   }
-  const fixtureClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-  await fixtureClient.connect();
-  try {
-    await migrateAuthFixture(fixtureClient, database);
-  } finally {
-    await fixtureClient.end();
-  }
-  const migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 4 });
-  const runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 4 });
-  const reviewer = (await bootstrapFirstAdmin(migrator, {
-    login: `config-${randomBytes(12).toString('hex')}`,
-    password: `Synthetic-Config-${randomBytes(12).toString('hex')}!`,
-  })).staffId;
-  const secondReviewer = await createSecondStaff(migrator);
-  return {
-    database,
-    migrator,
-    runtime,
-    reviewer,
-    secondReviewer,
-    async inTransaction<T>(run: (client: Client) => Promise<T>): Promise<T> {
-      const client = await runtime.connect();
-      try {
-        await client.query('BEGIN');
-        const result = await run(client);
-        await client.query('COMMIT');
-        return result;
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        throw error;
-      } finally {
-        client.release();
-      }
+  // Owned lifecycle: CREATE + the REVOKE/GRANT block on `postgres`, then exactly
+  // this run's database is dropped on any later failure (owned-test-database.ts).
+  const owned = await OwnedTestDatabase.create({
+    name: database,
+    pattern: /^fixlevelup_configuration_test_[a-f0-9]{24}$/,
+    prepare: async (maintenance) => {
+      await maintenance.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await maintenance.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
     },
-    async close(): Promise<void> {
-      await Promise.all([migrator.end(), runtime.end()]);
-    },
+  });
+  let migrator: Pool | undefined;
+  let runtime: Pool | undefined;
+  const closeOwnResources = async (): Promise<void> => {
+    const pools = [migrator, runtime].filter((pool): pool is Pool => pool !== undefined);
+    if (pools.length > 0) { await Promise.all(pools.map((pool) => pool.end())); }
   };
+  try {
+    const fixtureClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+    try {
+      await fixtureClient.connect();
+      if (chain) {
+        // Same isolation guard as migrateAuthFixture, applied to the capped chain.
+        // (The opt-in env was checked by the caller above; here only the disposable
+        // name pattern and the actual connection identity are re-proved.)
+        if (!/^fixlevelup_(bootstrap|recovery|web_auth|auth_e2e|legal|configuration)_test_[a-f0-9]{24}$/.test(database)
+          || (await fixtureClient.query<{ db: string }>('SELECT current_database() AS db')).rows[0]?.db !== database) {
+          throw new Error('Refusing non-isolated capped fixture');
+        }
+        for (const migration of chain) {
+          await fixtureClient.query(readFileSync(resolve(migrationRoot, migration, 'migration.sql'), 'utf8'));
+        }
+        await installPinnedMigrationHistory(fixtureClient, chain);
+      } else {
+        await migrateAuthFixture(fixtureClient, database);
+        await installPinnedMigrationHistory(fixtureClient, authFixtureMigrations);
+      }
+    } finally {
+      await fixtureClient.end().catch(() => undefined);
+    }
+    const migratorPool = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 4 });
+    migrator = migratorPool;
+    const runtimePool = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 4 });
+    runtime = runtimePool;
+    const reviewer = (await bootstrapFirstAdmin(migratorPool, {
+      login: `config-${randomBytes(12).toString('hex')}`,
+      password: `Synthetic-Config-${randomBytes(12).toString('hex')}!`,
+    })).staffId;
+    const secondReviewer = await createSecondStaff(migratorPool);
+    return {
+      database,
+      migrator: migratorPool,
+      runtime: runtimePool,
+      reviewer,
+      secondReviewer,
+      async inTransaction<T>(run: (client: Client) => Promise<T>): Promise<T> {
+        const client = await runtimePool.connect();
+        try {
+          await client.query('BEGIN');
+          const result = await run(client);
+          await client.query('COMMIT');
+          return result;
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+      async close(): Promise<void> {
+        // Ends this run's pools first, then drops exactly this run's database.
+        await owned.dispose(closeOwnResources);
+      },
+    };
+  } catch (error) {
+    // Provisioning failed after CREATE: close this run's pools, drop exactly this
+    // run's database, and surface a teardown failure instead of swallowing it.
+    throw await owned.failure(error, closeOwnResources);
+  }
 }
 
 /**
@@ -147,6 +193,24 @@ export interface SyntheticCity {
   readonly timezone: string;
 }
 
+/** Runs guarded-basis fixture DML under the unified writer fence (S1+). The lock
+ * and the statements must share one backend, so the pinned client is passed in. */
+async function fenced<T>(fixture: ConfigurationFixture, run: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await fixture.migrator.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+    const result = await run(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Creates a synthetic city with one reviewed version, as the migration owner.
  * `lifecycle` is ACTIVE for a city the resolver would serve.
@@ -159,14 +223,16 @@ export async function createSyntheticCity(
   const lifecycle = options.lifecycle ?? 'ACTIVE';
   const id = randomUUID();
   const versionId = randomUUID();
-  await fixture.migrator.query('INSERT INTO foundation.service_cities (id,code) VALUES ($1,$2)',
-    [id, `city-${id.slice(0, 8)}`]);
-  await fixture.migrator.query(`INSERT INTO foundation.service_city_versions
-    (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
-    VALUES ($1,$2,$3,'Synthetic city',$4,'office@example.test',$5::jsonb,$6)`,
-  [versionId, id, options.version ?? 1, timezone, JSON.stringify(Array.from({ length: 7 }, () => [])), fixture.reviewer]);
-  await fixture.migrator.query('UPDATE foundation.service_cities SET current_version_id=$2,lifecycle=$3 WHERE id=$1',
-    [id, versionId, lifecycle]);
+  await fenced(fixture, async (client) => {
+    await client.query('INSERT INTO foundation.service_cities (id,code) VALUES ($1,$2)',
+      [id, `city-${id.slice(0, 8)}`]);
+    await client.query(`INSERT INTO foundation.service_city_versions
+      (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
+      VALUES ($1,$2,$3,'Synthetic city',$4,'office@example.test',$5::jsonb,$6)`,
+    [versionId, id, options.version ?? 1, timezone, JSON.stringify(Array.from({ length: 7 }, () => [])), fixture.reviewer]);
+    await client.query('UPDATE foundation.service_cities SET current_version_id=$2,lifecycle=$3 WHERE id=$1',
+      [id, versionId, lifecycle]);
+  });
   return { id, versionId, timezone };
 }
 
@@ -177,11 +243,13 @@ export async function addSyntheticCityVersion(
   options: { timezone: string; version: number },
 ): Promise<string> {
   const versionId = randomUUID();
-  await fixture.migrator.query(`INSERT INTO foundation.service_city_versions
-    (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
-    VALUES ($1,$2,$3,'Synthetic city',$4,'office@example.test',$5::jsonb,$6)`,
-  [versionId, city.id, options.version, options.timezone,
-    JSON.stringify(Array.from({ length: 7 }, () => [])), fixture.reviewer]);
+  await fenced(fixture, async (client) => {
+    await client.query(`INSERT INTO foundation.service_city_versions
+      (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
+      VALUES ($1,$2,$3,'Synthetic city',$4,'office@example.test',$5::jsonb,$6)`,
+    [versionId, city.id, options.version, options.timezone,
+      JSON.stringify(Array.from({ length: 7 }, () => [])), fixture.reviewer]);
+  });
   return versionId;
 }
 
@@ -195,12 +263,15 @@ export async function createSyntheticSettingsBaseline(
   city: { id: string },
 ): Promise<{ id: string; version: number }> {
   const id = randomUUID();
-  const result = await fixture.migrator.query<{ version: number }>(
-    `INSERT INTO foundation.business_settings_versions (id,version,launch_mode,primary_city_id,reviewed_by)
-     SELECT $1,COALESCE(max(version),0)+1,'SINGLE_CITY',$2,$3 FROM foundation.business_settings_versions
-     RETURNING version`,
-    [id, city.id, fixture.reviewer]);
-  const version = result.rows[0]?.version;
+  let version: number | undefined;
+  await fenced(fixture, async (client) => {
+    const result = await client.query<{ version: number }>(
+      `INSERT INTO foundation.business_settings_versions (id,version,launch_mode,primary_city_id,reviewed_by)
+       SELECT $1,COALESCE(max(version),0)+1,'SINGLE_CITY',$2,$3 FROM foundation.business_settings_versions
+       RETURNING version`,
+      [id, city.id, fixture.reviewer]);
+    version = result.rows[0]?.version;
+  });
   if (version === undefined) {
     throw new Error('Missing settings baseline');
   }

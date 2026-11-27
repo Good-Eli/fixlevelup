@@ -62,6 +62,12 @@ const settingsFunctions = ['reference_entries_guard', 'reference_entry_versions_
   'content_block_revisions_immutable', 'legal_documents_guard', 'legal_document_versions_pointer_guard',
   'legal_document_versions_immutable', 'request_sessions_guard', 'consent_records_guard',
   'settings_history_reject_truncate'];
+// The P05-01 (022) unified GEO/CFG fence triggers on the two reference basis
+// tables of the 013 list: expected by exact name, function and enabled state.
+const settingsFenceTriggers = [
+  ['reference_entries', 'reference_entries_geo_cfg_fence', 'geo_cfg_fence_guard'],
+  ['reference_entry_versions', 'reference_entry_versions_geo_cfg_fence', 'geo_cfg_fence_guard'],
+];
 // The 012 delta must survive 013 untouched.
 const preservedTables = ['service_cities', 'service_city_versions', 'business_settings_versions',
   'administrative_districts', 'service_areas', 'service_area_versions', 'service_area_district_coverage',
@@ -103,7 +109,10 @@ const snapshotOf = async (db, tables, columns) => {
 
 // Exact runtime ACL of 013 on the final fresh database, plus the previous grants that
 // 013 must not widen or narrow. A missing, extra or table-level privilege fails here.
-export async function proveSettingsGrants(runtime) {
+export async function proveSettingsGrants(runtime, options = {}) {
+  // On a database capped at exactly 013 the P05-01 fence triggers do not exist
+  // yet; only the final full-chain proof expects them.
+  const fenceTriggers = options.expectFenceTriggers === true ? settingsFenceTriggers : [];
   const acl = {
     business_settings_versions: {
       select: ['id', 'version', 'launch_mode', 'primary_city_id', 'reviewed_by', 'published_at',
@@ -192,18 +201,27 @@ export async function proveSettingsGrants(runtime) {
     && row.proconfig?.includes('search_path=pg_catalog')), '013 guard ownership/security mismatch');
   // Every expected 013 trigger exists, is enabled, and is bound to its own function. A
   // disabled trigger would silently drop an immutability or pointer guard.
+  // P05-01 (022) additionally installs the two unified GEO/CFG fence triggers on
+  // the reference basis tables of this list; they are expected by exact name and
+  // bound function, never by a loose count.
   const triggers = await runtime.query(`SELECT c.relname AS table, g.tgname AS name, g.tgenabled IN ('O','A') AS enabled,
       p.proname AS fn
     FROM pg_trigger g JOIN pg_class c ON c.oid=g.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
     JOIN pg_proc p ON p.oid=g.tgfoid
     WHERE n.nspname='foundation' AND c.relname=ANY($1::text[]) AND NOT g.tgisinternal
     ORDER BY c.relname, g.tgname`, [settingsTables]);
-  assert.equal(triggers.rowCount, settingsTriggers.length, '013 trigger count mismatch');
+  assert.equal(triggers.rowCount, settingsTriggers.length + fenceTriggers.length, '013 trigger count mismatch');
   for (const [table, trigger, fn] of settingsTriggers) {
     const found = triggers.rows.find((row) => row.table === table && row.name === trigger);
     assert.ok(found, `Missing 013 trigger ${table}.${trigger}`);
     assert.equal(found.enabled, true, `Disabled 013 trigger ${table}.${trigger}`);
     assert.equal(found.fn, fn, `013 trigger ${table}.${trigger} bound to the wrong function`);
+  }
+  for (const [table, trigger, fn] of fenceTriggers) {
+    const found = triggers.rows.find((row) => row.table === table && row.name === trigger);
+    assert.ok(found, `Missing S1 fence trigger ${table}.${trigger}`);
+    assert.equal(found.enabled, true, `Disabled S1 fence trigger ${table}.${trigger}`);
+    assert.equal(found.fn, fn, `S1 fence trigger ${table}.${trigger} bound to the wrong function`);
   }
   // Exactly the two 010 validators remain callable: 013 neither adds nor removes EXECUTE.
   const validators = await runtime.query(`SELECT p.proname FROM pg_proc p

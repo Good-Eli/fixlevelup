@@ -1,7 +1,5 @@
 import 'reflect-metadata';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { BadRequestException, ForbiddenException, HttpException, NotFoundException } from '@nestjs/common';
 import { Client, Pool } from 'pg';
 import type { PoolClient } from 'pg';
@@ -17,6 +15,7 @@ import {
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { DUMMY_PASSWORD_HASH } from '../src/staff/password.js';
 import { migrateAuthFixture } from './auth-db-fixture.js';
+import { becomeOwner, dropOwnedTestDatabase, fixtureCredentials, maintenanceOpener } from './owned-test-database.js';
 
 const CITY = '11111111-1111-4111-8111-111111111111';
 const OTHER_CITY = '22222222-2222-4222-8222-222222222222';
@@ -258,7 +257,6 @@ describe('grant interval parsing', () => {
 
 // Explicit opt-in only: creates a random isolated database and never touches the dev database.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
-const root = resolve(import.meta.dirname, '../../..');
 const connection = { host: '127.0.0.1' as const, port: 55432 };
 
 /**
@@ -289,6 +287,34 @@ integration('membership commands against isolated PostgreSQL', () => {
   let managerAssignmentId = '';
   let cityMembershipId = '';
   let zoneGrantId = '';
+  let maintenance: Client | undefined;
+  let dbName: string | undefined;
+  let dbCreated = false;
+  let tornDown = false;
+
+  /** Ownership proof for the teardown drop, consumed exactly once: this run's CREATE
+   * result (flag) AND the strict disposable-name pattern. */
+  const takeOwnedDatabase = (): string | undefined => {
+    if (!dbCreated) { return undefined; }
+    dbCreated = false;
+    return dbName !== undefined && /^fixlevelup_auth_e2e_test_[a-f0-9]{24}$/.test(dbName) ? dbName : undefined;
+  };
+
+  /** The afterAll teardown, exactly once: this run's pools down first, then the drop
+   * of exactly the database this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const ownedDatabase = takeOwnedDatabase();
+    try { await Promise.all(pools.map((pool) => pool.end())); }
+    finally {
+      try {
+        if (ownedDatabase !== undefined && maintenance !== undefined) {
+          await dropOwnedTestDatabase(maintenance, ownedDatabase);
+        }
+      } finally { await maintenance?.end().catch(() => undefined); }
+    }
+  }
   // This fixture is compared with PostgreSQL's *current* time, not with a fixed release date.
   const anchor = Date.now();
   const day = (offset: number) => new Date(anchor + offset * 86_400_000).toISOString();
@@ -296,35 +322,53 @@ integration('membership commands against isolated PostgreSQL', () => {
   const liveZone = { validFrom: day(-10), validTo: day(10) };
 
   const TOKEN = () => randomBytes(32).toString('base64url');
-  const cityVersion = async (cityId: string, timezone: string) => {
-    const id = randomUUID();
-    await migrator.query(`INSERT INTO foundation.service_city_versions
-      (id, city_id, version, display_name, timezone, public_contact, office_hours, reviewed_by)
-      VALUES ($1,$2,1,'Synthetic city',$3,'office@example.test',$4::jsonb,$5)`,
-    [id, cityId, timezone, JSON.stringify(Array.from({ length: 7 }, () => [])), adminId]);
-    return id;
+  /** Wraps guarded GEO/CFG basis DML (migration 022) in one transaction that takes
+   * the unified writer fence before its first statement, on one pinned client. */
+  const fencedDml = async <T,>(run: (client: PoolClient) => Promise<T>): Promise<T> => {
+    const client = await migrator.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+      const result = await run(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   };
   const createCity = async (code: string, lifecycle: string, timezone = 'Europe/Moscow') => {
     const id = randomUUID();
-    await migrator.query('INSERT INTO foundation.service_cities (id, code) VALUES ($1,$2)', [id, code]);
-    const versionId = await cityVersion(id, timezone);
-    await migrator.query('UPDATE foundation.service_cities SET current_version_id=$2, lifecycle=$3 WHERE id=$1',
-      [id, versionId, lifecycle]);
+    const versionId = randomUUID();
+    await fencedDml(async (client) => {
+      await client.query('INSERT INTO foundation.service_cities (id, code) VALUES ($1,$2)', [id, code]);
+      await client.query(`INSERT INTO foundation.service_city_versions
+        (id, city_id, version, display_name, timezone, public_contact, office_hours, reviewed_by)
+        VALUES ($1,$2,1,'Synthetic city',$3,'office@example.test',$4::jsonb,$5)`,
+      [versionId, id, timezone, JSON.stringify(Array.from({ length: 7 }, () => [])), adminId]);
+      await client.query('UPDATE foundation.service_cities SET current_version_id=$2, lifecycle=$3 WHERE id=$1',
+        [id, versionId, lifecycle]);
+    });
     return id;
   };
   const createArea = async (cityId: string, code: string) => {
     const id = randomUUID();
-    await migrator.query('INSERT INTO foundation.service_areas (id, city_id, code) VALUES ($1,$2,$3)', [id, cityId, code]);
+    await fencedDml((client) => client.query('INSERT INTO foundation.service_areas (id, city_id, code) VALUES ($1,$2,$3)',
+      [id, cityId, code]));
     return id;
   };
   const publishArea = async (cityId: string, areaId: string, name: string) => {
     const versionId = randomUUID();
-    await migrator.query(`INSERT INTO foundation.service_area_versions
-      (id, city_id, area_id, version, name, created_by) VALUES ($1,$2,$3,1,$4,$5)`,
-    [versionId, cityId, areaId, name, adminId]);
-    await migrator.query('UPDATE foundation.service_area_versions SET published_at=statement_timestamp(), published_by=$2 WHERE id=$1',
-      [versionId, adminId]);
-    await migrator.query('UPDATE foundation.service_areas SET current_version_id=$2 WHERE id=$1', [areaId, versionId]);
+    await fencedDml(async (client) => {
+      await client.query(`INSERT INTO foundation.service_area_versions
+        (id, city_id, area_id, version, name, created_by) VALUES ($1,$2,$3,1,$4,$5)`,
+      [versionId, cityId, areaId, name, adminId]);
+      await client.query('UPDATE foundation.service_area_versions SET published_at=statement_timestamp(), published_by=$2 WHERE id=$1',
+        [versionId, adminId]);
+      await client.query('UPDATE foundation.service_areas SET current_version_id=$2 WHERE id=$1', [areaId, versionId]);
+    });
     return versionId;
   };
   /** The 009 deferred constraint requires a live role and a matching channel by commit,
@@ -390,63 +434,71 @@ integration('membership commands against isolated PostgreSQL', () => {
   };
 
   beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(toolingEnv)?.[1];
-    if (!adminPassword || !migratorPassword || !runtimePassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
+    // Lab mode reads the lab process env and the attested maintenance binding;
+    // dev mode reads the local ignored env files. Never the dev database.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
+    maintenance = await maintenanceOpener()();
+    const admin = maintenance;
     const database = `fixlevelup_auth_e2e_test_${randomBytes(12).toString('hex')}`;
-    const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
     try {
       await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
+      // CREATE is the reuse guard: an existing name is a hard error, so a successful
+      // CREATE proves this run owns the disposable database (the flag gates the drop).
+      dbName = database;
+      dbCreated = true;
+      // GRANT/REVOKE need the owner: in the lab the orchestrator is a NOINHERIT member.
+      await becomeOwner(admin);
       await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    } finally { await admin.end(); }
-    const fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    await fixture.connect();
-    try {
-      await fixture.query('CREATE SCHEMA IF NOT EXISTS foundation AUTHORIZATION fixlevelup_migrator');
-      await migrateAuthFixture(fixture, database);
-    } finally { await fixture.end(); }
-    migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 2 });
-    pools.push(migrator);
-    runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 2 });
-    pools.push(runtime);
-    auth = new AuthorizationService(runtime);
+      const fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      await fixture.connect();
+      try {
+        await fixture.query('CREATE SCHEMA IF NOT EXISTS foundation AUTHORIZATION fixlevelup_migrator');
+        await migrateAuthFixture(fixture, database);
+      } finally { await fixture.end(); }
+      migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 2 });
+      pools.push(migrator);
+      runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 2 });
+      pools.push(runtime);
+      auth = new AuthorizationService(runtime);
 
-    adminId = (await bootstrapFirstAdmin(migrator, { login: `geo-${randomBytes(12).toString('hex')}`,
-      password: `Synthetic-Geo-${randomBytes(12).toString('hex')}!` })).staffId;
-    managerId = await createStaff('MANAGER');
-    // Delegated geography in assigned cities only: the manager needs both the read and
-    // the manage code, and a manager can never hold GLOBAL geography.
-    await migrator.query(`INSERT INTO foundation.role_permissions (role_id, permission_code, scope_type)
-      SELECT r.id, g.code, 'CITY' FROM foundation.roles r
-      CROSS JOIN unnest(ARRAY['staff.geography.read','staff.geography.manage']) AS g(code)
-      WHERE r.role_type='SYSTEM' AND r.code='MANAGER'`);
-    technicianId = await createStaff('TECHNICIAN');
-    const linkId = randomUUID();
-    await migrator.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1,$2,$3)',
-      [linkId, technicianId, BigInt(`0x${randomBytes(5).toString('hex')}`) + 1n]);
+      adminId = (await bootstrapFirstAdmin(migrator, { login: `geo-${randomBytes(12).toString('hex')}`,
+        password: `Synthetic-Geo-${randomBytes(12).toString('hex')}!` })).staffId;
+      managerId = await createStaff('MANAGER');
+      // Delegated geography in assigned cities only: the manager needs both the read and
+      // the manage code, and a manager can never hold GLOBAL geography.
+      await migrator.query(`INSERT INTO foundation.role_permissions (role_id, permission_code, scope_type)
+        SELECT r.id, g.code, 'CITY' FROM foundation.roles r
+        CROSS JOIN unnest(ARRAY['staff.geography.read','staff.geography.manage']) AS g(code)
+        WHERE r.role_type='SYSTEM' AND r.code='MANAGER'`);
+      technicianId = await createStaff('TECHNICIAN');
+      const linkId = randomUUID();
+      await migrator.query('INSERT INTO foundation.staff_telegram_links (id, staff_id, telegram_user_id) VALUES ($1,$2,$3)',
+        [linkId, technicianId, BigInt(`0x${randomBytes(5).toString('hex')}`) + 1n]);
 
-    adminProof = await session(adminId, 'staff-web');
-    managerProof = await session(managerId, 'staff-web');
-    techProof = await session(technicianId, 'staff-telegram', linkId);
+      adminProof = await session(adminId, 'staff-web');
+      managerProof = await session(managerId, 'staff-web');
+      techProof = await session(technicianId, 'staff-telegram', linkId);
 
-    cityA = await createCity('city-a', 'ACTIVE');
-    cityB = await createCity('city-b', 'ACTIVE', 'Asia/Tokyo');
-    areaA = await createArea(cityA, 'zone-a');
-    await publishArea(cityA, areaA, 'Zone A');
-    areaDraftOnly = await createArea(cityA, 'zone-draft');
-    areaArchived = await createArea(cityA, 'zone-archived');
-    await publishArea(cityA, areaArchived, 'Archived zone');
-    await migrator.query('UPDATE foundation.service_areas SET archived_at=statement_timestamp() WHERE id=$1', [areaArchived]);
-    areaB = await createArea(cityB, 'zone-b');
-    await publishArea(cityB, areaB, 'Zone B');
+      cityA = await createCity('city-a', 'ACTIVE');
+      cityB = await createCity('city-b', 'ACTIVE', 'Asia/Tokyo');
+      areaA = await createArea(cityA, 'zone-a');
+      await publishArea(cityA, areaA, 'Zone A');
+      areaDraftOnly = await createArea(cityA, 'zone-draft');
+      areaArchived = await createArea(cityA, 'zone-archived');
+      await publishArea(cityA, areaArchived, 'Archived zone');
+      await fencedDml((client) => client.query(
+        'UPDATE foundation.service_areas SET archived_at=statement_timestamp() WHERE id=$1', [areaArchived]));
+      areaB = await createArea(cityB, 'zone-b');
+      await publishArea(cityB, areaB, 'Zone B');
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
+    }
   }, 60000);
 
-  afterAll(async () => { await Promise.all(pools.map(pool => pool.end())); });
+  afterAll(teardown);
 
   it('administrator assigns a city and the receipt carries the subject aggregate version', async () => {
     const before = await exec(adminProof, 'adminList', { staffId: managerId });
@@ -586,7 +638,8 @@ integration('membership commands against isolated PostgreSQL', () => {
   });
 
   it('revocation still works after the city is suspended, but new admission does not', async () => {
-    await migrator.query("UPDATE foundation.service_cities SET lifecycle='INACTIVE' WHERE id=$1", [cityA]);
+    await fencedDml((client) => client.query(
+      "UPDATE foundation.service_cities SET lifecycle='INACTIVE' WHERE id=$1", [cityA]));
     expect(await status(exec(managerProof, 'techGrantCity', { cityId: cityA, staffId: technicianId },
       { validFrom: day(0) }, 3))).toBe(409);
     const receipt = await exec(adminProof, 'adminRevoke',

@@ -3,6 +3,9 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { labDbOptions, labGarageBucket, labMode, labNewArchives } from './lab-resources.mjs';
+export { labGarageCli } from './lab-resources.mjs';
+export { restoreReviewedExpressions } from './reviewed-expressions.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const PG = 'fixlevelup-dev-postgres';
@@ -34,6 +37,9 @@ function secret(file, name) {
 }
 export function restoreDbOptions(database, role) {
   opts();
+  // Lab branch: attested cluster, scoped lab credentials from the lab process
+  // env only (never a dev `.env`), fixed loopback endpoint.
+  if (labMode()) {return labDbOptions(database, role);}
   if (role === 'maintenance' && database === 'postgres') {return { host: '127.0.0.1', port: 55432, database,
     user: 'fixlevelup_dev', password: secret('infra/dev-postgres/.env', 'POSTGRES_PASSWORD') };}
   if ((!SRC.test(database) && !DST.test(database)) || (role !== 'migrator' && role !== 'runtime')) {stop('database-allowlist');}
@@ -43,6 +49,8 @@ export function restoreDbOptions(database, role) {
 }
 export function freshGarageBucket(namespace) {
   opts();
+  // Lab branch: real Garage CLI at the pinned path/config, no Docker socket.
+  if (labMode()) {return labGarageBucket(namespace);}
   if (namespace !== undefined && !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(namespace)) {stop('bucket-namespace');}
   requireImage(GARAGE, 'dxflrs/garage:v2.5.0@sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5');
   const bucket = namespace === undefined ? `fixlevelup-restore-${randomBytes(12).toString('hex')}` : `p0304-${namespace}`;
@@ -77,6 +85,15 @@ export function newArchives(source, destination, overlayTables, maxDumpBytes) {
   if (!SRC.test(source) || !DST.test(destination) || !Number.isInteger(maxDumpBytes) || maxDumpBytes < 1
     || maxDumpBytes > 268_435_456 || !Array.isArray(overlayTables) || overlayTables.length > 24
     || overlayTables.some(t => !TABLE.test(t)) || new Set(overlayTables).size !== overlayTables.length) {stop('archive-allowlist');}
+  // Lab branch: real pg_dump/pg_restore/psql at the pinned paths against loopback
+  // 55432. The exclusive temp directory is created here so every archive path is
+  // owned by this run; there is no Docker copy and no container-side path.
+  if (labMode()) {
+    const work = join(root, 'backups');
+    mkdirSync(work, { recursive: true });
+    const labDirectory = mkdtempSync(join(work, 'p0304-file-restore-'));
+    return labNewArchives(source, destination, overlayTables, maxDumpBytes, labDirectory);
+  }
   requireImage(PG, 'postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402');
   const work = join(root, 'backups');
   mkdirSync(work, { recursive: true });

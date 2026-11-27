@@ -23,7 +23,11 @@ async function pinnedFixture() {
   const path = process.env['FIXLEVELUP_FILE_PROCESSING_FIXTURE'];
   if (path === undefined) {throw new Error('Real C test requires the explicitly prepared FIXLEVELUP_FILE_PROCESSING_FIXTURE');}
   const config: unknown = JSON.parse(await readFile(resolve(path), 'utf8'));
-  const launcherUrl = new URL('../../../infra/file-processing/docker-test-launcher.mjs', import.meta.url);
+  // Same production processor and assertions. Only the test transport changes
+  // when the real pinned engines are owned by the host of the private PG/S3 lab.
+  const launcherUrl = process.env['FIXLEVELUP_LAB_ENGINE_TICKET'] === undefined
+    ? new URL('../../../infra/file-processing/docker-test-launcher.mjs', import.meta.url)
+    : new URL('../../../infra/file-processing/p05-lab-engine-client.mjs', import.meta.url);
   const fixtureModule = await import(launcherUrl.href) as TestLauncherModule;
   return fixtureModule.createFileProcessingTestLauncher(config);
 }

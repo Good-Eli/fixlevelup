@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Pool } from 'pg';
+import { labGarageCli } from '../../../infra/file-restore/resources.mjs';
 import {
   bootstrapFileLedgerNamespace, createFileLedgerVerifier, createPgFileLedger, createPgFloorStore,
 } from '../src/files/file-ledger/index.js';
@@ -270,7 +271,12 @@ export async function rejectOutbox(db: FileReservationsFixture, intentId: string
     CREATE TRIGGER ${name} BEFORE INSERT ON foundation.outbox_events FOR EACH ROW EXECUTE FUNCTION foundation.${name}('${intentId}','${operationId ?? ''}')`);
 }
 
+/** Lab mode (P05-02 S4): the real Garage CLI at the pinned path and config.
+ * Dev mode keeps the historical Docker-exec path unchanged. */
 function garage(...args: string[]): string {
+  if (process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
+    return labGarageCli('privacy-garage', ...args);
+  }
   try {
     return execFileSync('docker', ['exec','fixlevelup-dev-s3','/garage', ...args], {
       encoding: 'utf8', timeout: 15_000, stdio: ['ignore','pipe','pipe'], windowsHide: true,
@@ -338,7 +344,7 @@ export function garageTarget(namespace: string) {
   };
 }
 
-export async function privacyFixture() {
+export async function openPrivacyLedger() {
   const config = readFileSync(resolve(import.meta.dirname, '../../../infra/file-ledger/.env'), 'utf8');
   function role(user: string, database: string, port: number): Pool {
     const password = new RegExp(`^${user.toUpperCase()}_PASSWORD=([^\\r\\n]+)$`, 'm').exec(config)?.[1];
@@ -357,25 +363,13 @@ export async function privacyFixture() {
     const genesis = await bootstrapFileLedgerNamespace({ mode: 'local-synthetic', ledgerOperatorPool: operator,
       floorOperatorPool: floorOperator, signerPublicKey: publicKey, initialEpoch: 1n });
     const scope: LedgerScope = { namespace: genesis.namespace, incarnation: genesis.incarnation, writerEpoch: 1n };
-    const db = await startPrivacyMain(scope.namespace);
-    const epoch = { namespace: scope.namespace, epoch: 1n };
     const floor = createPgFloorStore(floorVerifier);
-    const createLedger = (pool: Pool) => createPgFileLedger(pool, { mode: 'local-synthetic', signerPool: signer,
+    const ledger = createPgFileLedger(writer, { mode: 'local-synthetic', signerPool: signer,
       privateKey, limits, operatorPool: operator });
-    const ledger = createLedger(writer);
     const verifier = createFileLedgerVerifier({ ledger, signerPublicKey: publicKey, floor, limits });
-    const actorId = randomUUID();
-    const op = (role: 'RETENTION' | 'HOLD' | 'DELETE') =>
-      makeFilePrivacyGrant({ mode: 'local-synthetic', namespace: scope.namespace, role, actorId });
     return {
-      db, epoch, scope, actorId, ledger, verifier, floor,
+      scope, ledger, verifier, floor,
       withFloor: (other: DurableFloorStore) => createFileLedgerVerifier({ ledger, signerPublicKey: publicKey, floor: other, limits }),
-      holdOperator: op('HOLD'),
-      hold: (policy: RetentionPolicy, pool = db.runtime) => ({ pool, epoch, policy }),
-      plan: (policy: RetentionPolicy, pool = db.runtime) => ({ pool, epoch, policy, scope, grant: op('RETENTION') }),
-      delete: (policy: RetentionPolicy, broker: ReturnType<typeof createSyntheticDeleteBroker>) =>
-        ({ pool: db.runtime, epoch, policy, scope, grant: op('DELETE'), ledger, verifier, broker }),
-      broker: (...targets: StorageTestConfig[]) => createSyntheticDeleteBroker({ mode: 'local-synthetic', namespace: scope.namespace, epoch: 1n, targets }),
       events: () => signer.query<{ event_id: string; intent_id: string; seq: string; sha256: string }>(
         'SELECT event_id,intent_id,seq,sha256 FROM file_ledger.events WHERE namespace_id=$1 ORDER BY seq', [scope.namespace]).then(({ rows }) => rows),
       rollbackVerifier: () => {
@@ -384,9 +378,31 @@ export async function privacyFixture() {
           challenge, signature: sign(null, headMessage(oldHead, challenge), privateKey).toString('hex') }), getEvents: () => Promise.resolve([]) };
         return createFileLedgerVerifier({ ledger: rolledBack, signerPublicKey: publicKey, floor, limits });
       },
-      async close() { await db.close(); await closeLedger(); },
+      close: closeLedger,
     };
   } catch (error) { await closeLedger(); throw error; }
+}
+
+export async function privacyFixture() {
+  const external = await openPrivacyLedger();
+  const { scope, ledger, verifier } = external;
+  try {
+    const db = await startPrivacyMain(scope.namespace);
+    const epoch = { namespace: scope.namespace, epoch: 1n };
+    const actorId = randomUUID();
+    const op = (role: 'RETENTION' | 'HOLD' | 'DELETE') =>
+      makeFilePrivacyGrant({ mode: 'local-synthetic', namespace: scope.namespace, role, actorId });
+    return {
+      ...external, db, epoch, actorId,
+      holdOperator: op('HOLD'),
+      hold: (policy: RetentionPolicy, pool = db.runtime) => ({ pool, epoch, policy }),
+      plan: (policy: RetentionPolicy, pool = db.runtime) => ({ pool, epoch, policy, scope, grant: op('RETENTION') }),
+      delete: (policy: RetentionPolicy, broker: ReturnType<typeof createSyntheticDeleteBroker>) =>
+        ({ pool: db.runtime, epoch, policy, scope, grant: op('DELETE'), ledger, verifier, broker }),
+      broker: (...targets: StorageTestConfig[]) => createSyntheticDeleteBroker({ mode: 'local-synthetic', namespace: scope.namespace, epoch: 1n, targets }),
+      async close() { try { await db.close(); } finally { await external.close(); } },
+    };
+  } catch (error) { await external.close(); throw error; }
 }
 
 export { revokeDeleteBroker };

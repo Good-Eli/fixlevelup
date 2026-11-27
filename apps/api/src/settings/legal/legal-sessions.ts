@@ -89,7 +89,22 @@ export async function lockRequestSession(
      FROM foundation.request_sessions s WHERE s.id=$1 FOR UPDATE`,
     [uuidValue(sessionId)],
   ));
-  return result.rows[0] ?? null;
+  const row = result.rows[0] ?? null;
+  if (row === null) {
+    return null;
+  }
+  // The `clock_timestamp()` of the locking statement may have been evaluated
+  // before or while the statement waited for the row lock another transaction
+  // held. Expiry decisions must never be made on that possibly stale sample:
+  // re-read the database clock in its own statement *after* the lock wait has
+  // completed, so `db_now` is always a post-wait sample.
+  const clock = await guard(() => client.query<{ db_now: Date }>('SELECT clock_timestamp() AS db_now'));
+  const freshClock = clock.rows[0]?.db_now;
+  if (!freshClock) {
+    throw new LegalPortError('CONFLICT');
+  }
+  row.db_now = freshClock;
+  return row;
 }
 
 /** Read-only variant of `lockRequestSession` (no row lock). */

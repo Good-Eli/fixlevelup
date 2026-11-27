@@ -4,8 +4,8 @@ import type { PoolClient } from 'pg';
 import { AUTHORIZATION_SERVICE } from '../authz/authorization.resources.js';
 import { isSystemAdmin } from '../authz/authorization.service.js';
 import type { AuthorizationServiceApi, SessionProof, StaffWriteContext } from '../authz/authorization.service.js';
-import { GLOBAL_SCOPE, isCapability, isP03Capability, isP04Capability, isPermissionCode, P03_CAPABILITY_METADATA, p04Module, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES } from '../authz/capability.js';
-import type { Capability, GrantScope } from '../authz/capability.js';
+import { GLOBAL_SCOPE, isCapability, isP03Capability, isP04Capability, isP05Capability, isPermissionCode, P03_CAPABILITY_METADATA, P05_MODULE, p04Module, PERMISSION_CONTRACT, PROTECTED_CAPABILITIES } from '../authz/capability.js';
+import type { Capability, GrantScope, P05Capability } from '../authz/capability.js';
 import { staffReadFilter } from '../staff/staff-policy.js';
 import type { StaffDto } from '../staff/staff.service.js';
 import { catalogEntry, checkReplacement, grantableScopes } from './role-policy.js';
@@ -62,6 +62,9 @@ async function projected(ctx: StaffWriteContext, id: string | null): Promise<Rol
       if (!isPermissionCode(g.code)) { continue; }
       if (isP03Capability(g.code) && (g.protected !== false || g.module !== P03_CAPABILITY_METADATA[g.code].module)) { continue; }
       if (isP04Capability(g.code) && (g.protected !== false || g.module !== p04Module(g.code))) { continue; }
+      // P05 is displayed exactly as stored (it is never issued by this writer), but only
+      // as the exact ordinary `requests` catalog row; a drifted row stays invisible.
+      if (isP05Capability(g.code) && (g.protected !== false || g.module !== P05_MODULE)) { continue; }
       const scope = g.scope as GrantScope;
       if (!grantableScopes(g.code, role).includes(scope)) { continue; }
       permissions.push({ code: g.code, scope });
@@ -156,7 +159,8 @@ export class RolesService {
       return result(ctx, id, version + 1);
     });
   }
-  replacePermissions(session: SessionProof, id: string, version: number, desired: RoleGrant[]): Promise<RoleResult> {
+  replacePermissions(session: SessionProof, id: string, version: number, desired: readonly RoleGrant[],
+    revokeP05: readonly P05Capability[] = []): Promise<RoleResult> {
     return this.auth.authorizeForWrite(session, 'roles.permissions.manage', GLOBAL_SCOPE, async (ctx) => {
       const target = await writable(ctx, id, version, false);
       const available = await catalog(ctx.client);
@@ -164,14 +168,26 @@ export class RolesService {
         'SELECT permission_code AS code,scope_type AS scope FROM foundation.role_permissions WHERE role_id=$1 AND enabled ORDER BY permission_code', [id]);
       const current: RoleGrant[] = [];
       for (const g of before.rows) {
+        // P05 has its own closed handling below: a pre-P05 client cannot express it, so
+        // it is neither silently re-enabled nor dropped here.
+        if (isP05Capability(g.code)) {
+          // A drifted P05 row is not repairable by this writer: refuse the whole write.
+          if (!available.some((item) => item.code === g.code && item.scopes.includes(g.scope as GrantScope))) { throw new ConflictException(); }
+          current.push({ code: g.code, scope: g.scope as GrantScope });
+          continue;
+        }
         // Do not echo or silently re-enable unsupported/disabled grants from a drifted DB.
         const p = available.find((item) => item.code === g.code && item.scopes.includes(g.scope as GrantScope));
         if (!p || !grantableScopes(p.code, target).includes(g.scope as GrantScope)) { throw new ConflictException(); }
         current.push({ code: p.code, scope: g.scope as GrantScope });
       }
-      checkReplacement(ctx, target, available, current, desired);
+      checkReplacement(ctx, target, available, current, desired, revokeP05);
       // Compare code+scope: a geography grant may change CITY<->GLOBAL, which is a real change.
-      const removed = current.filter((g) => !desired.some((n) => n.code === g.code && n.scope === g.scope));
+      // An omitted enabled P05 grant is never part of `removed`: it was either refused above
+      // or explicitly listed in the opt-in revocation field.
+      const removed = current.filter((g) => isP05Capability(g.code)
+        ? revokeP05.includes(g.code)
+        : !desired.some((n) => n.code === g.code && n.scope === g.scope));
       const added = desired.filter((g) => !current.some((o) => o.code === g.code && o.scope === g.scope));
       // Matching sets receive the same version/audit treatment as changed sets.
       if (removed.length) {

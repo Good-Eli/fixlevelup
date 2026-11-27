@@ -6,13 +6,14 @@ import type { Pool, PoolClient } from 'pg';
 import { P03_REFERENCE_TYPES } from '@fixlevelup/p03-contracts';
 import type { P03Target } from '@fixlevelup/p03-contracts';
 import type { Principal, StaffWebPrincipal } from './principal.js';
-import type { Capability, GeoCapability, GeoGrant, P03Capability, P03Grant, Scope } from './capability.js';
+import type { Capability, GeoCapability, GeoGrant, P03Capability, P03Grant, P05Capability, P05Grant, Scope } from './capability.js';
 import {
-  GEO_CAPABILITIES, GEO_SCOPE_CONTRACT, isCapability, isGeoCapability, isP03Capability, PERMISSION_CONTRACT,
+  GEO_CAPABILITIES, GEO_SCOPE_CONTRACT, isCapability, isGeoCapability, isP03Capability, isP05Capability, PERMISSION_CONTRACT,
   PROTECTED_CAPABILITIES, scopeMatches,
 } from './capability.js';
 import { activeAdminCityIds, effectiveP03Grants } from './p03-grants.js';
 import { effectiveP04Grants } from './p04-grants.js';
+import { effectiveP05Grants } from './p05-grants.js';
 import type { P04Capability, P04Grant, P04Target } from './p04-grants.js';
 import { lockAccessPolicy } from './rbac-lock.js';
 import type { GeoAction, GeoContext, GeographyAuthorizationApi } from '../settings/geography/geo-contract.js';
@@ -29,6 +30,12 @@ export class AuthorizationError extends Error {
 export class P03CommitUnknown extends Error {
   constructor() { super('P03 commit acknowledgement unknown'); this.name = 'P03CommitUnknown'; }
 }
+/** P05 domain commands use the same shared policy lock and their own receipt code, so a
+ * caller cannot confuse a P03/P04 uncertain commit with a P05 one. Never auto-retry. */
+export class P05CommitUnknown extends Error {
+  readonly code = 'P05_COMMIT_UNKNOWN';
+  constructor() { super('P05 commit acknowledgement unknown'); this.name = 'P05CommitUnknown'; }
+}
 
 function definiteCommitRejection(error: unknown): boolean {
   if (!error || typeof error !== 'object' || !('severity' in error) || error.severity !== 'ERROR'
@@ -44,6 +51,7 @@ export interface AccessView {
   readonly geoPermissions?: readonly GeoGrant[];
   readonly p03Permissions?: readonly P03Grant[];
   readonly p04Permissions?: readonly P04Grant[];
+  readonly p05Permissions?: readonly P05Grant[];
   /** Own active P04 CITY assignments for UI affordances; never used as authorization. */
   readonly p04PricingWriteCityIds?: readonly string[];
 }
@@ -88,6 +96,30 @@ export interface P04AuthorizationApi {
     callback: (ctx: P04Context) => Promise<T>): Promise<T>;
 }
 
+/** Narrow P05 staff port. The callback resolves the persisted target under its own
+ * request/GEO locks and then names the target's city, so a wrong city and a missing
+ * target are indistinguishable (404); a missing command grant is a 403 decided from the
+ * locked policy, never from the body. Every command additionally requires
+ * `requests.read` on the same target. P05 domain writes take the *shared* RBAC lock:
+ * they never block each other and cannot invert against a policy writer, while a
+ * revocation still wins for every later command. */
+export interface P05Context {
+  readonly client: PoolClient;
+  readonly staffId: string;
+  /** Exact locked web session row, for receipts that bind a staff actor. */
+  readonly sessionId: string;
+  readonly role: EffectiveRole;
+  /** Null means every required grant is GLOBAL (exact SYSTEM ADMIN). */
+  readonly cityIds: readonly string[] | null;
+  readonly authorizeCity: (cityId: string) => Promise<void>;
+  readonly recheck: () => Promise<Date>;
+}
+export interface P05AuthorizationApi {
+  withP05<T>(proof: SessionProof, required: readonly P05Capability[], callback: (ctx: P05Context) => Promise<T>): Promise<T>;
+  withP05<Prepared, Result>(proof: SessionProof, required: readonly P05Capability[],
+    prepare: (ctx: P05Context) => Promise<Prepared>, decide: (prepared: Prepared, clock: Date) => Result): Promise<Result>;
+}
+
 const P04_COMPANY_ACTIONS: readonly (readonly P04Capability[])[] = [
   ['catalog.read'], ['catalog.read', 'catalog.manage'], ['pricing.rules.read'], ['pricing.rules.read', 'pricing.rules.manage'],
   ['content.externalreviews.read'], ['content.externalreviews.read', 'content.externalreviews.manage'],
@@ -97,7 +129,7 @@ const P04_FINAL_CLOCK_GUARDS = new Set([
   'catalog_price_periods_final_clock_guard', 'price_rule_periods_final_clock_guard',
   'pricing_policy_periods_final_clock_guard', 'public_price_estimate_periods_final_clock_guard',
 ]);
-type ReceiptCommitMode = false | 'P03' | 'P04';
+type ReceiptCommitMode = false | 'P03' | 'P04' | 'P05';
 
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -150,7 +182,7 @@ function effectiveGeoGrant(code: unknown, scope: unknown, role: EffectiveRole, s
 /** No permission cache, plain unchecked read callback or channel-derived grants. A guard preflight
  * is not authority for a later read/write: every protected projection and command takes
  * the policy lock, verifies the specific session and reads the role on its own transaction. */
-export class AuthorizationService implements AuthorizationServiceApi, GeographyAuthorizationApi, P03AuthorizationApi, P04AuthorizationApi {
+export class AuthorizationService implements AuthorizationServiceApi, GeographyAuthorizationApi, P03AuthorizationApi, P04AuthorizationApi, P05AuthorizationApi {
   constructor(private readonly pool: Pick<Pool, 'connect'>) {}
 
   private async transaction<T>(mode: 'read' | 'write', fn: (client: PoolClient) => Promise<T>, receiptCommitMode: ReceiptCommitMode = false): Promise<T> {
@@ -162,11 +194,15 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       inTransaction = true;
       await lockAccessPolicy(client, mode);
+      if (receiptCommitMode === 'P05') { await client.query('SET LOCAL synchronous_commit=on'); }
       const result = await fn(client);
       if (receiptCommitMode) {
         try {
           const acknowledgement = await client.query('COMMIT');
-          if (acknowledgement.command !== 'COMMIT') { throw new InternalServerErrorException(); }
+          if (acknowledgement.command !== 'COMMIT') {
+            if (receiptCommitMode === 'P05') { throw new P05CommitUnknown(); }
+            throw new InternalServerErrorException();
+          }
         } catch (error) {
           if (receiptCommitMode === 'P04' && definiteCommitRejection(error) && error && typeof error === 'object'
             && 'code' in error && error.code === '23514' && 'constraint' in error
@@ -178,7 +214,7 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
           // Only the caller's receipt-only path may open a new transaction.
           discard = true;
           inTransaction = false;
-          throw new P03CommitUnknown();
+          throw receiptCommitMode === 'P05' ? new P05CommitUnknown() : new P03CommitUnknown();
         }
       } else {
         await client.query('COMMIT');
@@ -187,7 +223,8 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
       return result;
     } catch (error) {
       if (client && inTransaction) { try { await client.query('ROLLBACK'); } catch { discard = true; } }
-      if (error instanceof AuthorizationError || error instanceof HttpException || (discard && error instanceof P03CommitUnknown)) { throw error; }
+      if (error instanceof AuthorizationError || error instanceof HttpException
+        || (discard && (error instanceof P03CommitUnknown || error instanceof P05CommitUnknown))) { throw error; }
       if (error && typeof error === 'object' && 'code' in error &&
         ['40001', '40P01', '55P03', '23505'].some((code) => code === error.code)) { throw new ConflictException(); }
       throw new InternalServerErrorException();
@@ -309,20 +346,28 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
    * a data, audit or receipt statement waits. This is the last statement before COMMIT.
    * SELF deactivation may itself make the actor INACTIVE at exactly the next epoch; the
    * original locked token must still be live, and no other actor transition can pass. */
-  private async assertProofCurrent(client: PoolClient, locked: LockedProof, selfDeactivation: boolean): Promise<void> {
+  private async assertProofCurrent(client: PoolClient, locked: LockedProof, selfDeactivation: boolean,
+    sampleDecisionClock = false): Promise<Date | undefined> {
     const { principal, sessionId, tokenHash, channel, linkId } = locked;
-    const result = await client.query(
-      `SELECT s.id FROM foundation.web_sessions ws
+    const clock = sampleDecisionClock ? 'sample.db_now' : 'clock_timestamp()';
+    const result = await client.query<{ db_now?: Date }>(
+      `SELECT s.id${sampleDecisionClock ? ',sample.db_now' : ''} FROM foundation.web_sessions ws
        JOIN foundation.staff s ON s.id=ws.staff_id AND s.role=$7
+       ${sampleDecisionClock ? 'CROSS JOIN (SELECT clock_timestamp() AS db_now) sample' : ''}
        WHERE ws.id=$1 AND ws.token_hash=$2 AND ws.channel=$3 AND ws.staff_id=$4 AND ws.auth_version=$5
        AND ws.telegram_link_id IS NOT DISTINCT FROM $6::uuid AND ws.revoked_at IS NULL
        AND ((s.employment_state='ACTIVE' AND s.auth_version=$5)
          OR ($8 AND s.employment_state='INACTIVE' AND s.auth_version=$5::bigint+1))
        AND (ws.telegram_link_id IS NULL OR EXISTS (SELECT 1 FROM foundation.staff_telegram_links l
          WHERE l.id=ws.telegram_link_id AND l.staff_id=s.id AND l.revoked_at IS NULL))
-       AND ws.idle_expires_at>clock_timestamp() AND ws.absolute_expires_at>clock_timestamp()`,
+       AND ws.idle_expires_at>${clock} AND ws.absolute_expires_at>${clock}`,
       [sessionId, tokenHash, channel, principal.staffId, principal.authVersion, linkId, principal.role, selfDeactivation]);
     if (result.rowCount !== 1) { throw new AuthorizationError('UNAUTHORIZED'); }
+    const now = result.rows[0]?.db_now;
+    if (sampleDecisionClock && (!(now instanceof Date) || !Number.isFinite(now.getTime()))) {
+      throw new AuthorizationError('FAILED');
+    }
+    return now;
   }
 
   private async withProof<T>(mode: 'read' | 'write', proof: SessionProof, callback: (client: PoolClient, principal: Principal) => Promise<T>,
@@ -483,6 +528,76 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
       await authorizeTargets([...checked.values()]);
       return result;
     }, mode === 'write' && 'P04');
+  }
+
+  /** P05 staff commands. The policy lock is deliberately the *shared* one, exactly as
+   * P04 uses it for its domain writes: P05 domain writers are serialized by their own
+   * request/anchor/geography locks, a shared policy lock cannot invert against a
+   * role/revocation writer, and a revocation still wins before every later command
+   * because its exclusive lock waits for running commands and is visible to the next
+   * one. `required` is the exact command set; `requests.read` is added here so no caller
+   * can forget it, and the union is never widened to another target. The callback
+   * resolves the persisted target under its own locks and calls `authorizeCity`, which
+   * turns a wrong city and a missing target into the same 404 and a missing command
+   * grant into a 403 only *after* that target exists. The proof is re-read after the
+   * callback, before COMMIT; a domain write gets its own unknown-COMMIT signal. */
+  async withP05<T>(proof: SessionProof, required: readonly P05Capability[], callback: (ctx: P05Context) => Promise<T>): Promise<T>;
+  async withP05<Prepared, Result>(proof: SessionProof, required: readonly P05Capability[],
+    prepare: (ctx: P05Context) => Promise<Prepared>, decide: (prepared: Prepared, clock: Date) => Result): Promise<Result>;
+  async withP05<Prepared, Result = Prepared>(proof: SessionProof, required: readonly P05Capability[],
+    callback: (ctx: P05Context) => Promise<Prepared>, decide?: (prepared: Prepared, clock: Date) => Result): Promise<Prepared | Result> {
+    const codes = [...required];
+    if (!codes.length || codes.some((code) => !isP05Capability(code))) { throw new BadRequestException(); }
+    const needed = Object.freeze([...new Set<P05Capability>(['requests.read', ...codes])]);
+    const write = codes.some((code) => code !== 'requests.read');
+    return this.transaction('read', async (client) => {
+      const locked = await this.lockedPrincipal(client, proof);
+      const { principal } = locked;
+      if (principal.kind !== 'staff-web') { throw new AuthorizationError('FORBIDDEN'); }
+      const authorizeTargets = async (targets: readonly string[], sampleDecisionClock = false) => {
+        const view = await this.policy(client, principal);
+        const p05Permissions = await effectiveP05Grants(client, principal, view.role);
+        const grants = needed.map((code) => p05Permissions.find((grant) => grant.code === code));
+        if (grants.some((grant) => !grant)) { throw new AuthorizationError('FORBIDDEN'); }
+        const cityIds = grants.some((grant) => grant?.scope === 'CITY') ? await activeAdminCityIds(client, principal.staffId) : null;
+        for (const cityId of targets) {
+          // A city outside the trusted assignment is indistinguishable from a missing one.
+          if (cityIds !== null && !cityIds.includes(cityId)) { throw new NotFoundException(); }
+          if ((await client.query('SELECT id FROM foundation.service_cities WHERE id=$1', [cityId])).rowCount !== 1) {
+            throw new NotFoundException();
+          }
+        }
+        // Keep the time-sensitive session predicate the last statement in the proof.
+        const clock = await this.assertProofCurrent(client, locked, false, sampleDecisionClock);
+        return { cityIds, role: view.role, clock };
+      };
+      const checked: string[] = [];
+      const authorizeCity = async (cityId: string): Promise<void> => {
+        if (typeof cityId !== 'string' || !UUID.test(cityId)) { throw new BadRequestException(); }
+        const city = cityId.toLowerCase();
+        checked.push(city);
+        await authorizeTargets([city]);
+      };
+      const recheck = async (): Promise<Date> => {
+        const { clock } = await authorizeTargets([...checked], true);
+        if (!clock) { throw new AuthorizationError('FAILED'); }
+        return clock;
+      };
+      const initial = await authorizeTargets([]);
+      const result = await callback(Object.freeze({ client, staffId: principal.staffId, sessionId: locked.sessionId,
+        role: initial.role, cityIds: initial.cityIds, authorizeCity, recheck }));
+      // A command that never named its target has no authority over any row: fail closed
+      // before COMMIT rather than after an effect.
+      if (!checked.length) { throw new InternalServerErrorException(); }
+      const { clock } = await authorizeTargets([...checked], decide !== undefined);
+      // No IO after this common SQL clock. The isolated domain can choose a
+      // restricted representation or roll back a write whose basis has expired.
+      if (decide) {
+        if (!clock) { throw new AuthorizationError('FAILED'); }
+        return decide(result, clock);
+      }
+      return result;
+    }, write && 'P05');
   }
 
   private p04Target(value: unknown): P04Target {

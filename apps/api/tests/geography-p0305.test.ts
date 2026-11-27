@@ -1,9 +1,28 @@
 import { expect, it } from 'vitest';
+import type { PoolClient } from 'pg';
 import { GeographyFixture, check, geoTag, idOf, itemsOf, text, versionOf } from './geography-fixture.js';
 import type { GeoResult } from './geography-fixture.js';
 import { fixturePerTest, integration, record } from './rbac-fixture.js';
 
 const base = '/settings/service-cities';
+
+/** Wraps guarded GEO/CFG basis DML (migration 022) in one transaction that holds
+ * the unified writer fence before its first statement, on one pinned pool client. */
+async function fencedDml<T>(f: GeographyFixture, run: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await f.base.db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+    const result = await run(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 const pageIds = (result: GeoResult) => itemsOf(result).map(row => text(row, 'id'));
 function more(result: GeoResult): string {
   const pageInfo = record(result.data['pageInfo']);
@@ -53,9 +72,9 @@ integration('P03-05 geography pagination and full coverage over closed HTTP + is
     // More than 200 authorized rows, and an earlier archived row that must not
     // consume the first slot or count as continuation when filtered out.
     const districts = `${base}/${city.id}/administrative-districts`;
-    await f.base.db.query(`INSERT INTO foundation.administrative_districts(id,city_id,code,name,archived_at)
+    await fencedDml(f, (client) => client.query(`INSERT INTO foundation.administrative_districts(id,city_id,code,name,archived_at)
       SELECT gen_random_uuid(),$1,'district-'||lpad(i::text,3,'0'),'Synthetic district',
-        CASE WHEN i=0 THEN statement_timestamp() END FROM generate_series(0,202) i`, [city.id]);
+        CASE WHEN i=0 THEN statement_timestamp() END FROM generate_series(0,202) i`, [city.id]));
     const defaultPage = check(await f.read(manager, `${districts}?includeArchived=false`), 200);
     expect(itemsOf(defaultPage)).toHaveLength(50);
     expect(defaultPage.etag).toBe(first.etag);
@@ -78,10 +97,10 @@ integration('P03-05 geography pagination and full coverage over closed HTTP + is
     const path = `${base}/${city.id}/service-areas/${idOf(area)}/versions`;
     // 2,000 permitted characters per field, but U+0001 expands to six JSON bytes.
     const escaped = '\u0001'.repeat(2_000);
-    await f.base.db.query(`INSERT INTO foundation.service_area_versions
+    await fencedDml(f, (client) => client.query(`INSERT INTO foundation.service_area_versions
       (id,city_id,area_id,version,name,coverage_description,address_criteria,created_by)
       SELECT gen_random_uuid(),$1,$2,i,'Synthetic escaped history',$3,$3,$4 FROM generate_series(1,200) i`,
-    [city.id, idOf(area), escaped, admin.id]);
+    [city.id, idOf(area), escaped, admin.id]));
     const small = check(await f.read(admin, `${path}?limit=1`), 200);
     expect(small.etag).toBe(area.etag);
     expect(itemsOf(small)[0]?.['coverageDescription']).toBe(escaped);
@@ -94,9 +113,9 @@ integration('P03-05 geography pagination and full coverage over closed HTTP + is
     const f = open(), admin = f.base.admin;
     const city = await f.activeCity(admin, 'coverage-city');
     const cityPath = `${base}/${city.id}`;
-    const records = await f.base.db.query<{ id: string; code: string }>(`INSERT INTO foundation.administrative_districts(id,city_id,code,name)
+    const records = await fencedDml(f, (client) => client.query<{ id: string; code: string }>(`INSERT INTO foundation.administrative_districts(id,city_id,code,name)
       SELECT gen_random_uuid(),$1,'district-'||lpad(i::text,3,'0'),'Synthetic district'
-      FROM generate_series(1,201) i RETURNING id,code`, [city.id]);
+      FROM generate_series(1,201) i RETURNING id,code`, [city.id]));
     const [first, ...remaining] = records.rows.sort((a, b) => a.code.localeCompare(b.code));
     const archived = remaining.find(row => row.code === 'district-200');
     const overflow = remaining.find(row => row.code === 'district-201');
@@ -139,8 +158,8 @@ integration('P03-05 geography pagination and full coverage over closed HTTP + is
 
     // Older privileged SQL imports were not upper-bounded by the schema. Model an
     // oversized draft in this isolated DB; the API must refuse the entire response.
-    await f.base.db.query(`INSERT INTO foundation.service_area_district_coverage(city_id,area_version_id,district_id,relation)
-      VALUES ($1,$2,$3,'FULL'),($1,$2,$4,'FULL')`, [city.id, rev, archived.id, overflow.id]);
+    await fencedDml(f, (client) => client.query(`INSERT INTO foundation.service_area_district_coverage(city_id,area_version_id,district_id,relation)
+      VALUES ($1,$2,$3,'FULL'),($1,$2,$4,'FULL')`, [city.id, rev, archived.id, overflow.id]));
     const refused = check(await f.read(admin, path), 500);
     expect(refused.payload).toBeUndefined();
     expect(JSON.stringify(refused.body)).not.toContain(archived.id);

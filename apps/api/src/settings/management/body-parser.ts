@@ -7,18 +7,24 @@ import { parseStrictPricingJson } from '../../pricing/codec/index.js';
 import { header } from '../../auth/http.js';
 import type { StaffRequest } from '../../auth/http.js';
 
-function closeAfterProblem(req: StaffRequest, res: ServerResponse): void {
+export function closeAfterProblem(req: StaffRequest, res: ServerResponse): void {
   req.pause();
   res.setHeader('Connection', 'close');
-  // The problem must win the race against socket shutdown. end() after response finish
-  // flushes queued bytes and prevents an unfinished/slow body from keeping HTTP alive.
+  // Flush the problem before shutting down an incomplete request.
   const socket = req.socket;
   res.once('finish', () => { socket.end(); });
 }
 
-/** Runs before any route/controller/authorization; Express's automatic parser is off.
- * Never coerce a pathname, decompress input or trust Content-Length as a byte count. */
-export function boundedJson(req: StaffRequest, res: ServerResponse, next: (error?: HttpException) => void): void {
+type Next = (error?: HttpException) => void;
+interface BodyOptions {
+  readonly limit: number;
+  readonly decode: ((value: Buffer) => unknown) | null;
+  readonly forbidBody?: boolean;
+}
+
+/** Cap and bound the byte stream before interpreting it. `decode:null` hands
+ * opaque bytes to an isolated caller that must authorize before decoding. */
+export function readBoundedJson(req: StaffRequest, res: ServerResponse, next: Next, options: BodyOptions): void {
   let type: string | undefined;
   try {
     const encoding = header(req, 'content-encoding');
@@ -36,17 +42,12 @@ export function boundedJson(req: StaffRequest, res: ServerResponse, next: (error
   const hasBody = req.headers['transfer-encoding'] !== undefined ||
     (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0');
   if (!hasBody) { next(); return; }
-  if (!/^application\/json(?:\s*;\s*charset\s*=\s*utf-8)?$/i.test(type ?? '')) {
-    // End invalid uploads without letting a client stall the connection or reach DB work.
+  if (options.forbidBody || !/^application\/json(?:\s*;\s*charset\s*=\s*utf-8)?$/i.test(type ?? '')) {
     closeAfterProblem(req, res);
-    next(type && /^application\/json\s*;/i.test(type) ? new HttpException('Unsupported Media Type', 415) : new BadRequestException());
+    next(!options.forbidBody && type && /^application\/json\s*;/i.test(type)
+      ? new HttpException('Unsupported Media Type', 415) : new BadRequestException());
     return;
   }
-
-  const method = req.method ?? '';
-  const path = (req.url ?? '').split('?', 1)[0] ?? '';
-  const p04 = method === 'POST' ? matchP04Route(method, path) : null;
-  const limit = p04 ? P04_ROUTES[p04.operation].bodyLimit : p03BodyLimit(method, path);
   const chunks: Buffer[] = [];
   let bytes = 0;
   let done = false;
@@ -68,17 +69,17 @@ export function boundedJson(req: StaffRequest, res: ServerResponse, next: (error
   };
   function onData(chunk: Buffer): void {
     bytes += chunk.length;
-    if (bytes > limit) { finish(new HttpException('Payload Too Large', 413), true); return; }
+    if (bytes > options.limit) { finish(new HttpException('Payload Too Large', 413), true); return; }
     chunks.push(chunk);
   }
   function onEnd(): void {
     try {
       const buffer = Buffer.concat(chunks, bytes);
-      const value: unknown = p04 ? parseStrictPricingJson(buffer) : JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer));
+      const value = options.decode === null ? buffer : options.decode(buffer);
       if (value === null || typeof value !== 'object') { throw new BadRequestException(); }
       req.body = value;
-    } catch {
-      finish(new BadRequestException());
+    } catch (error) {
+      finish(error instanceof HttpException && error.getStatus() === 413 ? error : new BadRequestException());
       return;
     }
     finish();
@@ -91,4 +92,12 @@ export function boundedJson(req: StaffRequest, res: ServerResponse, next: (error
   req.on('close', onClose);
   req.on('end', onEnd);
   req.on('data', onData);
+}
+
+export function boundedJson(req: StaffRequest, res: ServerResponse, next: Next): void {
+  const method = req.method ?? '';
+  const path = (req.url ?? '').split('?', 1)[0] ?? '';
+  const p04 = method === 'POST' ? matchP04Route(method, path) : null;
+  readBoundedJson(req, res, next, { limit: p04 ? P04_ROUTES[p04.operation].bodyLimit : p03BodyLimit(method, path),
+    decode: p04 ? parseStrictPricingJson : (value): unknown => JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(value)) });
 }

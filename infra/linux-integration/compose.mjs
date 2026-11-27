@@ -41,6 +41,7 @@ if (operation === 'restart-garage') {
     cwd: new URL('../../', import.meta.url),
     env: isolatedEnv,
     stdio: 'inherit',
-    timeout: 1_200_000,
+    // The full check includes nine serial 15-minute CITY matrix slices.
+    timeout: operation === 'run' ? 9_600_000 : 1_200_000,
   });
 }

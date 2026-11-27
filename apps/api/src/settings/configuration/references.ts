@@ -30,6 +30,7 @@
  * same transaction, so a failed audit rolls the publish/archive back.
  */
 import { randomUUID } from 'node:crypto';
+import { acquireCompanySettingsLock } from './company-lock.js';
 import { writeConfigurationAudit } from './configuration-audit.js';
 import { assertCallerTransaction } from './configuration-tx.js';
 import { ConfigurationError, conflict, notFound, staleVersion } from './configuration-errors.js';
@@ -179,6 +180,10 @@ export async function createReferenceEntry(
   // The caller's explicit transaction is mandatory: the entry row, its audit row and
   // its outbox event must commit or roll back together.
   await assertCallerTransaction(client);
+  // P05-01 unified GEO/CFG writer fence: the reference basis is shared with the
+  // geography writers and the P05 readers, so the exclusive lock precedes the
+  // first city read (the S1 statement guards would otherwise refuse the write).
+  await acquireCompanySettingsLock(client);
   const scope = REFERENCE_TYPE_SCOPE[input.type];
   if (input.cityId !== null) {
     const city = await client.query('SELECT 1 FROM foundation.service_cities WHERE id=$1', [input.cityId]);
@@ -228,6 +233,8 @@ export async function publishReferenceVersion(
   const input: ReferenceVersionInput = referenceVersionInput(raw);
   // Guard before any row lock: an autocommit FOR UPDATE would release instantly.
   await assertCallerTransaction(client);
+  // P05-01 unified GEO/CFG writer fence (see createReferenceEntry).
+  await acquireCompanySettingsLock(client);
   const locked = await client.query<ReferenceEntryRow>(
     `SELECT ${REFERENCE_ENTRY_COLUMNS} FROM foundation.reference_entries WHERE id=$1 FOR UPDATE`, [input.entryId]);
   const entry = locked.rows[0];
@@ -318,6 +325,8 @@ export async function archiveReferenceEntry(
   const actor = requireUuid(actorStaffId, 'actorStaffId');
   const input: ReferenceArchiveInput = referenceArchiveInput(raw);
   await assertCallerTransaction(client);
+  // P05-01 unified GEO/CFG writer fence (see createReferenceEntry).
+  await acquireCompanySettingsLock(client);
   const locked = await client.query<ReferenceEntryRow>(
     `SELECT ${REFERENCE_ENTRY_COLUMNS} FROM foundation.reference_entries WHERE id=$1 FOR UPDATE`, [input.entryId]);
   const entry = locked.rows[0];

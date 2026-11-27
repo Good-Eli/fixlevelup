@@ -11,10 +11,13 @@
  *   suffix means a run never reuses a previous database, and the existing
  *   `fixlevelup_(...|legal)_test_...` guard in `auth-db-fixture.ts` already accepts
  *   it, so no extra allowlist entry is needed;
- * - the maintenance role only reaches `postgres` and one CREATE/GRANT block;
+ * - the maintenance role only reaches `postgres` and one CREATE/GRANT block
+ *   (owned lifecycle in owned-test-database.ts, which also drops this run's own
+ *   database when provisioning fails midway);
  *   migrations run as the migrator role, the ports under test run as the real
  *   `fixlevelup_runtime` role;
- * - nothing deletes a database, drops rows or touches the working dev database.
+ * - nothing drops rows or touches the working dev database; the only database
+ *   this fixture deletes is the one it created itself.
  *
  * The migration chain is the shared `authFixtureMigrations` list (the file-proof
  * task adds migration 014 to it). This fixture requires 014 to be present and
@@ -23,12 +26,10 @@
  *
  * All synthetic rows (reviewed staff, city, legal documents, consent evidence) are
  * written by the migration owner, never by the port under test, so a port cannot
- * authorize itself. Credentials are read from the local ignored env files and are
- * never printed.
+ * authorize itself. Credentials come from the shared fixture policy (lab process
+ * env in lab mode, local ignored env files otherwise) and are never printed.
  */
 import { randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { Client, Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { describe } from 'vitest';
@@ -38,8 +39,8 @@ import {
   publishLegalDocumentVersion, recordConsentGiven, recordConsentRevoked,
 } from '../src/settings/legal/index.js';
 import { authFixtureMigrations, migrateAuthFixture } from './auth-db-fixture.js';
+import { OwnedTestDatabase, fixtureCredentials } from './owned-test-database.js';
 
-const root = resolve(import.meta.dirname, '../../..');
 const FILE_RESERVATIONS_MIGRATION = '20261121000500_file_upload_reservations';
 const connection = { host: '127.0.0.1' as const, port: 55432 };
 
@@ -50,24 +51,6 @@ export const fileReservationsIntegration =
 if (!authFixtureMigrations.includes(FILE_RESERVATIONS_MIGRATION)) {
   // Fail loudly instead of silently proving the ports against a schema without 014.
   throw new Error('File reservation fixture requires migration 014 in the shared auth fixture chain');
-}
-
-function secret(env: string, name: string): string {
-  const match = new RegExp(`^${name}=([a-f0-9]{64})$`, 'm').exec(env);
-  if (!match?.[1]) {
-    throw new Error(`Missing local isolated test credential: ${name}`);
-  }
-  return match[1];
-}
-
-function credentials(): { admin: string; migrator: string; runtime: string } {
-  const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-  const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-  return {
-    admin: secret(adminEnv, 'POSTGRES_PASSWORD'),
-    migrator: secret(toolingEnv, 'FIXLEVELUP_MIGRATOR_PASSWORD'),
-    runtime: secret(toolingEnv, 'FIXLEVELUP_RUNTIME_PASSWORD'),
-  };
 }
 
 export interface FixtureCity {
@@ -84,79 +67,124 @@ export interface FileReservationsFixture {
   readonly city: FixtureCity;
   /** Runs `run` inside one explicit runtime transaction, rolling back on failure. */
   inTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T>;
+  /** End both application pools once; the operator may keep the closed database for a restore handoff. */
+  drainPools(): Promise<void>;
   close(): Promise<void>;
 }
 
-/** Creates one isolated database, applies the real chain and seeds reviewed rows. */
-export async function startFileReservationsDatabase(): Promise<FileReservationsFixture> {
+export const FILE_RESTORE_S0_CAP = '20261123000100_request_intake_foundation';
+
+/** Creates one isolated database, applies the real chain and seeds reviewed rows.
+ * Only the synthetic full-archive restore proof may opt in to the exact S0 cap. */
+export async function startFileReservationsDatabase(capBefore?: typeof FILE_RESTORE_S0_CAP): Promise<FileReservationsFixture> {
   if (process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] !== '1') {
     throw new Error('File reservation fixture requires FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1');
   }
-  const { admin: adminPassword, migrator: migratorPassword, runtime: runtimePassword } = credentials();
+  if (capBefore !== undefined && (!Object.is(capBefore, FILE_RESTORE_S0_CAP)
+    || process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] !== '1'
+    || process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] !== '1')) {
+    throw new Error('Legacy file restore requires the exact synthetic S0 cap');
+  }
+  // Credentials follow the shared fixture policy: lab mode reads only the lab
+  // process env (never the dev `.env` files, no partial-env fallback).
+  const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
   // The existing auth fixture guard already accepts this prefix; the random suffix
   // makes CREATE DATABASE the reuse check (an existing name is a hard error).
   const database = `fixlevelup_legal_test_${randomBytes(12).toString('hex')}`;
-  const admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-  await admin.connect();
-  try {
-    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-  } finally {
-    await admin.end();
+  if (!/^fixlevelup_legal_test_[a-f0-9]{24}$/.test(database)) {
+    throw new Error('Invalid file reservation fixture database name');
   }
-  const migrationClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-  await migrationClient.connect();
-  try {
-    await migrateAuthFixture(migrationClient, database);
-  } finally {
-    await migrationClient.end();
-  }
+  // Owned lifecycle: the maintenance role only reaches `postgres` for this one
+  // CREATE/REVOKE/GRANT block, and any failure from here to the returned fixture
+  // drops exactly this run's database (see owned-test-database.ts).
+  const owned = await OwnedTestDatabase.create({
+    name: database,
+    gracefulFileDrop: true,
+    pattern: /^fixlevelup_legal_test_[a-f0-9]{24}$/,
+    prepare: async (maintenance) => {
+      await maintenance.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await maintenance.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+    },
+  });
   const migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword, max: 4 });
   const runtime = new Pool({ ...connection, database, user: 'fixlevelup_runtime', password: runtimePassword, max: 6 });
-  const reviewer = (await bootstrapFirstAdmin(migrator, {
-    login: `files-${randomBytes(12).toString('hex')}`,
-    password: `Synthetic-Files-${randomBytes(12).toString('hex')}!`,
-  })).staffId;
-  const city = await seedCity(migrator, reviewer);
-  return {
-    database,
-    migrator,
-    runtime,
-    reviewer,
-    city,
-    async inTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
-      const client = await runtime.connect();
-      try {
-        await beginLegalTransaction(client);
-        const result = await run(client);
-        await client.query('COMMIT');
-        return result;
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        throw error;
-      } finally {
-        client.release();
-      }
-    },
-    async close(): Promise<void> {
-      await Promise.all([runtime.end(), migrator.end()]);
-    },
-  };
+  let drained: Promise<void> | undefined;
+  const drainPools = (): Promise<void> => (drained ??= (async () => {
+    const results = await Promise.allSettled([runtime.end(), migrator.end()]);
+    const errors = results.filter(result => result.status === 'rejected').map(result => result.reason as unknown);
+    if (errors.length) { throw new AggregateError(errors, 'File reservation fixture pool drain failed'); }
+  })());
+  try {
+    const migrationClient = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+    await migrationClient.connect();
+    try {
+      await migrateAuthFixture(migrationClient, database, capBefore);
+    } finally {
+      await migrationClient.end();
+    }
+    const reviewer = (await bootstrapFirstAdmin(migrator, {
+      login: `files-${randomBytes(12).toString('hex')}`,
+      password: `Synthetic-Files-${randomBytes(12).toString('hex')}!`,
+    })).staffId;
+    const city = await seedCity(migrator, reviewer);
+    return {
+      database,
+      migrator,
+      runtime,
+      reviewer,
+      city,
+      async inTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+        const client = await runtime.connect();
+        try {
+          await beginLegalTransaction(client);
+          const result = await run(client);
+          await client.query('COMMIT');
+          return result;
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+      drainPools,
+      async close(): Promise<void> {
+        // Ends this run's pools first, then drops exactly this run's database.
+        await owned.dispose(drainPools);
+      },
+    };
+  } catch (error) {
+    // Provisioning failed after CREATE: close this run's pools, drop exactly this
+    // run's database, and surface a teardown failure instead of swallowing it
+    // (AggregateError carries both errors).
+    throw await owned.failure(error, drainPools);
+  }
 }
 
-/** One city with one published reviewed version, inserted as the migrator. */
+/** One city with one published reviewed version, inserted as the migrator under
+ * the unified GEO/CFG writer fence on one pinned client. */
 async function seedCity(db: Pool, staffId: string): Promise<FixtureCity> {
   const cityId = randomUUID();
   const cityVersionId = randomUUID();
   const hours = JSON.stringify(Array.from({ length: 7 }, () => [[540, 1080]]));
-  await db.query("INSERT INTO foundation.service_cities (id,code,lifecycle) VALUES ($1,$2,'DRAFT')",
-    [cityId, `files-${cityId.slice(0, 8)}`]);
-  await db.query(`INSERT INTO foundation.service_city_versions
-      (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
-    VALUES ($1,$2,1,'File fixture city','Europe/Moscow','+70000000000',$3::jsonb,$4)`,
-  [cityVersionId, cityId, hours, staffId]);
-  await db.query('UPDATE foundation.service_cities SET current_version_id=$2 WHERE id=$1', [cityId, cityVersionId]);
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+    await client.query("INSERT INTO foundation.service_cities (id,code,lifecycle) VALUES ($1,$2,'DRAFT')",
+      [cityId, `files-${cityId.slice(0, 8)}`]);
+    await client.query(`INSERT INTO foundation.service_city_versions
+        (id,city_id,version,display_name,timezone,public_contact,office_hours,reviewed_by)
+      VALUES ($1,$2,1,'File fixture city','Europe/Moscow','+70000000000',$3::jsonb,$4)`,
+    [cityVersionId, cityId, hours, staffId]);
+    await client.query('UPDATE foundation.service_cities SET current_version_id=$2 WHERE id=$1', [cityId, cityVersionId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
   return { cityId, cityVersionId };
 }
 

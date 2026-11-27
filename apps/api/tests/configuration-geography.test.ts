@@ -241,11 +241,23 @@ configurationIntegration('settings and geography share one company aggregate', (
 
   it('refuses a reserved MULTI_CITY latest revision instead of converting it', async () => {
     // Synthetic reserved-mode revision written by the migration owner, exactly as an
-    // unsupported configuration would look after a manual/legacy change.
-    await fixture.migrator.query(`INSERT INTO foundation.business_settings_versions
-      (id,version,launch_mode,primary_city_id,reviewed_by)
-      SELECT $1,COALESCE(max(version),0)+1,'MULTI_CITY',$2,$3 FROM foundation.business_settings_versions`,
-    ['55555555-5555-4555-8555-555555555555', secondary.id, fixture.reviewer]);
+    // unsupported configuration would look after a manual/legacy change. The 022
+    // GEO/CFG guard requires the unified writer fence before the statement.
+    const client = await fixture.migrator.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(734305,1)');
+      await client.query(`INSERT INTO foundation.business_settings_versions
+        (id,version,launch_mode,primary_city_id,reviewed_by)
+        SELECT $1,COALESCE(max(version),0)+1,'MULTI_CITY',$2,$3 FROM foundation.business_settings_versions`,
+      ['55555555-5555-4555-8555-555555555555', secondary.id, fixture.reviewer]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
 
     const cityRow = await fixture.migrator.query<{ row_version: number }>(
       'SELECT row_version FROM foundation.service_cities WHERE id=$1', [primary.id]);

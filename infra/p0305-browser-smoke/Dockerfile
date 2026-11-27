@@ -1,5 +1,8 @@
-# The local base is the already built, pinned matching proof image (see infra/browser-proof).
-FROM fixlevelup-browser-proof:p0111c
+# The local base is the already built, pinned matching proof image (see
+# infra/browser-proof). `build-live.ps1` verifies the exact base ID; a different
+# base is only accepted as an explicitly declared and verified parameter.
+ARG PROOF_BASE=fixlevelup-browser-proof:p0111c
+FROM ${PROOF_BASE}
 WORKDIR /p0305
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc tsconfig.json eslint.config.mjs vitest.config.mts ./
 COPY apps/api/package.json apps/api/package.json
@@ -21,5 +24,9 @@ COPY infra/p0404-browser-smoke/ infra/p0404-browser-smoke/
 COPY pnpm-workspace.yaml .
 RUN --network=none node infra/linux-proof/source-check.mjs && cp -a apps packages prisma infra /p0305/
 WORKDIR /p0305
+# The frozen install suppresses lifecycle scripts, so Prisma's pinned engine is
+# fetched here (the only step with network) rather than inside the workspace
+# build. The workspace build below stays offline.
+RUN corepack pnpm run db:generate
 RUN --network=none corepack pnpm run build
 CMD ["corepack", "pnpm", "--filter", "@fixlevelup/browser-tooling", "run", "test"]

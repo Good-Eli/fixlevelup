@@ -6,7 +6,8 @@ import request from 'supertest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebAuthController, WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE } from '../src/auth/web-auth.controller.js';
 import { WebAuthError, WebAuthService } from '../src/auth/web-auth.service.js';
-import { createApi } from '../src/bootstrap/factories.js';
+import { boundedJson } from '../src/settings/management/body-parser.js';
+import { ProblemFilter } from '../src/runtime/problem.filter.js';
 import { loadConfig } from '../src/runtime/config.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 
@@ -62,9 +63,16 @@ describe('web auth HTTP boundary', () => {
     const events = vi.spyOn(logger, 'event').mockImplementation(() => undefined);
     const output = vi.spyOn(ConsoleLogger.prototype, 'log').mockImplementation(() => undefined);
     const config = loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' });
-    const app = await createApi(config, logger,
-      { host: '127.0.0.1', port: 1, database: 'unused', user: 'fixlevelup_runtime', password: 'unused' },
-      { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) });
+    // Production parser/filter; no SQL-capable resource is composed in this transport test.
+    const module = await Test.createTestingModule({ controllers: [WebAuthController], providers: [
+      { provide: WEB_AUTH_SERVICE, useValue: { login: loginSpy } },
+      { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin, csrfSecret: 'a'.repeat(64) } },
+    ] }).compile();
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-class-instance-assignment
+    const app = module.createNestApplication({ logger, bodyParser: false });
+    app.use(boundedJson);
+    app.useGlobalFilters(new ProblemFilter(logger));
+    await app.listen(config.port, config.host);
     closers.push(() => app.close());
     const server = app.getHttpServer() as Server;
     const malformed = await request(server).post('/api/v1/auth/login').set('Origin', origin).set('X-CSRF-Token', 'login')

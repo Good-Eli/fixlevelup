@@ -8,7 +8,7 @@ import { StaffTelegramAuthGuard } from '../authz/telegram-auth.guard.js';
 import { authFailure, expectedVersion, mutation, proof, readOrigin, uuid } from '../authz/rbac-http.js';
 import type { RbacRequest } from '../authz/rbac-http.js';
 import { RequireCapability } from '../authz/require-capability.decorator.js';
-import { createMetadata, emptyBody, metadataPatch, replacement } from './role-policy.js';
+import { createMetadata, emptyBody, metadataPatch, permissionReplacement } from './role-policy.js';
 import { RolesService } from './roles.service.js';
 import type { RoleResult } from './roles.service.js';
 
@@ -66,7 +66,8 @@ export class RolesController extends RoleReads {
   @Put(':id/permissions') @RequireCapability('roles.permissions.manage') @Header('Cache-Control', 'no-store')
   replace(@Req() req: RbacRequest, @Param('id') id: string, @Res({ passthrough: true }) res: ServerResponse) {
     mutation(req, this.config);
-    return sendRole(this.service.replacePermissions(proof(req), uuid(id), expectedVersion(req, 'role'), replacement(req.body)), res);
+    const body = permissionReplacement(req.body);
+    return sendRole(this.service.replacePermissions(proof(req), uuid(id), expectedVersion(req, 'role'), body.grants, body.revokeP05), res);
   }
 }
 

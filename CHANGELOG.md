@@ -1,12 +1,58 @@
 # История изменений
 
-Техническая история репозитория по состоянию на 22.11.2026. Дата — дата коммитов в их локальном часовом поясе; номера релизов не назначались. Актуальные статусы P01 — в [Preflight](docs/PREFLIGHT_P01.md); контур P02 — в [RBAC](docs/RBAC.md) и [журнале подэтапов](docs/SUBTASKS.md); остальные документы R3.2 сохраняют исторические формулировки этапа 0.
+Техническая история репозитория по состоянию на 27.11.2026. Дата — дата коммитов в их локальном часовом поясе; номера релизов не назначались. Актуальные статусы P01 — в [Preflight](docs/PREFLIGHT_P01.md); контур P02 — в [RBAC](docs/RBAC.md); прогресс, трудоёмкость и все подэтапы — в [журнале подэтапов](docs/SUBTASKS.md), подробные доказательства приёмок — в [SUBTASKS-EVIDENCE](docs/SUBTASKS-EVIDENCE.md); остальные документы R3.2 сохраняют исторические формулировки этапа 0.
+
+## 22.11.2026 — P04 принят полностью (4 из 4), FULL ASTRA P04 — PASS
+
+- **Статус:** P04 открыт прямым поручением владельца 22.11.2026 на изолированных synthetic данных. [План](docs/P04-PLAN.md) прошёл безусловный Gate 0 PASS `GPT-6.2 Astra` (high); каждый подэтап получил свой PASS и адресный локальный коммит. Итоговый [FULL ASTRA P04](docs/P04-AUDIT.md) — **PASS 22.11.2026** после пяти межсрезовых исправлений; принятые коммиты не переписаны.
+- **P04-01** (`d04758c`) — typed каталог и источники фиксированной цены: категории, бренды, модели, симптомы и позиции WORK/PART/MATERIAL/TRAVEL/DIAGNOSTICS с версиями, архивом и `row_version`; mapping «симптом → работа той же категории»; серии цен по `(city,item)`; append-only версии цены в `BIGINT` минорных единиц с обязательной 1:1 проекцией периода и `EXCLUDE` по пересечению; shared fence для свежего чтения цены. Миграция `019`.
+- **P04-02** (`2a29c79`) — правила, диапазоны и детерминированный расчёт: политика города с явным порядком и совместимостью правил, `EVENING`/`NIGHT`/`EXPRESS`/`SURCHARGE`/`DISCOUNT`, `FIXED`/`RATE`, базы `WORKS`/`WORKS_AND_PARTS`/`ORDER_BASE`, `HALF_UP`/`DOWN`; количество канонической десятичной строкой, расчёт на `BigInt` без `Number`, неизменяемый snapshot v1 с сохранённой локальной проекцией времени. Миграция `020`.
+- **P04-03** (`39d1c72`) — закрытый staff API и ручные данные Авито: права `catalog.*`, `pricing.*`, `content.external-reviews.*` с COMPANY/CITY scope, неизменяемые квитанции, `Idempotency-Key` и `If-Match`, bounded keyset-списки, один OpenAPI 3.1 и проверяемый typed client. Миграция `021`.
+- **P04-04** (`30079d3`) — CRM-раздел каталога и цен и полнота 14 групп: формы create/edit/publish/archive/history с явным городом для цены, канонические ссылки P03 для зон и контента, браузерные и HTTPS-проверки.
+- **Исправления FULL ASTRA P04** (`7a60d4c`) — пять межсрезовых замечаний закрыты адресно, без переписывания принятых коммитов.
+- Границы: реальный [прайс](info/Прайс.txt) не читается и не импортируется, доменных сидов нет, Q06/Q09/Q10 открыты. Нет заявок, планирования, смет, оплат, публичных маршрутов и production.
+
+## 27.11.2026 — FULL P05 PASS; owner acceptance 4/4
+
+- **Приёмка:** P05-01…P05-04 реализованы и приняты владельцем (4/4) в
+  synthetic scope. P05-01 сохраняет ранее зафиксированную историческую
+  acceptance (`f2caab05`); P05-02/P05-03/P05-04 приняты владельцем
+  27.11.2026.
+- **Эквивалентность ревью:** владелец прямо признал ChatGPT
+  `PASS — FULL P05` эквивалентом требуемого `PASS — FULL ASTRA P05`.
+  Это owner-authorized equivalence, а не заявление о проведённом отдельном
+  Astra-run.
+- **Точный technical Gate:** run [45953489126](https://github.com/Good-Eli/fixlevelup/actions/runs/45953489126),
+  candidate SHA `0d7f60dbee1bddca63e9f1868a03ebf1230ec69f`; семь required jobs
+  плюс freeze job — **8/8 success**. Freeze artifact
+  `p05-exact-candidate-45953489126`, 681 tracked files, manifest SHA-256
+  `f781b1facbbb2c8117e464ec4a8d24dfbaf2f9c38353a6cbc60f70a44b39dd5e`,
+  canonical tree SHA-256
+  `3c6ab92f01f6b1c2c5f379f60aa529da62221365f356e15e31124801f53ed8b5`.
+- **Targeted proof:** CITY-RBAC × state × command — 432 cells across 9 HTTPS
+  phases; both one-ticket real-engine HTTP attachment cases passed (READY
+  attach+digest and refuse after retention decision); F-01 direct-DML boundary,
+  PII/decrypt, partial effects/rollback, restore, migration 24/370 CHECKs,
+  builds, wire and browser gates all passed.
+- **P05-03:** F callback/repair submit, staff manual intake with separate
+  staff evidence, channel readiness/offers (without live delivery), READY
+  attachment, retention interlock and staff bridge; migration 024.
+- **P05-04:** allowlisted early F/staff commands, PHONE withdrawal/cancel,
+  bounded non-PII staff read, read-only waiting/cleanup selectors, OpenAPI 3.1
+  and typed client.
+- **Boundaries:** P05 HTTP controllers remain in isolated test composition T;
+  release composition R does not register P05 routes. Migrations 023/024 were
+  tested only on disposable PostgreSQL. No working DB migration, production
+  deployment, real PII, public site/file byte transport, live channel delivery
+  or manager notification was activated. After this documentation/policy
+  amendment, run full CI and freeze again on the resulting exact SHA before
+  fast-forward to `main`; no production action is authorized.
 
 ## 22.11.2026 — P03-05 принят владельцем в synthetic scope, Astra Gate 2 PASS
 
 - Владелец отдельно поручил начать P03-05, потребовал Astra после плана и после готовности и явно выбрал A: 18 личных GLOBAL-источников только исходному bootstrap-назначению, не общей роли. Astra Gate 1 — PASS после исправления шести MUST плана. Принятый baseline `225af45` опубликован: [GitHub Actions 44972705234](https://github.com/Good-Eli/fixlevelup/actions/runs/44972705234) — success только для этого SHA (реализация C/D/E — `dd87cb4`). Предыдущее поручение не начинать P03-05 ниже относится к приёмке P03-04 и заменено отдельным разрешением.
 - Реализованы закрытые CRM и HTTP для географии и существующих сущностей: семь полей компании, пять справочников, FAQ/FACT/SEO, legal REQUEST_PROCESSING/MARKETING, безопасная сводка готовности. Additive `018`: каталог, личный bootstrap-источник, десять операций с минимальными квитанциями. Общий `@fixlevelup/p03-contracts` — внутренний ESM без внешних зависимостей. Нет сохраняемого черновика настроек/справочника/контента/документа: только явная публикация неизменяемой версии; прежние географические черновики сохранены.
-- Независимый migration proof — PASS: 18 миграций / 188 CHECK. Первое source review Gate 2 выявило четыре MUST (staff v0, связка snapshot+V формы, авторизация старой цели/типа до 409, предупреждение о действии CITY role grant на всех членов роли). Четыре исправления повторно сверены в source review; адресно подтверждены management API 19/19, Web 23/23 (16+7), geography 5/5 и restore 1/1. Полный E927/927 в73файлах, browser150/150 и real HTTPS smoke1/1 прошли. После E изменены только два Legal React keys и QA fixtures; follow-up Web23/23, production build, workspace typecheck/lint пройдены. Окончательный полный Astra Gate 2 — PASS, открытых MUST нет; [точные доказательства](docs/P03-05-CONTRACT.md#4-итоговые-доказательства-22112026). Владелец принял P03-05 22.11.2026; P03 — 100% (5 из 5 приняты). Отдельный полный аудит Astra P03-01…P03-05 — окончательный PASS после двух межсрезовых expiry-исправлений, E933/933 на неизменном дереве и нового HTTPS smoke1/1. Прежний 932/933 сохранён как неуспешный; без изменений исходников выполнен отдельный полный повтор. [Общий аудит и граница доказательств](docs/P03-AUDIT.md). Commit и обычный push в GitHub прямо разрешены владельцем после общего PASS; публикация/CI проверяются отдельно.
+- Независимый migration proof — PASS: 18 миграций / 188 CHECK. Первое source review Gate 2 выявило четыре MUST (staff v0, связка snapshot+V формы, авторизация старой цели/типа до 409, предупреждение о действии CITY role grant на всех членов роли). Четыре исправления повторно сверены в source review; адресно подтверждены management API 19/19, Web 23/23 (16+7), geography 5/5 и restore 1/1. Полный E927/927 в73файлах, browser150/150 и real HTTPS smoke1/1 прошли. После E изменены только два Legal React keys и QA fixtures; follow-up Web23/23, production build, workspace typecheck/lint пройдены. Окончательный полный Astra Gate 2 — PASS, открытых MUST нет; [точные доказательства](docs/P03-05-CONTRACT.md#4-итоговые-доказательства-22112026). Владелец принял P03-05 22.11.2026; P03 — 100% (5 из 5 приняты). Отдельный полный аудит Astra P03-01…P03-05 — окончательный PASS после двух межсрезовых expiry-исправлений, E933/933 на неизменном дереве и нового HTTPS smoke1/1. Прежний 932/933 сохранён как неуспешный; без изменений исходников выполнен отдельный полный повтор. [Общий аудит и граница доказательств](docs/P03-AUDIT.md). Commit и обычный push в GitHub прямо разрешены владельцем после общего PASS; `7799b86` опубликован, [GitHub Actions 44983060539](https://github.com/Good-Eli/fixlevelup/actions/runs/44983060539) — success (прогон 28).
 - Нет новых файловых HTTP, клиентских intake/F, `ADDRESS_COVERAGE` HTTP, external reviews, privacy cases, P04/P09/providers, реальных ПД, default TTL/retention или production. Рабочая БД не мигрировалась.
 
 ## 22.11.2026 — P03-04 полностью принят владельцем во внутреннем synthetic scope
@@ -49,7 +95,7 @@
 ## Принят — P03-01: город и его опубликованные настройки
 
 - P03-01 принят владельцем 21.11.2026. Добавлены схема городов и неизменяемые ревизии, связь primary city с настройками компании и серверное чтение контекста `SINGLE_CITY`. Город определяется только в режиме `SINGLE_CITY`, если он одновременно основной и единственный активный. При другой конфигурации подстановки нет.
-- Это синтетический первый подэтап, не открытие приёма заявок. Миграция не создаёт городов и не выдаёт `CITY`-полномочий. P03-02 разрешён к планированию; [план и точки приёмки P03](docs/SUBTASKS.md#p03--настройки-география-согласия-и-приватные-файлы) сохраняют остальные gates.
+- Это синтетический первый подэтап, не открытие приёма заявок. Миграция не создаёт городов и не выдаёт `CITY`-полномочий. P03-02 разрешён к планированию; [план и точки приёмки P03](docs/SUBTASKS-EVIDENCE.md#p03--доказательства-состав-и-приёмки-по-подэтапам) сохраняют остальные gates.
 
 ## 20–21.11.2026 — контур сотрудников P02 (P02-01—P02-06)
 

@@ -16,9 +16,16 @@ export function registerShutdown(app: INestApplicationContext, config: RuntimeCo
     }, config.shutdownTimeoutMs);
     void app.close().then(() => {
       clearTimeout(deadline);
-      process.removeListener('SIGINT', shutdown);
-      process.removeListener('SIGTERM', shutdown);
       logger.event('shutdown_completed');
+      // Removing the final listener for the signal synchronously inside its
+      // own delivery reinstates the OS default action for that same signal.
+      // Node then terminates with SIGTERM/SIGINT even though app.close resolved.
+      // Defer detachment until the next event-loop turn so the active signal
+      // delivery has fully returned before restoring the default disposition.
+      setImmediate(() => {
+        process.removeListener('SIGINT', shutdown);
+        process.removeListener('SIGTERM', shutdown);
+      });
     }).catch(() => {
       // Keep the force-exit deadline active if close leaves live handles.
       logger.event('shutdown_failed');

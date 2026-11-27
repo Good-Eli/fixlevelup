@@ -45,6 +45,12 @@ describe('closed v1 file-ledger graph codec', () => {
 describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('isolated real PostgreSQL file ledger + independent floor', () => {
   const databases = { ledger: 'fixlevelup_file_ledger', floor: 'fixlevelup_file_floor' };
   const pools: Pool[] = [];
+  const backgroundPoolErrors: string[] = [];
+  /** Disposable database names created by THIS run on the docker test containers:
+   * pushed exactly when the run's CREATE DATABASE succeeded (CREATE is the reuse
+   * guard, so a successful CREATE proves this run owns that database). */
+  const createdLedgerDbs: string[] = [];
+  const createdFloorDbs: string[] = [];
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   let env: ReturnType<typeof parseEnv>;
   let writer: Pool, signer: Pool, operator: Pool, floorAdmin: Pool, ledgerAdmin: Pool, floorOperator: Pool, floorVerifier: Pool;
@@ -55,6 +61,12 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
     if (!password || !/^[0-9a-f]{64}$/.test(password)) {throw new Error('INVALID_SYNTHETIC_LEDGER_CREDENTIAL_CONFIG');}
     const p = new Pool({ user, password, database, host: '127.0.0.1', port: kind === 'ledger' ? 55433 : 55434, max: 4,
       connectionTimeoutMillis: 5_000, statement_timeout: 10_000 });
+    // Idle-client socket errors must be observed and asserted during teardown,
+    // never escape Vitest as process-level unhandled errors.
+    p.on('error', (error: unknown) => {
+      const code: unknown = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+      backgroundPoolErrors.push(typeof code === 'string' ? code : 'PG_POOL_ERROR');
+    });
     pools.push(p);
     return p;
   };
@@ -75,6 +87,9 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
     if (!row) { throw new Error('SYNTHETIC_LEDGER_SNAPSHOT_MISSING'); }
     expect(row).toMatchObject({ seq: '0', chain_sha256: anchor.hash });
     await ledgerAdmin.query(`CREATE DATABASE ${db}`);
+    // A successful CREATE proves this run owns the disposable database; the name is
+    // tracked so this run's teardown can drop exactly it.
+    createdLedgerDbs.push(db);
     const restoredAdmin = pool('ledger', 'admin', db);
     const sql = readFileSync(new URL('../../../infra/file-ledger/ledger.sql', import.meta.url), 'utf8');
     await restoredAdmin.query(sql.slice(sql.indexOf('REVOKE ALL ON SCHEMA public')));
@@ -88,6 +103,25 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
       [row.namespace_id, row.writer_epoch, binding.writer_role_oid]);
     return makeLedger(pool('ledger', 'writer', db), pool('ledger', 'signer', db), pool('ledger', 'operator', db));
   };
+  /** Drops exactly the disposable databases this run created on the docker test
+   * containers, from the matching admin pool and only after every pool of this run
+   * was ended. Ownership is re-proven by the strict disposable-name pattern. */
+  const dropCreatedDatabases = async (): Promise<void> => {
+    for (const db of createdLedgerDbs.splice(0)) {
+      if (!/^file_ledger_proof_[a-f0-9]{24}$/.test(db)) { throw new Error('SYNTHETIC_LEDGER_REFUSING_NON_FIXTURE_DROP'); }
+      const active = await ledgerAdmin.query<{ pid: number }>(
+        'SELECT pid FROM pg_stat_activity WHERE datname=$1', [db]);
+      if (active.rowCount !== 0) { throw new Error('SYNTHETIC_LEDGER_DISPOSABLE_DATABASE_HAS_OPEN_SESSIONS'); }
+      await ledgerAdmin.query(`DROP DATABASE IF EXISTS "${db}"`);
+    }
+    for (const db of createdFloorDbs.splice(0)) {
+      if (!/^file_floor_proof_[a-f0-9]{24}$/.test(db)) { throw new Error('SYNTHETIC_LEDGER_REFUSING_NON_FIXTURE_DROP'); }
+      const active = await floorAdmin.query<{ pid: number }>(
+        'SELECT pid FROM pg_stat_activity WHERE datname=$1', [db]);
+      if (active.rowCount !== 0) { throw new Error('SYNTHETIC_LEDGER_DISPOSABLE_DATABASE_HAS_OPEN_SESSIONS'); }
+      await floorAdmin.query(`DROP DATABASE IF EXISTS "${db}"`);
+    }
+  };
   beforeAll(() => {
     env = parseEnv(readFileSync(new URL('../../../infra/file-ledger/.env', import.meta.url), 'utf8'));
     writer = pool('ledger', 'writer'); signer = pool('ledger', 'signer'); operator = pool('ledger', 'operator');
@@ -95,7 +129,33 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
     floorAdmin = pool('floor', 'admin'); ledgerAdmin = pool('ledger', 'admin');
     ledger = makeLedger(writer, signer, operator);
   });
-  afterAll(async () => { await Promise.all(pools.map((p) => p.end())); });
+  afterAll(async () => {
+    // Close every non-admin pool completely before touching its disposable DB.
+    // If any pool fails to close, do not force-drop its DB: that would SIGTERM
+    // live clients and turn a cleanup defect into Vitest unhandled 57P01 errors.
+    const droppers = [ledgerAdmin, floorAdmin];
+    let teardownFailure: string | undefined;
+    try {
+      const closing = await Promise.allSettled(pools
+        .filter((p) => p !== ledgerAdmin && p !== floorAdmin).map((p) => p.end()));
+      if (closing.some((result) => result.status === 'rejected')) {
+        throw new Error('SYNTHETIC_LEDGER_POOL_CLOSE_FAILED');
+      }
+      if (backgroundPoolErrors.length > 0) {
+        throw new Error('SYNTHETIC_LEDGER_BACKGROUND_CONNECTION_ERROR');
+      }
+      await dropCreatedDatabases();
+    } catch (error: unknown) {
+      teardownFailure = error instanceof Error ? error.message : 'SYNTHETIC_LEDGER_TEARDOWN_FAILED';
+    }
+    const closingDroppers = await Promise.allSettled(droppers.map((p) => p.end()));
+    if (closingDroppers.some((result) => result.status === 'rejected')) {
+      teardownFailure ??= 'SYNTHETIC_LEDGER_ADMIN_POOL_CLOSE_FAILED';
+    }
+    if (teardownFailure !== undefined) {
+      throw new Error(teardownFailure);
+    }
+  });
 
   it('serializes two real writers under head lock, rolls back head+event and idempotently replays exact payload only', async () => {
     const genesis = await bootstrap(), scope = scopeOf(genesis);
@@ -216,6 +276,9 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
     const position = await ledger.append(event);
     const db = `file_floor_proof_${randomBytes(12).toString('hex')}`;
     await floorAdmin.query(`CREATE DATABASE ${db}`);
+    // A successful CREATE proves this run owns the disposable database; the name is
+    // tracked so this run's teardown can drop exactly it.
+    createdFloorDbs.push(db);
     const floorSql = readFileSync(new URL('../../../infra/file-ledger/floor.sql', import.meta.url), 'utf8');
     // The cluster-wide roles already exist; install only schema+ACL in this empty DB.
     await pool('floor', 'admin', db).query(floorSql.slice(floorSql.indexOf('REVOKE ALL ON SCHEMA public')));

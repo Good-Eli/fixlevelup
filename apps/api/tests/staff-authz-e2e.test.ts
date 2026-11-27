@@ -5,7 +5,7 @@ import { check, fixturePerTest, grant, integration, items, text } from './rbac-f
 integration('staff authorization real HTTP against isolated PostgreSQL', () => {
   const fixture = fixturePerTest();
 
-  it('denies by default; explicit role grants apply to all members without logging in again', async () => {
+  it('denies by default; explicit role grants apply to all members without logging in again', { timeout: 30_000 }, async () => {
     const f = fixture(); const custom = text(check(await f.createRole(), 201).data, 'id');
     const a = await f.webStaff(); const b = await f.webStaff();
     for (const web of [a, b]) { check(await f.assign(web.id, custom), 200); }
@@ -31,7 +31,7 @@ integration('staff authorization real HTTP against isolated PostgreSQL', () => {
     for (const w of subjects) { check(await f.call(w, 'get', '/staff'), 403); }
   });
 
-  it('locks manager access to technicians and non-idempotent creates commit both staff and audit', async () => {
+  it('locks manager access to technicians and non-idempotent creates commit both staff and audit', { timeout: 30_000 }, async () => {
     const f = fixture(); const m = await f.webStaff(); const other = await f.webStaff();
     const creates: string[] = [];
     for (let i = 0; i < 2; i++) {

@@ -6,5 +6,7 @@
     "outDir": "dist"
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["tests", "dist", "node_modules"]
+  "exclude": ["tests", "dist", "build", "node_modules", "src/form-session", "src/requests",
+    "src/files/file-access/ready-attachment.ts", "src/infrastructure/admission/launcher.ts",
+    "src/infrastructure/admission/registry.ts", "src/infrastructure/admission/control-contour.ts"]
 }

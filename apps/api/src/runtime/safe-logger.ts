@@ -5,7 +5,7 @@ import type { ProcessRole } from './config.js';
 export type TechnicalEvent =
   | 'started' | 'heartbeat' | 'shutdown_started' | 'shutdown_completed'
   | 'shutdown_failed' | 'shutdown_timeout' | 'startup_failed' | 'request_failed'
-  | 'outbox_unavailable' | 'outbox_lease_lost';
+  | 'outbox_unavailable' | 'outbox_lease_lost' | 'admission_missing' | 'admission_denied';
 
 export class SafeLogger implements LoggerService {
   private readonly output: ConsoleLogger;

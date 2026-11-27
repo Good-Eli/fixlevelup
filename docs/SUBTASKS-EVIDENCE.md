@@ -1,0 +1,468 @@
+# Подэтапы: подробные доказательства и записи приёмок
+
+Приложение к [SUBTASKS.md](SUBTASKS.md). Здесь сохранены подробные технические
+записи прошлых приёмок: критерии, фактические прогоны, ограничения и история
+срезов. Основной файл содержит сводку, прогресс, трудоёмкость и описания
+подэтапов простыми словами; этот файл — источник деталей для проверки.
+
+Записи приведены в исходном виде на момент приёмки. Они описывают состояние
+своего среза и не задают текущую готовность.
+
+## P01 — приёмочные критерии и ограничения
+
+### Приёмочные критерии P01
+
+| Пункт | Статус | Комментарий |
+|---|---|---|
+| F01 workspace/tooling | **PASS** | |
+| F02 API/worker | **PASS** | |
+| F03 dev infra PG + S3 | **PASS** | |
+| F04 миграции, роли, audit/outbox | **PASS** | |
+| F05 outbox worker | **PASS** | |
+| F06 CI + reproducibility + licenses | **PARTIAL** | CI работает (4/4 job), но остаются: инспекция архива `@visx/vendor@4.0.0-alpha.0`, архивная проверка всех вариантов Lightning CSS, artifact-level SBOM/notices для Sharp/libvips, юридическая оценка распространения |
+| F07 Git identity | **PASS** | Старая публичная metadata остаётся — принято владельцем осознанно |
+
+F06 не закрывается до коммерческого распространения: это не блокирует следующий
+этап на synthetic-данных, но обязательно до production release.
+
+### Ограничения P01
+
+- P01 — технический фундамент: доменных таблиц, бизнес-модулей и адаптеров
+  мессенджеров нет.
+- Последнее подтверждённое CI evidence — run `44677729359` на commit
+  `1165f0d950984c2555e61aceef681640ff0e075d`, 4/4 job success. Прогон
+  подтверждает только этот SHA и не является проверкой текущего HEAD.
+- Историческая публичная Git-метаданные не переписаны; это осознанное решение
+  владельца.
+
+
+## P02 — что сделано по подэтапам, gates и итог
+
+### Что сделано в P02-03
+
+- `apps/api/src/auth/web-auth.service.ts` — вход, проверка сессии, продление,
+  выход, смена пароля; в базе только SHA-256 хеш токена; лимиты по логину
+  и по источнику; резервирование слота до Argon2, чтобы параллельные попытки
+  не обходили лимит.
+- `apps/api/src/auth/web-auth.controller.ts` — маршруты `POST /api/v1/auth/login`,
+  `GET /api/v1/auth/me` (требует `X-Auth-Request: 1`),
+  `POST /api/v1/auth/session/renew`, `POST /api/v1/auth/logout` (204),
+  `POST /api/v1/auth/password/change` (требует `If-Match` из ETag).
+  Cookie `__Host-…`: Secure, HttpOnly, SameSite=Strict, Path=/, без Domain.
+  Проверяются точный Origin и session-bound CSRF; все ответы `no-store`,
+  токен в JSON не возвращается.
+- `apps/api/src/auth/web-auth.config.ts` — web auth выключена по умолчанию;
+  для включения нужны `WEB_AUTH_ENABLED=1`, точный HTTPS `WEB_AUTH_ORIGIN`,
+  `WEB_AUTH_CSRF_SECRET` и `WEB_AUTH_THROTTLE_SECRET` (32 байта hex, разные).
+  Частичная или небезопасная конфигурация отклоняется при запуске.
+- `apps/api/src/staff/password.ts` — общий модуль Argon2id, вынесен из bootstrap.
+- `prisma/migrations/20261120000500_web_auth/` — таблицы `web_sessions`,
+  `web_auth_throttles`, `web_auth_attempts`, column-level GRANT для runtime-роли
+  и три `SECURITY DEFINER` функции очистки истёкших записей (не более 100 строк
+  за вызов, запуск раз в 10 секунд при включённом auth).
+- Readiness-probe при включённом auth дополнительно сверяет identity/auth-таблицы,
+  их столбцы и права runtime-роли.
+- Тесты: `web-auth-config`, `staff-password`, `web-auth-http`,
+  `web-auth-integration`, `web-auth-readiness`, `web-auth-e2e`, плюс обновлённый
+  `runtime-database`; интеграционные и e2e включаются через
+  `FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1`.
+- Обновлены `apps/api/src/app.module.ts`, `apps/api/.env.example`,
+  `prisma/schema.prisma`, `packages/database-tooling/scripts/test-migrations.mjs`
+  (пятая миграция в цепочке fresh/upgrade/replay) и `apps/api/README.md`.
+
+Принятые ограничения: TTL и лимиты — согласованные владельцем значения, а не
+production-тюнинг; источник запроса берётся из socket address, не из
+`X-Forwarded-For`, поэтому за reverse proxy все клиенты могут разделить один
+лимит; публикация наружу и доверенная схема source IP требуют отдельного
+подэтапа; P02-03 не является security/production approval.
+
+### Что сделано в P02-04
+
+Принят и закоммичен (`0041698`, доработка fail-fast — `24944dc`).
+
+- `apps/api/src/authz/principal.ts` — `StaffWebPrincipal` создаётся только
+  guard-ом из проверенной сессии; клиентские поля в principal не попадают.
+- `apps/api/src/authz/capability.ts` — фиксированный словарь
+  `staff.read`/`staff.manage` и `GLOBAL` scope; неизвестная capability всегда
+  отклоняется.
+- `apps/api/src/authz/authorization.service.ts` — default-deny проверка прав
+  из `foundation.user_permissions`; для записи сессия, состояние сотрудника
+  и права перепроверяются под блокировками (staff → session → permissions)
+  в одной транзакции с самой записью.
+- `apps/api/src/authz/authorization.guard.ts` — guard и
+  `@RequireCapability`; отказ по умолчанию, безопасные 401/403. Guard
+  зарегистрирован в DI явно: отсутствие зависимости падает при старте
+  приложения, а не при первом запросе, и не может выродиться в доступ без
+  проверки прав. Отсутствие метаданных capability на защищённом маршруте даёт
+  500, а не молчаливое разрешение.
+- `apps/api/src/staff/staff.controller.ts` — `GET /api/v1/staff`
+  (`staff.read`) и `POST /api/v1/staff` (`staff.manage`).
+- `prisma/migrations/20261120000600_authorization/` — таблица
+  `user_permissions`, partial unique index на активный грант и column-level
+  GRANT для runtime-роли; `staff` получил INSERT только четырёх столбцов.
+- Тесты: `staff-authz-http` (13, включая два fail-closed случая для guard)
+  и opt-in `staff-authz-e2e` (6) под `FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1`;
+  обновлён `packages/database-tooling/scripts/test-migrations.mjs` (шестая
+  миграция в цепочке fresh/upgrade/replay и проверки новых прав).
+
+Принятые ограничения: capability-словарь минимален и расширяется только
+отдельным решением; CITY-scope грантов ждёт P03; матрица §13 остаётся
+на согласование; P02-04 не является security/production approval.
+
+### Что сделано в P02-05
+
+Принят и закоммичен (`f1045e6`, hotfix-и `6946a1b` и `d05b664`).
+
+- `apps/api/src/auth/telegram-initdata.ts` — проверка подписи `initData`
+  по официальному алгоритму (HMAC-SHA256 от bot token, сравнение
+  `hash` за постоянное время), разбор и валидация полей, свежесть
+  `auth_date`, отказ при подделке и просрочке.
+- `apps/api/src/auth/telegram-auth.service.ts` — обмен проверенного `initData`
+  на сессию мастера: активная заранее созданная связь `staff_telegram_links`,
+  активный сотрудник роли TECHNICIAN, digest `initData` вместо сырых данных,
+  единичный обмен с 60-секундным grace-окном и отказ на повтор после него.
+  Сессия жёстко привязана к конкретной строке связи (`telegram_link_id`):
+  перепривязка сотрудника к другому Telegram-аккаунту гасит старую сессию,
+  и grace-окно не может её воскресить через новую активную связь. Обмен
+  блокирует строки staff и link в порядке staff → link, поэтому параллельный
+  отзыв связи сериализуется с обменом. Связь перепроверяется под её `FOR UPDATE`
+  уже после блокировки staff: отзыв, пришедший между первичным чтением и
+  блокировкой, закрывает обмен, а не создаёт сессию по устаревшему чтению.
+  Grace-повтор меняет только токен: idle и absolute TTL остаются неизменными,
+  продление idle происходит исключительно в `authenticate`.
+- `apps/api/src/auth/telegram-auth.controller.ts` и
+  `apps/api/src/authz/telegram-auth.guard.ts` — маршруты и guard для
+  staff-telegram principal; bearer-токен только в памяти Mini App, без cookie
+  и без автоматического веб-логина.
+- `apps/api/src/authz/principal.ts` — `Principal` стал объединением
+  `staff-web` и `staff-telegram`; `telegramUserId` хранится десятичной строкой,
+  а не JavaScript number.
+- `prisma/migrations/20261120000700_staff_telegram_auth/` — таблица
+  `staff_telegram_links` с partial unique index на активную связь,
+  колонки `channel`/`initdata_digest`/`initdata_exchanged_at`/`telegram_link_id`
+  в `web_sessions`, FK на строку связи и column-level GRANT для runtime-роли
+  без INSERT/DELETE связей.
+- Тесты: `telegram-initdata` (проверка подписи и полей), `telegram-auth-config`,
+  `telegram-auth-http` и opt-in `telegram-auth-integration` на реальном
+  PostgreSQL под `FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS=1`, включая
+  регрессии hotfix: привязка сессии к точной связи при перепривязке,
+  сериализация параллельного отзыва связи с обменом, отказ обмена при отзыве
+  между первичным чтением и блокировкой, а также неизменность обоих TTL
+  при grace-повторе. Тестовый `signedInitData` формирует уникальный
+  `query_id` на вызов, поэтому digest стабилен только там, где тест
+  намеренно переиспользует одну строку.
+- Обновлён `packages/database-tooling/scripts/test-migrations.mjs` —
+  седьмая миграция в цепочке fresh/upgrade/replay и проверки новых прав.
+
+Принятые ограничения: реальный Telegram/Mini App staging и живая приёмка
+не выполнялись, проверки идут на синтетических подписанных данных; создание
+связей `staff_telegram_links` вне scope P02-05; Q12 для staff-сессий закрыт
+только в объёме, реализованном здесь; P02-05 не является security approval
+и не заменяет реальную проверку с настоящим bot token.
+
+### Что сделано в P02-06
+
+Принят и закоммичен (`8f0b204`, 63 файла). Подэтап вырос из «увольнения»
+в полноценный управляемый доступ сотрудников: спецификация —
+[docs/RBAC.md](RBAC.md).
+
+**Модель.** У сотрудника ровно одна текущая роль, наследования нет, клиентских
+ролей и индивидуальных grants нет. Каталог `permissions` — 13 кодов
+(`staff.self.*`, `staff.*`, `roles.*`, `staff.role.assign`), пять из них
+защищённые: их нельзя снять, передать или выдать не-ADMIN. Скоуп только
+`SELF` и `GLOBAL`; `CITY` зарезервирован в CHECK, но не выдаётся, пока нет
+принадлежности сотрудника и объекта городу.
+
+**Миграция `20261120000900_rbac`** — cutover, а не добавление:
+
+- `ACCESS EXCLUSIVE` на `staff`/`staff_web_credentials`/`staff_bootstrap_marker`/
+  `user_permissions`: старые писатели должны быть остановлены до применения.
+- Отказ при непустой БД без проверенного singleton-marker → ACTIVE ADMIN
+  с web credential; отказ при неподдерживаемом логине или формате Argon2id
+  (значение не выводится в диагностику).
+- Новые таблицы `permissions`, `roles`, `role_permissions`,
+  `staff_role_assignments`; `display_name`/`profile_version` в `staff`.
+- Частичный уникальный индекс: не более одного текущего назначения; история
+  назначений append-only.
+- Legacy-гранты не повышаются: старый `staff.read`/`staff.manage` сворачивается
+  в до четырёх **общих** CUSTOM-профилей `LEGACY_OPERATIONS_*`, администратором
+  становится только проверенный bootstrap. Сотрудникам увеличивается
+  `auth_version` — обе сессии прежней версии умирают.
+- Триггеры: единая `pg_advisory_xact_lock` до строк субъекта/цели, неизменяемость
+  системных ролей и защищённых прав, отложенная проверка «последний ACTIVE
+  SYSTEM ADMIN с web credential», требование валидной роли при COMMIT.
+- Отзыв прежних runtime-привилегий на `user_permissions`: старый backend после
+  cutover не читает grants, новый к ним не обращается.
+
+**Код.** `authz/capability.ts` (словарь `PERMISSION_CONTRACT` + защищённые коды),
+`authz/rbac-lock.ts` (write/shared advisory-блокировка), расширенный
+`authz/authorization.service.ts` (`inspectAccess`, `authorizeForWrite` под
+блокировкой), `authz/access.controller.ts` (`GET /api/v1/access`),
+`roles/role-policy.ts`, `roles/roles.service.ts`, `roles/roles.controller.ts`,
+`staff/staff-policy.ts`, `staff/staff.service.ts`, переписанный
+`staff/staff.controller.ts` (staff/self-маршруты, `PUT /staff/{id}/role`,
+ETag/`If-Match`, коды 428/400/412/409), `authz/rbac-http.ts`.
+
+**CRM.** `apps/web/app/crm/access/` — раздел «Сотрудники и доступ»: `page.tsx`,
+`desk.tsx`, `people.tsx`, `roles.tsx`, `api.ts`, `workspace.ts`, `style.css`.
+Серверный HTML — только оболочка, данные грузятся после проверки CRM-сессии;
+Next не имеет доступа к БД и не заменяет серверную авторизацию.
+
+**Тесты.** `rbac-e2e`, `rbac-roles-unit`, `rbac-web-client`, `rbac-authz`,
+`staff-policy`, переработанные `staff-authz-*`, `staff-lifecycle-e2e`,
+`web-auth-readiness`; на стороне Web — `access-client.test.ts`; в браузере —
+`packages/browser-tooling/tests/rbac.spec.ts` на production Next с
+перехватом только синтетических `/api/v1/*`. Отдельный
+`packages/database-tooling/scripts/test-rbac-migration.mjs` проверяет сам
+cutover: провал guard-а откатывает и фикстуры, и DDL, оставляя БД на 008.
+Readiness дополнительно сверяет новые таблицы, индексы, триггеры и права.
+
+**Секреты.** `infra/ci/secrets.mjs` ужесточён: единственное исключение
+в `.gitleaksignore` привязано к конкретному commit/path/line/rule **и** к
+SHA-256 blob-а, поэтому изменённый, перемещённый или продублированный контент
+остаётся находкой.
+
+Принятые ограничения: `CITY` не включён; списки отдаются целиком, без cursor
+pagination; нет инструмента выпуска web credential и установления
+Telegram-связи для новых сотрудников; откат на старый бинарник после cutover
+невозможен; приёмка подэтапа не является production approval.
+
+### Информационные патчи в `info/`
+
+Патчи `info/*.patch` добавлялись по запросу владельца как информационные файлы и
+затем удалялись; в истории они сохраняются. `info/Полный diff P02-06.patch`
+остаётся в коммите `5ff9278`, и единственное исключение в `.gitleaksignore`
+привязано к тому commit/path/line/rule и к SHA-256 blob-а. Удаление файла из
+рабочего дерева это исключение не отменяет и не расширяет; изменённый,
+перемещённый или продублированный контент остаётся находкой secret scan.
+
+### Открытые gates P02
+
+- **Q12 закрыт для web-сессий M/A.** Владелец утвердил idle 30 минут, absolute
+  12 часов, атомарный renew с ротацией без продления absolute TTL, logout
+  отзывает текущую сессию, смена пароля — остальные, recovery через
+  `auth_version` — все. Пять неудач по идентификатору за 15 минут плюс
+  source-лимит приняты как основа защиты входа
+  ([DECISIONS §21](DECISIONS.md#открыто-до-соответствующей-реализации)).
+  Остальные части Q12 (staff/F/link-сессии и повторный обмен initData) закрыты
+  для P02-05 в реализованном объёме: единичный обмен с grace-окном, отказ
+  на повтор после него; полная live-приёмка с реальным Telegram остаётся
+  отдельным шагом.
+- **Матрица role × capability × scope** (§13) остаётся проектной. Для
+  реализованных staff-операций её заменил [RBAC](RBAC.md): 13 кодов,
+  `SELF`/`GLOBAL`, одна роль на сотрудника. Доменные права §13 не реализованы.
+- **`CITY` не выдаётся.** Колонка `scope_type` знает `CITY`, но CHECK запрещает
+  её без принадлежности сотрудника и объекта городу — это придёт с P03.
+- **Ручная проверка CLI в живом терминале** (P02-02) не выполнена: скрытие
+  пароля, подтверждение, Backspace, несовпадение, Ctrl+C. Обязательна перед
+  первым реальным использованием bootstrap/recovery.
+- **Мастеру веб-пароль не создаётся** — это правило, а не недоделка.
+- **Первичная привязка Telegram** осталась вне scope `P02-05`/`P02-06`:
+  таблица `staff_telegram_links` есть и защищена, но потока
+  invitation/challenge/intended-employee proof нет. Пока его нет, реальный
+  Telegram-вход не используется.
+- **Нет инструмента выпуска web credential** для нового сотрудника: создать
+  карточку можно, а выдать ей вход — нет.
+- **Списки отдаются целиком**, без cursor pagination. Для мастерской на P02
+  это приемлемо, для роста численности — нет.
+- **Customer request grants в P02 не реализованы** — это `P05`/`P07-core`
+  вместе с Q03/Q17.
+- **Cutover `009` необратим в обратную сторону:** старый бинарник ожидает
+  отозванные legacy-grants. Перед применением нужны остановка писателей
+  старой версии и проверяемый backup.
+- **Нет живого Telegram E2E, доверенного HTTPS reverse proxy и согласования
+  обработки ПД.** Ни тестовые БД, ни браузерные фикстуры этого не доказывают.
+
+### Дальше
+
+**Итог P02:** все шесть подэтапов закоммичены; P02 принят владельцем в согласованных границах. Приёмка относится к scoped staff-auth/RBAC контуру и не означает production/live readiness. Следующий этап — **P03** — открыт отдельным поручением владельца 21.11.2026.
+
+## P03 — доказательства, состав и приёмки по подэтапам
+
+### P03-05 — принято владельцем, окончательный Astra Gate 2 PASS
+
+[План](P03-05-PLAN.md) и [контракт](P03-05-CONTRACT.md) задают scope. Добавлены
+18 обычных permissions, отдельные личные bootstrap-источники и их отзыв,
+неизменяемые минимальные квитанции команд; migration018 не переписывает SQL001–017.
+Управление охватывает существующие города/версии/районы/зоны/допуски, 7 company
+fields, 5 типов справочников, FAQ/FACT/SEO, legal REQUEST_PROCESSING/MARKETING и
+безопасную readiness projection. Draft text хранится в памяти формы до явной
+публикации. Файловые HTTP, ADDRESS_COVERAGE, клиентский intake и новые business
+policies не включены.
+
+Фактические отдельные проверки: 18 миграций/188 CHECK (fresh/populated/replay/drift,
+старые данные/ACL сохранены), runtime11/11, auth50/50, прежние staff/geo76/76,
+bootstrap15/15, geography5/5 с новым staff v0, management API19/19, Web23/23,
+copy-only restore1/1 с точным сохранением 18 bootstrap-строк. Доказательства
+миграций: `node_modules/.cache/p0305-proof/migrations-frozen.log`; restore —
+`restore-final.log`. Это не замена полного frozen gate и браузерной проверке.
+
+Первый общий запуск — промежуточный/mixed (922/923), не окончательный PASS.
+После исправлений Astra M1–M4 полный E прошёл **927/927 в73файлах**. После него
+исправлены только два Legal React keys; follow-up Web23/23, production build и
+workspace typecheck/lint — PASS. **Browser150/150 и real HTTPS smoke1/1** прошли.
+[Точные доказательства и post-E граница](P03-05-CONTRACT.md#4-итоговые-доказательства-22112026).
+Окончательный полный Astra Gate 2 — **PASS**, открытых MUST нет;
+Владелец принял P03-05 и разрешил commit/push после отдельного полного Astra-аудита
+всего P03. Общий аудит завершён с **PASS** после двух expiry-исправлений, нового
+**E933/933** и повторного **HTTPS smoke1/1**; исходники до/после совпали. [Отчёт](P03-AUDIT.md).
+Публикация выполнена: `7799b86` опубликован в `origin/main`, [GitHub CI 44983060539](https://github.com/Good-Eli/fixlevelup/actions/runs/44983060539) — success. После этого владелец отдельным поручением открыл P04.
+
+### P03-04A — принят: первый срез без byte IO (Astra PASS; история A)
+
+Astra проверила фактическую реализацию по отдельному запросу владельца и нашла три MUST FIX: полный DTO в квитанции cancel после withdrawal, изменяемые исходные Date в хешируемом snapshot и недостаточную semantic validation audit values. Добавлена рекомендация replay с буквально прежним input. Замечания исправлены без schema/dependency изменений; 670/670 ниже — предыдущий gate (исторический). Новый gate: **679/679 в 50 файлах**, unit 40/40 + PG 17/17, workspace typecheck/source-lint/production builds PASS, source snapshot неизменен, secret scan/diff PASS. Проверены exact five-key cancel receipt после withdrawal/expiry (первый+replay), Date mutation во время lock-wait с сохранением original времен/хешей, строгие audit UUID/enum/numbers и отсутствие public writer; exact original replay после re-GIVEN даёт `CONSENT_NOT_CURRENT`. Повторный read-only вердикт Astra — **PASS для A**, все три MUST FIX и SHOULD закрыты, остаточных блокеров в рамках ревью нет. **Владелец принял только срез A (no-byte, RESERVED→CANCELLED) 21.11.2026 в synthetic внутреннем scope; принятый срез коммитится отдельным локальным коммитом (создаёт root), SHA не заявлен.** Реализация P03-04B остановлена и запрещена до нового решения: принятый A-коммит не включает B, ранее начатые B-артефакты остаются вне A, а старт возможен только через отдельное предложение с проверкой Astra. Весь P03-04 не завершён, прогресс P03 остаётся 60%.
+
+По прямому поручению владельца после приёмки P03-03 начат P03-04; перед реализацией план проверил `GPT-6.2 Astra`, reasoning high. [План и замечания Astra](P03-04-PLAN.md) фиксируют безопасный порядок: **A — intent/reservation без байтов**, B — private upload/quarantine, C — обработка/stream, D — delete/restore, затем общая приёмка. Срез A не закрывает P03-04 и не повышает принятый прогресс выше 60%.
+
+В A нет policy по умолчанию, byte IO/S3/SDK/scanner/EXIF/READY/download/delete, новых зависимостей или HTTP. Реализованы существующий F-owner, живое exact consent basis, policy snapshot, idempotency и конкурентные квоты. Адресные тесты — 40/40 unit + 17/17 PostgreSQL (предыдущий срез 34/34 + 14/14 сохранён как исторический); полный PostgreSQL Vitest — **679/679 в 50 файлах** (предыдущий 670/670 — исторический). Workspace typecheck и production builds API/Web/Mini App — PASS. Полный migration proof — **14 миграций, 138 CHECK**, fresh/013→014/replay/drift, exact ACL и отрицательные guards — PASS. [Контракт первого среза](P03-04-CONTRACT.md) отделяет эту готовность от отсутствующих upload/processing/access/delete/restore. Финальные source-lint, secret scan рабочих файлов/истории (0 неожиданных находок) и diff/whitespace — PASS. SQL014 SHA-256 `2ec24c3365b4681859cd11d4fc7dd031fc487d410ff695692f4a2ec650bb4377`. Принятый срез A коммитится отдельным локальным коммитом (создаёт root), SHA не заявлен; весь P03-04 по-прежнему не завершён. Staff/reference parents не выдумываются; будущие request/file связи появятся вместе с реальными parent tables. Q02/Q12/Q13/Q16 и зависимости/движки/численные production политики не согласуются автоматически. Весь подэтап не принят; рабочая dev БД не мигрируется.
+
+### P03-04B1+B2 — принято владельцем, ASTRA PASS (история B)
+
+После [отдельного предложения ASTRA](P03-04B-PROPOSAL.md) владелец явно разрешил B1+B2 с дополнительным gate: **B2 не начинается до ASTRA PASS по B1**, после B2 требуется отдельное ASTRA review. B1 — только private S3 adapter и synthetic transport/Garage проверки; единственная прямая runtime-зависимость — `@aws-sdk/client-s3@3.1172.0` (ignore-scripts/frozen/dependency audit). В границах B1 не было подключённого business upload, HTTP или schema B2. После ASTRA PASS реализован внутренний B2 durable attempt registry/register-before-byte/post-IO authorization и QUARANTINED finalize; HTTP/READY/scanner/EXIF/выдача и реальные ПД по-прежнему отсутствуют; Q02/Q12/Q13/Q16 не закрываются. A уже принят и закоммичен отдельно `7d92122`.
+
+Первое промежуточное B1 review Astra нашло 4 MUST FIX: target binding, cap service response до SDK serde, public validator с credentials и caller exceptions. Они адресно исправлены, регрессии B1 — 50/50 (unit26+transport17+realGarage7), повторный полный gate с PG+S3 — **729/729 в 53 файлах**, workspace tsc/lint/build PASS, schema/A hashes без изменений, secrets/diff PASS. [Контракт B1](P03-04B-STORAGE.md) отделяет предыдущий 722/722 gate от исправленного. Повторный Astra verdict закрыл первые три MUST FIX, но оставил один путь MUST4: чтение `iterator.return` getter до защищённого try в optional cleanup. Исправление минимальное (получение метода один раз и вызов с исходным receiver внутри try); добавляются EOF+abort регрессии. 729/729 — evidence предыдущего среза; остаточная cleanup правка прошла B1 52/52 и полный PostgreSQL+S3 gate **731/731 в 53 файлах**, без skipped/ENOSPC, все tsc/lint/build/security/diff PASS. После адресного повторного read-only ревью получен **ASTRA PASS для B1**. По ранее данному владельцем разрешению теперь начинается B2 с отдельным финальным ASTRA review; коммит B1 без приёмки владельца не создаётся.
+
+B2 реализован по [контракту](P03-04B2-CONTRACT.md) отдельными GPT-6.2 Sol исполнителями: additive015 (`file_upload_attempts`, `file_quarantine_objects`), видимый `upload-coordinator/`, internal GET-only probes. Передача source начинается после registration COMMIT, PUT — после dispatch COMMIT; post-IO reauthorization exact original GIVEN и fencing перед единственным QUARANTINED binding. Независимые адресные тесты — **28/28** (20 PG/controlled transport, 7 unit/probes, 1 real PG+Garage); migration proof — **15 миграций/149 CHECK**, populated014→015/fresh/replay/drift/ACL PASS; dependency525/audit0, secrets/diff PASS. Интеграционное Sol review закрыло suppressed abort, next-getter cleanup и post-audit clock/fence gaps с регрессиями. Полный frozen gate завершён: **759/759 тестов в 56 файлах**, оба PG/S3 opt-in включены, no skipped; generate/workspace tsc/source-lint/all builds exit0, non-doc294file hashes identical. Первый обязательный ASTRA B2 verdict — **не готов к приёмке**: main GET проверял hash/bytes без отказа partial/range response, replay clock проверялся до потенциально ожидающего binding read, отсутствовали обязательные rollback/outbox-failure регрессии dispatch/finalize. Адресная доработка source+tests выполнена без изменений schema/dependencies/policy. Финальный B2-набор **36/36** (28 PG/wire +7 unit/probes +1 real PG/Garage); полный frozen gate **767/767 в56файлах**, оба opt-in без skipped, все tsc/lint/build/security/diff PASS, non-doc294file hashes identical. Повторный read-only вердикт **ASTRA PASS для B2**, все три MUST FIX закрыты. Владелец принял B1+B2 22.11.2026 в согласованном synthetic scope и разрешил отдельный коммит/push; поручил продолжить C/D/E, без объявления их уже реализованными. 759/759 остаётся историческим evidence до этих исправлений. HTTP/READY/scanner/выдача/real PII не добавлялись.
+
+### P03-04C/D/E — принято владельцем, полный Astra A→E PASS
+
+Текущий CDE-срез включает обработку/выдачу, hold/delete, независимый ledger/floor
+и copy-only restore. Владелец поручил завершить P03-04 и перед коммитом получить
+полную проверку Astra A→E; окончательный вердикт — PASS. После этого владелец принял
+весь P03-04. C/D/E зафиксированы в `dd87cb4`; push и CI проверяются отдельно.
+
+Предыдущий scoped Astra C/D/E PASS и E **872/872 в 66 файлах** действительны для
+предыдущего дерева. Затем полное A→E ревью нашло три межсрезовых MUST FIX:
+
+- A read и точный reserve replay теперь закрывают metadata при D freeze и FENCED;
+  минимальная cancel-квитанция сохранена. Runtime блокируется перед session/document,
+  privacy control — после intent; свежий DB clock проверяется после последнего lock.
+- B reconcile до LIMIT использует общий raw/sanitized/read/processing бюджет и
+  исключает замороженные intent. UNKNOWN и занятые slots не освобождаются по expiry.
+- Новые B/C записи допускаются только в исходной epoch 1 (или legacy B без runtime
+  row на текущей схеме). Восстановленные epoch >1 работают с проверенными копиями
+  для чтения/удаления; новые raw/sanitized PUT закрыты до source/worker IO.
+
+Адресные результаты после исправлений: **22/22 PostgreSQL D**, включая четыре
+новых межсрезовых случая; **40/40 A unit**; **1/1 реальный restore-drill** с нулём
+вызовов factory/next/raw GET/worker/sanitized PUT для новых записей epoch 2 и с
+успешными чтением/удалением проверенных копий. Новый полный E прошёл **876/876
+в 66 файлах**, без skipped; generate/typecheck/source lint/API-Web-MiniApp builds
+завершились с кодом 0. Все 371 non-Markdown inputs и worker descriptor неизменны
+до/после прогона. Окончательный общий Astra A→E — **PASS**, открытых MUST FIX нет.
+После тестов изменены только Markdown и review-status metadata OCI JSON; версии,
+image digests и исполняемый код неизменны. Снимок 371 файла относится к моменту E.
+Миграционный proof остаётся **17 миграций/181 CHECK**: SQL014–017
+при этой доработке не менялся; рабочая dev БД не мигрировалась.
+
+Состав: additive016/017, модули `file-processing`, `file-lifecycle`,
+`file-access`, `file-privacy`, `file-ledger`, `file-restore`, инфраструктура
+worker/ledger/restore и `sharp@0.35.5`. [Контракт](P03-04CDE-CONTRACT.md),
+[engine pins](P03-04CDE-PROPOSAL.md), [ограничения OCI](../infra/file-processing/OCI-REMEDIATION.md).
+Security вывод ограничен точными offline scanner/decoder entrypoints: это не
+«0 CVE», одобрение FreshClam updater или production. HTTP, signed URL, реальные
+ПД, Q02/Q12/Q13/Q16 и P03-05 остаются за границами результата.
+
+### Состав подэтапов и как проверяем
+
+| Подэтап | Что сдаём | Как проверяем / какое решение нужно |
+|---|---|---|
+| **P03-01 — город и его версия** (принят) | Первая миграция географии, неизменяемые городские ревизии, отдельная ревизия компании с primary city. Внутреннее чтение городского контекста, не приём заявок. Без HTTP и seed. | PostgreSQL: fresh, обновление с наполненной `009`, replay и drift; нельзя присвоить версию чужого города или переписать историю. На двух тестовых городах без ALTER: только единственный ACTIVE, совпавший с primary последней ревизии `SINGLE_CITY`, даёт контекст. Иначе `CONFIGURATION_INCOMPLETE`. |
+| **P03-02 — зоны и полномочия** (принят) | Районы, версии зон, M:N FULL/PARTIAL и членство мастера в городе и зоне. Защищённые команды создания/публикации городов и зон, реальные CITY grants только вместе с привязкой субъекта и объекта к городу. | Same-city FK, временные границы, отказ на чужой город и после отзыва, конфликт версий и повтор команды. FULL/PARTIAL не подтверждает конкретный адрес. Матрица прав согласована — [P03-02-ACCESS](P03-02-ACCESS.md); автоматическое исключение — только первое исходное назначение администратора. |
+| **P03-03 — настройки, справочники и согласия** (принят) | Company/CITY настройки и контент с источником значения; `CALLBACK_INTERVAL` привязан к городу, прочие малые справочники — к компании. Неизменяемые документы и события согласия с целью, версией, основанием и якорем до submit. | Неверный тип/город, архивирование без изменения старого снимка, устаревшая версия и отзыв согласия, раздельные цели; неполная конфигурация не публикуется. Согласовать Q02 и относящуюся часть Q13. |
+| **P03-04 — файлы и приватность** (принят владельцем во внутреннем synthetic scope; полный Astra A→E PASS, E876/876) | Приватное хранилище, загрузка после основания, карантин и проверка, выдача только уполномоченному. Политики хранения/очистки и инструкция по восстановлению БД **и** объектов. | MIME/сигнатура, размер/количество, EXIF, чужой владелец, недоступный scanner ≠ READY. Истечение подписанной ссылки; для немедленного отзыва — backend stream, не обещание отозвать уже выданный URL. До реализации зависящих политик согласовать Q12/Q13/Q16, до P05 — решение по шифрованию полей/поисковому индексу. |
+| **P03-05 — управление и общая приёмка** | Защищённое управление настройками через CRM/API, без ручного SQL и публичного выбора города; проверка интерфейсов и границ P04/P05/P09. | Контрактные и browser-тесты, запрет публикации с неизвестными значениями, полномочия/аудит, полный quality gate. G01–G07 проверяются **в части доступных сущностей**: цены, заявки и визиты проверяются на своих этапах. Раздельно предъявить synthetic evidence и открытые эксплуатационные условия. |
+
+**Контрольная точка P03-01.** Не выдаём CITY grants, не меняем staff-аутентификацию и не открываем загрузки. Реальные название города, IANA timezone, публичные контакты, часы и покрытие (Q25) вводятся владельцем позже через согласованные настройки. Нет резервного города из браузера, ENV или первой строки. Выбор города не подтверждает готовность прайса, зон или законность обработки ПД. После проверки конкретного подэтапа — приёмка владельцем и локальный коммит по [протоколу](../AGENTS.md); старт следующего требует отдельного указания.
+
+**Локальные результаты P03-01 (21.11.2026):** PostgreSQL 18.7 — 10 миграций, включая обновление с заполненной `009`, повторное применение, сверку истории/схемы и 53 проверенных ограничения `CHECK`. Сохранены сотрудники P02 и назначения ролей; у runtime только девять читаемых колонок географии/настроек, без записи или прямого вызова функций миграции. Полный Vitest с включёнными PostgreSQL-тестами: **473/473**, 38 файлов. Проверены lint исходников (без архивных снимков QA), typecheck, сборки API/Web/Mini App и Prisma validate. Для повторного полного прогона под Windows `TEMP`/`TMP` были направлены в игнорируемый локальный каталог: системный TEMP в первом прогоне отказал тесту в создании фикстуры. Миграция не развёрнута в рабочей БД; внешний CI и production не проверялись.
+
+### Как повторить проверку P03-01
+
+На [локальном стенде PostgreSQL](../infra/dev-postgres/README.md) с уже подготовленными тестовыми ролями выполнить из корня в PowerShell:
+
+```powershell
+corepack pnpm run db:test-migrations
+$env:FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS = '1'
+corepack pnpm exec vitest run apps/api/tests/city-context.test.ts
+```
+
+Первая команда проверяет историю миграций и ограничения в отдельных тестовых БД; `db:deploy` для этого не нужен. Вторая проверяет [серверное чтение](../apps/api/src/settings/geography/city-context.ts) под `fixlevelup_runtime`: пустая конфигурация, неактивный primary и два активных города дают отказ, а одна активная конфигурация — ID города, ID его версии и IANA timezone. Интерфейс для ручного создания реального города на этом подэтапе не открывается.
+
+### Приёмка P03-02
+
+**Согласовано владельцем:** вариант 1 — делегированное управление только в назначенных городах. Матрица записана в [P03-02-ACCESS](P03-02-ACCESS.md): администратор создаёт города через `geography.manage` и публикует через `geography.publish`; менеджеру `geography.manage` можно делегировать только в назначенных городах и без публикации; мастер видит лишь свои допуски. Территориальные допуски — отдельные `staff.geography.read`/`staff.geography.manage`. После согласования политики владелец отдельно принял реализацию и выбрал остановку до P03-03.
+
+**Состав подэтапа (миграции 011 и 012):**
+
+- `prisma/migrations/20261121000200_service_areas/` (`011`) — четыре таблицы: `administrative_districts`, `service_areas`, `service_area_versions`, `service_area_district_coverage`. Составные FK по `(city_id, …)` не дают подставить чужой район, чужую версию или чужой город. Ревизия создаётся только черновиком; публикация — отдельный переход, который не меняет проверенный контент; опубликованная ревизия неизменяема для всех, включая владельца. Указатель `current_version_id` проверяется триггером на «тот же город, та же зона, опубликовано». `row_version` присваивает БД (`OLD+1`), поэтому вызывающий не может удержать его и обойти оптимистичную блокировку. `TRUNCATE` истории отклоняется отдельным триггером.
+- `prisma/migrations/20261121000300_geography_access/` (`012`) — пять обычных (не `protected`) кодов `geography.read/manage/publish`, `staff.geography.read/manage`; членство мастера в городе и допуск в зону как отдельные записи с датами; таблица `geography_bootstrap_permissions` для первого проверенного SYSTEM ADMIN. Порядок блокировок: RBAC advisory-lock → advisory-lock по `technician_id` → строки. Ключ блокировки — только id мастера, не пара «мастер + город»: ёмкость и присутствие общие для всех городов.
+- `apps/api/src/settings/geography/` — `geo-contract.ts` (пять прав и три специальных действия, `GeoContext` с разрешёнными городами), `geo-runner.ts` (общий прогон команды с перепроверкой), `catalog-commands.ts`, `catalog-input.ts`, `membership-commands.ts`, `bootstrap-revoke.ts`, `geography.controller.ts` (~35 маршрутов: города, версии, публикация, активация, primary, районы, зоны, покрытие, администраторы, допуски мастера, `/territory`).
+- `prisma/schema.prisma` — модели четырёх таблиц `011` и пяти таблиц `012` с внешними ключами. Ограничения, которые Prisma не выражает (частичные индексы и триггеры), проверяются на PostgreSQL.
+- `packages/database-tooling/scripts/test-area-migration.mjs` — независимый от DDL инвентарь ограничений: ослабленный или удалённый guard обязан упасть в CI; проверяется блокировка строки ревизии (`55P03`), то есть что изменение покрытия действительно ждёт публикацию.
+- `apps/api/tests/geography-fixture.ts`, `geography-catalog-input.test.ts`, `geography-memberships.test.ts` — фикстура и тесты каталога/членства.
+- Правки RBAC под geography: `authz/capability.ts`, `authz/authorization.service.ts`, `roles/*`, `staff.service.ts`, `app.module.ts`, `apps/web/app/crm/access/*`.
+
+**Граница приёмки:** защищённый GET возвращает покрытие выбранной версии зоны. Тесты миграций на PostgreSQL подтвердили 12 миграций, 79 CHECK, сохранность данных при обновлении и отсутствие расхождения Prisma с БД. Автоматическое исключение — пять прав только у первого подтверждённого администратора на исходном назначении; общая роль ADMIN этих прав не получает. Реальных городов или сотрудников миграции не создают. Формы CRM для географических настроек, публичный приём и решения по согласиям и файлам в подэтап не входят. Владелец принял только P03-02, без автоматического перехода к P03-03. Фактические проверки: 545/545 Vitest, 48/48 Playwright; браузеры проверяли интерфейс с синтетическими ответами, авторизация отдельно проверена на Nest/PostgreSQL.
+
+### P03-03 — принят после независимого ревью (21.11.2026)
+
+**Повторный срез по трём замечаниям:** (1) `beginLegalTransaction` явно открывает READ COMMITTED до первого data access, а guard до собственных чтений выполняет SET/проверку фактической изоляции и отказывает старому RR snapshot (`CONFLICT`, не `GRANTED`); (2) `ReferenceResolution.timezoneCityVersionId` возвращает ID прочитанной версии города отдельно от `versionId` справочника; (3) отзыв перепроверяет expiry после document lock и возвращает `SESSION_EXPIRED` до любых INSERT. Адресные PostgreSQL-тесты отдельно доказывают committed revoke при stale snapshot A/B и отсутствие consent/audit/outbox изменений при expiry, включая состояние до ROLLBACK. В адресной доработке SQL/Prisma не менялись; Q02/Q12/Q13/Q16 оставались открытыми, а dev deploy/commit/push/P03-04 на тот момент были запрещены. **Повторная проверка PASS:** legal-unit 18/18, legal-db 18/18, configuration-references 8/8; полный Vitest с PostgreSQL — **622/622 в 48 файлах**, workspace typecheck, source-lint (без прежних ignored QA-архивов) и production builds API/Web/Mini App — PASS. Независимое ревью трёх исправлений — PASS. Secret scan рабочих файлов/истории — 0 неожиданных находок, прежние два исключения не менялись; diff/whitespace — PASS. Хеши SQL/Prisma/migration proofs совпали: schema не менялась, поэтому отдельный migration gate не перезапускался; fresh isolated PostgreSQL tests применяли прежние 13 миграций. Подробные файлы/код/тесты и актуальное evidence — [P03-03-CONTRACT](P03-03-CONTRACT.md#адресная-доработка-по-независимому-ревью-21112026). **Принят владельцем 21.11.2026 в 21:34 в synthetic внутреннем scope после этой повторной проверки; принятый срез зафиксирован локально в `9116812` (48 файлов, без push).**
+
+**P02 и P03-01/P03-02 приняты владельцем.** Приёмка относится к scoped
+staff-auth/RBAC и административной географии и не означает production/live
+readiness. Ограничение `CITY` снято только для пяти географических операций
+P03-02 и требует явного права роли плюс отдельного административного назначения
+сотрудника в город ресурса.
+
+**P03-03 начат прямым поручением владельца 21.11.2026; после первого предъявления возвращён на адресную доработку трёх замечаний независимого ревью, исправлен и принят владельцем 21.11.2026 в 21:34 в synthetic внутреннем scope. Принятый срез коммитится отдельным локальным коммитом; SHA не заявлен.** Границы и интерфейсы зафиксированы в [P03-03-CONTRACT](P03-03-CONTRACT.md), решение — [DECISIONS §24](DECISIONS.md#24-p03-03--внутренние-порты-настроек-справочников-и-согласий). Подэтап добавляет **внутренние типизированные порты и данные**: ревизии настроек компании со ссылками на reviewed политику, малые типизированные справочники (CITY только для `CALLBACK_INTERVAL`), контент COMPANY/CITY с provenance, юридические документы и append-only события согласия, минимальный pre-submit anchor доверенной серверной сессии. HTTP/CRM-управление — P03-05, intake/submit и выпуск F-сессии — P05, приватные файлы — P03-04; capability, роли и маршруты в этом подэтапе не добавляются. Q02/Q12/Q13/Q16 остаются открытыми: срок жизни anchor передаёт вызывающая политика без TTL по умолчанию; сроки хранения не выдумываются — в настройках компании хранятся только policy refs (reviewed provenance), а не сами правила. Юридические документы хранят неизменяемый текст: synthetic-тесты используют собственный текст, реальные тексты утверждает владелец. `ADDRESS_COVERAGE` — зарезервированное слово словаря без live-включения (нет реального документа, seed и маршрута); synthetic-вставка для проверки раздельности целей допустима.
+
+**Предыдущие локальные результаты P03-03 (21.11.2026, до возврата на доработку):** PostgreSQL 18.7 — `db:test-migrations` подтвердил **13 миграций и 121 CHECK**, включая обновление с наполненной `012`, повторное применение и сверку истории/схемы; SHA-256 итогового SQL миграции `013` — `54fda83b0eff7055a0b1dbac46d9df64910666eb984bd5df316a30c9d81cfbf9`. Полный Vitest: **610/610 в 48 файлах** (`final-vitest2.log`, 20:29:36), включая ранее падавшие readiness/runtime-database и два web-auth теста. Контрактные тесты портов: **39 configuration + 24 legal** случаев; focused readiness — **13/13 в 2 файлах** (20:29:30). Проверены typecheck (`final2-typecheck.log`), source-lint (`final2-lint.log`, `eslint . --ignore-pattern 'test-results/**' --max-warnings 0`) и финальная сборка API/Web/Mini App (`final2-build.log`, те же 58 исходников до и после, hash идентичен). Prisma validate, gitleaks (working tree и история: 0 неожиданных находок, две прежние одобренные исключения без изменений). Playwright **не запускался** — frontend не менялся; внешний CI и dev/production deploy не выполнялись. **Граница lint-проверки:** первоначальный общий `pnpm check` падал и на lint нового чернового кода, и на уже существовавших игнорируемых QA-архивах; итоговый явный source-lint ограничен исходниками (`test-results` и архивные снимки QA исключены) и прошёл — та же оговорка о границах проверки, что в P03-01. Миграция не развёрнута в рабочей БД. **Это evidence предыдущего среза: владелец вернул подэтап на адресную доработку; повторный прогон и повторная приёмка описаны в начале этого раздела. Коммита нет.**
+
+
+## P04 — границы и историческое состояние P04-01
+
+> Историческая запись: на момент её составления P04-01 был в рабочем дереве
+> и не принят. Позже он принят (`d04758c`), как и P04-02…P04-04; итог —
+> [P04-AUDIT](P04-AUDIT.md). Текст ниже сохранён как история среза.
+
+### Границы и открытые решения
+
+- **Q06/Q09/Q10 открыты.** Валюта и налоги, дробность количества, округление,
+  процентные базы и лимиты, обязательность выезда и диагностики, выбор
+  тарифного момента — всё это проверяется только на явных synthetic настройках.
+  Механизм не подставляет боевые значения и не выбирает бизнес-политику.
+- **Никаких доменных сидов.** Миграции не создают категорий, брендов, моделей,
+  работ, цен, диапазонов, правил или политик. Нулевая цена допустима только с
+  явным основанием «без оплаты»; отсутствие цены — это `PRICE_NOT_CONFIGURED`,
+  а не ноль, не диапазон и не цена другого города.
+- **Деньги только целыми минорными единицами** (`BIGINT` в БД, каноническая
+  десятичная строка в wire и snapshot), расчёт — `BigInt`, без `Number` и без
+  промежуточного округления.
+- **Нет** заявок, F-сессий, workflow, планирования, Quote/accepted agreement,
+  оплаты, adjust-approval, ролей клиента и новых публичных маршрутов. Публичные
+  проекции остаются выключены; «public estimate» здесь — тип подготовленных
+  данных, а не сайт.
+- Реальный прайс не импортируется; Q15, P03/F06 и live gates не закрываются.
+
+### Состояние P04-01 (в рабочем дереве, не принят)
+
+**Что есть:** `apps/api/src/catalog/` — `contracts.ts`, `validation.ts`,
+`transaction.ts`, `audit.ts`, `records.ts`, `directory.ts`, `items.ts`,
+`mappings.ts`, `prices.ts`, `reads.ts`, `index.ts`; миграция `019`
+(`prisma/migrations/20261122000500_catalog_fixed_prices/migration.sql`, 32 КБ):
+справочники и позиции с версиями и архивом, mapping «симптом → работа той же
+категории», серии цен по городу, append-only версии цены и обязательная 1:1
+проекция периода с `EXCLUDE` по пересечению; тест
+`apps/api/tests/catalog-p0401-db.test.ts` и скрипт проверки миграции
+`packages/database-tooling/scripts/test-catalog-fixed-prices-migration.mjs`.
+
+**Проверено 22.11.2026:** ничего не подтверждено как готовое — `corepack pnpm run
+typecheck` по workspace **падает** на `apps/api/tests/catalog-p0401-db.test.ts:269`:
+`TS2339: Property 'cityVersionId' does not exist on type '{ cityId; itemId;
+priceVersionId }'`. То есть тест вызывает чтение точной ревизии цены без
+обязательного `cityVersionId`, который требует контракт. DB-тест, migration proof
+`018→019`, Playwright и сборки по этому срезу **не запускались**.
+
+**Вывод:** P04-01 предъявлять рано; сначала нужно привести тест (или тип входа)
+в соответствие контракту и прогнать адресные PG-проверки. Коммита нет, приёмки нет.

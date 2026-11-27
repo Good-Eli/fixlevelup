@@ -73,15 +73,42 @@ export function isP04Capability(value: unknown): value is P04Capability {
 }
 export function p04Module(code: P04Capability): string { return code.slice(0, code.indexOf('.')); }
 
-export type PermissionCode = Capability | GeoCapability | P03Capability | P04Capability;
+/** P05 request processing is a separate domain contract from the staff dictionary.
+ * Every code is an ordinary (never protected) catalog entry in the fixed `requests`
+ * module, and its stored scope is CITY or GLOBAL. GLOBAL is authority only for the
+ * exact SYSTEM ADMIN role; SYSTEM MANAGER and CUSTOM web roles may store CITY only,
+ * and the technician channel holds no P05 grant at all. A catalog row, a request body
+ * or a role name never becomes authority: the enabled grant, live role and current
+ * admin-city assignment are checked on every command by the P05 authorization port.
+ * These are the seven exact codes of the closed P05 surface; adding a code here does
+ * not provision it in a database (migration 024 does, operator-owned). */
+export const P05_SCOPE_CONTRACT = {
+  'requests.read': ['CITY', 'GLOBAL'],
+  'requests.create': ['CITY', 'GLOBAL'],
+  'requests.review': ['CITY', 'GLOBAL'],
+  'requests.coverage.assess': ['CITY', 'GLOBAL'],
+  'requests.contact.manage': ['CITY', 'GLOBAL'],
+  'requests.ready': ['CITY', 'GLOBAL'],
+  'requests.cancel': ['CITY', 'GLOBAL'],
+} as const satisfies Record<string, readonly GrantScope[]>;
+export type P05Capability = keyof typeof P05_SCOPE_CONTRACT;
+export type P05Scope = 'CITY' | 'GLOBAL';
+export interface P05Grant { readonly code: P05Capability; readonly scope: P05Scope }
+export const P05_CAPABILITIES = Object.freeze(Object.keys(P05_SCOPE_CONTRACT) as P05Capability[]);
+export const P05_MODULE = 'requests' as const;
+export function isP05Capability(value: unknown): value is P05Capability {
+  return typeof value === 'string' && Object.hasOwn(P05_SCOPE_CONTRACT, value);
+}
+export type PermissionCode = Capability | GeoCapability | P03Capability | P04Capability | P05Capability;
 export const PERMISSION_CODES: readonly PermissionCode[] = Object.freeze([
-  ...STAFF_CAPABILITIES, ...GEO_CAPABILITIES, ...P03_CAPABILITIES, ...P04_CAPABILITIES,
+  ...STAFF_CAPABILITIES, ...GEO_CAPABILITIES, ...P03_CAPABILITIES, ...P04_CAPABILITIES, ...P05_CAPABILITIES,
 ]);
 export function isGeoCapability(value: unknown): value is GeoCapability {
   return typeof value === 'string' && Object.hasOwn(GEO_SCOPE_CONTRACT, value);
 }
 export function isPermissionCode(value: unknown): value is PermissionCode {
-  return isCapability(value) || isGeoCapability(value) || isP03Capability(value) || isP04Capability(value);
+  return isCapability(value) || isGeoCapability(value) || isP03Capability(value) || isP04Capability(value)
+    || isP05Capability(value);
 }
 export function isGrantScope(value: unknown): value is GrantScope {
   return value === 'GLOBAL' || value === 'SELF' || value === 'CITY';

@@ -18,6 +18,8 @@ model AuditLog {
   correlationId String   @map("correlation_id") @db.Uuid
   occurredAt    DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
   details       Json     @default("{}") @db.JsonB
+  // Migration 024: a P05 command receipt names its own audit row exactly once.
+  requestCommandReceipts RequestCommandReceipt[]
 
   @@map("audit_logs")
   @@schema("foundation")
@@ -57,8 +59,11 @@ model Staff {
   revokedZoneAdmissions   TechnicianServiceArea[]   @relation("TechnicianZoneRevoker")
   geographyReceipts       GeographyCommandReceipt[] @relation("GeographyReceiptActor")
   p03Receipts             P03CommandReceipt[]       @relation("P03ReceiptActor")
+  requestEvents          RequestEvent[]            @relation("RequestEventActor")
   revokedP03BootstrapGrants P03BootstrapPermission[] @relation("P03BootstrapRevoker")
   reviewedReferenceEntryVersions  ReferenceEntryVersion[] @relation("ReferenceEntryVersionReviewer")
+  requestStaffEvidence    RequestStaffEvidence[]
+  requestCoverageAssessments RequestCoverageAssessment[]
   reviewedContentBlockRevisions   ContentBlockRevision[]  @relation("ContentBlockRevisionReviewer")
   reviewedLegalDocumentVersions   LegalDocumentVersion[]  @relation("LegalDocumentVersionReviewer")
   fileUploadIntents               FileUploadIntent[]      @relation("FileUploadIntentStaff")
@@ -265,6 +270,8 @@ model OutboxEvent {
   leaseExpiresAt  DateTime? @map("lease_expires_at") @db.Timestamptz(6)
   nextAttemptAt   DateTime  @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
   lastErrorCode   String?   @map("last_error_code") @db.VarChar(32)
+  // Migration 024: a P05 command receipt names its own outbox row exactly once.
+  requestCommandReceipts RequestCommandReceipt[]
 
   @@index([status, createdAt], map: "outbox_events_queue_idx")
   @@index([status, nextAttemptAt, createdAt, id], map: "outbox_events_due_idx")
@@ -300,6 +307,7 @@ model ServiceCity {
   pricingPolicySeries PricingPolicySeries?
   publicPriceEstimateSeries PublicPriceEstimateSeries[]
   p04Receipts P04CommandReceipt[] @relation("P04ReceiptCity")
+  requests Request[] @relation("RequestCity")
 
   @@map("service_cities")
   @@schema("foundation")
@@ -330,6 +338,8 @@ model ServiceCityVersion {
   priceRuleVersions PriceRuleVersion[] @relation("PriceRuleCityVersion")
   pricingPolicyVersions PricingPolicyVersion[] @relation("PricingPolicyCityVersion")
   publicPriceEstimates PublicPriceEstimate[] @relation("PublicPriceEstimateCityVersion")
+  intakeRequests Request[] @relation("RequestIntakeCityVersion")
+  requestCoverageAssessments RequestCoverageAssessment[] @relation("RequestCoverageAssessmentCityVersion")
 
   @@unique([cityId, version], map: "service_city_versions_city_version_key")
   @@unique([cityId, id], map: "service_city_versions_city_id_key")
@@ -385,6 +395,7 @@ model AdministrativeDistrict {
   rowVersion Int      @default(1) @map("row_version")
   city      ServiceCity @relation(fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   coverage  ServiceAreaDistrictCoverage[]
+  addressRevisions RequestAddressRevision[]
 
   @@unique([cityId, code], map: "administrative_districts_city_code_key")
   @@unique([cityId, id], map: "administrative_districts_city_id_key")
@@ -436,6 +447,7 @@ model ServiceAreaVersion {
   publisher           Staff?    @relation("ServiceAreaVersionPublisher", fields: [publishedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
   currentFor          ServiceArea[] @relation("ServiceAreaCurrentVersion")
   coverage            ServiceAreaDistrictCoverage[]
+  requestCoverageAssessments RequestCoverageAssessment[] @relation("RequestCoverageAssessmentAreaVersion")
 
   @@unique([cityId, areaId, version], map: "service_area_versions_city_area_version_key")
   @@unique([cityId, id], map: "service_area_versions_city_id_key")
@@ -669,6 +681,8 @@ model ReferenceEntryVersion {
   cityVersion    ServiceCityVersion? @relation("ReferenceEntryVersionCityVersion", fields: [cityId, cityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
   reviewer       Staff          @relation("ReferenceEntryVersionReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict)
   currentFor     ReferenceEntry[] @relation("ReferenceEntryCurrentVersion")
+  intakeProvenanceSources  RequestIntakeProvenance[] @relation("IntakeProvenanceSource")
+  intakeProvenanceCallbacks RequestIntakeProvenance[] @relation("IntakeProvenanceCallback")
 
   @@unique([entryId, version], map: "reference_entry_versions_entry_version_key")
   @@unique([entryId, type, id], map: "reference_entry_versions_entry_type_id_key")
@@ -788,7 +802,11 @@ model RequestSession {
   intakeCityVersion   ServiceCityVersion @relation("RequestSessionCityVersion", fields: [intakeCityId, intakeCityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict)
   consents            ConsentRecord[]
   fileUploadIntents   FileUploadIntent[] @relation("FileUploadIntentSession")
+  requestEvents       RequestEvent[]
+  formGroupMembership FormSessionGroupMembership?
+  anchorSubmits       RequestSessionSubmit[] @relation("RequestSessionSubmitAnchor")
 
+  @@unique([id, intakeCityId, intakeCityVersionId], map: "request_sessions_intake_tuple_key")
   @@map("request_sessions")
   @@schema("foundation")
 }
@@ -817,10 +835,13 @@ model ConsentRecord {
   supersedes        ConsentRecord?      @relation("ConsentSupersedes", fields: [supersedesId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   supersededBy      ConsentRecord?      @relation("ConsentSupersedes")
   fileUploadIntents FileUploadIntent[]  @relation("FileUploadIntentConsent")
+  sessionSubmits    RequestSessionSubmit[]
 
   @@unique([sessionId, evidenceRef], map: "consent_records_session_evidence_key")
   @@unique([supersedesId], map: "consent_records_supersedes_id_key")
   @@unique([id, sessionId, documentVersionId, purpose], map: "consent_records_intent_basis_key")
+  // Migration 024: the exact six-column tuple an F submit edge pins its consent to.
+  @@unique([id, sessionId, documentId, documentVersionId, purpose, action], map: "consent_records_request_given_tuple_key")
   @@map("consent_records")
   @@schema("foundation")
 }
@@ -870,6 +891,7 @@ model FileUploadIntent {
   uploadAttempts           FileUploadAttempt[]
   privacyControl           FilePrivacyControl?
   sanitizedAttempts        FileSanitizedAttempt[]
+  requestFiles             RequestFile[]
 
   // The two owner+idempotency unique indexes and the pending-quota index are PARTIAL
   // indexes (WHERE owner_... IS NOT NULL), which Prisma cannot express; they exist only
@@ -982,8 +1004,11 @@ model FilePrivacyControl {
 
   intent      FileUploadIntent @relation(fields: [intentId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "file_privacy_controls_intent_id_fkey")
   deleteItems FileDeleteItem[]
+  requestFiles RequestFile[]
 
   @@unique([intentId, deleteEventId], map: "file_privacy_controls_intent_event_key")
+  // Migration 024: the (intent, delete_state) target of the P05 attachment interlock.
+  @@unique([intentId, deleteState], map: "file_privacy_controls_intent_open_key")
   @@map("file_privacy_controls")
   @@schema("foundation")
 }
@@ -1044,7 +1069,10 @@ model FilePublication {
 
   quarantine       FileQuarantineObject @relation(fields: [intentId, quarantineId, rawBytes, rawSha256], references: [intentId, id, actualBytes, sha256], onDelete: Restrict, onUpdate: Restrict, map: "file_publications_raw_tuple_fkey")
   sanitizedAttempt FileSanitizedAttempt @relation(fields: [intentId, quarantineId, sanitizedAttemptId, mime, servedBytes, servedSha256], references: [intentId, quarantineId, id, mime, verifiedBytes, verifiedSha256], onDelete: Restrict, onUpdate: Restrict, map: "file_publications_served_tuple_fkey")
+  requestFiles     RequestFile[]
 
+  // Migration 024: exact (intent, publication) pair a P05 attachment pins.
+  @@unique([intentId, id], map: "file_publications_intent_file_key")
   @@map("file_publications")
   @@schema("foundation")
 }
@@ -1098,6 +1126,10 @@ model CatalogDirectoryEntry {
   faultMappings    CatalogFaultServiceMapping[] @relation("CatalogMappingFault")
   priceRuleScopes  PriceRuleScope[] @relation("PriceRuleScopeCategory")
   publicPriceEstimateSeries PublicPriceEstimateSeries[] @relation("PublicPriceEstimateCategory")
+  applianceCategories RequestApplianceRevision[] @relation("RequestApplianceCategory")
+  applianceModels    RequestApplianceRevision[] @relation("RequestApplianceModel")
+  requestFaults      RequestFault[] @relation("RequestFaultEntry")
+  requestApplianceBrands RequestApplianceBrand[] @relation("RequestApplianceBrandEntry")
 
   @@unique([kind, code], map: "catalog_directory_entries_kind_code_key")
   @@unique([id, kind], map: "catalog_directory_entries_id_kind_key")
@@ -1117,6 +1149,10 @@ model CatalogDirectoryVersion {
   entry       CatalogDirectoryEntry @relation("CatalogDirectoryVersions", fields: [entryId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_versions_entry_fkey")
   reviewer    Staff @relation("CatalogDirectoryReviewer", fields: [reviewedBy], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "catalog_directory_versions_reviewer_fkey")
   currentFor  CatalogDirectoryEntry[] @relation("CatalogDirectoryCurrentVersion")
+  requestFaults RequestFault[] @relation("RequestFaultRevision")
+  applianceCategories RequestApplianceRevision[] @relation("RequestApplianceCategoryRevision")
+  applianceModels    RequestApplianceRevision[] @relation("RequestApplianceModelRevision")
+  requestApplianceBrands RequestApplianceBrand[] @relation("RequestApplianceBrandVersion")
 
   @@unique([entryId, version], map: "catalog_directory_versions_entry_version_key")
   @@unique([entryId, id], map: "catalog_directory_versions_entry_id_key")
@@ -1600,5 +1636,568 @@ model ExternalReviewRevision {
   @@unique([entryId, version], map: "external_review_revisions_entry_version_key")
   @@unique([entryId, kind, id], map: "external_review_revisions_entry_kind_id_key")
   @@map("external_review_revisions")
+  @@schema("foundation")
+}
+
+// ---------------------------------------------------------------------------
+// P05-01 (022, schema profile S1): request intake foundation. Immutable policy
+// packages, the business customer record, the request aggregate and its typed
+// encrypted history. All SQL guards/triggers/grants live in migration 022.
+// ---------------------------------------------------------------------------
+
+// Reviewed intake/workflow policy metadata pair; versions are provisioned by
+// the isolated test stand, never by a runtime seed. Append-only.
+model RequestPolicyPackage {
+  id              String   @id @db.Uuid
+  // Migration 024 drops request_policy_packages_workflow_version_key: several
+  // reviewed policy revisions may pin the same workflow package semantics, so the
+  // workflow version is no longer unique on its own. The pair rule
+  // (requests.workflow_package_id = requests.intake_policy_revision_id) is a CHECK
+  // added by the same migration and lives only in SQL.
+  workflowVersion String   @map("workflow_version") @db.VarChar(64)
+  policyRevision  String   @map("policy_revision") @unique @db.VarChar(68)
+  metadataSha256  String   @map("metadata_sha256") @db.VarChar(64)
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  requests           Request[] @relation("RequestWorkflowPackage")
+  intakePolicyFor    Request[] @relation("RequestIntakePolicy")
+
+  @@map("request_policy_packages")
+  @@schema("foundation")
+}
+
+// Q03: a business record, not an auth principal. No plaintext personal column;
+// every personal value lives in RequestPayloadCell ciphertext.
+model Customer {
+  id        String   @id @db.Uuid
+  createdAt DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  requests  Request[]
+
+  @@map("customers")
+  @@schema("foundation")
+}
+
+// One random DEK per payload, wrapped under a versioned external KEK. The AAD
+// is rebuilt from the immutable (request, kind, revision) identity.
+model RequestPayloadCell {
+  id         String   @id @db.Uuid
+  requestId  String   @map("request_id") @db.Uuid
+  kind       String   @db.VarChar(24)
+  revision   Int
+  keyId      String   @map("key_id") @db.VarChar(64)
+  wrappedDek Bytes    @map("wrapped_dek")
+  nonce      Bytes
+  ciphertext Bytes
+  authTag    Bytes    @map("auth_tag")
+  aadContext String   @map("aad_context") @db.VarChar(128)
+  createdAt  DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request    Request @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_payload_cells_request_id_fkey")
+  contacts   RequestContactRevision[]
+  addresses  RequestAddressRevision[]
+  appliances RequestApplianceRevision[]
+
+  @@unique([requestId, kind, revision], map: "request_payload_cells_request_kind_revision_key")
+  @@unique([requestId, id], map: "request_payload_cells_request_id_id_key")
+  @@map("request_payload_cells")
+  @@schema("foundation")
+}
+
+model Request {
+  id                          String  @id @db.Uuid
+  publicNumber                BigInt  @default(autoincrement()) @map("public_number")
+  type                        String  @db.VarChar(16)
+  status                      String  @db.VarChar(32)
+  rowVersion                  Int     @default(1) @map("row_version")
+  customerId                  String  @map("customer_id") @db.Uuid
+  cityId                      String  @map("city_id") @db.Uuid
+  intakeCityVersionId         String  @map("intake_city_version_id") @db.Uuid
+  workflowPackageId           String  @map("workflow_package_id") @db.Uuid
+  intakePolicyRevisionId      String  @map("intake_policy_revision_id") @db.Uuid
+  currentContactRevisionId    String? @map("current_contact_revision_id") @db.Uuid
+  currentAddressRevisionId    String? @map("current_address_revision_id") @db.Uuid
+  currentApplianceRevisionId  String? @map("current_appliance_revision_id") @db.Uuid
+  currentPreferenceRevisionId String? @map("current_preference_revision_id") @db.Uuid
+  currentAssessmentId         String? @map("current_assessment_id") @db.Uuid
+  createdAt                   DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime @default(dbgenerated("clock_timestamp()")) @map("updated_at") @db.Timestamptz(6)
+  isWaitingLink               Boolean @default(dbgenerated("((status)::text = ANY ((ARRAY['WAITING_TELEGRAM_LINK'::character varying, 'WAITING_CHANNEL_LINK'::character varying])::text[]))")) @map("is_waiting_link")
+  customer                    Customer @relation(fields: [customerId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "requests_customer_id_fkey")
+  city                        ServiceCity @relation("RequestCity", fields: [cityId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "requests_city_id_fkey")
+  intakeCityVersion           ServiceCityVersion @relation("RequestIntakeCityVersion", fields: [cityId, intakeCityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_city_id_intake_city_version_id_fkey")
+  workflowPackage             RequestPolicyPackage @relation("RequestWorkflowPackage", fields: [workflowPackageId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "requests_workflow_package_id_fkey")
+  intakePolicyRevision        RequestPolicyPackage @relation("RequestIntakePolicy", fields: [intakePolicyRevisionId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "requests_intake_policy_revision_id_fkey")
+  currentContactRevision      RequestContactRevision? @relation("RequestCurrentContact", fields: [id, currentContactRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_current_contact_revision_fkey")
+  currentAddressRevision      RequestAddressRevision? @relation("RequestCurrentAddress", fields: [id, currentAddressRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_current_address_revision_fkey")
+  currentApplianceRevision    RequestApplianceRevision? @relation("RequestCurrentAppliance", fields: [id, currentApplianceRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_current_appliance_revision_fkey")
+  currentPreferenceRevision   RequestPreferenceRevision? @relation("RequestCurrentPreference", fields: [id, currentPreferenceRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "requests_current_preference_revision_fkey")
+  // Migration 024 adds current_assessment_id and a composite FK to
+  // (request_id, address_revision_id, id). The target unique exists in SQL, so the
+  // relation is modellable; DEFERRABLE INITIALLY DEFERRED itself is SQL-only.
+  currentAssessment           RequestCoverageAssessment? @relation("RequestCurrentAssessment", fields: [id, currentAddressRevisionId, currentAssessmentId], references: [requestId, addressRevisionId, id], onDelete: Restrict, onUpdate: NoAction, map: "requests_current_assessment_fkey")
+  payloadCells                RequestPayloadCell[]
+  contacts                    RequestContactRevision[] @relation("RequestContactHistory")
+  addresses                   RequestAddressRevision[] @relation("RequestAddressHistory")
+  appliances                  RequestApplianceRevision[] @relation("RequestApplianceHistory")
+  preferences                 RequestPreferenceRevision[]
+  events                      RequestEvent[]
+  staffEvidence               RequestStaffEvidence[]
+  cityPairSessionSubmit       RequestSessionSubmit[] @relation("RequestSessionSubmitCityPair")
+  customerPairSessionSubmit   RequestSessionSubmit[] @relation("RequestSessionSubmitCustomer")
+  channelChoice               RequestChannelChoice?
+  assessmentCityPair          RequestCoverageAssessment[] @relation("RequestCoverageAssessmentCity")
+  intakeProvenance            RequestIntakeProvenance?
+
+  @@unique([publicNumber], map: "requests_public_number_key")
+  @@unique([id, customerId], map: "requests_id_customer_id_key")
+  @@unique([id, cityId], map: "requests_id_city_key")
+  @@unique([id, cityId, intakeCityVersionId], map: "requests_id_city_id_intake_city_version_id_key")
+  @@unique([id, currentContactRevisionId], map: "requests_current_contact_key")
+  @@unique([id, currentAddressRevisionId], map: "requests_current_address_key")
+  @@unique([id, currentApplianceRevisionId], map: "requests_current_appliance_key")
+  @@unique([id, currentPreferenceRevisionId], map: "requests_current_preference_key")
+  @@index([customerId], map: "requests_customer_id_idx")
+  @@map("requests")
+  @@schema("foundation")
+}
+
+model RequestContactRevision {
+  id            String   @id @db.Uuid
+  requestId     String   @map("request_id") @db.Uuid
+  revision      Int
+  mode          String   @db.VarChar(16)
+  payloadCellId String   @map("payload_cell_id") @db.Uuid
+  createdAt     DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request       Request @relation("RequestContactHistory", fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_contact_revisions_request_id_fkey")
+  payloadCell   RequestPayloadCell @relation(fields: [requestId, payloadCellId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_contact_revisions_payload_fkey")
+  currentFor    Request[] @relation("RequestCurrentContact")
+  phonePermissions PhonePermissionEvent[]
+
+  @@unique([requestId, revision], map: "request_contact_revisions_request_revision_key")
+  @@unique([requestId, id], map: "request_contact_revisions_request_id_id_key")
+  @@map("request_contact_revisions")
+  @@schema("foundation")
+}
+
+model RequestAddressRevision {
+  id            String   @id @db.Uuid
+  requestId     String   @map("request_id") @db.Uuid
+  revision      Int
+  districtId         String?  @map("district_id") @db.Uuid
+  districtRowVersion Int?     @map("district_row_version")
+  payloadCellId String   @map("payload_cell_id") @db.Uuid
+  createdAt     DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request       Request @relation("RequestAddressHistory", fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_address_revisions_request_id_fkey")
+  district      AdministrativeDistrict? @relation(fields: [districtId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_address_revisions_district_fkey")
+  payloadCell   RequestPayloadCell @relation(fields: [requestId, payloadCellId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_address_revisions_payload_fkey")
+  currentFor    Request[] @relation("RequestCurrentAddress")
+  coverageAssessments RequestCoverageAssessment[]
+
+  @@unique([requestId, revision], map: "request_address_revisions_request_revision_key")
+  @@unique([requestId, id], map: "request_address_revisions_request_id_id_key")
+  @@map("request_address_revisions")
+  @@schema("foundation")
+}
+
+model RequestApplianceRevision {
+  id            String   @id @db.Uuid
+  requestId     String   @map("request_id") @db.Uuid
+  revision      Int
+  categoryId         String   @map("category_id") @db.Uuid
+  categoryKind       String   @default("CATEGORY") @map("category_kind") @db.VarChar(16)
+  categoryVersionId  String   @map("category_version_id") @db.Uuid
+  modelId            String?  @map("model_id") @db.Uuid
+  modelKind          String   @default("MODEL") @map("model_kind") @db.VarChar(16)
+  modelVersionId     String?  @map("model_version_id") @db.Uuid
+  payloadCellId String   @map("payload_cell_id") @db.Uuid
+  createdAt     DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request       Request @relation("RequestApplianceHistory", fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_request_id_fkey")
+  category      CatalogDirectoryEntry @relation("RequestApplianceCategory", fields: [categoryId, categoryKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_category_fkey")
+  model         CatalogDirectoryEntry? @relation("RequestApplianceModel", fields: [modelId, modelKind], references: [id, kind], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_model_fkey")
+  categoryVersion CatalogDirectoryVersion @relation("RequestApplianceCategoryRevision", fields: [categoryId, categoryVersionId], references: [entryId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_category_revision_fkey")
+  modelVersion    CatalogDirectoryVersion? @relation("RequestApplianceModelRevision", fields: [modelId, modelVersionId], references: [entryId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_model_revision_fkey")
+  payloadCell   RequestPayloadCell @relation(fields: [requestId, payloadCellId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_appliance_revisions_payload_fkey")
+  currentFor    Request[] @relation("RequestCurrentAppliance")
+  faults        RequestFault[]
+  brands        RequestApplianceBrand[]
+
+  @@unique([requestId, revision], map: "request_appliance_revisions_request_revision_key")
+  @@unique([requestId, id], map: "request_appliance_revisions_request_id_id_key")
+  @@map("request_appliance_revisions")
+  @@schema("foundation")
+}
+
+model RequestFault {
+  id                   String  @id @db.Uuid
+  requestId            String  @map("request_id") @db.Uuid
+  applianceRevisionId  String  @map("appliance_revision_id") @db.Uuid
+  isOther              Boolean @default(false) @map("is_other")
+  faultId              String? @map("fault_id") @db.Uuid
+  faultKind            String  @default("FAULT") @map("fault_kind") @db.VarChar(16)
+  faultVersionId       String? @map("fault_version_id") @db.Uuid
+  categoryId           String  @map("category_id") @db.Uuid
+  categoryKind         String  @default("CATEGORY") @map("category_kind") @db.VarChar(16)
+  applianceRevision    RequestApplianceRevision @relation(fields: [requestId, applianceRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_faults_request_id_appliance_revision_id_fkey")
+  fault                CatalogDirectoryEntry? @relation("RequestFaultEntry", fields: [faultId, faultKind, categoryId], references: [id, kind, categoryId], onDelete: Restrict, onUpdate: Restrict, map: "request_faults_fault_entry_fkey")
+  faultVersion         CatalogDirectoryVersion? @relation("RequestFaultRevision", fields: [faultId, faultVersionId], references: [entryId, id], onDelete: Restrict, onUpdate: Restrict, map: "request_faults_fault_revision_fkey")
+
+  @@unique([requestId, applianceRevisionId, faultId], map: "request_faults_request_revision_key")
+  @@map("request_faults")
+  @@schema("foundation")
+}
+
+model RequestPreferenceRevision {
+  id               String   @id @db.Uuid
+  requestId        String   @map("request_id") @db.Uuid
+  revision         Int
+  urgency          String?  @db.VarChar(16)
+  preferredWindows Json     @default("[]") @map("preferred_windows")
+  // Migration 024: explicit contact preference of the command that wrote this
+  // revision. NULL on legacy (S1 lab) rows; never reclassified as permission.
+  contactMode      String?  @map("contact_mode") @db.VarChar(16)
+  createdAt        DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request          Request @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_preference_revisions_request_id_fkey")
+  currentFor       Request[] @relation("RequestCurrentPreference")
+
+  @@unique([requestId, revision], map: "request_preference_revisions_request_revision_key")
+  @@unique([requestId, id], map: "request_preference_revisions_request_id_id_key")
+  @@map("request_preference_revisions")
+  @@schema("foundation")
+}
+
+// Append-only business event; UNIQUE(principal,operation,idempotency_key) is
+// the durable command identity of the idempotency contract.
+model RequestEvent {
+  id               String   @id @db.Uuid
+  requestId        String   @map("request_id") @db.Uuid
+  command          String   @db.VarChar(64)
+  principal        String   @db.VarChar(160)
+  operation        String   @db.VarChar(64)
+  idempotencyKey   String   @map("idempotency_key") @db.Uuid
+  actorType        String   @map("actor_type") @db.VarChar(12)
+  actorSessionId   String?  @map("actor_session_id") @db.Uuid
+  actorStaffId     String?  @map("actor_staff_id") @db.Uuid
+  resultingVersion Int      @map("resulting_version")
+  correlationId    String   @map("correlation_id") @db.Uuid
+  details          Json     @default("{}")
+  createdAt        DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  request          Request @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_events_request_id_fkey")
+  actorSession     RequestSession? @relation(fields: [actorSessionId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_events_actor_session_id_fkey")
+  actorStaff       Staff? @relation("RequestEventActor", fields: [actorStaffId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "request_events_actor_staff_id_fkey")
+  // Inverse sides are lists even where SQL makes the pair unique: Prisma demands a
+  // source-side unique to accept 1:1, and inventing one would add an index the
+  // reviewed SQL does not have. The real uniqueness stays in migration 024.
+  commandReceipts  RequestCommandReceipt[]
+  sessionSubmits   RequestSessionSubmit[] @relation("RequestEventSessionSubmits")
+
+  @@unique([principal, operation, idempotencyKey], map: "request_events_principal_operation_key_key")
+  @@unique([requestId, resultingVersion], map: "request_events_request_version_key")
+  @@unique([id, requestId, resultingVersion, correlationId, command], map: "request_events_receipt_tuple_key")
+  @@unique([id, requestId, command, actorSessionId], map: "request_events_form_submit_key")
+  @@index([requestId, createdAt], map: "request_events_request_idx")
+  @@map("request_events")
+  @@schema("foundation")
+}
+
+// P05-02 opaque browser group: a server-side hash of an opaque grouping secret
+// plus a trusted expiry window. Not an F-session and not an identity; no PII,
+// no revoke. Expiry is decided by comparing the stored timestamps with the
+// database clock, so the row always stays: UPDATE and DELETE are refused by the
+// form_browser_groups_guard trigger (23514), which also pins created_at to the
+// database clock on every INSERT. Expired groups are never deleted either:
+// form session group memberships outlive as history and reference them.
+model FormBrowserGroup {
+  id          String   @id @db.Uuid
+  secretHash  String   @unique(map: "form_browser_groups_secret_hash_key") @map("secret_hash") @db.VarChar(64)
+  createdAt   DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  expiresAt   DateTime @map("expires_at") @db.Timestamptz(6)
+  memberships FormSessionGroupMembership[]
+
+  @@map("form_browser_groups")
+  @@schema("foundation")
+}
+
+// P05-02 form session group membership (S2): the thin 1:1 mapping of a
+// request_sessions.id issued through the F protocol to its browser group.
+// session_id is both the primary key and the P03 anchor reference — there is
+// no second anchor id, no second secret hash and no own expiry, revoke or
+// intake pair here; the anchor secret, expiry and provenance keep living in
+// request_sessions (013), so the same F token keeps authorizing
+// reserveFileUpload (014) and consent_records (013). The
+// form_session_group_memberships_guard trigger (23514) requires the browser
+// group and a live (unrevoked, unexpired) request session to exist, pins the
+// anchor expiry to the group expiry and pins created_at to the database clock
+// on INSERT; UPDATE and DELETE are refused.
+model FormSessionGroupMembership {
+  sessionId String   @id @map("session_id") @db.Uuid
+  groupId   String   @map("group_id") @db.Uuid
+  createdAt DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  group     FormBrowserGroup @relation(fields: [groupId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  session   RequestSession   @relation(fields: [sessionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([groupId], map: "form_session_group_memberships_group_id_idx")
+  @@map("form_session_group_memberships")
+  @@schema("foundation")
+}
+
+// P05-02 bounded fixed-window throttle counters for the form session issuance
+// paths. A bucket is a keyed counter, not a policy and not PII. Identity and
+// window columns are immutable, hit_count can only grow or stay (the
+// form_throttle_buckets_guard trigger refuses a decrease and any DELETE); a new
+// window is a new row keyed by UNIQUE(kind,key_hash,window_started_at).
+model FormThrottleBucket {
+  id              String   @id @db.Uuid
+  kind            String   @db.VarChar(16)
+  keyHash         String   @map("key_hash") @db.VarChar(64)
+  windowStartedAt DateTime @map("window_started_at") @db.Timestamptz(6)
+  windowSeconds   Int      @map("window_seconds")
+  hitCount        Int      @map("hit_count")
+
+  @@unique([kind, keyHash, windowStartedAt], map: "form_throttle_buckets_kind_key_hash_window_started_at_key")
+  @@map("form_throttle_buckets")
+  @@schema("foundation")
+}
+
+// ---------------------------------------------------------------------------
+// P05-03/P05-04 (S3, migration 024 request_intake_effects): command evidence,
+// submit receipts, phone permission, attachment interlock, coverage basis and
+// manual provenance. These are the tables the Prisma layer of P05 writes and
+// reads; every guard, immutability trigger, exact runtime column ACL and
+// deferred completeness constraint lives only in migration 024 SQL.
+//
+// Naming contract for this block: `onDelete: Restrict` wherever the SQL says
+// ON DELETE RESTRICT, and `onUpdate: NoAction` wherever the SQL omits the
+// ON UPDATE clause (PostgreSQL then stores NO ACTION, which is a different
+// catalog value than RESTRICT). The single exception is
+// request_files.intent_id -> open_state, which SQL declares ON UPDATE RESTRICT.
+//
+// Three things stay SQL-only and must not be "fixed" by regenerating this
+// schema: partial unique indexes (WHERE ...), CHECK constraints, and
+// DEFERRABLE INITIALLY DEFERRED foreign keys.
+// ---------------------------------------------------------------------------
+
+// Staff-side intake evidence: the exact reviewed procedure revision and the
+// declaration window a manual/no-call command was taken under. Append-only.
+// `request_staff_one_source_key` is a PARTIAL unique index
+// (WHERE purpose='MANUAL_INTAKE'): one request has at most one manual source.
+model RequestStaffEvidence {
+  id                String   @id @db.Uuid
+  requestId         String   @map("request_id") @db.Uuid
+  staffId           String   @map("staff_id") @db.Uuid
+  purpose           String   @db.VarChar(32)
+  procedureRevision String   @map("procedure_revision") @db.VarChar(68)
+  validUntil        DateTime @map("valid_until") @db.Timestamptz(6)
+  declaredAt        DateTime @default(dbgenerated("clock_timestamp()")) @map("declared_at") @db.Timestamptz(6)
+  request           Request  @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  staff             Staff    @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  phonePermissions  PhonePermissionEvent[]
+
+  @@unique([id, requestId])
+  @@map("request_staff_evidence")
+  @@schema("foundation")
+}
+
+// Durable command identity next to the receipt: one row per committed command
+// event, bound to the exact request event tuple and to its own audit/outbox rows.
+// The audit_id/outbox_id uniques make a second receipt for the same evidence
+// impossible; the composite FK pins (event, request, version, correlation, command).
+model RequestCommandReceipt {
+  eventId             String   @id @map("event_id") @db.Uuid
+  requestId           String   @map("request_id") @db.Uuid
+  version             Int
+  correlationId       String   @map("correlation_id") @db.Uuid
+  command             String   @db.VarChar(64)
+  keyId               String   @map("key_id") @db.VarChar(64)
+  fingerprint         Bytes
+  resultingStatus     String   @map("resulting_status") @db.VarChar(32)
+  auditId             String   @unique(map: "request_command_receipts_audit_id_key") @map("audit_id") @db.Uuid
+  outboxId            String   @unique(map: "request_command_receipts_outbox_id_key") @map("outbox_id") @db.Uuid
+  event               RequestEvent @relation(fields: [eventId, requestId, version, correlationId, command], references: [id, requestId, resultingVersion, correlationId, command], onDelete: Restrict, onUpdate: NoAction)
+  audit               AuditLog @relation(fields: [auditId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  outbox              OutboxEvent @relation(fields: [outboxId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  sessionSubmits      RequestSessionSubmit[]
+  phonePermissions    PhonePermissionEvent[]
+  coverageAssessments RequestCoverageAssessment[]
+
+  @@unique([eventId, requestId])
+  @@map("request_command_receipts")
+  @@schema("foundation")
+}
+
+// F-origin submit edge: exactly one immutable row per consumed F anchor and per
+// request. It binds the anchor tuple, the exact consent basis, the city/version
+// pair and the submit event, so an F submit cannot be re-pointed at another
+// request, city, customer or consent after the fact.
+model RequestSessionSubmit {
+  sessionId           String   @id @map("session_id") @db.Uuid
+  requestId           String   @unique(map: "request_session_submits_request_id_key") @map("request_id") @db.Uuid
+  customerId          String   @map("customer_id") @db.Uuid
+  intakeCityId        String   @map("intake_city_id") @db.Uuid
+  intakeCityVersionId String   @map("intake_city_version_id") @db.Uuid
+  consentId           String   @map("consent_id") @db.Uuid
+  documentId          String   @map("document_id") @db.Uuid
+  documentVersionId   String   @map("document_version_id") @db.Uuid
+  purpose             String   @default("REQUEST_PROCESSING") @db.VarChar(32)
+  action              String   @default("GIVEN") @db.VarChar(16)
+  eventId             String   @unique(map: "request_session_submits_event_id_key") @map("event_id") @db.Uuid
+  submitCommand       String   @map("submit_command") @db.VarChar(64)
+  cityPairRequest     Request  @relation("RequestSessionSubmitCityPair", fields: [requestId, intakeCityId, intakeCityVersionId], references: [id, cityId, intakeCityVersionId], onDelete: Restrict, onUpdate: NoAction)
+  customerPairRequest Request  @relation("RequestSessionSubmitCustomer", fields: [requestId, customerId], references: [id, customerId], onDelete: Restrict, onUpdate: NoAction)
+  anchorPair          RequestSession @relation("RequestSessionSubmitAnchor", fields: [sessionId, intakeCityId, intakeCityVersionId], references: [id, intakeCityId, intakeCityVersionId], onDelete: Restrict, onUpdate: NoAction)
+  consent             ConsentRecord @relation(fields: [consentId, sessionId, documentId, documentVersionId, purpose, action], references: [id, sessionId, documentId, documentVersionId, purpose, action], onDelete: Restrict, onUpdate: NoAction)
+  event               RequestEvent @relation("RequestEventSessionSubmits", fields: [eventId, requestId, submitCommand, sessionId], references: [id, requestId, command, actorSessionId], onDelete: Restrict, onUpdate: NoAction)
+  receipt             RequestCommandReceipt @relation(fields: [eventId, requestId], references: [eventId, requestId], onDelete: Restrict, onUpdate: NoAction)
+  files               RequestFile[]
+
+  @@unique([requestId, sessionId])
+  @@map("request_session_submits")
+  @@schema("foundation")
+}
+
+// Append-only PHONE permission history (§4.4). GIVEN carries no supersedes id;
+// REVOKED must name the exact GIVEN row of the same request/contact/purpose, so
+// one GIVEN has at most one REVOKED. `request_one_phone_given_key` is a PARTIAL
+// unique index (WHERE action='GIVEN'): one live GIVEN per contact revision.
+model PhonePermissionEvent {
+  id                String   @id @db.Uuid
+  requestId         String   @map("request_id") @db.Uuid
+  contactRevisionId String   @map("contact_revision_id") @db.Uuid
+  purpose           String   @default("REQUEST_SERVICE_CALL") @db.VarChar(32)
+  action            String   @db.VarChar(16)
+  supersedesGivenId String?  @unique(map: "phone_permission_events_supersedes_given_id_key") @map("supersedes_given_id") @db.Uuid
+  givenAction       String   @default("GIVEN") @map("given_action") @db.VarChar(16)
+  eventId           String   @unique(map: "phone_permission_events_event_id_key") @map("event_id") @db.Uuid
+  staffEvidenceId   String?  @map("staff_evidence_id") @db.Uuid
+  occurredAt        DateTime @default(dbgenerated("clock_timestamp()")) @map("occurred_at") @db.Timestamptz(6)
+  contactRevision   RequestContactRevision @relation(fields: [requestId, contactRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: NoAction)
+  supersedes        PhonePermissionEvent? @relation("PhonePermissionSupersedes", fields: [supersedesGivenId, requestId, contactRevisionId, purpose, givenAction], references: [id, requestId, contactRevisionId, purpose, action], onDelete: Restrict, onUpdate: NoAction)
+  supersededBy      PhonePermissionEvent[] @relation("PhonePermissionSupersedes")
+  receipt           RequestCommandReceipt @relation(fields: [eventId, requestId], references: [eventId, requestId], onDelete: Restrict, onUpdate: NoAction)
+  staffEvidence     RequestStaffEvidence? @relation(fields: [staffEvidenceId, requestId], references: [id, requestId], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([id, requestId, contactRevisionId, purpose, action])
+  @@map("phone_permission_events")
+  @@schema("foundation")
+}
+
+// P05 attachment interlock (§5.2): one READY publication per request, exactly
+// once. The (intent_id, open_state) FK to file_privacy_controls(intent_id,
+// delete_state) with open_state pinned to 'OPEN' is the DB backstop that makes an
+// attachment impossible while the intent is not OPEN — including a concurrent
+// OPEN -> PENDING_LEDGER transition by the old writer.
+model RequestFile {
+  requestId      String @map("request_id") @db.Uuid
+  ownerSessionId String @map("owner_session_id") @db.Uuid
+  intentId       String @unique(map: "request_files_intent_id_key") @map("intent_id") @db.Uuid
+  fileId         String @unique(map: "request_files_file_id_key") @map("file_id") @db.Uuid
+  openState      String @default("OPEN") @map("open_state") @db.VarChar(24)
+  submit         RequestSessionSubmit @relation(fields: [requestId, ownerSessionId], references: [requestId, sessionId], onDelete: Restrict, onUpdate: NoAction)
+  intent         FileUploadIntent @relation(fields: [intentId, ownerSessionId], references: [id, ownerRequestSessionId], onDelete: Restrict, onUpdate: NoAction)
+  publication    FilePublication @relation(fields: [intentId, fileId], references: [intentId, id], onDelete: Restrict, onUpdate: NoAction)
+  privacyControl FilePrivacyControl @relation(fields: [intentId, openState], references: [intentId, deleteState], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([requestId, fileId])
+  @@map("request_files")
+  @@schema("foundation")
+}
+
+// Exact reviewed brand (and brand version) snapshot of one appliance revision.
+// The entry/version FKs are kind-scoped so a brand cannot be pinned to another
+// catalog kind.
+model RequestApplianceBrand {
+  applianceRevisionId String @id @map("appliance_revision_id") @db.Uuid
+  requestId           String @map("request_id") @db.Uuid
+  brandId             String @map("brand_id") @db.Uuid
+  brandKind           String @default("BRAND") @map("brand_kind") @db.VarChar(16)
+  brandVersionId      String @map("brand_version_id") @db.Uuid
+  applianceRevision   RequestApplianceRevision @relation(fields: [requestId, applianceRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: NoAction)
+  brandEntry          CatalogDirectoryEntry @relation("RequestApplianceBrandEntry", fields: [brandId, brandKind], references: [id, kind], onDelete: Restrict, onUpdate: NoAction)
+  brandVersion        CatalogDirectoryVersion @relation("RequestApplianceBrandVersion", fields: [brandId, brandVersionId], references: [entryId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@map("request_appliance_brands")
+  @@schema("foundation")
+}
+
+// The admitted no-call channel choice of a request: exactly one per request, with
+// the catalog/option/readiness basis it was verified against.
+model RequestChannelChoice {
+  requestId        String   @id @map("request_id") @db.Uuid
+  provider         String   @db.VarChar(8)
+  catalogVersionId String   @map("catalog_version_id") @db.Uuid
+  optionVersionId  String   @map("option_version_id") @db.Uuid
+  readinessBasisId String   @map("readiness_basis_id") @db.Uuid
+  checkedAt        DateTime @default(dbgenerated("clock_timestamp()")) @map("checked_at") @db.Timestamptz(6)
+  request          Request  @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@map("request_channel_choices")
+  @@schema("foundation")
+}
+
+// Bounded append-only audit of one address-coverage review attempt. It is
+// committed on a separate guarded connection BEFORE the plaintext comparison, so
+// it deliberately has NO foreign key to the request or the address revision.
+model RequestAddressReviewAttempt {
+  evidenceId        String   @id @map("evidence_id") @db.Uuid
+  staffId           String   @map("staff_id") @db.Uuid
+  requestId         String   @map("request_id") @db.Uuid
+  addressRevisionId String   @map("address_revision_id") @db.Uuid
+  purpose           String   @db.VarChar(24)
+  correlationId     String   @unique(map: "request_address_review_attempts_correlation_id_key") @map("correlation_id") @db.Uuid
+  occurredAt        DateTime @default(dbgenerated("clock_timestamp()")) @map("occurred_at") @db.Timestamptz(6)
+  assessments       RequestCoverageAssessment[]
+
+  @@unique([correlationId, requestId, addressRevisionId, staffId], map: "request_address_review_attemp_correlation_id_request_id_add_key")
+  @@map("request_address_review_attempts")
+  @@schema("foundation")
+}
+
+// Immutable coverage assessment (§5.1): the exact address revision, the city and
+// city version, the selected same-city area version, the digest of the whole
+// normalized basis and the outcome/reason pair. The DB CHECKs in migration 024
+// enforce area_id <-> area_version_id and the outcome/reason combinations; the
+// attempt_correlation_id FK proves a committed review attempt exists first.
+model RequestCoverageAssessment {
+  id                   String   @id @db.Uuid
+  requestId            String   @map("request_id") @db.Uuid
+  addressRevisionId    String   @map("address_revision_id") @db.Uuid
+  cityId               String   @map("city_id") @db.Uuid
+  cityVersionId        String   @map("city_version_id") @db.Uuid
+  areaId               String?  @map("area_id") @db.Uuid
+  areaVersionId        String?  @map("area_version_id") @db.Uuid
+  basisDigest          String   @map("basis_digest") @db.VarChar(64)
+  outcome              String   @db.VarChar(16)
+  reason               String?  @db.VarChar(24)
+  staffId              String   @map("staff_id") @db.Uuid
+  attemptCorrelationId String   @unique(map: "request_coverage_assessments_attempt_correlation_id_key") @map("attempt_correlation_id") @db.Uuid
+  eventId              String   @unique(map: "request_coverage_assessments_event_id_key") @map("event_id") @db.Uuid
+  createdAt            DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  addressRevision      RequestAddressRevision @relation(fields: [requestId, addressRevisionId], references: [requestId, id], onDelete: Restrict, onUpdate: NoAction)
+  cityVersion          ServiceCityVersion @relation("RequestCoverageAssessmentCityVersion", fields: [cityId, cityVersionId], references: [cityId, id], onDelete: Restrict, onUpdate: NoAction)
+  areaVersion          ServiceAreaVersion? @relation("RequestCoverageAssessmentAreaVersion", fields: [areaId, cityId, areaVersionId], references: [areaId, cityId, id], onDelete: Restrict, onUpdate: NoAction)
+  cityPairRequest      Request  @relation("RequestCoverageAssessmentCity", fields: [requestId, cityId], references: [id, cityId], onDelete: Restrict, onUpdate: NoAction)
+  attempt              RequestAddressReviewAttempt @relation(fields: [attemptCorrelationId, requestId, addressRevisionId, staffId], references: [correlationId, requestId, addressRevisionId, staffId], onDelete: Restrict, onUpdate: NoAction)
+  staff                Staff    @relation(fields: [staffId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  receipt              RequestCommandReceipt @relation(fields: [eventId, requestId], references: [eventId, requestId], onDelete: Restrict, onUpdate: NoAction)
+  currentFor           Request[] @relation("RequestCurrentAssessment")
+
+  @@unique([requestId, addressRevisionId, id])
+  @@map("request_coverage_assessments")
+  @@schema("foundation")
+}
+
+// Manual intake provenance: the exact reviewed source entry/version and the
+// optional callback-interval reference, both kind-scoped to reference entries.
+model RequestIntakeProvenance {
+  requestId         String  @id @map("request_id") @db.Uuid
+  sourceEntryId     String  @map("source_entry_id") @db.Uuid
+  sourceVersionId   String  @map("source_version_id") @db.Uuid
+  sourceType        String  @default("REQUEST_SOURCE") @map("source_type") @db.VarChar(32)
+  callbackEntryId   String? @map("callback_entry_id") @db.Uuid
+  callbackVersionId String? @map("callback_version_id") @db.Uuid
+  callbackType      String  @default("CALLBACK_INTERVAL") @map("callback_type") @db.VarChar(32)
+  request           Request @relation(fields: [requestId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  source            ReferenceEntryVersion @relation("IntakeProvenanceSource", fields: [sourceEntryId, sourceType, sourceVersionId], references: [entryId, type, id], onDelete: Restrict, onUpdate: NoAction)
+  callback          ReferenceEntryVersion? @relation("IntakeProvenanceCallback", fields: [callbackEntryId, callbackType, callbackVersionId], references: [entryId, type, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@map("request_intake_provenance")
   @@schema("foundation")
 }

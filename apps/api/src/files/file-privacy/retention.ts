@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { ledgerGraphSha256 } from '../file-ledger/index.js';
 import type { LedgerGraph, LedgerItem, LedgerScope } from '../file-ledger/index.js';
+import { probeAttachmentInterlock } from '../file-lifecycle/authorization.js';
+import type { AttachmentInterlock } from '../file-lifecycle/authorization.js';
 import { refusePrivacy } from './contract.js';
 import type { AggregateOnly, DatabaseContext, HoldContext, HoldGrant, PrivacyContext, RetentionContext } from './contract.js';
 import { lockDecision, lockPrivacyRuntime, privacyAudit, privacyTx, requireFreshPolicy, T } from './db.js';
@@ -69,10 +71,63 @@ async function lockAttempts(client: PoolClient, intentId: string, cap: number): 
   return items;
 }
 
-async function decide(ctx: DatabaseContext, scope: LedgerScope, intentId: string, signal: AbortSignal): Promise<boolean> {
+/**
+ * P05 §5.2 attach/delete interlock: an attached intent is excluded from aging.
+ *
+ * `DRIFTED` (an intermediate schema, a missing FK/CHECK/UNIQUE, a deferrable
+ * interlock or a same-prefixed artifact) is never treated as "no attachments":
+ * the whole retention run fails closed with `NOT_CONFIGURED` instead of using the
+ * legacy query on a schema whose interlock cannot be proven.
+ */
+export function requireRetentionInterlock(mode: AttachmentInterlock): 'S3' | 'PRE_S3' {
+  if (mode === 'DRIFTED') {
+    return refusePrivacy('NOT_CONFIGURED');
+  }
+  return mode;
+}
+
+const ATTACHMENT_EXCLUSION = `NOT EXISTS (SELECT 1 FROM foundation.request_files rf WHERE rf.intent_id=i.id)`;
+
+/**
+ * Candidate selection. On the exact S3 profile an attached intent is excluded
+ * before the `LIMIT`, so it cannot consume a batch slot; on the exact pre-S3
+ * profile the reviewed relation does not exist and the legacy query is unchanged.
+ */
+export function retentionCandidateSql(mode: AttachmentInterlock): string {
+  const interlock = requireRetentionInterlock(mode);
+  return `WITH now AS MATERIALIZED (SELECT clock_timestamp() AS t)
+      SELECT i.id FROM ${T.intents} i CROSS JOIN now LEFT JOIN ${T.controls} c ON c.intent_id=i.id
+      WHERE (c.intent_id IS NULL OR (c.delete_state='OPEN' AND NOT c.hold_active))
+        AND (EXISTS (SELECT 1 FROM ${T.raw} a WHERE a.intent_id=i.id) OR EXISTS (SELECT 1 FROM ${T.sanitized} a WHERE a.intent_id=i.id))
+        AND (SELECT count(*) FROM (SELECT 1 FROM ${T.raw} a WHERE a.intent_id=i.id
+          UNION ALL SELECT 1 FROM ${T.sanitized} a WHERE a.intent_id=i.id LIMIT ($5::integer + 1)) bounded) <= $5::integer
+        ${interlock === 'S3' ? `AND ${ATTACHMENT_EXCLUSION}` : ''}
+        AND ${DUE} ORDER BY i.id LIMIT $6`;
+}
+
+/**
+ * Second, irreversible check after the intent/control locks: an attachment that
+ * committed while this planner waited must defer the decision. The S3 FK is the
+ * database backstop for the reverse order (a decision that wins must make a later
+ * attach refuse), this read is the application-side half of the same interlock.
+ */
+export function retentionAttachmentGuardSql(mode: AttachmentInterlock): string | undefined {
+  return requireRetentionInterlock(mode) === 'S3'
+    ? `SELECT rf.intent_id FROM foundation.request_files rf WHERE rf.intent_id=$1 LIMIT 1`
+    : undefined;
+}
+
+async function decide(ctx: DatabaseContext, scope: LedgerScope, intentId: string, signal: AbortSignal,
+  mode: AttachmentInterlock,
+): Promise<boolean> {
   return await privacyTx(ctx.pool, async (client) => {
     const row = await lockDecision(client, ctx, intentId, 'ACTIVE', true);
     if (row === undefined || row.delete_state !== 'OPEN' || row.hold_active) { return false; }
+    const attachmentGuard = retentionAttachmentGuardSql(mode);
+    if (attachmentGuard !== undefined) {
+      const { rows } = await client.query(attachmentGuard, [intentId]);
+      if (rows.length > 0) { return false; }
+    }
     const items = await lockAttempts(client, intentId, ctx.policy.maxItemsPerIntent);
     if (items === undefined || items.length === 0) { return false; }
     const { rows: [due] } = await client.query<{ due: boolean }>(`WITH now AS MATERIALIZED (SELECT clock_timestamp() AS t)
@@ -107,22 +162,19 @@ export async function planRetention(input: RetentionContext, abort: AbortSignal)
   const scope = scopeSnapshot(ctx.fields['scope'], ctx.epoch);
   const signal = nativeSignal(abort);
   checkSignal(signal);
-  const candidates = await privacyTx(ctx.pool, async (client) => {
+  const planned = await privacyTx(ctx.pool, async (client) => {
     await lockPrivacyRuntime(client, ctx, 'ACTIVE');
-    const { rows } = await client.query<{ id: string }>(`WITH now AS MATERIALIZED (SELECT clock_timestamp() AS t)
-      SELECT i.id FROM ${T.intents} i CROSS JOIN now LEFT JOIN ${T.controls} c ON c.intent_id=i.id
-      WHERE (c.intent_id IS NULL OR (c.delete_state='OPEN' AND NOT c.hold_active))
-        AND (EXISTS (SELECT 1 FROM ${T.raw} a WHERE a.intent_id=i.id) OR EXISTS (SELECT 1 FROM ${T.sanitized} a WHERE a.intent_id=i.id))
-        AND (SELECT count(*) FROM (SELECT 1 FROM ${T.raw} a WHERE a.intent_id=i.id
-          UNION ALL SELECT 1 FROM ${T.sanitized} a WHERE a.intent_id=i.id LIMIT ($5::integer + 1)) bounded) <= $5::integer
-        AND ${DUE} ORDER BY i.id LIMIT $6`, [...ages(ctx), ctx.policy.maxItemsPerIntent, ctx.policy.maxBatch]);
+    // Explicit interlock probe: catalog facts only, never a caught SQL error.
+    const mode = await probeAttachmentInterlock(client);
+    const { rows } = await client.query<{ id: string }>(retentionCandidateSql(mode),
+      [...ages(ctx), ctx.policy.maxItemsPerIntent, ctx.policy.maxBatch]);
     await requireFreshPolicy(client, ctx);
-    return rows;
+    return { mode, rows };
   });
   let advanced = 0;
-  for (const { id } of candidates) {
+  for (const { id } of planned.rows) {
     checkSignal(signal);
-    if (await decide(ctx, scope, id, signal)) { advanced++; }
+    if (await decide(ctx, scope, id, signal, planned.mode)) { advanced++; }
   }
-  return { examined: candidates.length, advanced, deferred: candidates.length - advanced };
+  return { examined: planned.rows.length, advanced, deferred: planned.rows.length - advanced };
 }

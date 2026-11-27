@@ -23,12 +23,14 @@ vi.mock('node:fs/promises', () => ({
 // @ts-expect-error The local synthetic infrastructure is native ESM, not an API TS module.
 import * as infrastructure from '../../../infra/file-processing/docker-test-launcher.mjs';
 
-const { createFileProcessingTestLauncher, syntheticSnapshotDigest, DECODER_IMAGE, DECODER_PLATFORM_SHA,
-  SCANNER_IMAGE, SCANNER_PLATFORM_SHA } = infrastructure as {
+const { createFileProcessingTestLauncher, syntheticSnapshotDigest, DECODER_CONFIG_SHA, DECODER_PLATFORM_SHA,
+  SCANNER_CONFIG_SHA, SCANNER_PLATFORM_SHA } = infrastructure as {
   createFileProcessingTestLauncher: (config: unknown) => Promise<{ launcher: FileProcessingLauncher; epoch: DefinitionEpoch }>;
   syntheticSnapshotDigest: (path: string) => Promise<string>;
-  DECODER_IMAGE: string; DECODER_PLATFORM_SHA: string; SCANNER_IMAGE: string; SCANNER_PLATFORM_SHA: string;
+  DECODER_CONFIG_SHA: string; DECODER_PLATFORM_SHA: string; SCANNER_CONFIG_SHA: string; SCANNER_PLATFORM_SHA: string;
 };
+const scannerImageId = SCANNER_CONFIG_SHA;
+const decoderImageId = DECODER_CONFIG_SHA;
 const id = '1'.repeat(64);
 const unknown = { name: 'UnknownWorkerSettlementError', message: 'Synthetic worker settlement unknown' };
 const fixtureRoot = resolve('node_modules', '.cache', 'p0304cde', 'launcher-mock');
@@ -74,9 +76,13 @@ function fixtureDescriptor() {
   for (const name of fakeNames) { h.update(`${name}\t${String(fakeBytes.length)}\t${fileDigest}\n`); }
   const limits = { cpuMilli: 1000, memoryMiB: 1200, pids: 32, tmpfsMiB: 32, wallMs: 750 };
   return {
-    snapshotDir: fixtureRoot, decoderImage: DECODER_IMAGE,
+    snapshotDir: fixtureRoot, scannerImageId, decoderImage: decoderImageId,
     epoch: { engineVersion: '1.4.7', engineImageSha256: SCANNER_PLATFORM_SHA.slice(7),
       defsSha256: h.digest('hex'), defsBuiltAt: '2026-11-21T06:27:04Z' },
+    imageIdentity: { scannerConfigSha256: SCANNER_CONFIG_SHA.slice(7),
+      scannerPlatformSha256: SCANNER_PLATFORM_SHA.slice(7),
+      decoderConfigSha256: DECODER_CONFIG_SHA.slice(7),
+      decoderPlatformSha256: DECODER_PLATFORM_SHA.slice(7) },
     scanner: { ...limits, dailyRevision: 28190, maxFileBytes: 4096, maxScanBytes: 8192, maxFiles: 64, maxRecursion: 8 },
     decoder: limits,
   };
@@ -85,8 +91,8 @@ function fixtureDescriptor() {
 function normal(rpc: Rpc, args: string[]): Reply {
   switch (rpc) {
     case 'context': return { stdout: 'unix:///var/run/docker.sock\n' };
-    case 'image': return { stdout: args.at(-1) === SCANNER_IMAGE ? `linux/amd64 ${SCANNER_PLATFORM_SHA}\n` :
-      args.includes('--platform') ? `linux/amd64 ${DECODER_PLATFORM_SHA}\n` : `${DECODER_IMAGE}\n` };
+    case 'image': return { stdout: args.at(-1) === scannerImageId
+      ? `${scannerImageId} linux/amd64\n` : `${decoderImageId} linux/amd64\n` };
     case 'create': return { stdout: `${id}\n` };
     case 'start': return { stdout: phase === 'preflight' ? 'ClamAV 1.4.7/28190/Sat Nov 21 06:27:04 2026\n' : 'stdin: OK\n' };
     case 'inspect': return { stdout: 'exited 0 false\n' };
@@ -136,11 +142,18 @@ describe('bounded Docker synthetic fixture', () => {
     expect(operations()).toEqual([]);
   });
 
-  it('refuses an index with the wrong inspected linux/amd64 child before creating containers', async () => {
-    scenario = (rpc, args) => rpc === 'image' && args.includes('--platform') && args.at(-1) === DECODER_IMAGE ?
-      { stdout: `linux/amd64 sha256:${'f'.repeat(64)}\n` } : undefined;
+  it('refuses a descriptor with the wrong pinned linux/amd64 manifest before inspecting Docker', async () => {
+    const fixture = fixtureDescriptor();
+    fixture.imageIdentity.decoderPlatformSha256 = 'f'.repeat(64);
+    await expect(createFileProcessingTestLauncher(fixture)).rejects.toThrow('Synthetic worker unavailable or misconfigured');
+    expect(operations()).toEqual([]);
+  });
+
+  it('refuses a local image whose config digest differs from the verified Buildx metadata', async () => {
+    scenario = (rpc, args) => rpc === 'image' && args.at(-1) === scannerImageId
+      ? { stdout: `sha256:${'f'.repeat(64)} linux/amd64\n` } : undefined;
     await expect(createFileProcessingTestLauncher(fixtureDescriptor())).rejects.toThrow('Synthetic worker unavailable or misconfigured');
-    expect(operations()).toEqual(['context', 'image', 'image', 'image']);
+    expect(operations()).toEqual(['context', 'image']);
   });
 
   it('bounds an unresponsive metadata RPC even if the local CLI never closes', async () => {

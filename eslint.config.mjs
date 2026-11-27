@@ -6,7 +6,7 @@ import nextPlugin from '@next/eslint-plugin-next';
 
 export default [
   {
-    ignores: ['**/node_modules/**', '**/dist/**', '**/coverage/**', '**/.next/**', 'apps/api/src/generated/**'],
+    ignores: ['**/node_modules/**', '**/dist/**', '**/build/**', '**/coverage/**', '**/.next/**', 'apps/api/src/generated/**', 'test-results/**', 'playwright-report/**'],
   },
   js.configs.recommended,
   {

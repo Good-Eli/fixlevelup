@@ -8,12 +8,20 @@ import { OutboxStore } from '../src/infrastructure/outbox/outbox-store.js';
 import type { OutboxLease } from '../src/infrastructure/outbox/outbox-store.js';
 import { OutboxWorker } from '../src/infrastructure/outbox/outbox-worker.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
+import { admitFixture } from './admission-fixture.js';
+import { authFixtureMigrations, installPinnedMigrationHistory } from './auth-db-fixture.js';
+import { loadP05LabTarget } from './p05-lab-target.js';
+import { pinFreshFileDatabase } from './owned-test-database.js';
+
+const lab = () => process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1' ? loadP05LabTarget() : undefined;
+import type { AdmittedHandle } from './admission-fixture.js';
 
 const root = resolve(import.meta.dirname, '../../..');
 const databaseName = `fixlevelup_p019a_worker_${randomBytes(6).toString('hex')}`;
 const clients: Client[] = [];
 const stores: OutboxStore[] = [];
 const workers: OutboxWorker[] = [];
+let admission: AdmittedHandle;
 let config: DatabaseConfig;
 let migrator: Client;
 let runtime: Client;
@@ -141,52 +149,105 @@ async function commandCounts(commandId: string): Promise<{ effects: number; audi
   return counts;
 }
 
-describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
+describe.runIf(process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1')('real PostgreSQL outbox leases (P01-01.9A)', () => {
+  // Set exactly when this run's CREATE DATABASE succeeded (below): the flag plus the
+  // strict disposable-name pattern gate the teardown drop to this run's own database.
+  let dbCreated = false;
+
+  /** Drops exactly the disposable database this run created, from the maintenance
+  * connection, after this run's clients/pools were ended. FORCE handles stragglers. */
+  async function dropFixtureDatabase(): Promise<void> {
+    if (!dbCreated) { return; }
+    if (!/^fixlevelup_p019a_worker_[a-f0-9]{12}$/.test(databaseName)) {
+      throw new Error('Refusing to drop a non-fixture database');
+    }
+    dbCreated = false;
+    const target = lab();
+    const admin = target ? await target.openMaintenance() : new Client({ host: '127.0.0.1', port: 55432, database: 'postgres', user: 'fixlevelup_dev',
+      password: credential(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'), 'POSTGRES_PASSWORD'),
+      connectionTimeoutMillis: 3000, statement_timeout: 3000, query_timeout: 4000 });
+    try {
+      if (target) {
+        await admin.query('SET ROLE fixlevelup_migrator');
+        const dispose = await pinFreshFileDatabase(admin, databaseName);
+        await dispose(admin);
+      } else {
+        await admin.connect();
+        await admin.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+      }
+    } finally {
+      await admin.end().catch(() => undefined);
+    }
+  }
+
   beforeAll(async () => {
     // Read ignored credentials only in memory. Never log configs, passwords, URLs or env contents.
-    const adminPassword = credential(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'), 'POSTGRES_PASSWORD');
-    const toolingEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const migratorPassword = credential(toolingEnv, 'FIXLEVELUP_MIGRATOR_PASSWORD');
-    const runtimePassword = credential(toolingEnv, 'FIXLEVELUP_RUNTIME_PASSWORD');
-    const admin = await connect('fixlevelup_dev', adminPassword, 'fixlevelup_dev');
+    const target = lab();
+    const toolingEnv = target ? '' : readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
+    const migratorPassword = target?.migrator.password ?? credential(toolingEnv, 'FIXLEVELUP_MIGRATOR_PASSWORD');
+    const runtimePassword = target?.runtime.password ?? credential(toolingEnv, 'FIXLEVELUP_RUNTIME_PASSWORD');
+    const admin = target ? await target.openMaintenance() : await connect('fixlevelup_dev',
+      credential(readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8'), 'POSTGRES_PASSWORD'), 'postgres');
+    if (target) { clients.push(admin); }
     // The name is generated above from a fixed prefix and twelve hexadecimal characters.
     await admin.query(`CREATE DATABASE "${databaseName}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${databaseName}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${databaseName}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    migrator = await connect('fixlevelup_migrator', migratorPassword);
-    await migrator.query('REVOKE CREATE ON SCHEMA public FROM PUBLIC');
-    for (const migration of [
-      '20261120000100_technical_audit_outbox',
-      '20261120000200_technical_outbox_attempts',
-      '20261120000300_technical_outbox_leases',
-    ]) {
-      await migrator.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
+    // CREATE is the reuse guard: an existing name is a hard error, so a successful
+    // CREATE proves this run owns the disposable database (the flag gates the drop).
+    dbCreated = true;
+    try {
+      if (target) { await admin.query('SET ROLE fixlevelup_migrator'); }
+      await admin.query(`REVOKE ALL ON DATABASE "${databaseName}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${databaseName}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      migrator = await connect('fixlevelup_migrator', migratorPassword);
+      await migrator.query('REVOKE CREATE ON SCHEMA public FROM PUBLIC');
+      // A business worker is admitted only on a complete, reviewed profile.
+      for (const migration of authFixtureMigrations) {
+        await migrator.query(readFileSync(resolve(root, 'prisma/migrations', migration, 'migration.sql'), 'utf8'));
+      }
+      await installPinnedMigrationHistory(migrator);
+      await migrator.query(`CREATE SCHEMA outbox_test;
+        REVOKE ALL ON SCHEMA outbox_test FROM PUBLIC;
+        GRANT USAGE ON SCHEMA outbox_test TO fixlevelup_runtime;
+        CREATE TABLE outbox_test.command_effects(command_id uuid PRIMARY KEY);
+        GRANT SELECT, INSERT ON outbox_test.command_effects TO fixlevelup_runtime`);
+      runtime = await connect('fixlevelup_runtime', runtimePassword);
+      contender = await connect('fixlevelup_runtime', runtimePassword);
+      config = { host: '127.0.0.1', port: 55432, database: databaseName,
+        user: 'fixlevelup_runtime', password: runtimePassword };
+      // P05-01: the stores/workers are admitted through the launch gate — a real
+      // migrator-held witness in this isolated DB pins the admission.
+      admission = await admitFixture(migrator, databaseName, 'WORKER');
+      first = new OutboxStore(config, admission.authorization);
+      stores.push(first);
+      second = new OutboxStore(config, admission.authorization);
+      stores.push(second);
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await Promise.allSettled([
+        ...stores.map(async (store) => { await store.close(); }),
+        ...clients.map(async (client) => { await client.end(); }),
+      ]);
+      await dropFixtureDatabase().catch(() => undefined);
+      throw error;
     }
-    // Direct SQL fixtures do not run Prisma migrate; its private metadata table stays test-local.
-    await migrator.query('CREATE TABLE IF NOT EXISTS foundation._prisma_migrations(id text PRIMARY KEY)');
-    await migrator.query(`CREATE SCHEMA outbox_test;
-      REVOKE ALL ON SCHEMA outbox_test FROM PUBLIC;
-      GRANT USAGE ON SCHEMA outbox_test TO fixlevelup_runtime;
-      CREATE TABLE outbox_test.command_effects(command_id uuid PRIMARY KEY);
-      GRANT SELECT, INSERT ON outbox_test.command_effects TO fixlevelup_runtime`);
-    runtime = await connect('fixlevelup_runtime', runtimePassword);
-    contender = await connect('fixlevelup_runtime', runtimePassword);
-    config = { host: '127.0.0.1', port: 55432, database: databaseName,
-      user: 'fixlevelup_runtime', password: runtimePassword };
-    first = new OutboxStore(config);
-    stores.push(first);
-    second = new OutboxStore(config);
-    stores.push(second);
   }, 30_000);
 
   afterAll(async () => {
-    // Keep the isolated database for inspection; never drop or truncate it or the development DB.
+    // The isolated database created above is dropped by this run's own teardown
+    // (exactly that name, after every resource of this run was closed); the
+    // development database is never dropped or truncated.
     const stopped = await Promise.allSettled(workers.map(async (worker) => { await worker.onModuleDestroy(); }));
     const closed = await Promise.allSettled(stores.map(async (store) => { await store.close(); }));
+    const released = await Promise.allSettled([admission.release()]);
     const ended = await Promise.allSettled(clients.map(async (client) => { await client.end(); }));
-    for (const result of [...stopped, ...closed, ...ended]) {
+    let dropError: Error | undefined;
+    try { await dropFixtureDatabase(); } catch (error) {
+      dropError = error instanceof Error ? error : new Error(String(error));
+    }
+    for (const result of [...stopped, ...closed, ...released, ...ended]) {
       if (result.status === 'rejected') { throw new Error('Failed to close an isolated outbox test resource'); }
     }
+    if (dropError !== undefined) { throw dropError; }
   });
 
   it('gives one event to exactly one of two concurrent owners and completes only once', async () => {
@@ -438,7 +499,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const scheduled = vi.spyOn(globalThis, 'setTimeout');
     const cleared = vi.spyOn(globalThis, 'clearTimeout');
     const close = vi.spyOn(OutboxStore.prototype, 'close');
-    const worker = new OutboxWorker(config, logger);
+    const worker = new OutboxWorker(config, logger, new Map(), admission.authorization);
     workers.push(worker);
     try {
       await worker.runOnce();
@@ -471,7 +532,8 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const handler = vi.fn<(lease: OutboxLease, signal: AbortSignal) => Promise<void>>(() => Promise.resolve());
     const logger = new SafeLogger('worker');
     const log = vi.spyOn(logger, 'event').mockImplementation(() => undefined);
-    const worker = new OutboxWorker(config, logger, new Map([[type, handler]]));
+    const testLaunch = await admitFixture(migrator, databaseName, 'WORKER');
+    const worker = new OutboxWorker(config, logger, new Map([[type, handler]]), testLaunch.authorization);
     workers.push(worker);
     const hide = missing === 'metadata'
       ? 'ALTER TABLE foundation._prisma_migrations RENAME TO _prisma_migrations_test_hidden'
@@ -488,6 +550,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     } finally {
       await worker.onModuleDestroy();
       await migrator.query(restore);
+      await testLaunch.release();
       log.mockRestore();
     }
     expect(await row(fixture.id)).toEqual(before);
@@ -497,7 +560,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const type = eventType();
     const fixture = await seed(type);
     const handler = vi.fn<(lease: OutboxLease, signal: AbortSignal) => Promise<void>>(() => Promise.resolve());
-    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]));
+    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]), admission.authorization);
     workers.push(worker);
     try {
       await worker.runOnce();
@@ -521,7 +584,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
     const handler = vi.fn((): Promise<void> => Promise.reject(new Error(canary)));
     const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     const errors = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]));
+    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]), admission.authorization);
     workers.push(worker);
     try {
       await worker.runOnce();
@@ -558,7 +621,7 @@ describe('real PostgreSQL outbox leases (P01-01.9A)', () => {
       handlerFinished = true;
     });
     const close = vi.spyOn(OutboxStore.prototype, 'close');
-    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]));
+    const worker = new OutboxWorker(config, new SafeLogger('worker'), new Map([[type, handler]]), admission.authorization);
     workers.push(worker);
     const pending = worker.runOnce();
     try {

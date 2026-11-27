@@ -1,13 +1,15 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
 import {
-  GEO_SCOPE_CONTRACT, isCapability, isGeoCapability, isP03Capability, isP04Capability, isPermissionCode, P03_CAPABILITY_METADATA,
-  P04_SCOPE_CONTRACT, p04Module, PERMISSION_CONTRACT, PERMISSION_CODES, PROTECTED_CAPABILITIES,
+  GEO_SCOPE_CONTRACT, isCapability, isGeoCapability, isP03Capability, isP04Capability, isP05Capability, isPermissionCode,
+  P03_CAPABILITY_METADATA, P04_SCOPE_CONTRACT, P05_CAPABILITIES, P05_MODULE, P05_SCOPE_CONTRACT, p04Module, PERMISSION_CONTRACT,
+  PERMISSION_CODES, PROTECTED_CAPABILITIES,
 } from '../authz/capability.js';
-import type { GeoCapability, GrantScope, PermissionCode } from '../authz/capability.js';
+import type { GeoCapability, GrantScope, P05Capability, PermissionCode } from '../authz/capability.js';
 import { isSystemAdmin } from '../authz/authorization.service.js';
 import type { AccessView, EffectiveRole } from '../authz/authorization.service.js';
 import { holdsGlobalP03, p03GrantableScopes } from '../authz/p03-grants.js';
 import { holdsGlobalP04, p04GrantableScopes } from '../authz/p04-grants.js';
+import { p05GrantableScopes } from '../authz/p05-grants.js';
 
 export interface RoleGrant { code: PermissionCode; scope: GrantScope }
 export interface PermissionDto extends RoleGrant {
@@ -54,6 +56,7 @@ export function grantableScopes(code: PermissionCode, target: Pick<EffectiveRole
   if (isCapability(code)) { return [PERMISSION_CONTRACT[code]]; }
   if (isP03Capability(code)) { return p03GrantableScopes(code, target); }
   if (isP04Capability(code)) { return p04GrantableScopes(code, target); }
+  if (isP05Capability(code)) { return p05GrantableScopes(code, target); }
   if (target.type === 'SYSTEM' && target.code === 'TECHNICIAN') { return []; }
   const admin = isSystemAdmin({ id: '', type: target.type, code: target.code });
   if (code === 'geography.publish' && !admin) { return []; }
@@ -61,11 +64,21 @@ export function grantableScopes(code: PermissionCode, target: Pick<EffectiveRole
 }
 
 export function replacement(body: unknown): RoleGrant[] {
-  const obj = fields(body, ['permissions']);
+  return [...permissionReplacement(body).grants];
+}
+
+export interface PermissionReplacement { readonly grants: readonly RoleGrant[]; readonly revokeP05: readonly P05Capability[] }
+
+/** The legacy body is `{permissions:[...]}` and keeps its exact meaning. P05 grants are
+ * never issued or expanded through this wire; the only additive field is an explicit
+ * revocation list, because a pre-P05 client cannot express a revoke and must not have
+ * one inferred from an omission. */
+export function permissionReplacement(body: unknown): PermissionReplacement {
+  const obj = fields(body, ['permissions', 'revokeP05Permissions']);
   const input = obj['permissions'];
   if (!Object.hasOwn(obj, 'permissions') || !Array.isArray(input) || input.length > PERMISSION_CODES.length) { throw new BadRequestException(); }
   const seen = new Set<PermissionCode>();
-  return input.map((item: unknown): RoleGrant => {
+  const grants = input.map((item: unknown): RoleGrant => {
     const entry = fields(item, ['code', 'scope']);
     const code = entry['code'];
     if (!Object.hasOwn(entry, 'code') || !Object.hasOwn(entry, 'scope') || !isPermissionCode(code) || seen.has(code)) { throw new BadRequestException(); }
@@ -76,6 +89,15 @@ export function replacement(body: unknown): RoleGrant[] {
     seen.add(code);
     return { code, scope: scope as GrantScope };
   });
+  const raw = obj['revokeP05Permissions'];
+  if (raw === undefined) { return { grants, revokeP05: [] }; }
+  if (!Array.isArray(raw) || raw.length > P05_CAPABILITIES.length) { throw new BadRequestException(); }
+  const revokeP05: P05Capability[] = [];
+  for (const item of raw) {
+    if (!isP05Capability(item) || revokeP05.includes(item)) { throw new BadRequestException(); }
+    revokeP05.push(item);
+  }
+  return { grants, revokeP05 };
 }
 
 /** A database catalog entry alone is not an implemented server contract. Geography rows
@@ -98,6 +120,12 @@ export function catalogEntry(row: { code: string; description: string; module: s
     const scopes = P04_SCOPE_CONTRACT[row.code];
     return { ...row, code: row.code, scope: scopes[0], scopes };
   }
+  if (isP05Capability(row.code)) {
+    // The whole P05 contract lives in the exact `requests` module and is never protected.
+    if (row.protected || row.module !== P05_MODULE) { return null; }
+    const scopes = P05_SCOPE_CONTRACT[row.code];
+    return { ...row, code: row.code, scope: scopes[0], scopes };
+  }
   if (!isGeoCapability(row.code) || row.protected) { return null; }
   const scopes = GEO_SCOPE_CONTRACT[row.code];
   return { code: row.code, module: row.module, description: row.description, protected: false, scope: 'CITY', scopes };
@@ -110,10 +138,33 @@ function holdsGlobalGeo(actor: AccessView, code: GeoCapability): boolean {
 
 /** Called on the locked policy snapshot, before making any permission write. The list is
  * authoritative: we neither silently preserve omitted ADMIN grants nor synthesize grants. */
-export function checkReplacement(actor: AccessView, target: EffectiveRole, catalog: readonly PermissionDto[], current: readonly RoleGrant[], desired: readonly RoleGrant[]): void {
+export function checkReplacement(actor: AccessView, target: EffectiveRole, catalog: readonly PermissionDto[],
+  current: readonly RoleGrant[], desired: readonly RoleGrant[], revokeP05: readonly P05Capability[] = []): void {
   if (!isSystemAdmin(actor.role)) { throw new ForbiddenException(); }
   const targetAdmin = isSystemAdmin(target);
   if (targetAdmin && PROTECTED_CAPABILITIES.some((code) => !desired.some((g) => g.code === code))) { throw new ForbiddenException(); }
+  // P05 is a closed, operator-provisioned surface. The ordinary release composition
+  // never issues or expands it through this writer:
+  //  - a desired pair must be exactly an already enabled pair (retention, not delegation);
+  //  - an enabled grant omitted from the legacy body is refused as an incomplete
+  //    authority set instead of being silently preserved or silently revoked;
+  //  - a revocation must be explicit and name a currently enabled P05 grant.
+  const p05Current = current.filter((grant): grant is RoleGrant & { code: P05Capability } => isP05Capability(grant.code));
+  const p05Desired = desired.filter((grant): grant is RoleGrant & { code: P05Capability } => isP05Capability(grant.code));
+  const revoked = new Set<P05Capability>(revokeP05);
+  for (const code of revoked) {
+    if (!p05Current.some((grant) => grant.code === code)) { throw new ConflictException(); }
+    if (p05Desired.some((grant) => grant.code === code)) { throw new BadRequestException(); }
+  }
+  for (const grant of p05Current) {
+    if (revoked.has(grant.code)) { continue; }
+    if (!p05Desired.some((next) => next.code === grant.code && next.scope === grant.scope)) { throw new ConflictException(); }
+  }
+  for (const grant of p05Desired) {
+    if (!p05Current.some((existing) => existing.code === grant.code && existing.scope === grant.scope)) {
+      throw new ForbiddenException();
+    }
+  }
   for (const grant of desired) {
     const item = catalog.find(({ code }) => code === grant.code);
     if (!item || !grantableScopes(grant.code, target).includes(grant.scope)) { throw new BadRequestException(); }
@@ -123,6 +174,10 @@ export function checkReplacement(actor: AccessView, target: EffectiveRole, catal
       && current.some((g) => g.code === grant.code && g.scope === grant.scope);
     if (isCapability(grant.code)) {
       if ((item.protected && !targetAdmin) || (!actor.permissions.includes(grant.code) && !mayRetain)) { throw new ForbiddenException(); }
+      continue;
+    }
+    if (isP05Capability(grant.code)) {
+      // Only retention reached this point; it never confers a new P05 right on the actor.
       continue;
     }
     // Domain grants are delegable only when the actor independently owns that exact

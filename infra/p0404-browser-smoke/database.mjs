@@ -2,15 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as wait } from 'node:timers/promises';
 import { bootstrapFirstAdmin } from '../../apps/api/dist/staff/bootstrap.js';
 import { hashPassword } from '../../apps/api/dist/staff/password.js';
-import { connection, Pool, token, verifyIdentity } from './isolation.mjs';
+import { adminRole, connection, controlIdentity, Pool, token, verifyContour, verifyIdentity } from './isolation.mjs';
 import { deploy } from './migrations.mjs';
+import { artifactDigest, compileLauncherModules, createControlContour, physicalContractDigest } from '../p0305-browser-smoke/launch.mjs';
 
 const runtimeRole = 'fixlevelup_runtime';
 const ownerRole = 'fixlevelup_migrator';
-const adminRole = 'p0404_postgres';
-function pool(namespace, role, password) {
+function pool(namespace, role, password, timeoutMs = 12_000) {
   return new Pool({ ...connection(namespace, role, password), max: 1, connectionTimeoutMillis: 1000,
-    statement_timeout: 12000, query_timeout: 13000, idleTimeoutMillis: 1000 });
+    statement_timeout: timeoutMs, query_timeout: timeoutMs + 1000, idleTimeoutMillis: 1000 });
 }
 async function waitForPostgres(admin) {
   for (let attempt = 0; attempt < 50; attempt++) {
@@ -21,10 +21,18 @@ async function waitForPostgres(admin) {
 }
 
 export async function provision(namespace) {
-  const admin = pool(namespace, adminRole, process.env['P0404_PG_BOOTSTRAP']);
+  const adminPassword = process.env['P0404_PG_BOOTSTRAP'];
+  if (typeof adminPassword !== 'string' || !/^[a-f0-9]{64}$/u.test(adminPassword)) {
+    throw new Error('Disposable database token missing');
+  }
+  const operator = Object.freeze({ host: '127.0.0.1', port: 55432, user: adminRole, password: adminPassword });
+  const admin = pool(namespace, adminRole, adminPassword, 60_000);
   const runtimePassword = token(), migratorPassword = token();
+  let control;
   try {
     await waitForPostgres(admin);
+    // The cluster must be provably fresh BEFORE anything is created: this is
+    // also the only place the "no preexisting databases" invariant is checked.
     await verifyIdentity(admin, namespace, adminRole, 'fresh');
     // Identifier/password interpolation is confined to fixed identifiers and generated hex.
     await admin.query(`CREATE ROLE ${ownerRole} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '${migratorPassword}';
@@ -35,7 +43,13 @@ export async function provision(namespace) {
       CREATE SCHEMA foundation AUTHORIZATION ${ownerRole};
       REVOKE ALL ON SCHEMA foundation FROM PUBLIC;
       REVOKE CREATE ON SCHEMA public FROM PUBLIC`);
-  } finally { await admin.end(); }
+    // Separate disposable control contour (plan §7): its own database with its
+    // own owner and its own narrow launcher role; the application roles get no
+    // CONNECT on it. Created by the reviewed registry module, then read back.
+    const modules = await compileLauncherModules();
+    control = await createControlContour({ admin, owner: operator, marker: namespace.marker, modules });
+    await verifyContour(admin, namespace, control, control.facts);
+  } finally { await admin.end().catch(() => undefined); }
 
   const migrator = pool(namespace, ownerRole, migratorPassword);
   migrator.on('error', () => {});
@@ -43,7 +57,7 @@ export async function provision(namespace) {
   const manager = { login: `p0404-manager-${randomUUID()}`, password: token() };
   try {
     await verifyIdentity(migrator, namespace, ownerRole, 'migrator');
-    await deploy(migrator, namespace.database, migratorPassword);
+    const history = await deploy(migrator);
     administrator.id = (await bootstrapFirstAdmin(migrator, administrator)).staffId;
     const client = await migrator.connect();
     try {
@@ -60,7 +74,23 @@ export async function provision(namespace) {
       await client.query('COMMIT');
     } catch (error) { await client.query('ROLLBACK'); throw error; }
     finally { client.release(); }
-    return { administrator, manager, migrator, runtimePassword };
+    const identity = await migrator.query('SELECT oid FROM pg_database WHERE datname=current_database()');
+    const databaseOid = identity.rows[0]?.oid;
+    if (!Number.isSafeInteger(databaseOid) || databaseOid <= 0) { throw new Error('Application database OID missing'); }
+    const { database, role } = controlIdentity(namespace.marker);
+    if (control.database !== database || control.role !== role) { throw new Error('Control contour mismatch'); }
+    // Mutable fixture record: commissioning adds the created city IDs to it.
+    // Only the nested connection/contour facts are frozen.
+    return {
+      administrator, manager, migrator, runtimePassword, databaseOid,
+      database: Object.freeze(connection(namespace, runtimeRole, runtimePassword)),
+      operator: Object.freeze(connection(namespace, ownerRole, migratorPassword)),
+      control,
+      artifact: await artifactDigest(),
+      physical: await physicalContractDigest(),
+      history: history.historyManifestDigest,
+      migrationReport: Object.freeze({ applied: history.applied, chain: history.chain, excluded: history.excluded }),
+    };
   } catch (error) { await migrator.end(); throw error; }
 }
 

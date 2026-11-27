@@ -17,6 +17,7 @@ RUN corepack pnpm peers check
 RUN corepack pnpm run db:generate
 
 FROM source AS proof
-# Runtime proof is invoked with Docker --network none. No host source/secret mounts,
-# Docker socket, service networks or ports are exposed to the test container.
+# Runtime proof is invoked with Docker --network none. Its only host bind mount
+# is the empty runner-temp directory dedicated to redacted JSON evidence output;
+# no host source, credentials, Docker socket, service networks or ports are exposed.
 CMD ["node", "infra/linux-proof/run.mjs"]

@@ -1,20 +1,23 @@
 import type { OnModuleDestroy } from '@nestjs/common';
-import { Pool } from 'pg';
 import type { DatabaseConfig } from '../infrastructure/database/runtime-database.js';
+import { admittedPool } from '../infrastructure/admission/pool-guard.js';
+import type { GuardedPool } from '../infrastructure/admission/pool-guard.js';
+import type { ProcessAuthorization } from '../infrastructure/admission/process-admission.js';
 import { AuthorizationService } from './authorization.service.js';
 
 /** DI token for the authorization service API consumed by the guard and controllers. */
 export const AUTHORIZATION_SERVICE = Symbol('AUTHORIZATION_SERVICE');
 
-/** A separate bounded pool isolates authorization queries from other pools; raw driver
- * errors and credentials are never logged, matching WebAuthResources.
+/** A separate bounded pool isolates authorization queries from other pools; raw
+ * driver errors and credentials are never logged, matching WebAuthResources.
  */
 export class AuthorizationResources implements OnModuleDestroy {
-  private readonly pool: Pool;
+  private readonly pool: GuardedPool;
   readonly service: AuthorizationService;
 
-  constructor(database: DatabaseConfig) {
-    this.pool = new Pool({ ...database, max: 4, connectionTimeoutMillis: 1000,
+  constructor(database: DatabaseConfig, authorization: ProcessAuthorization) {
+    // P05-01 §7: this pool is admitted per checkout by the launch gate.
+    this.pool = admittedPool({ authorization, kind: 'API' }, database, { max: 4, connectionTimeoutMillis: 1000,
       query_timeout: 5500, statement_timeout: 5000, idleTimeoutMillis: 1000, options: '-c lock_timeout=4500',
       application_name: 'fixlevelup-authz' });
     this.pool.on('error', () => { /* Never log raw driver errors. */ });

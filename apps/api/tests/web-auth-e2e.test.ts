@@ -1,8 +1,6 @@
 import 'reflect-metadata';
 import { randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import type { Server } from 'node:http';
-import { resolve } from 'node:path';
 import { ConsoleLogger } from '@nestjs/common';
 import { Client, Pool } from 'pg';
 import request from 'supertest';
@@ -14,10 +12,12 @@ import { loadConfig } from '../src/runtime/config.js';
 import { SafeLogger } from '../src/runtime/safe-logger.js';
 import { bootstrapFirstAdmin } from '../src/staff/bootstrap.js';
 import { migrateAuthFixture } from './auth-db-fixture.js';
+import { admitFixture } from './admission-fixture.js';
+import type { AdmittedHandle } from './admission-fixture.js';
+import { becomeOwner, dropOwnedTestDatabase, fixtureCredentials, maintenanceOpener } from './owned-test-database.js';
 
 // Explicit opt-in: preserve the random fixture database, never modify the dev schema.
 const integration = process.env['FIXLEVELUP_BOOTSTRAP_ISOLATED_DB_TESTS'] === '1' ? describe : describe.skip;
-const root = resolve(import.meta.dirname, '../../..');
 const origin = 'https://crm.example.test';
 const cookieName = '__Host-fixlevelup_session';
 const oldPassword = 'Synthetic-E2E-Old-Password-2026!';
@@ -41,46 +41,85 @@ integration('web auth real HTTP against isolated PostgreSQL', () => {
   let admin: Client | undefined;
   let fixture: Client | undefined;
   let migrator: Pool | undefined;
+  let admission: AdmittedHandle | undefined;
   let app: Awaited<ReturnType<typeof createApi>> | undefined;
   let server: Server;
   let staffId: string;
+  let dbName: string | undefined;
+  let dbCreated = false;
+  let tornDown = false;
 
-  beforeAll(async () => {
-    const adminEnv = readFileSync(resolve(root, 'infra/dev-postgres/.env'), 'utf8');
-    const runtimeEnv = readFileSync(resolve(root, 'packages/database-tooling/.env'), 'utf8');
-    const adminPassword = /^POSTGRES_PASSWORD=([a-f0-9]{64})$/m.exec(adminEnv)?.[1];
-    const runtimePassword = /^FIXLEVELUP_RUNTIME_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    const migratorPassword = /^FIXLEVELUP_MIGRATOR_PASSWORD=([a-f0-9]{64})$/m.exec(runtimeEnv)?.[1];
-    if (!adminPassword || !runtimePassword || !migratorPassword) { throw new Error('Local isolated PostgreSQL test credentials are required'); }
-    const connection = { host: '127.0.0.1' as const, port: 55432 };
-    admin = new Client({ ...connection, database: 'postgres', user: 'fixlevelup_dev', password: adminPassword });
-    await admin.connect();
-    const database = `fixlevelup_auth_e2e_test_${randomBytes(12).toString('hex')}`;
-    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
-    await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
-    await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
-    fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    await fixture.connect();
-    await migrateAuthFixture(fixture, database);
-    await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
-    migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
-    ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));
-    const dbConfig = { ...connection, database, user: 'fixlevelup_runtime' as const, password: runtimePassword } as DatabaseConfig;
-    const webAuth: WebAuthConfig = { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
-    app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'), dbConfig, webAuth);
-    server = app.getHttpServer() as Server;
-  }, 30000);
+  /** Ownership proof for the teardown drop, consumed exactly once: this run's CREATE
+   * result (flag) AND the strict disposable-name pattern. */
+  const takeOwnedDatabase = (): string | undefined => {
+    if (!dbCreated) { return undefined; }
+    dbCreated = false;
+    return dbName !== undefined && /^fixlevelup_auth_e2e_test_[a-f0-9]{24}$/.test(dbName) ? dbName : undefined;
+  };
 
-  afterAll(async () => {
+  /** The afterAll teardown, exactly once: this run's pools/clients down first, then
+   * the drop of exactly the database this run created. A second call is a no-op. */
+  async function teardown(): Promise<void> {
+    if (tornDown) { return; }
+    tornDown = true;
+    const ownedDatabase = takeOwnedDatabase();
     try { await app?.close(); }
     finally {
-      try { await migrator?.end(); }
+      try { await admission?.release(); }
       finally {
-        try { await fixture?.end(); }
-        finally { await admin?.end(); vi.restoreAllMocks(); }
+        try { await migrator?.end(); }
+        finally {
+          try { await fixture?.end(); }
+          finally {
+            try {
+              if (ownedDatabase !== undefined && admin !== undefined) {
+                await dropOwnedTestDatabase(admin, ownedDatabase);
+              }
+            } finally { try { await admin?.end(); } finally { vi.restoreAllMocks(); } }
+          }
+        }
       }
     }
-  });
+  }
+
+  beforeAll(async () => {
+    // Lab mode reads the lab process env and the attested maintenance binding;
+    // dev mode reads the local ignored env files. Never the dev database.
+    const { migrator: migratorPassword, runtime: runtimePassword } = fixtureCredentials();
+    const connection = { host: '127.0.0.1' as const, port: 55432 };
+    admin = await maintenanceOpener()();
+    const database = `fixlevelup_auth_e2e_test_${randomBytes(12).toString('hex')}`;
+    await admin.query(`CREATE DATABASE "${database}" OWNER fixlevelup_migrator TEMPLATE template0`);
+    // CREATE is the reuse guard: an existing name is a hard error, so a successful
+    // CREATE proves this run owns the disposable database (the flag gates the drop).
+    dbName = database;
+    dbCreated = true;
+    try {
+      // GRANT/REVOKE need the owner: in the lab the orchestrator is a NOINHERIT member.
+      await becomeOwner(admin);
+      await admin.query(`REVOKE ALL ON DATABASE "${database}" FROM PUBLIC`);
+      await admin.query(`GRANT CONNECT ON DATABASE "${database}" TO fixlevelup_migrator, fixlevelup_runtime`);
+      fixture = new Client({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      await fixture.connect();
+      await migrateAuthFixture(fixture, database);
+      await fixture.query('CREATE TABLE foundation._prisma_migrations (id text PRIMARY KEY)');
+      migrator = new Pool({ ...connection, database, user: 'fixlevelup_migrator', password: migratorPassword });
+      ({ staffId } = await bootstrapFirstAdmin(migrator, { login, password: oldPassword }));
+      const dbConfig = { ...connection, database, user: 'fixlevelup_runtime' as const, password: runtimePassword } as DatabaseConfig;
+      const webAuth: WebAuthConfig = { origin, csrfSecret: 'a'.repeat(64), throttleSecret: 'b'.repeat(64) };
+      // P05-01: the app is admitted through the same launch gate contour — a real
+      // migrator-held witness in this fixture DB pins the admission.
+      admission = await admitFixture(migrator, database, 'API');
+      app = await createApi(loadConfig({ NODE_ENV: 'test', APP_HOST: '127.0.0.1', APP_PORT: '0' }), new SafeLogger('api'), dbConfig, webAuth, undefined, admission.authorization);
+      server = app.getHttpServer() as Server;
+    } catch (error) {
+      // Provisioning failed after CREATE: run the same lifecycle cleanup before rethrowing.
+      await teardown().catch(() => undefined);
+      throw error;
+    }
+  }, 30000);
+
+  afterAll(teardown);
 
   it('enforces CSRF and rotates credentials through the complete session lifecycle', async () => {
     const logs = vi.spyOn(ConsoleLogger.prototype, 'log').mockImplementation(() => undefined);

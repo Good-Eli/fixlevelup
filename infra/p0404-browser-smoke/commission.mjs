@@ -24,7 +24,10 @@ export async function signIn(credential) {
         ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    if (request.status !== expected || request.headers.get('cache-control') !== 'no-store') { throw new Error('Unexpected commissioning response'); }
+    if (request.status !== expected || request.headers.get('cache-control') !== 'no-store') {
+      // Status and route only: never a body, header or credential.
+      throw new Error(`Unexpected commissioning response ${method} ${route} -> ${String(request.status)} (expected ${String(expected)}, cache-control ${String(request.headers.get('cache-control'))})`);
+    }
     if (expected >= 400 || expected === 204) { await request.body?.cancel(); return {}; }
     const { data: value } = await request.json();
     return { data: value, etag: request.headers.get('etag') };

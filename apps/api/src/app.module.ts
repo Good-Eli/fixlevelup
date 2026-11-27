@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import type { DynamicModule } from '@nestjs/common';
 import { RuntimeDatabase } from './infrastructure/database/runtime-database.js';
 import type { DatabaseConfig } from './infrastructure/database/runtime-database.js';
+import { requireRuntimeAuthorization } from './infrastructure/admission/pool-guard.js';
+import type { ProcessAuthorization } from './infrastructure/admission/process-admission.js';
 import { HealthController, HealthService } from './health/health.controller.js';
 import type { WebAuthConfig } from './auth/web-auth.config.js';
 import { WEB_AUTH_HTTP_CONFIG, WEB_AUTH_SERVICE, WebAuthController } from './auth/web-auth.controller.js';
@@ -22,32 +24,46 @@ import { CatalogManagementController } from './catalog-management/controller.js'
 import { CatalogManagementRunner } from './catalog-management/runner.js';
 import { GeographyController, TechnicianTerritoryController } from './settings/geography/geography.controller.js';
 import { PermissionsController, RolesController, RolesService, TelegramPermissionsController, TelegramRolesController } from './roles/index.js';
+import { ConfigurationError } from './runtime/config.js';
+
+function requireAdmission(admission: ProcessAuthorization | undefined, database: DatabaseConfig): ProcessAuthorization {
+  if (!admission) { throw new ConfigurationError(['LAUNCH_PROOF_TOKEN']); }
+  requireRuntimeAuthorization(admission, 'API', database);
+  return admission;
+}
 
 @Module({})
 export class AppModule {
-  static register(database?: DatabaseConfig, webAuth?: WebAuthConfig, telegramAuth?: TelegramAuthConfig): DynamicModule {
+  static register(database?: DatabaseConfig, webAuth?: WebAuthConfig, telegramAuth?: TelegramAuthConfig, admission?: ProcessAuthorization): DynamicModule {
     if ((webAuth || telegramAuth) && !database) { throw new Error('Web authentication requires a database'); }
     if (telegramAuth && !webAuth) { throw new Error('Telegram authentication requires web authentication configuration'); }
+    // P05-01 §7: every DB consumer in this module exists only behind the launch
+    // admission gate; a database without an admission constructs nothing (fail closed).
+    if (database) { requireAdmission(admission, database); }
     const controllers = webAuth
       ? [HealthController, WebAuthController, AccessController, StaffController, RolesController,
           PermissionsController, GeographyController, ManagementController, CatalogManagementController,
           ...(telegramAuth ? [TelegramAuthController, TelegramStaffController, TelegramRolesController, TelegramPermissionsController, TechnicianTerritoryController] : [])]
       : [HealthController];
     const providers = [
-      HealthService, { provide: RuntimeDatabase, useFactory: () => new RuntimeDatabase(database, Boolean(webAuth)) },
+      // Without a database the RuntimeDatabase is the inert always-unready
+      // object (health-only boots; /ready fails honestly); with a database it
+      // exists only behind the completed process admission (fail closed).
+      HealthService, { provide: RuntimeDatabase,
+        useFactory: () => new RuntimeDatabase(database, Boolean(webAuth), database ? requireAdmission(admission, database) : undefined) },
       ...(webAuth && database ? [
         StaffService, RolesService, GeoRunner, ManagementRunner, CatalogManagementRunner,
         // Explicit DI registration makes missing security dependencies a startup failure.
         StaffWebAuthGuard,
-        { provide: WebAuthResources, useFactory: () => new WebAuthResources(database, webAuth) },
+        { provide: WebAuthResources, useFactory: () => new WebAuthResources(database, webAuth, requireAdmission(admission, database)) },
         { provide: WEB_AUTH_SERVICE, useFactory: (resources: WebAuthResources) => resources.service, inject: [WebAuthResources] },
         { provide: WEB_AUTH_HTTP_CONFIG, useValue: { origin: webAuth.origin, csrfSecret: webAuth.csrfSecret } },
-        { provide: AuthorizationResources, useFactory: () => new AuthorizationResources(database) },
+        { provide: AuthorizationResources, useFactory: () => new AuthorizationResources(database, requireAdmission(admission, database)) },
         { provide: AUTHORIZATION_SERVICE, useFactory: (resources: AuthorizationResources) => resources.service, inject: [AuthorizationResources] },
         ...(telegramAuth ? [
           // No bearer routes without a configured exchange and guard.
           StaffTelegramAuthGuard,
-          { provide: TelegramAuthResources, useFactory: () => new TelegramAuthResources(database, telegramAuth, webAuth.throttleSecret) },
+          { provide: TelegramAuthResources, useFactory: () => new TelegramAuthResources(database, telegramAuth, webAuth.throttleSecret, requireAdmission(admission, database)) },
           { provide: TELEGRAM_AUTH_SERVICE, useFactory: (resources: TelegramAuthResources) => resources.service, inject: [TelegramAuthResources] },
         ] : []),
       ] : []),
