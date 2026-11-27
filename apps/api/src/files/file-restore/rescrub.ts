@@ -291,10 +291,31 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
       refuseRestore('RESTORE_CLOSED');
     }
     stage = 'RESTORE_AUTHORITY';
-    await requireP05AbsentForActivation(conn, manifest, carried);
-    if (await readAuthorityInventory(conn, limits) !== auth.record.inventorySha256) {refuseRestore('RESTORE_AUTHORITY');}
+    try { await requireP05AbsentForActivation(conn, manifest, carried); }
+    catch (error) {
+      restoreTestDiagnostic('target-p05-profile-refused', error, { sourceProfile });
+      throw error;
+    }
+    let targetAuthorityInventory: string;
+    try { targetAuthorityInventory = await readAuthorityInventory(conn, limits); }
+    catch (error) {
+      restoreTestDiagnostic('target-authority-inventory-read-failed', error);
+      throw error;
+    }
+    if (targetAuthorityInventory !== auth.record.inventorySha256) {
+      restoreTestDiagnostic('target-authority-inventory-mismatch', undefined, {
+        sourceDigest: auth.record.inventorySha256, targetDigest: targetAuthorityInventory,
+      });
+      refuseRestore('RESTORE_AUTHORITY');
+    }
     const current = await readRestoreInventory(conn, limits);
-    requireMatchingInventory(manifest.inventory, current);
+    try { requireMatchingInventory(manifest.inventory, current); }
+    catch (error) {
+      restoreTestDiagnostic('target-object-inventory-mismatch', error, {
+        manifestCount: manifest.inventory.length, targetCount: current.length,
+      });
+      throw error;
+    }
     stage = 'RESTORE_LEDGER';
     await requireExactTombstones(conn, limits, ctx.verifier, old, manifest.base, lineage.head, lineage.events, current);
 
@@ -351,12 +372,33 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
       if (tables.length > 0) {
         await client.query(`LOCK TABLE ${tables.map(table => `foundation.${table}`).join(', ')} IN SHARE MODE`);
       }
-      await requireP05AbsentForActivation(client, manifest, carried);
-      const terminal = await observeFencedSource(observer, { ...source, challenge: last, backendPid: drained.backendPid }, limits, carried);
-      requireP05ProfileFact(manifest, terminal, drained.nonce, new Date(), last);
+      try { await requireP05AbsentForActivation(client, manifest, carried); }
+      catch (error) {
+        restoreTestDiagnostic('terminal-target-p05-profile-refused', error, { sourceProfile });
+        throw error;
+      }
+      let terminal: FencedSourceObservation;
+      try {
+        terminal = await observeFencedSource(observer, { ...source, challenge: last, backendPid: drained.backendPid }, limits, carried);
+      } catch (error) {
+        restoreTestDiagnostic('terminal-source-observation-refused', error);
+        throw error;
+      }
+      try { requireP05ProfileFact(manifest, terminal, drained.nonce, new Date(), last); }
+      catch (error) {
+        restoreTestDiagnostic('terminal-source-profile-fact-refused', error);
+        throw error;
+      }
       if (terminal.fact !== drained.fact || terminal.policySha256 !== drained.policySha256
         || terminal.manifestSha256 !== hash || terminal.inventorySha256 !== fresh.inventorySha256
         || !sameCluster(terminal.cluster, fresh.cluster)) {
+        restoreTestDiagnostic('terminal-source-facts-mismatch', undefined, {
+          factMatches: terminal.fact === drained.fact,
+          policyMatches: terminal.policySha256 === drained.policySha256,
+          manifestMatches: terminal.manifestSha256 === hash,
+          inventoryMatches: terminal.inventorySha256 === fresh.inventorySha256,
+          clusterMatches: sameCluster(terminal.cluster, fresh.cluster),
+        });
         refuseRestore('RESTORE_AUTHORITY');
       }
       abortCheck(signal);
@@ -385,7 +427,8 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
     ALIASES.set(receipt, { database: manifest.destinationDatabase, entries: resolved,
       destinations: Object.freeze(manifest.aliases.map(pair => pair.destination)) });
     return receipt;
-  } catch {
+  } catch (error) {
+    restoreTestDiagnostic('restore-refused', error, { stage });
     if (stage === 'RESTORE_COMMIT_UNKNOWN') { return refuseRestore(stage); }
     if (ABORTED !== undefined && signal instanceof AbortSignal && Reflect.apply(ABORTED, signal, []) === true) {refuseRestore('RESTORE_ABORTED');}
     return refuseRestore(stage);
