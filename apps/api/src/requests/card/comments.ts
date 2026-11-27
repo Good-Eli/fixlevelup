@@ -118,8 +118,8 @@ export async function writeInternalComment(staff: P05Context, row: RequestRow, c
   const fingerprint = idempotencyHmac({ring:config.ring,namespace,canonicalIntent});
   const { rows:[data] } = await staff.client.query<CommentIdentity>(`SELECT id,request_version AS version,
       to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"
-    FROM p06_crm.insert_internal_comment($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-  [id,row.id,staff.staffId,staff.sessionId,row.row_version,input.key,fingerprint.keyId,fingerprint.digest,
+    FROM p06_crm.insert_internal_comment($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+  [id,row.id,staff.staffId,staff.sessionId,staff.sessionToken,row.row_version,input.key,fingerprint.keyId,fingerprint.digest,
     sealed.nonce,sealed.ciphertext,sealed.authTag,sealed.aadContext,randomUUID()]);
   if (!data) { return deny('NOT_READY'); }
   return { data,replayed:false };
