@@ -24,6 +24,9 @@ import { deny, RequestFailure } from './errors.js';
 import type { RequestFailureCode } from './errors.js';
 import { activeReference, boundConsent, confirmEvidence, confirmOffer, currentCity, geoFence,
   lockConsent, staffEvidenceLive, submitEdge } from './basis.js';
+import { readVisibleRegistry } from '../registry/store.js';
+import { readRegistryOptions } from '../registry/options.js';
+import type { RegistryQuery } from '../registry/filters.js';
 import type { ConsentBinding, OfferBasis, RequestOffers, SessionSubmit, StaffEvidence, StaffEvidencePort } from './basis.js';
 import { activePhone, clonePhonePreference, createRequestRow, insertStaffEvidence, modeOf, readContactMode,
   requestRow, updateRequestRow, writeAddress, writeAppliance, writeContact, writePhone, writePreference } from './store.js';
@@ -435,6 +438,34 @@ export class RequestIntake {
       return (clock: Date) => requestRepresentation('STAFF',row,available
         && (basis.expiresAtMs === null || clock.getTime() < basis.expiresAtMs));
     },decidePrepared));
+  }
+
+  async readStaffRegistry(proof: SessionProof, query: RegistryQuery) {
+    return await this.staffCall(() => this.staff.withP05(proof, ['requests.read'], async (staff) => {
+      await geoFence(staff.client);
+      const city = await currentCity(staff.client);
+      await staff.authorizeCity(city.cityId);
+      // Consent withdrawal takes this same document lock before writing the revocation.
+      if (!await lockConsent(staff.client, undefined, 'shared')) { return deny('NOT_READY'); }
+      const evidencePort = this.config.staffEvidence;
+      if (evidencePort && !evidencePort.openRegistry) { return deny('NOT_READY'); }
+      const isCurrent = await evidencePort?.openRegistry?.(staff.client);
+      return { ...await readVisibleRegistry(staff.client, city, query, isCurrent), isCurrent };
+    }, ({ items, nextCursor, manualEvidence, isCurrent }, clock) => {
+      if (manualEvidence.some(evidence => !(evidence.validUntil.getTime() > clock.getTime()) || !isCurrent?.(evidence))) {
+        return deny('NOT_READY');
+      }
+      return { items, nextCursor };
+    }));
+  }
+
+  async readStaffRegistryOptions(proof: SessionProof) {
+    return await this.staffCall(() => this.staff.withP05(proof, ['requests.read'], async (staff) => {
+      await geoFence(staff.client);
+      const city = await currentCity(staff.client);
+      await staff.authorizeCity(city.cityId);
+      return await readRegistryOptions(staff.client, city.cityId);
+    }));
   }
 
   async readForm(proof: FProof) {

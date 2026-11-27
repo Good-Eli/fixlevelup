@@ -13,6 +13,7 @@ import { formatHostCookie } from '../../form-session/cookies.js';
 import { FormSessionAuthError } from '../../form-session/service.js';
 import { boundedJsonForFormSession } from '../../form-session/body-parser.js';
 import { closeAfterProblem, readBoundedJson } from '../../settings/management/body-parser.js';
+import { parseRegistryQuery } from '../registry/filters.js';
 import { deny, RequestFailure } from './errors.js';
 import type { FProof, RequestIntake, StaffCommand, WriteInput, WriteResult } from './service.js';
 
@@ -31,14 +32,24 @@ export const REQUEST_INTAKE_HTTP = Symbol('REQUEST_INTAKE_HTTP');
 const RAW_HEADERS = ['cookie','origin','authorization','content-type','content-encoding','content-length',
   'transfer-encoding','x-form-session-id','x-csrf-token','idempotency-key','if-match','if-none-match'];
 
+function registryQueryString(method: string, target: string): string | null {
+  if (method !== 'GET') { return null; }
+  const separator = target.indexOf('?');
+  const path = separator === -1 ? target : target.slice(0, separator);
+  if (path !== '/api/v1/requests') { return null; }
+  return separator === -1 ? '' : target.slice(separator + 1);
+}
+
 /** Install only in T. Unknown aliases don't get interpreted or forwarded as a
  * successful route; real P03/P04 and S2 paths keep their own parser. */
 export function intakeBody(readiness: Readiness) {
   const form = boundedJsonForFormSession(readiness);
   return (req: StaffRequest,res: ServerResponse,next: (error?: HttpException) => void): void => {
     const method = req.method ?? '';
-    const matched = matchP05Route(method,req.url ?? '');
-    if (!matched) { form(req,res,next); return; }
+    const target = req.url ?? '';
+    if (registryQueryString(method,target) === null && !isRegistryOptions(method,target) && !matchP05Route(method,target)) {
+      form(req,res,next); return;
+    }
     void readiness.requestEffectsReady().then((ready) => {
       if (!ready) { return deny('NOT_READY'); }
       if (!res.destroyed) { readBoundedJson(req,res,next,{ limit:P05_BODY_BYTES, decode:null, forbidBody:method === 'GET' }); }
@@ -46,6 +57,10 @@ export function intakeBody(readiness: Readiness) {
       if (!res.destroyed) { closeAfterProblem(req,res); next(new RequestFailure('NOT_READY')); }
     });
   };
+}
+
+function isRegistryOptions(method: string, target: string): boolean {
+  return method === 'GET' && target === '/api/v1/requests/filters';
 }
 
 function isStaffCommand(operation: P05Operation): operation is StaffCommand {
@@ -102,15 +117,37 @@ export class RequestIntakeController {
     'public/request-session/phone-permissions','public/request-session/cancel','requests','requests/:id','requests/:id/commands/:command'])
   async handle(@Req() req: StaffRequest, @Res() res: ServerResponse): Promise<void> {
     res.setHeader('Cache-Control','no-store');
-    const matched = matchP05Route(req.method ?? '',req.url ?? '');
-    if (!matched) { return deny('NOT_FOUND'); }
+    const method = req.method ?? '';
+    const target = req.url ?? '';
+    const matched = matchP05Route(method,target);
+    const registry = registryQueryString(method,target);
+    const options = isRegistryOptions(method,target);
+    if (matched === null && registry === null && !options) { return deny('NOT_FOUND'); }
     if (!await this.deps.readiness.requestEffectsReady()) { return deny('NOT_READY'); }
     for (const key of RAW_HEADERS) { header(req,key); }
     const cookies = header(req,'cookie');
     if (cookies && Buffer.byteLength(cookies,'utf8') > F_MAX_COOKIE_BYTES) { return deny('BODY_TOO_LARGE'); }
     if (header(req,'authorization') !== undefined) { throw new AuthorizationError('UNAUTHORIZED'); }
-    const op = matched.operation;
     const service = this.deps.service;
+    if (registry !== null || options) {
+      expectExactOrigin(req,this.deps.staff.origin);
+      const token = sessionToken(req);
+      if ((registry !== null && (registry.length > 2048 || registry.includes('#')))
+        || ['x-form-session-id','x-csrf-token','idempotency-key','if-match','if-none-match'].some(key => header(req,key) !== undefined)) {
+        return deny('INVALID_REQUEST');
+      }
+      const proof = { kind:'staff-web' as const,token };
+      const data = registry === null ? await service.readStaffRegistryOptions(proof)
+        : await service.readStaffRegistry(proof,parseRegistryQuery(new URLSearchParams(registry)));
+      res.setHeader('Cache-Control','no-store, no-transform');
+      res.setHeader('Content-Type','application/json; charset=utf-8');
+      res.setHeader('X-Request-Id',randomUUID());
+      res.statusCode=200;
+      res.end(JSON.stringify({ data }));
+      return;
+    }
+    if (matched === null) { return deny('NOT_FOUND'); }
+    const op = matched.operation;
     if (op === 'readRequestSession' || op === 'createCallback' || op === 'createRepair' || op === 'chooseCallback'
       || op === 'withdrawPhonePermission' || op === 'cancelRequestF') {
       const origin = header(req,'origin');

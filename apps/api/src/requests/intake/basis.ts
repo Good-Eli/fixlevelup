@@ -35,11 +35,11 @@ export async function submitEdge(client: PoolClient, id: { sessionId: string } |
   [session ? id.sessionId : id.requestId])).rows[0];
 }
 
-/** Call only after the F anchor lock, before locking the request. Use the
- * exact bound parent for history; fresh intake locks the canonical parent. */
-export async function lockConsent(client: PoolClient, prior?: ConsentBinding): Promise<string | undefined> {
+/** Request commands call after the F anchor lock and before locking the request.
+ * The city registry takes a shared lock on the canonical document. */
+export async function lockConsent(client: PoolClient, prior?: ConsentBinding, mode: 'shared' | 'exclusive' = 'exclusive'): Promise<string | undefined> {
   const { rows: [row] } = await client.query<{ id: string }>(`SELECT id FROM foundation.legal_documents
-    WHERE purpose='REQUEST_PROCESSING' AND kind='CONSENT_FORM' AND ($1::uuid IS NULL OR id=$1) FOR UPDATE`,
+    WHERE purpose='REQUEST_PROCESSING' AND kind='CONSENT_FORM' AND ($1::uuid IS NULL OR id=$1) FOR ${mode === 'shared' ? 'SHARE' : 'UPDATE'}`,
   [prior?.document_id ?? null]);
   return row?.id;
 }
@@ -114,6 +114,10 @@ export interface StaffEvidencePort {
   verify(client: PoolClient, input: { readonly id: string; readonly purpose: StaffEvidencePurpose;
     readonly staffId: string; readonly target: string; readonly canonicalIntent: string }): Promise<StaffEvidence | undefined>;
   isCurrent(client: PoolClient, evidence: StaffEvidence): Promise<boolean>;
+  /** Open a registry view once per transaction. The synchronous predicate must
+   * agree with isCurrent through the final decision, either under the issuer's
+   * transaction fence or by reading authoritative in-process synthetic state. */
+  openRegistry?(client: PoolClient): Promise<(evidence: StaffEvidence) => boolean>;
 }
 export async function confirmEvidence(client: PoolClient, port: StaffEvidencePort | undefined,
   input: Parameters<StaffEvidencePort['verify']>[1]): Promise<StaffEvidence> {

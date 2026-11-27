@@ -45,22 +45,27 @@ export async function findEvent(client: PoolClient, cmd: Pick<CommandIdentity,'a
 interface PersistedReceipt {
   readonly event_id: string; readonly request_id: string; readonly version: number; readonly status: RequestStatus;
   readonly key_id: string; readonly fingerprint: Buffer; readonly command: CommandName; readonly key: string;
-  readonly principal: string; readonly good_audit: boolean; readonly good_outbox: boolean; readonly good_phone: boolean; readonly public_number: string;
+  readonly principal: string; readonly complete: boolean; readonly public_number: string;
 }
+
+/** Requires the receipt/event/audit/outbox aliases r/e/a/o. */
+export const REQUEST_RECEIPT_COMPLETE_SQL = `coalesce(
+    a.operation=e.command AND a.correlation_id=e.correlation_id AND a.details->>'requestId'=e.request_id::text
+    AND o.event_id=e.id AND o.event_type=CASE e.command WHEN 'CreateCallback' THEN 'REQUEST_CALLBACK_INTENT'
+      WHEN 'ReadyForDispatch' THEN 'REQUEST_READY_FOR_ASSIGNMENT' ELSE 'REQUEST_EFFECT_RECORDED' END
+    AND o.payload->>'requestId'=e.request_id::text AND o.payload->>'version'=e.resulting_version::text
+    AND ${REQUEST_PHONE_HISTORY_COMPLETE},false)`;
+
 export async function checkedReceipt(client: PoolClient, request: RequestRow, eventId: string): Promise<PersistedReceipt> {
   const { rows: [row] } = await client.query<PersistedReceipt>(`SELECT r.event_id,r.request_id,r.version,r.resulting_status AS status,
     r.key_id,r.fingerprint,r.command,e.idempotency_key AS key,e.principal,q.public_number::text,
-    coalesce(a.operation=e.command AND a.correlation_id=e.correlation_id AND a.details->>'requestId'=e.request_id::text,false) AS good_audit,
-    coalesce(o.event_id=e.id AND o.event_type=CASE e.command WHEN 'CreateCallback' THEN 'REQUEST_CALLBACK_INTENT'
-      WHEN 'ReadyForDispatch' THEN 'REQUEST_READY_FOR_ASSIGNMENT' ELSE 'REQUEST_EFFECT_RECORDED' END
-      AND o.payload->>'requestId'=e.request_id::text AND o.payload->>'version'=e.resulting_version::text,false) AS good_outbox,
-    ${REQUEST_PHONE_HISTORY_COMPLETE} AS good_phone
+    ${REQUEST_RECEIPT_COMPLETE_SQL} AS complete
     FROM foundation.request_events e JOIN foundation.request_command_receipts r ON r.event_id=e.id AND r.request_id=e.request_id
       AND r.version=e.resulting_version AND r.correlation_id=e.correlation_id AND r.command=e.command AND r.resulting_status=e.details->>'status'
     JOIN foundation.requests q ON q.id=e.request_id
     LEFT JOIN foundation.audit_logs a ON a.id=r.audit_id LEFT JOIN foundation.outbox_events o ON o.id=r.outbox_id
     WHERE e.id=$1 AND e.request_id=$2`, [eventId,request.id]);
-  if (!row || !row.good_audit || !row.good_outbox || !row.good_phone || row.version > request.row_version || !Buffer.isBuffer(row.fingerprint)
+  if (!row || !row.complete || row.version > request.row_version || !Buffer.isBuffer(row.fingerprint)
     || row.fingerprint.length !== 32) { return deny('NOT_READY'); }
   return row;
 }

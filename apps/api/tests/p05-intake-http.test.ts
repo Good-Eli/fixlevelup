@@ -21,6 +21,8 @@ import { clonePhonePreference, requestRow, updateRequestRow, writeContact, write
 import { requestEffectsHistoryComplete } from '../src/infrastructure/database/request-phone-history.js';
 import type { RequestOffers, StaffEvidence, StaffEvidencePort } from '../src/requests/intake/basis.js';
 import { coverageEffects } from '../src/requests/intake/coverage-effects.js';
+import { parseRegistryQuery } from '../src/requests/registry/filters.js';
+import { readVisibleRegistry } from '../src/requests/registry/store.js';
 import type { CoverageReviewEvidence } from '../src/requests/intake/coverage.js';
 import { fixtureCredentials } from './owned-test-database.js';
 import { RbacFixture, record, text } from './rbac-fixture.js';
@@ -56,6 +58,7 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   let fixture: RequestFixtures;
   let testApp: Awaited<ReturnType<typeof startIsolatedIntake>> | undefined;
   let cert: Buffer;
+  let staffTlsKey: Buffer;
   let port: number;
   let offers: RequestOfferFixture;
   let historical: PolicyPackage;
@@ -67,6 +70,8 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   const evidence = new Map<string, NonNullable<Awaited<ReturnType<StaffEvidencePort['verify']>>> & Parameters<StaffEvidencePort['verify']>[1]>();
   const review = new Map<string,CoverageReviewEvidence>();
   const evidenceClockHooks = new Map<string,(client: import('pg').PoolClient, proof: StaffEvidence) => Promise<void>>();
+  const registryEvidenceHooks = new Map<string,() => void>();
+  let registryOpenHook: ((client: import('pg').PoolClient) => Promise<void>) | undefined;
   const evidencePort: StaffEvidencePort = {
     async verify(_client, expected) {
       await Promise.resolve();
@@ -77,6 +82,14 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     async isCurrent(client, proof) {
       await evidenceClockHooks.get(proof.id)?.(client,proof);
       return evidence.get(proof.id)?.procedureRevision === proof.procedureRevision;
+    },
+    async openRegistry(client) {
+      await registryOpenHook?.(client);
+      return proof => {
+        const current = evidence.get(proof.id)?.procedureRevision === proof.procedureRevision;
+        registryEvidenceHooks.get(proof.id)?.();
+        return current;
+      };
     },
   };
   function db() { if (!base) { throw new Error('Missing fixture'); } return base; }
@@ -93,7 +106,6 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     await lab.db.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type)
       SELECT r.id,c,'GLOBAL' FROM foundation.roles r CROSS JOIN unnest($1::text[]) c WHERE r.role_type='SYSTEM' AND r.code='ADMIN'`, [P05_CAPABILITIES]);
     const dir = mkdtempSync(resolve(tmpdir(),'p05-intake-tls-'));
-    let key: Buffer;
     try {
       const pem = resolve(dir,'server.pem');
       const privateKey = resolve(dir,'server.key');
@@ -101,7 +113,7 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       execFileSync(openssl,['req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=localhost',
         '-addext','subjectAltName=IP:127.0.0.1,DNS:localhost','-keyout',privateKey,'-out',pem],{stdio:'ignore',timeout:10000});
       cert = readFileSync(pem);
-      key = readFileSync(privateKey);
+      staffTlsKey = readFileSync(privateKey);
     } finally { rmSync(dir,{recursive:true,force:true}); }
     keyring = loadKeyring({ activeKekId:'test-kek-1',activeHmacKeyId:'test-hmac-1',
       kek:[{keyId:'test-kek-1',secretHex:randomBytes(32).toString('hex')}],
@@ -118,7 +130,7 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
         supportedPolicies:pins,formSourceEntryId:fixture.formSourceEntryId };
       const matrix = matrixOffers !== undefined;
       return await startIsolatedIntake({ target:{ host:'127.0.0.1',port:55432,database:lab.database,user:'fixlevelup_runtime',password:fixtureCredentials().runtime },
-        authorization:lab.admitted.authorization,tls:{key,cert},staff:{origin,csrfSecret:csrf},
+        authorization:lab.admitted.authorization,tls:{key:staffTlsKey,cert},staff:{origin,csrfSecret:csrf},
         form:{ origin,csrfKeyring:{current:{keyId:'csrf-t1',secret:randomBytes(32)}},throttleSecret:randomBytes(32),
           groupTtlMs:matrix ? 1800000 : 900000,anchorTtlMs,csrfTtlMs:matrix ? anchorTtlMs : Math.min(300000,anchorTtlMs),
           throttles:{ source:{windowSeconds:600,maxHits:matrix ? 3000 : 300},global:{windowSeconds:600,maxHits:matrix ? 3000 : 300},
@@ -212,12 +224,13 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       validUntil:new Date(Date.now()+300000)});
   }
 
-  async function manualPrepared() {
+  async function manualPrepared(districtId?: string) {
     const source=(await db().db.query<{version:string}>('SELECT current_version_id AS version FROM foundation.reference_entries WHERE id=$1',[fixture.formSourceEntryId])).rows[0];
     if (!source) { throw new Error('Missing synthetic source'); }
     const key=randomUUID();
     const body=decodeP05ManualRequest({type:'REPAIR',sourceEntryId:fixture.formSourceEntryId,evidenceId:randomUUID(),contact:{...contact,
-      mode:'PHONE',phonePermission:true,phoneEvidenceId:randomUUID()},address,appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]}});
+      mode:'PHONE',phonePermission:true,phoneEvidenceId:randomUUID()},address:{...address,...(districtId ? {districtId} : {})},
+      appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]}});
     if (body.type !== 'REPAIR' || body.contact.mode !== 'PHONE') { throw new Error('Wrong test DTO'); }
     const target=canonicalJson({cityId:fixture.cityId,cityVersionId:fixture.cityVersionId,sourceVersionId:source.version,operation:'CreateRepair',key});
     const phoneEvidenceId=body.contact.phoneEvidenceId;
@@ -364,6 +377,109 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     throw new Error('Expected two observed PostgreSQL lock contenders');
   }
 
+  it('P06 registry paginates only visible requests over HTTPS', async () => {
+    const { rows: [start] } = await db().db.query<{ instant: string }>(`SELECT
+      to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS instant`);
+    if (!start) { throw new Error('Missing fixture clock'); }
+    const path = `/requests?from=${encodeURIComponent(start.instant)}&limit=1`;
+    const form = await issue();
+    const evidenceId = await given(form);
+    const callback = accepted(await https('POST',`${pub}/callback-requests`,{
+      contact,phonePermission:true,callbackIntervalId:fixture.callbackIntervalEntryId,
+      consent:{evidenceId,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(form,randomUUID())),201).data();
+    const manual = await manualPrepared(fixture.districtId);
+    manual.authorize();
+    const repair = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+
+    failure(await https('GET',path),401,'UNAUTHORIZED');
+    failure(await https('GET',path,undefined,{...staff(),Origin:'https://other.example.test'}),403,'FORBIDDEN');
+    failure(await https('GET',`${path}&cityId=${fixture.cityId}`,undefined,staff()),400,'MALFORMED');
+    const first = closed(await https('GET',path,undefined,staff()),200,['items','nextCursor']).data();
+    const items = first['items'];
+    if (!Array.isArray(items) || items.length !== 1) { throw new Error('Expected one registry item'); }
+    const { createdAt, ...row } = record(items[0]);
+    expect(row).toEqual({ id:repair['id'],publicNumber:repair['publicNumber'],status:repair['status'],type:'REPAIR',version:1 });
+    expect(String(createdAt)).toMatch(/\.\d{6}Z$/);
+    const optionsPath = '/requests/filters';
+    failure(await https('GET',optionsPath),401,'UNAUTHORIZED');
+    const options = closed(await https('GET',optionsPath,undefined,staff()),200,['categories','districts','sources','unavailable']).data();
+    expect(options['categories']).toContainEqual({id:fixture.categoryId,name:'Synthetic category'});
+    expect(options['districts']).toContainEqual({id:fixture.districtId,name:'Synthetic district'});
+    expect(options['sources']).toContainEqual(expect.objectContaining({id:fixture.formSourceEntryId}));
+    expect(options['unavailable']).toEqual({technician:'not_ready',payment:'not_ready',alert:'not_ready'});
+    const named = `categoryId=${fixture.categoryId}&districtId=${fixture.districtId}&sourceId=${fixture.formSourceEntryId}`;
+    expect(accepted(await https('GET',`${path}&${named}`,undefined,staff()),200).data()).toEqual({items,nextCursor:null});
+    const cursor = encodeURIComponent(text(first,'nextCursor'));
+    const second = accepted(await https('GET',`${path}&cursor=${cursor}`,undefined,staff()),200).data();
+    expect(second).toEqual({items:[expect.objectContaining({publicNumber:callback['publicNumber']})],nextCursor:null});
+
+    registryEvidenceHooks.set(manual.body.evidenceId, () => {
+      registryEvidenceHooks.delete(manual.body.evidenceId);
+      evidence.delete(manual.body.evidenceId);
+    });
+    try { failure(await https('GET',path,undefined,staff()),503,'NOT_READY'); }
+    finally { registryEvidenceHooks.delete(manual.body.evidenceId); }
+    manual.authorize();
+
+    const withdrawalKey = randomUUID();
+    accepted(await https('POST',`${pub}/form-session/consents`,{
+      action:'REVOKED',evidenceRef:withdrawalKey,supersedesEvidenceId:evidenceId,
+    },mutate(form,withdrawalKey)),201);
+    expect(accepted(await https('GET',path,undefined,staff()),200).data()).toEqual({items:first['items'],nextCursor:null});
+    expect(accepted(await https('GET',`${path}&cursor=${cursor}`,undefined,staff()),200).data()).toEqual({items:[],nextCursor:null});
+    evidence.delete(manual.body.evidenceId);
+    expect(accepted(await https('GET',path,undefined,staff()),200).data()).toEqual({items:[],nextCursor:null});
+  },45000);
+
+  it('P06 registry enforces GLOBAL and CITY grants over HTTPS', async () => {
+    const path = '/requests?from=2099-01-01T00%3A00%3A00.000Z';
+    const read = (actor: StaffProof) => https('GET', path, undefined, { Cookie:actor.cookie });
+    await withHttpMatrixActors(db(), fixture.cityId, async actors => {
+      const expected = {items:[],nextCursor:null};
+      for (const actor of [actors.global,actors.reader,actors.manager,actors.custom]) {
+        expect(accepted(await read(actor),200).data()).toEqual(expected);
+      }
+      failure(await read(actors.actionOnly),403,'FORBIDDEN');
+      failure(await read(actors.wrong),404,'NOT_FOUND');
+      failure(await https('GET','/requests/filters',undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+      failure(await read(actors.noCity),404,'NOT_FOUND');
+      await actors.setAdminScope('CITY');
+      expect(accepted(await read(actors.cityAdmin),200).data()).toEqual(expected);
+      await actors.revokeCity(actors.cityAdmin);
+      failure(await read(actors.cityAdmin),404,'NOT_FOUND');
+
+      const app = testApp;
+      if (!app) { throw new Error('Missing isolated app'); }
+      const hash = createHash('sha256').update(actors.reader.token).digest('hex');
+      const { rows: [session] } = await db().db.query<{ expires: Date }>(`UPDATE foundation.web_sessions
+        SET idle_expires_at=clock_timestamp()+interval '3 seconds' WHERE token_hash=$1
+        RETURNING idle_expires_at AS expires`,[hash]);
+      if (!session) { throw new Error('Missing synthetic reader session'); }
+      let opened = false;
+      registryOpenHook = async client => {
+        opened = true;
+        await client.query("SELECT pg_sleep_until($1::timestamptz + interval '20 milliseconds')", [session.expires.toISOString()]);
+      };
+      try {
+        await expect(app.service.readStaffRegistry({kind:'staff-web',token:actors.reader.token},
+          parseRegistryQuery(new URLSearchParams({from:'2099-01-01T00:00:00.000Z'})))).rejects.toMatchObject({code:'UNAUTHORIZED'});
+        expect(opened).toBe(true);
+      } finally { registryOpenHook = undefined; }
+    });
+  },45000);
+
+  it.runIf(process.env['FIXLEVELUP_P06_BROWSER'] === '1')('P06 browser renders and filters the live CRM registry', async () => {
+    const manual = await manualPrepared(fixture.districtId);
+    manual.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const browserFixture = { origin,apiPort:port,key:staffTlsKey,cert,sessionToken:db().admin.token,
+      publicNumber:text(created,'publicNumber') };
+    const helper = new URL('../../../packages/browser-tooling/fixtures/p06-live.ts', import.meta.url);
+    const { proveLiveRegistry } = await import(helper.href) as { proveLiveRegistry: (input: typeof browserFixture) => Promise<void> };
+    await proveLiveRegistry(browserFixture);
+  },75000);
+
   it('callback is consent-bound, single effect and exact replay; revoke changes both GET validators without changing row_version', async () => {
     const f=await issue();
     const cb=`${pub}/callback-requests`;
@@ -429,13 +545,25 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     const evidenceId=await given(f);
     const repair=`${pub}/repair-requests`;
     const body={contact,address:{...address,districtId:fixture.districtId},appliance:{categoryId:fixture.categoryId},
-      fault:{otherDescription:'Synthetic other symptom sentinel'},
+      fault:{otherDescription:'Synthetic other symptom sentinel'},urgency:'WITHIN_DAY',
       consent:{evidenceId,documentVersionId:fixture.consentDocumentVersionId,accepted:true},channelSelection:offers.ids};
     const key=randomUUID();
     failure(await https('POST',repair,{...body,fault:{}},mutate(f,key)),422,'SEMANTIC');
     expect(await db().count('SELECT count(*)::int n FROM foundation.request_events WHERE idempotency_key=$1',[key])).toBe(0);
     const created=accepted(await https('POST',repair,body,mutate(f,key)),201);
     expect(created.data()['status']).toBe('WAITING_TELEGRAM_LINK');
+    const { rows:[stamp] } = await db().db.query<{ instant: string }>(`SELECT
+      to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS instant
+      FROM foundation.requests WHERE public_number=$1`,[created.data()['publicNumber']]);
+    if (!stamp) { throw new Error('Missing captured request'); }
+    const timestamp = encodeURIComponent(stamp.instant);
+    const included = await https('GET',`/requests?from=${timestamp}&status=WAITING_TELEGRAM_LINK&urgency=WITHIN_DAY&contactMode=CHANNEL&provider=TG`,undefined,staff());
+    expect(accepted(included,200).data()['items']).toContainEqual(expect.objectContaining({publicNumber:created.data()['publicNumber']}));
+    for (const filter of ['status=NEW','urgency=FLEXIBLE','contactMode=PHONE','provider=VK']) {
+      expect(accepted(await https('GET',`/requests?from=${timestamp}&${filter}`,undefined,staff()),200).data()).toEqual({items:[],nextCursor:null});
+    }
+    expect(accepted(await https('GET',`/requests?to=${timestamp}&status=WAITING_TELEGRAM_LINK&urgency=WITHIN_DAY&provider=TG`,undefined,staff()),200)
+      .data()['items']).not.toContainEqual(expect.objectContaining({publicNumber:created.data()['publicNumber']}));
     const fault=await db().db.query(`SELECT f.is_other,f.fault_id,f.fault_version_id FROM foundation.request_faults f
       JOIN foundation.requests q ON q.id=f.request_id AND q.current_appliance_revision_id=f.appliance_revision_id
       WHERE q.public_number=$1`,[created.data()['publicNumber']]);
@@ -1497,4 +1625,91 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       },
     });
   },90000);
+
+  it.runIf(process.env['FIXLEVELUP_P06_LOAD_PROOF'] === '1')('P06 registry measures a multi-page PostgreSQL fixture under runtime role', async () => {
+    if (!testApp) { throw new Error('Missing isolated app'); }
+    const app = testApp;
+    const { rows: [clock] } = await db().db.query<{ instant: string }>(`SELECT
+      to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS instant`);
+    if (!clock) { throw new Error('Missing fixture clock'); }
+    const proof = { kind:'staff-web' as const,token:db().admin.token };
+    async function createRepair() {
+      const { authorize, key, body } = await manualPrepared(fixture.districtId);
+      authorize();
+      return (await app.service.submitStaff(proof, { key,bytes:Buffer.from(JSON.stringify(body)) })).receipt.publicNumber;
+    }
+    const created: string[] = [];
+    for (let index = 0; index < 105; index++) { created.push(await createRepair()); }
+
+    const query = parseRegistryQuery(new URLSearchParams({from:clock.instant,limit:'100',categoryId:fixture.categoryId}));
+    const first = await app.service.readStaffRegistry(proof, query);
+    expect(first.items).toHaveLength(100);
+    expect(first.nextCursor).not.toBeNull();
+    const inserted = await createRepair();
+    const second = await app.service.readStaffRegistry(proof, { ...query,cursor:first.nextCursor });
+    expect(second.nextCursor).toBeNull();
+    const numbers = [...first.items,...second.items].map(item => item.publicNumber);
+    expect(numbers).toEqual(created.reverse());
+    expect(numbers).not.toContain(inserted);
+
+    const { cityId, cityVersionId } = fixture;
+    const client = await app.filePool.connect();
+    try {
+      const { rows: [identity] } = await client.query<{ role: string }>('SELECT current_user AS role');
+      expect(identity?.role).toBe('fixlevelup_runtime');
+      let executions = 0;
+      const explain = new Proxy(client, { get(target, key) {
+        if (key !== 'query') { return Reflect.get(target, key, target) as unknown; }
+        return async (sql: string, parameters: unknown[]) => {
+          executions++;
+          const result = await target.query<{ 'QUERY PLAN': readonly { 'Execution Time': number }[] }>(
+            `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, parameters);
+          const milliseconds = result.rows[0]?.['QUERY PLAN'][0]?.['Execution Time'];
+          expect(milliseconds).toBeGreaterThan(0);
+          process.stdout.write(`P06 registry PostgreSQL execution ${String(milliseconds)} ms\n`);
+          return await target.query(sql, parameters);
+        };
+      } });
+      const page = await readVisibleRegistry(explain, {cityId,cityVersionId,timezone:'UTC'}, query,
+        item => evidence.get(item.id)?.procedureRevision === item.procedureRevision);
+      expect(page.items).toHaveLength(100);
+      expect(executions).toBe(1);
+
+      // Keep the persisted request facts and run the production ordering with a
+      // deterministic timestamp projection. This avoids changing P05's clock or schema.
+      const tied = new Proxy(client, { get(target, key) {
+        if (key !== 'query') { return Reflect.get(target, key, target) as unknown; }
+        return async (sql: string, parameters: unknown[]) => {
+          const pair = parameters.length + 1;
+          const near = pair + 1;
+          const fixtureSql = sql.replace('FROM foundation.requests AS request', `FROM (
+            SELECT id,city_id,public_number,type,status,row_version,current_appliance_revision_id,
+              current_address_revision_id,current_preference_revision_id,
+              CASE WHEN public_number = ANY($${String(pair)}::bigint[]) THEN '2090-01-01 00:00:00.123456Z'::timestamptz
+                WHEN public_number = $${String(near)}::bigint THEN '2090-01-01 00:00:00.123455Z'::timestamptz
+                ELSE created_at END AS created_at
+            FROM foundation.requests
+          ) AS request`);
+          expect(fixtureSql).not.toBe(sql);
+          return await target.query(fixtureSql, [...parameters, numbers.slice(1,3), numbers[0]]);
+        };
+      } });
+      const scope = {cityId,cityVersionId,timezone:'UTC'};
+      const boundary = parseRegistryQuery(new URLSearchParams({from:'2090-01-01T00:00:00.123455Z',
+        to:'2090-01-01T00:00:00.123457Z',limit:'1'}));
+      const current = (item: {id: string; procedureRevision: string}) => evidence.get(item.id)?.procedureRevision === item.procedureRevision;
+      const a = await readVisibleRegistry(tied, scope, boundary, current);
+      const b = await readVisibleRegistry(tied, scope, { ...boundary,cursor:a.nextCursor }, current);
+      const c = await readVisibleRegistry(tied, scope, { ...boundary,cursor:b.nextCursor }, current);
+      expect([a,b,c].flatMap(result => result.items.map(item => [item.publicNumber,item.createdAt]))).toEqual([
+        [numbers[1],'2090-01-01T00:00:00.123456Z'],
+        [numbers[2],'2090-01-01T00:00:00.123456Z'],
+        [numbers[0],'2090-01-01T00:00:00.123455Z'],
+      ]);
+      expect(c.nextCursor).toBeNull();
+      const exclusive = await readVisibleRegistry(tied, scope, { ...boundary,to:'2090-01-01T00:00:00.123456Z' }, current);
+      expect(exclusive.items.map(item => item.publicNumber)).toEqual([numbers[0]]);
+      expect(exclusive.nextCursor).toBeNull();
+    } finally { client.release(); }
+  },180000);
 });

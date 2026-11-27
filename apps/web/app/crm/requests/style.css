@@ -1,0 +1,5 @@
+.registry-table { overflow-x: auto; margin-block: 1rem; }
+.registry-table table { width: 100%; border-collapse: collapse; }
+.registry-table th, .registry-table td { padding: .65rem; text-align: start; border-bottom: 1px solid #afc2c7; }
+.registry-table time { white-space: nowrap; }
+.registry-table th { background: #edf6f3; }
