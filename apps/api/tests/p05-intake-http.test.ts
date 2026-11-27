@@ -42,6 +42,8 @@ import { installCommentFixture, grantCommentFixture, grantContactFixture } from 
 import { createContactAudit } from '../src/requests/card/contacts.js';
 import { ContactSearchIndex } from '../src/requests/search/index.js';
 import { installSearchFixture, rebuildSearchFixture } from './p06-search-fixture.js';
+import { DashboardSnapshots } from '../src/requests/dashboard/snapshots.js';
+import { captureDashboard, dashboardClockSql, dashboardRowsCurrent } from '../src/requests/dashboard/store.js';
 
 const origin = 'https://crm.example.test';
 const enabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
@@ -51,6 +53,7 @@ const address = Object.freeze({ street:'Synthetic comparison sentinel',building:
 const pub = '/public';
 const commentProof = process.env['FIXLEVELUP_P06_COMMENT_PROOF'] === '1';
 const searchProof = process.env['FIXLEVELUP_P06_SEARCH_PROOF'] === '1';
+const dashboardProof = process.env['FIXLEVELUP_P06_DASHBOARD_PROOF'] === '1';
 
 interface Reply {
   readonly status: number;
@@ -74,6 +77,7 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   let managedComments: Awaited<ReturnType<typeof createSyntheticKeySlots>> | undefined;
   let activeSearch: ContactSearchIndex | undefined;
   const firstSearchKey = { generation:randomUUID(),key:randomBytes(32) };
+  let dashboardClockOffset = 0;
   let launchWithPolicy: (id: string, pins?: ReadonlyMap<string,string>, anchorTtlMs?: number,
     matrixOffers?: RequestOffers, searchKey?: { generation:string; key:Buffer } | null) => ReturnType<typeof startIsolatedIntake>;
   const historicalDigest = '3799c7e532579641d010675a229541c998f4d02bf85c3156fe167f79d33631cf';
@@ -156,6 +160,7 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
         configure:audit=>({
           ...settings,offers:matrixOffers ?? offers,staffEvidence:evidencePort,
           ...(searchProof && searchKey ? { search:activeSearch = new ContactSearchIndex(audit,'p05-isolated',searchKey.generation,searchKey.key) } : {}),
+          ...(dashboardProof ? { dashboard:new DashboardSnapshots(() => performance.now()+dashboardClockOffset) } : {}),
           ...(managedComments ? {comments:{ring:keyring,keySlots:managedComments.slots},contactAudit:createContactAudit(audit)} : {}),
           coverage:coverageEffects(settings,audit,{
           async verify(input) { return await Promise.resolve(review.get(input.evidenceId)); },
@@ -416,6 +421,229 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     throw new Error('Expected two observed PostgreSQL lock contenders');
   }
 
+  it.runIf(dashboardProof)('P06 dashboard keeps counts and pages on one authorized snapshot and refreshes expired or changed data', async () => {
+    const path = '/crm/dashboard';
+    const keys = ['snapshotId','asOf','definitionsVersion','cityId','cityVersionId','timezone','localDay','metrics'];
+    const ready = ['newRequests','createdToday','callbackRequired','awaitingChannel','readyForAssignment'];
+    const read = async (headers = staff()) => closed(await https('GET',path,undefined,headers),200,keys).data();
+    const metric = (dashboard: Record<string,unknown>, name: string) => record(record(dashboard['metrics'])[name]);
+    const drill = async (dashboard: Record<string,unknown>, name: string, headers = staff(), offset?: number) => {
+      const href = text(metric(dashboard,name),'href');
+      expect(href).toBe(`/crm/requests?snapshot=${text(dashboard,'snapshotId')}&metric=${name}`);
+      return closed(await https('GET',href.slice(4)+(offset === undefined ? '' : `&offset=${String(offset)}`),undefined,headers),
+        200,['snapshot','metric','items','nextOffset','refreshed']).data();
+    };
+    const rows = (data: Record<string,unknown>) => {
+      const result = data['items'];
+      if (!Array.isArray(result)) { throw new Error('Invalid snapshot result'); }
+      return result.map(record);
+    };
+    const uuidOfNumber = async (number: unknown) => {
+      const { rows:[row] } = await db().db.query<{ id:string }>('SELECT id FROM foundation.requests WHERE public_number=$1',[number]);
+      if (!row) { throw new Error('Missing synthetic request'); }
+      return row.id;
+    };
+    const createManual = async () => {
+      const prepared = await manualPrepared();
+      prepared.authorize();
+      const result = accepted(await https('POST','/requests',prepared.body,staffMutation(prepared.key)),201).data();
+      return {id:text(result,'id'),prepared};
+    };
+    failure(await https('GET',path),401,'UNAUTHORIZED');
+    failure(await https('GET',`${path}?cityId=${fixture.cityId}`,undefined,staff()),404,'NOT_FOUND');
+    const empty = await read();
+    expect(empty).toMatchObject({definitionsVersion:'p06-v1',cityId:fixture.cityId,cityVersionId:fixture.cityVersionId,timezone:fixture.timezone});
+    const day = record(empty['localDay']);
+    expect(text(day,'from') <= text(empty,'asOf') && text(empty,'asOf') < text(day,'to')).toBe(true);
+    for (const key of ready) { expect(metric(empty,key)).toMatchObject({state:'ready',count:0}); }
+    expect(metric(empty,'newRequests')['appliedFilters']).toEqual({statuses:['NEW']});
+    expect(metric(empty,'createdToday')['appliedFilters']).toEqual(day);
+    expect(metric(empty,'callbackRequired')['appliedFilters']).toEqual({statuses:['CALLBACK_REQUIRED'],contactMode:'PHONE',
+      phonePermission:'active_current_revision',processing:'current'});
+    expect(metric(empty,'awaitingChannel')['appliedFilters']).toEqual({statuses:['WAITING_TELEGRAM_LINK','WAITING_CHANNEL_LINK']});
+    expect(metric(empty,'readyForAssignment')['appliedFilters']).toEqual({statuses:['WAITING_ASSIGNMENT']});
+    for (const key of ['unassigned','unconfirmedAssignments','visitsToday','diagnosisOrApproval','pendingReports','overdueOrProblem','freeTechnicians']) {
+      expect(metric(empty,key)).toEqual({state:'not_ready'});
+    }
+    expect(rows(await drill(empty,'newRequests'))).toEqual([]);
+    const rawLink = text(metric(empty,'newRequests'),'href').slice(4);
+    failure(await https('GET',`${rawLink}&status=NEW`,undefined,staff()),400,'MALFORMED');
+    failure(await https('GET',`${rawLink}&offset=1`,undefined,staff()),400,'MALFORMED');
+    failure(await https('GET',`${rawLink}&metric=createdToday`,undefined,staff()),400,'MALFORMED');
+
+    const newRequest = await createManual();
+    const pending = await createManual();
+    const pendingPath = `/requests/${pending.id}`;
+    const pendingTag = async () => tag(accepted(await https('GET',pendingPath,undefined,staff()),200));
+    accepted(await https('POST',`${pendingPath}/commands/start-review`,{},staffMutation(undefined,await pendingTag())),200);
+    const { rows:[pendingAddress] } = await db().db.query<{id:string}>(
+      'SELECT current_address_revision_id AS id FROM foundation.requests WHERE id=$1',[pending.id]);
+    if (!pendingAddress) { throw new Error('Missing synthetic address'); }
+    const reviewId = randomUUID();
+    review.set(reviewId,{evidenceId:reviewId,issuer:'T',purpose:'COVERAGE_REVIEW',staffId:db().admin.id,requestId:pending.id,
+      addressRevisionId:pendingAddress.id,candidate:address,expiresAt:new Date(Date.now()+60000)});
+    accepted(await https('POST',`${pendingPath}/commands/record-coverage`,
+      {evidenceId:reviewId,outcome:'IN_ZONE',areaId:fixture.areaId},staffMutation(undefined,await pendingTag())),200);
+    accepted(await https('POST',`${pendingPath}/commands/ready-for-dispatch`,{},staffMutation(undefined,await pendingTag())),200);
+
+    const callback = await issue();
+    const callbackConsent = await given(callback);
+    const callbackResult = accepted(await https('POST',`${pub}/callback-requests`,{
+      contact,phonePermission:true,callbackIntervalId:fixture.callbackIntervalEntryId,
+      consent:{evidenceId:callbackConsent,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(callback)),201).data();
+    const callbackId = await uuidOfNumber(callbackResult['publicNumber']);
+    const channel = await issue();
+    const channelConsent = await given(channel);
+    const channelResult = accepted(await https('POST',`${pub}/repair-requests`,{
+      contact,address,appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]},channelSelection:offers.ids,
+      consent:{evidenceId:channelConsent,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(channel)),201).data();
+    const channelId = await uuidOfNumber(channelResult['publicNumber']);
+
+    const snapshot = await read();
+    const expected: Record<string,string[]> = {newRequests:[newRequest.id],createdToday:[channelId,callbackId,pending.id,newRequest.id],
+      callbackRequired:[callbackId],awaitingChannel:[channelId],readyForAssignment:[pending.id]};
+    for (const [key,ids] of Object.entries(expected)) {
+      const page = await drill(snapshot,key);
+      expect(page).toMatchObject({metric:key,refreshed:false,nextOffset:null});
+      expect(page['snapshot']).toEqual(snapshot);
+      expect(metric(snapshot,key)['count']).toBe(ids.length);
+      expect(rows(page).map(row => text(row,'id'))).toEqual(ids);
+      for (const row of rows(page)) { expect(Object.keys(row).sort()).toEqual(['createdAt','id','publicNumber','status','type','version']); }
+    }
+    await withHttpMatrixActors(db(),fixture.cityId,async actors => {
+      const foreign = await drill(snapshot,'newRequests',{Cookie:actors.reader.cookie});
+      const missing = randomUUID();
+      const unknown = {...snapshot,snapshotId:missing,metrics:{ ...record(snapshot['metrics']),
+        newRequests:{...metric(snapshot,'newRequests'),href:`/crm/requests?snapshot=${missing}&metric=newRequests`} }};
+      const absent = await drill(unknown,'newRequests',{Cookie:actors.reader.cookie});
+      expect(foreign['refreshed']).toBe(true);
+      expect(absent['refreshed']).toBe(true);
+      expect(record(foreign['snapshot'])['snapshotId']).not.toEqual(snapshot['snapshotId']);
+      failure(await https('GET',path,undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+      failure(await https('GET',rawLink,undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+    });
+
+    const [duringInsert,inserted] = await Promise.all([drill(snapshot,'newRequests'),createManual()]);
+    expect(duringInsert['snapshot']).toEqual(snapshot);
+    expect(rows(duringInsert).map(row => row['id'])).toEqual([newRequest.id]);
+
+    const formRequest = `${pub}/request-session`;
+    const callbackTag = tag(accepted(await https('GET',formRequest,undefined,proof(callback)),200));
+    accepted(await https('POST',`${formRequest}/phone-permissions`,{action:'REVOKED'},mutate(callback,randomUUID(),callbackTag)),200);
+    const lostPhone = await drill(snapshot,'callbackRequired');
+    const fresh = record(lostPhone['snapshot']);
+    expect(lostPhone['refreshed']).toBe(true);
+    expect(rows(lostPhone)).toEqual([]);
+    expect(metric(fresh,'callbackRequired')['count']).toBe(0);
+    expect(metric(fresh,'newRequests')['count']).toBe(2);
+
+    const withdrew = randomUUID();
+    accepted(await https('POST',`${pub}/form-session/consents`,{action:'REVOKED',evidenceRef:withdrew,supersedesEvidenceId:channelConsent},
+      mutate(channel,withdrew)),201);
+    const noChannel = await drill(fresh,'newRequests');
+    expect(noChannel['refreshed']).toBe(true);
+    expect(metric(record(noChannel['snapshot']),'awaitingChannel')['count']).toBe(0);
+
+    registryEvidenceHooks.set(inserted.prepared.body.evidenceId,() => { evidence.delete(inserted.prepared.body.evidenceId); });
+    try {
+      const noLongerVisible = await drill(record(noChannel['snapshot']),'newRequests');
+      expect(noLongerVisible['refreshed']).toBe(true);
+      expect(rows(noLongerVisible).map(row => row['id'])).toEqual([newRequest.id]);
+      const expired = record(noLongerVisible['snapshot']);
+      dashboardClockOffset = 91000;
+      const next = await drill(expired,'newRequests',staff(),30);
+      expect(next['refreshed']).toBe(true);
+      expect(record(next['snapshot'])['snapshotId']).not.toEqual(expired['snapshotId']);
+      expect(rows(next).map(row => row['id'])).toEqual([newRequest.id]);
+    } finally {
+      dashboardClockOffset = 0;
+      registryEvidenceHooks.delete(inserted.prepared.body.evidenceId);
+    }
+  },90000);
+
+  it.runIf(dashboardProof)('P06 dashboard paginates a large snapshot without N+1 and uses true city-day bounds', async () => {
+    if (!testApp) { throw new Error('Missing dashboard fixture'); }
+    const app = testApp;
+    const staffProof = {kind:'staff-web' as const,token:db().admin.token};
+    const created: string[] = [];
+    for (let index = 0; index < 105; index++) {
+      const prepared = await manualPrepared(fixture.districtId);
+      prepared.authorize();
+      const {receipt} = await app.service.submitStaff(staffProof,{key:prepared.key,bytes:Buffer.from(JSON.stringify(prepared.body))});
+      created.unshift(receipt.requestId);
+    }
+    const dashboard = accepted(await https('GET','/crm/dashboard',undefined,staff()),200).data();
+    const metric = record(record(dashboard['metrics'])['newRequests']);
+    const href = text(metric,'href').slice(4);
+    const seen: string[] = [];
+    let offset = 0;
+    for (;;) {
+      const page = accepted(await https('GET',`${href}&offset=${String(offset)}`,undefined,staff()),200).data();
+      expect(page['refreshed']).toBe(false);
+      expect(page['snapshot']).toEqual(dashboard);
+      const items = page['items'];
+      if (!Array.isArray(items)) { throw new Error('Invalid dashboard page'); }
+      seen.push(...items.map(item => text(record(item),'id')));
+      if (page['nextOffset'] === null) { break; }
+      expect(page['nextOffset']).toBe(offset+30);
+      offset += 30;
+    }
+    expect(seen).toHaveLength(Number(metric['count']));
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen.slice(0,created.length)).toEqual(created);
+
+    const dbClient = await app.filePool.connect();
+    try {
+      const { rows:[identity] } = await dbClient.query<{role:string}>('SELECT current_user AS role');
+      expect(identity?.role).toBe('fixlevelup_runtime');
+      const observed: number[] = [];
+      const measured = new Proxy(dbClient,{get(target,key) {
+        if (key !== 'query') { return Reflect.get(target,key,target) as unknown; }
+        return async (sql: string, parameters: unknown[]) => {
+          const plan = await target.query<{ 'QUERY PLAN': readonly { 'Execution Time': number }[] }>(
+            `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`,parameters);
+          const duration = plan.rows[0]?.['QUERY PLAN'][0]?.['Execution Time'];
+          if (duration === undefined) { throw new Error('Missing dashboard execution plan'); }
+          observed.push(duration);
+          return await target.query(sql,parameters);
+        };
+      }});
+      const city = {cityId:fixture.cityId,cityVersionId:fixture.cityVersionId,timezone:fixture.timezone};
+      const current = (item: StaffEvidence) => evidence.get(item.id)?.procedureRevision === item.procedureRevision;
+      const material = await captureDashboard(measured,city,current);
+      expect(material.queues.newRequests.map(row => row.id)).toEqual(seen);
+      expect(await dashboardRowsCurrent(measured,city.cityId,material)).toBe(true);
+      expect(observed).toHaveLength(2);
+      process.stdout.write(`P06 dashboard PostgreSQL capture and revalidation ms ${JSON.stringify(observed)}\n`);
+
+      const dayBounds = dashboardClockSql('$1::timestamptz','$2::text');
+      const boundary = async (instant: string, timezone: string) => (await dbClient.query<{
+        from:Date; to:Date; includesStart:boolean; excludesEnd:boolean;
+      }>(`SELECT clock.day_start AS "from",clock.day_end AS "to",
+        (clock.day_start AT TIME ZONE $2::text)::date=clock.city_date AS "includesStart",
+        (clock.day_end AT TIME ZONE $2::text)::date<>clock.city_date AS "excludesEnd"
+        FROM (${dayBounds}) AS clock`,[instant,timezone])).rows[0];
+      const beforeMidnight = await boundary('2026-11-27T20:59:59.999999Z','Europe/Moscow');
+      const midnight = await boundary('2026-11-27T21:00:00Z','Europe/Moscow');
+      expect(beforeMidnight?.from.toISOString()).toBe('2026-11-26T21:00:00.000Z');
+      expect(beforeMidnight?.to.toISOString()).toBe(midnight?.from.toISOString());
+      expect(midnight?.from.toISOString()).toBe('2026-11-27T21:00:00.000Z');
+      expect(midnight).toMatchObject({includesStart:true,excludesEnd:true});
+      const spring = await boundary('2026-03-29T12:00:00Z','Europe/Berlin');
+      const autumn = await boundary('2026-10-25T12:00:00Z','Europe/Berlin');
+      const repeatedMidnight = await boundary('2025-11-02T04:30:00Z','America/Havana');
+      const secondMidnight = await boundary('2025-11-02T05:30:00Z','America/Havana');
+      if (!spring || !autumn || !repeatedMidnight || !secondMidnight) { throw new Error('Missing DST boundaries'); }
+      expect((spring.to.getTime()-spring.from.getTime())/3600000).toBe(23);
+      expect((autumn.to.getTime()-autumn.from.getTime())/3600000).toBe(25);
+      expect(repeatedMidnight.from.toISOString()).toBe('2025-11-02T04:00:00.000Z');
+      expect((repeatedMidnight.to.getTime()-repeatedMidnight.from.getTime())/3600000).toBe(25);
+      expect(secondMidnight).toEqual(repeatedMidnight);
+    } finally { dbClient.release(); }
+  },150000);
+
   it('P06 registry paginates only visible requests over HTTPS', async () => {
     const { rows: [start] } = await db().db.query<{ instant: string }>(`SELECT
       to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS instant`);
@@ -519,7 +747,8 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       await grantContactFixture(db(),db().admin.id,fixture.cityId);
     }
     const browserFixture = { origin,apiPort:port,key:staffTlsKey,cert,sessionToken:db().admin.token,
-      publicNumber:text(created,'publicNumber'),requestId:text(created,'id'),checkPanels:commentProof,checkSearch:searchProof };
+      publicNumber:text(created,'publicNumber'),requestId:text(created,'id'),checkPanels:commentProof,checkSearch:searchProof,
+      checkDashboard:dashboardProof };
     const helper = new URL('../../../packages/browser-tooling/fixtures/p06-live.ts', import.meta.url);
     const { proveLiveRegistry } = await import(helper.href) as { proveLiveRegistry: (input: typeof browserFixture) => Promise<void> };
     await proveLiveRegistry(browserFixture);

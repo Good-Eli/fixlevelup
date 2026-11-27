@@ -34,6 +34,10 @@ import { hasContactGrant, readContactDetails, readStoredContact } from '../card/
 import type { ContactAudit } from '../card/contacts.js';
 import { parseSearch } from '../search/contract.js';
 import type { ContactSearchIndex } from '../search/index.js';
+import { captureDashboard, dashboardRowsCurrent } from '../dashboard/store.js';
+import { dashboardDto, dashboardPage } from '../dashboard/snapshots.js';
+import type { DashboardSnapshot, DashboardSnapshots, DashboardSubject } from '../dashboard/snapshots.js';
+import type { DashboardLink } from '../dashboard/contract.js';
 import type { ConsentBinding, OfferBasis, RequestOffers, SessionSubmit, StaffEvidence, StaffEvidencePort } from './basis.js';
 import { activePhone, clonePhonePreference, createRequestRow, insertStaffEvidence, modeOf, readContactMode,
   requestRow, updateRequestRow, writeAddress, writeAppliance, writeContact, writePhone, writePreference } from './store.js';
@@ -65,6 +69,7 @@ export interface RequestIntakeConfig extends Snapshots {
   readonly comments?: CommentConfig;
   readonly contactAudit?: ContactAudit;
   readonly search?: ContactSearchIndex;
+  readonly dashboard?: DashboardSnapshots;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -596,6 +601,45 @@ export class RequestIntake {
       }
       return { items,truncated };
     }));
+  }
+
+  async readStaffDashboard(proof: SessionProof) {
+    return dashboardDto((await this.dashboardSnapshot(proof)).snapshot);
+  }
+
+  async readStaffDashboardPage(proof: SessionProof, link: DashboardLink) {
+    const { snapshot,reused } = await this.dashboardSnapshot(proof,link);
+    return dashboardPage(snapshot,link,!reused);
+  }
+
+  private async dashboardSnapshot(proof: SessionProof, link?: DashboardLink) {
+    const cache = this.config.dashboard;
+    if (!cache) { return deny('NOT_READY'); }
+    const run = async (tryReuse: boolean) => await this.staffCall(() => this.staff.withP05(proof,['requests.read'],async staff => {
+      await geoFence(staff.client);
+      const city = await currentCity(staff.client);
+      await staff.authorizeCity(city.cityId);
+      if (!await lockConsent(staff.client,undefined,'shared')) { return deny('NOT_READY'); }
+      const port = this.config.staffEvidence;
+      if (port && !port.openRegistry) { return deny('NOT_READY'); }
+      const isCurrent = await port?.openRegistry?.(staff.client);
+      const subject: DashboardSubject = { ...city,staffId:staff.staffId,sessionId:staff.sessionId };
+      const basisCurrent = (snapshot: DashboardSnapshot, clock: Date) => snapshot.material.evidence.every(evidence =>
+        evidence.validUntil.getTime() > clock.getTime() && isCurrent?.(evidence) === true);
+      const usable = (snapshot: DashboardSnapshot, clock: Date) => cache.live(snapshot)
+        && Date.parse(snapshot.material.localDay.to) > clock.getTime() && basisCurrent(snapshot,clock);
+      const previous = tryReuse && link ? cache.find(link.snapshot,subject) : undefined;
+      if (previous && await dashboardRowsCurrent(staff.client,city.cityId,previous.material)
+        && usable(previous,await staff.recheck())) {
+        return (clock:Date) => usable(previous,clock) ? { snapshot:previous,reused:true } : null;
+      }
+      const snapshot = cache.issue(subject,await captureDashboard(staff.client,city,isCurrent));
+      return (clock:Date) => usable(snapshot,clock) ? { snapshot,reused:false } : null;
+    },decidePrepared));
+    const selected = await run(true) ?? await run(false);
+    if (!selected) { return deny('NOT_READY'); }
+    if (!selected.reused) { cache.remember(selected.snapshot); }
+    return selected;
   }
 
   async readForm(proof: FProof) {

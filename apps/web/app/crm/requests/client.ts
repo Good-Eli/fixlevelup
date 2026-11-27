@@ -15,7 +15,7 @@ function object(value: unknown, keys: readonly string[], error: Error = new Regi
   return value as Record<string, unknown>;
 }
 
-function item(value: unknown) {
+export function readRegistryItem(value: unknown) {
   const { createdAt, ...fields } = object(value, ['id', 'publicNumber', 'type', 'status', 'version', 'createdAt']);
   const request = decodeP05StaffRequestData(fields);
   if (!('id' in request) || typeof createdAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(createdAt)
@@ -25,7 +25,7 @@ function item(value: unknown) {
   return { ...request, createdAt };
 }
 
-function request(path: string, signal: AbortSignal, authRequest = false) {
+export function request(path: string, signal: AbortSignal, authRequest = false) {
   const headers = new Headers({ Accept: 'application/json' });
   if (authRequest) { headers.set('X-Auth-Request', '1'); }
   return fetch(path, {
@@ -50,7 +50,7 @@ export async function readRegistry(query: URLSearchParams, signal: AbortSignal) 
     || nextCursor.length === 0 || nextCursor.length > 256))) {
     throw new RegistryError('Некорректная страница реестра.');
   }
-  return { items: items.map(item), nextCursor };
+  return { items: items.map(readRegistryItem), nextCursor };
 }
 
 export type RegistrySearchKind = 'number' | 'name' | 'phone';
@@ -84,7 +84,7 @@ export async function searchRegistry(kind: RegistrySearchKind, query: string, si
   if (!Array.isArray(items) || items.length > 50 || typeof truncated !== 'boolean') {
     throw new RegistryError('Некорректный ответ поиска.');
   }
-  return { items: items.map(item), truncated };
+  return { items: items.map(readRegistryItem), truncated };
 }
 
 function choices(value: unknown) {

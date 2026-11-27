@@ -16,6 +16,7 @@ import { closeAfterProblem, readBoundedJson } from '../../settings/management/bo
 import { parseRegistryQuery } from '../registry/filters.js';
 import { COMMENT_BODY_BYTES } from '../card/comments.js';
 import { SEARCH_BODY_BYTES } from '../search/contract.js';
+import { parseDashboardLink } from '../dashboard/contract.js';
 import { deny, RequestFailure } from './errors.js';
 import type { FProof, RequestIntake, StaffCommand, WriteInput, WriteResult } from './service.js';
 
@@ -56,6 +57,10 @@ function isRegistrySearch(method: string, target: string): boolean {
   return method === 'POST' && target === '/api/v1/requests/search';
 }
 
+function isDashboard(method: string, target: string): boolean {
+  return method === 'GET' && target === '/api/v1/crm/dashboard';
+}
+
 /** Install only in T. Unknown aliases don't get interpreted or forwarded as a
  * successful route; real P03/P04 and S2 paths keep their own parser. */
 export function intakeBody(readiness: Readiness) {
@@ -65,7 +70,8 @@ export function intakeBody(readiness: Readiness) {
     const target = req.url ?? '';
     const detail = crmDetail(method,target);
     const search = isRegistrySearch(method,target);
-    if (registryQueryString(method,target) === null && !isRegistryOptions(method,target) && !search && !detail && !matchP05Route(method,target)) {
+    if (registryQueryString(method,target) === null && !isRegistryOptions(method,target) && !isDashboard(method,target)
+      && !search && !detail && !matchP05Route(method,target)) {
       form(req,res,next); return;
     }
     void readiness.requestEffectsReady().then((ready) => {
@@ -135,7 +141,7 @@ export class RequestIntakeController {
 
   @All(['public/callback-requests','public/repair-requests','public/request-session','public/request-session/contact-mode',
     'public/request-session/phone-permissions','public/request-session/cancel','requests','requests/:id','requests/:id/commands/:command',
-    'requests/search','requests/:id/card','requests/:id/events','requests/:id/comments','requests/:id/contact-details'])
+    'requests/search','requests/:id/card','requests/:id/events','requests/:id/comments','requests/:id/contact-details','crm/dashboard'])
   async handle(@Req() req: StaffRequest, @Res() res: ServerResponse): Promise<void> {
     res.setHeader('Cache-Control','no-store');
     const method = req.method ?? '';
@@ -144,8 +150,9 @@ export class RequestIntakeController {
     const registry = registryQueryString(method,target);
     const options = isRegistryOptions(method,target);
     const search = isRegistrySearch(method,target);
+    const dashboard = isDashboard(method,target);
     const detail = crmDetail(method,target);
-    if (matched === null && registry === null && !options && !search && detail === null) { return deny('NOT_FOUND'); }
+    if (matched === null && registry === null && !options && !search && !dashboard && detail === null) { return deny('NOT_FOUND'); }
     if (!await this.deps.readiness.requestEffectsReady()) { return deny('NOT_READY'); }
     for (const key of RAW_HEADERS) { header(req,key); }
     const cookies = header(req,'cookie');
@@ -178,7 +185,7 @@ export class RequestIntakeController {
       res.end(JSON.stringify({ data:result.data }));
       return;
     }
-    if (registry !== null || options || detail !== null) {
+    if (registry !== null || options || dashboard || detail !== null) {
       expectExactOrigin(req,this.deps.staff.origin);
       const token = sessionToken(req);
       if ((registry !== null && (registry.length > 2048 || registry.includes('#')))
@@ -187,7 +194,9 @@ export class RequestIntakeController {
       }
       const proof = { kind:'staff-web' as const,token };
       let data: unknown;
-      if (detail?.resource === 'card') {
+      if (dashboard) {
+        data = await service.readStaffDashboard(proof);
+      } else if (detail?.resource === 'card') {
         const result = await service.readStaffCard(proof,detail.id);
         data = result.data;
         if (result.commandEtag) { res.setHeader('X-Command-ETag',result.commandEtag); }
@@ -205,8 +214,12 @@ export class RequestIntakeController {
         if (header(req,'x-auth-request') !== '1') { return deny('FORBIDDEN'); }
         data = await service.readStaffContact(proof,detail.id);
       } else {
-        data = registry === null ? await service.readStaffRegistryOptions(proof)
-          : await service.readStaffRegistry(proof,parseRegistryQuery(new URLSearchParams(registry)));
+        if (registry === null) { data = await service.readStaffRegistryOptions(proof); }
+        else {
+          const query = new URLSearchParams(registry);
+          const link = parseDashboardLink(query);
+          data = link ? await service.readStaffDashboardPage(proof,link) : await service.readStaffRegistry(proof,parseRegistryQuery(query));
+        }
       }
       res.setHeader('Cache-Control','no-store, no-transform');
       res.setHeader('Content-Type','application/json; charset=utf-8');

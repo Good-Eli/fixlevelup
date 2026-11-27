@@ -13,20 +13,20 @@ interface RegistryPosition {
   readonly publicNumber: string;
 }
 
-interface RegistryItem extends RegistryPosition {
+export interface RegistryItem extends RegistryPosition {
   readonly id: string;
   readonly type: string;
   readonly status: string;
   readonly version: number;
 }
 
-interface RegistryRow extends RegistryItem {
+export interface RegistryRow extends RegistryItem {
   readonly evidenceId: string | null;
   readonly procedureRevision: string | null;
   readonly validUntil: Date | null;
 }
 
-const visibleFields = `request.id, request.public_number::text AS "publicNumber",
+export const registryVisibleFields = `request.id, request.public_number::text AS "publicNumber",
   to_char(request.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt",
   request.type, request.status, request.row_version AS version,
   manual.id AS "evidenceId", manual.procedure_revision AS "procedureRevision", manual.valid_until AS "validUntil"`;
@@ -96,7 +96,7 @@ export async function readRegistrySearch(client: PoolClient, cityId: string,
   isCurrent: ((evidence: StaffEvidence) => boolean) | undefined) {
   const byContact = query.kind !== 'number';
   const from = `FROM foundation.requests AS request ${byContact ? searchJoin : ''}`;
-  const selection = `SELECT ${visibleFields} ${from} ${registryBasisJoins}
+  const selection = `SELECT ${registryVisibleFields} ${from} ${registryBasisJoins}
     WHERE request.city_id=$1 ${byContact ? 'AND token.city_id=$1' : ''} AND ${searchMatch[query.kind]}
       AND ${registryVisibilitySql(byContact)} ${query.kind === 'phone' ? `AND ${livePhonePermission}` : ''}`;
   const order = byContact ? 'token' : 'request';
@@ -174,7 +174,7 @@ async function scanRegistry(client: Pick<PoolClient, 'query'>, city: SingleCityC
     predicates.push(`(request.created_at, request.public_number) < (${bind(after.createdAt)}::timestamptz, ${bind(after.publicNumber)}::bigint)`);
   }
   const { rows } = await client.query<RegistryRow>(`
-    SELECT ${visibleFields}
+    SELECT ${registryVisibleFields}
     FROM foundation.requests AS request
     LEFT JOIN foundation.request_appliance_revisions AS appliance
       ON appliance.request_id = request.id AND appliance.id = request.current_appliance_revision_id

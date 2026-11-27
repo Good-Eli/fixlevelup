@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { request as http } from 'node:http';
@@ -14,6 +15,8 @@ const registryPath = '/crm/requests';
 const list = '/api/v1/requests';
 const optionsPath = `${list}/filters`;
 const searchPath = `${list}/search`;
+const dashboardPage = '/crm/dashboard';
+const dashboardApi = '/api/v1/crm/dashboard';
 const browserEndpoint = `ws://${loopback}:4178/p06-registry`;
 const web = new URL('../../../apps/web/', import.meta.url);
 const next = createRequire(new URL('package.json', web)).resolve('next/dist/bin/next');
@@ -28,6 +31,7 @@ interface Fixture {
   readonly requestId: string;
   readonly checkPanels: boolean;
   readonly checkSearch: boolean;
+  readonly checkDashboard: boolean;
 }
 
 export async function proveLiveRegistry(fixture: Fixture) {
@@ -52,11 +56,13 @@ export async function proveLiveRegistry(fixture: Fixture) {
   const ingress = createServer({ key: fixture.key, cert: fixture.cert }, (req, res) => {
     const path = new URL(req.url ?? '/', fixture.origin).pathname;
     const api = path === list || path === optionsPath || path === cardApi || path === eventApi || path === reviewApi
-      || (fixture.checkPanels && (path === commentApi || path === contactApi)) || (fixture.checkSearch && path === searchPath);
+      || (fixture.checkPanels && (path === commentApi || path === contactApi)) || (fixture.checkSearch && path === searchPath)
+      || (fixture.checkDashboard && path === dashboardApi);
     const methodOk = path === reviewApi || (fixture.checkSearch && path === searchPath) ? req.method === 'POST'
       : req.method === 'GET' || (fixture.checkPanels && path === commentApi && req.method === 'POST');
     if (req.headers.host !== new URL(fixture.origin).host || !methodOk
-      || (!api && path !== registryPath && path !== cardPage && !path.startsWith('/_next/static/') && path !== '/favicon.ico')) {
+      || (!api && path !== registryPath && path !== cardPage && (!fixture.checkDashboard || path !== dashboardPage)
+        && !path.startsWith('/_next/static/') && path !== '/favicon.ico')) {
       unexpected++;
       res.writeHead(404).end();
       return;
@@ -150,6 +156,35 @@ export async function proveLiveRegistry(fixture: Fixture) {
       await expect(category).toHaveValue('');
       await expect(district).toHaveValue('');
       await expect(source).toHaveValue('');
+      if (fixture.checkDashboard) {
+        const [dashboard] = await Promise.all([byPath(dashboardApi),page.getByRole('link',{name:'Дашборд CRM',exact:true}).click()]);
+        expect(dashboard.status()).toBe(200);
+        expect(dashboard.headers()['cache-control']).toMatch(/^no-store\b/u);
+        await expect(page.getByRole('heading',{name:'Дашборд CRM'})).toBeVisible();
+        const pending = page.getByRole('region',{name:'Другие показатели'});
+        await expect(pending.getByText('Пока недоступно',{exact:true})).toHaveCount(7);
+        await expect(pending.getByRole('link')).toHaveCount(0);
+        const metric = page.getByRole('link',{name:'Новые заявки',exact:true});
+        await expect(metric.getByText('1',{exact:true})).toBeVisible();
+        const timestamp = await page.locator('time').getAttribute('datetime');
+        const [drilled] = await Promise.all([
+          page.waitForResponse(response => {
+            const url = new URL(response.url());
+            return url.pathname === list && url.searchParams.get('metric') === 'newRequests';
+          }),metric.click(),
+        ]);
+        expect(drilled.status()).toBe(200);
+        const snapshots = page.getByRole('region',{name:'Новые заявки'});
+        await expect(snapshots.getByText('Заявок в снимке: 1.',{exact:true})).toBeVisible();
+        await expect(snapshots.getByRole('link',{name:fixture.publicNumber})).toBeVisible();
+        expect(await snapshots.locator('time').first().getAttribute('datetime')).toBe(timestamp);
+        const stale = `${pageUrl}?snapshot=${randomUUID()}&metric=newRequests&offset=30`;
+        await page.goto(stale);
+        await expect(snapshots.getByText('Снимок обновлён. Показана первая страница актуального списка.',{exact:true})).toBeVisible();
+        await expect(snapshots.getByRole('link',{name:fixture.publicNumber})).toBeVisible();
+        await page.getByRole('link',{name:'Весь реестр',exact:true}).click();
+        await expect(row).toBeVisible();
+      }
       let cardLink = row.getByRole('link', { name:fixture.publicNumber });
       if (fixture.checkSearch) {
         const search = page.getByRole('region',{name:'Поиск заявок'});
