@@ -317,7 +317,7 @@ export async function rescrubFileRestore(ctx: RestoreContext, snapshot: SignedSn
     try { requireMatchingInventory(manifest.inventory, current); }
     catch (error) {
       const shape = (items: readonly RestoreObject[]) => ['COPY', 'NEVER_DISPATCHED', 'UNRESOLVED', 'TOMBSTONED']
-        .map(disposition => `${disposition}=${items.filter(item => item.disposition === disposition).length}`).join(',');
+        .map(disposition => `${disposition}=${String(items.filter(item => item.disposition === disposition).length)}`).join(',');
       restoreTestDiagnostic('target-object-inventory-mismatch', error, {
         manifestCount: manifest.inventory.length, targetCount: current.length,
         manifestShape: shape(manifest.inventory), targetShape: shape(current),
