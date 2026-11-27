@@ -77,6 +77,9 @@ export async function readClusterFact(client: Pick<Client, 'query'>): Promise<Cl
  * backend and prepared transaction excludes writers already inside the barrier.
  * In this synthetic contour the operator must keep the barrier installed until
  * target completion; a privileged external DBA changing it is out of model. */
+const SOURCE_FENCE_BACKEND_DRAIN_TIMEOUT_MS = 1_500;
+const SOURCE_FENCE_BACKEND_DRAIN_POLL_MS = 25;
+
 export async function observeFencedSource(client: Client, expected: {
   readonly database: string; readonly databaseOid: number; readonly scope: LedgerScope;
   readonly profile: RestoreSchemaProfile; readonly backendPid?: number;
@@ -85,69 +88,112 @@ export async function observeFencedSource(client: Client, expected: {
   if (!Number.isSafeInteger(expected.databaseOid) || expected.databaseOid < 1 || expected.databaseOid > 0xffff_ffff) {
     return refuseRestore('RESTORE_AUTHORITY');
   }
-  let stage = 'begin-read-only-transaction';
-  try {
-    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+  const deadline = Date.now() + SOURCE_FENCE_BACKEND_DRAIN_TIMEOUT_MS;
+  let loggedBackendWait = false;
+  let lastBackendCount = 0;
+  let lastBackendUsers: string[] = [];
+  for (;;) {
+    let retryForBackendDrain = false;
+    let stage = 'begin-read-only-transaction';
     try {
-      stage = 'read-fence-facts';
-      const result = await client.query<{ pid: number; valid: boolean; system_identifier: string | null;
-        server_version_num: string | null; postmaster_start: string | null; is_primary: boolean;
-        database_matches: boolean; database_oid_matches: boolean; database_connections_disabled: boolean;
-        migrator_identity: boolean; default_read_only: boolean; transaction_read_only: boolean;
-        runtime_connect_revoked: boolean; no_other_backends: boolean; other_backend_types: string[]; other_backend_users: string[];
-        other_backend_count: number; no_prepared_xacts: boolean; matching_fenced_epoch: boolean }>(FENCE_SQL,
-      [expected.database, expected.databaseOid, expected.scope.namespace, expected.scope.writerEpoch.toString()]);
-      const fence = result.rows[0];
-      if (fence?.valid !== true || !Number.isSafeInteger(fence.pid)
-        || (expected.backendPid !== undefined && expected.backendPid !== fence.pid)
-        || typeof fence.system_identifier !== 'string' || !/^[1-9][0-9]{0,19}$/.test(fence.system_identifier)
-        || typeof fence.server_version_num !== 'string' || !/^[1-9][0-9]{5}$/.test(fence.server_version_num)
-        || typeof fence.postmaster_start !== 'string' || fence.postmaster_start.length < 10) {
-        if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
-          && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
-          const facts = fence === undefined ? { rowPresent: false } : {
-            rowPresent: true, isPrimary: fence.is_primary, databaseMatches: fence.database_matches,
-            databaseOidMatches: fence.database_oid_matches, databaseConnectionsDisabled: fence.database_connections_disabled,
-            migratorIdentity: fence.migrator_identity, defaultReadOnly: fence.default_read_only,
-            transactionReadOnly: fence.transaction_read_only, runtimeConnectRevoked: fence.runtime_connect_revoked,
-            noOtherBackends: fence.no_other_backends, otherBackendCount: fence.other_backend_count,
-            otherBackendTypes: fence.other_backend_types, otherBackendUsers: fence.other_backend_users,
-            noPreparedXacts: fence.no_prepared_xacts,
-            matchingFencedEpoch: fence.matching_fenced_epoch,
-            backendPidMatches: expected.backendPid === undefined || expected.backendPid === fence.pid,
-            clusterIdentityPresent: typeof fence.system_identifier === 'string'
-              && typeof fence.server_version_num === 'string' && typeof fence.postmaster_start === 'string',
-          };
-          process.stderr.write('[p05-source-fence-diagnostic] '
-            + JSON.stringify({ event: 'source-fence-refused', facts }) + String.fromCharCode(10));
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      try {
+        stage = 'read-fence-facts';
+        const result = await client.query<{ pid: number; valid: boolean; system_identifier: string | null;
+          server_version_num: string | null; postmaster_start: string | null; is_primary: boolean;
+          database_matches: boolean; database_oid_matches: boolean; database_connections_disabled: boolean;
+          migrator_identity: boolean; default_read_only: boolean; transaction_read_only: boolean;
+          runtime_connect_revoked: boolean; no_other_backends: boolean; other_backend_types: string[];
+          other_backend_users: string[]; other_backend_count: number; no_prepared_xacts: boolean;
+          matching_fenced_epoch: boolean }>(FENCE_SQL,
+        [expected.database, expected.databaseOid, expected.scope.namespace, expected.scope.writerEpoch.toString()]);
+        const fence = result.rows[0];
+        const clusterIdentityPresent = typeof fence?.system_identifier === 'string'
+          && /^[1-9][0-9]{0,19}$/.test(fence.system_identifier)
+          && typeof fence.server_version_num === 'string' && /^[1-9][0-9]{5}$/.test(fence.server_version_num)
+          && typeof fence.postmaster_start === 'string' && fence.postmaster_start.length >= 10;
+        const backendPidMatches = fence !== undefined && Number.isSafeInteger(fence.pid)
+          && (expected.backendPid === undefined || expected.backendPid === fence.pid);
+        const onlyBackendDrainPending = fence !== undefined && fence.valid === false
+          && fence.is_primary === true && fence.database_matches === true && fence.database_oid_matches === true
+          && fence.database_connections_disabled === true && fence.migrator_identity === true
+          && fence.default_read_only === true && fence.transaction_read_only === true
+          && fence.runtime_connect_revoked === true && fence.no_other_backends === false
+          && Number.isSafeInteger(fence.other_backend_count) && fence.other_backend_count > 0
+          && fence.no_prepared_xacts === true && fence.matching_fenced_epoch === true
+          && backendPidMatches && clusterIdentityPresent;
+        if (fence?.valid !== true || !backendPidMatches || !clusterIdentityPresent) {
+          if (onlyBackendDrainPending) {
+            retryForBackendDrain = true;
+            lastBackendCount = fence.other_backend_count;
+            lastBackendUsers = fence.other_backend_users;
+            if (!loggedBackendWait && process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
+              && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
+              loggedBackendWait = true;
+              process.stderr.write('[p05-source-fence-diagnostic] '
+                + JSON.stringify({ event: 'source-fence-waiting-for-backend-drain', facts: {
+                  otherBackendCount: fence.other_backend_count, otherBackendUsers: fence.other_backend_users,
+                } }) + String.fromCharCode(10));
+            }
+          } else {
+            if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
+              && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
+              const facts = fence === undefined ? { rowPresent: false } : {
+                rowPresent: true, isPrimary: fence.is_primary, databaseMatches: fence.database_matches,
+                databaseOidMatches: fence.database_oid_matches, databaseConnectionsDisabled: fence.database_connections_disabled,
+                migratorIdentity: fence.migrator_identity, defaultReadOnly: fence.default_read_only,
+                transactionReadOnly: fence.transaction_read_only, runtimeConnectRevoked: fence.runtime_connect_revoked,
+                noOtherBackends: fence.no_other_backends, otherBackendCount: fence.other_backend_count,
+                otherBackendTypes: fence.other_backend_types, otherBackendUsers: fence.other_backend_users,
+                noPreparedXacts: fence.no_prepared_xacts, matchingFencedEpoch: fence.matching_fenced_epoch,
+                backendPidMatches, clusterIdentityPresent,
+              };
+              process.stderr.write('[p05-source-fence-diagnostic] '
+                + JSON.stringify({ event: 'source-fence-refused', facts }) + String.fromCharCode(10));
+            }
+            return refuseRestore('RESTORE_AUTHORITY');
+          }
+        } else {
+          const cluster: ClusterFact = Object.freeze({ systemIdentifier: fence.system_identifier,
+            serverVersionNum: fence.server_version_num, postmasterStart: fence.postmaster_start });
+          stage = 'read-p05-drain-state';
+          const drain = await readP05RestoreDrainState(client, expected.profile, carried);
+          stage = 'read-authority-inventory';
+          const inventorySha256 = await readAuthorityInventory(client, limits);
+          return Object.freeze({ ...drain, backendPid: fence.pid, nonce: expected.challenge,
+            manifestSha256: expected.manifestSha256, inventorySha256, cluster,
+            ...(carried === undefined ? {} : { policySha256: carried.sha256 }) });
         }
-        return refuseRestore('RESTORE_AUTHORITY');
+      } finally {
+        await client.query('ROLLBACK');
       }
-      const cluster: ClusterFact = Object.freeze({ systemIdentifier: fence.system_identifier,
-        serverVersionNum: fence.server_version_num, postmasterStart: fence.postmaster_start });
-      stage = 'read-p05-drain-state';
-      const drain = await readP05RestoreDrainState(client, expected.profile, carried);
-      stage = 'read-authority-inventory';
-      const inventorySha256 = await readAuthorityInventory(client, limits);
-      return Object.freeze({ ...drain, backendPid: fence.pid, nonce: expected.challenge,
-        manifestSha256: expected.manifestSha256, inventorySha256, cluster,
-        ...(carried === undefined ? {} : { policySha256: carried.sha256 }) });
-    } finally {
-      await client.query('ROLLBACK');
+    } catch (error) {
+      if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
+        && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
+        const value = error !== null && typeof error === 'object'
+          ? error as { readonly name?: unknown; readonly code?: unknown } : undefined;
+        const name = typeof value?.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(value.name)
+          ? value.name : 'UnknownError';
+        const code = typeof value?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(value.code)
+          ? value.code : undefined;
+        process.stderr.write('[p05-source-fence-diagnostic] '
+          + JSON.stringify({ event: 'source-observation-error', stage, name, ...(code === undefined ? {} : { code }) })
+          + String.fromCharCode(10));
+      }
+      return refuseRestore('RESTORE_AUTHORITY');
     }
-  } catch (error) {
-    if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
-      && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
-      const value = error !== null && typeof error === 'object'
-        ? error as { readonly name?: unknown; readonly code?: unknown } : undefined;
-      const name = typeof value?.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(value.name)
-        ? value.name : 'UnknownError';
-      const code = typeof value?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(value.code)
-        ? value.code : undefined;
-      process.stderr.write('[p05-source-fence-diagnostic] '
-        + JSON.stringify({ event: 'source-observation-error', stage, name, ...(code === undefined ? {} : { code }) })
-        + String.fromCharCode(10));
+    if (!retryForBackendDrain) { return refuseRestore('RESTORE_AUTHORITY'); }
+    if (Date.now() >= deadline) {
+      if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
+        && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
+        process.stderr.write('[p05-source-fence-diagnostic] '
+          + JSON.stringify({ event: 'source-fence-backend-drain-timeout', facts: {
+            timeoutMs: SOURCE_FENCE_BACKEND_DRAIN_TIMEOUT_MS,
+            otherBackendCount: lastBackendCount, otherBackendUsers: lastBackendUsers,
+          } }) + String.fromCharCode(10));
+      }
+      return refuseRestore('RESTORE_AUTHORITY');
     }
-    return refuseRestore('RESTORE_AUTHORITY');
+    await new Promise<void>((resolveDelay) => { setTimeout(resolveDelay, SOURCE_FENCE_BACKEND_DRAIN_POLL_MS); });
   }
 }
