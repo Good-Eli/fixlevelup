@@ -550,7 +550,7 @@ export class RequestIntake {
       await authorizeComments(staff,row,true);
       if (!basis.current) { return deny('CONSENT_REQUIRED'); }
       const stillCurrent = await this.crmBasisAtDecision(staff,basis);
-      const result = await writeInternalComment(staff,row,config,input,requestRepresentation('STAFF',row,true).etag);
+      const result = await writeInternalComment(staff,row,config,input,requestRepresentation('STAFF',row,true).etag,proof.token);
       if (!await basis.recheck()) { return deny('CONSENT_REQUIRED'); }
       return atDecision(basisDeadline(basis),() => stillCurrent() ? result : deny('CONSENT_REQUIRED'));
     },decidePrepared,'write'));
