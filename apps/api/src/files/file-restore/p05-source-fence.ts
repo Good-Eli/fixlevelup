@@ -83,9 +83,11 @@ export async function observeFencedSource(client: Client, expected: {
   if (!Number.isSafeInteger(expected.databaseOid) || expected.databaseOid < 1 || expected.databaseOid > 0xffff_ffff) {
     return refuseRestore('RESTORE_AUTHORITY');
   }
+  let stage = 'begin-read-only-transaction';
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     try {
+      stage = 'read-fence-facts';
       const result = await client.query<{ pid: number; valid: boolean; system_identifier: string | null;
         server_version_num: string | null; postmaster_start: string | null; is_primary: boolean;
         database_matches: boolean; database_oid_matches: boolean; database_connections_disabled: boolean;
@@ -120,7 +122,9 @@ export async function observeFencedSource(client: Client, expected: {
       }
       const cluster: ClusterFact = Object.freeze({ systemIdentifier: fence.system_identifier,
         serverVersionNum: fence.server_version_num, postmasterStart: fence.postmaster_start });
+      stage = 'read-p05-drain-state';
       const drain = await readP05RestoreDrainState(client, expected.profile, carried);
+      stage = 'read-authority-inventory';
       const inventorySha256 = await readAuthorityInventory(client, limits);
       return Object.freeze({ ...drain, backendPid: fence.pid, nonce: expected.challenge,
         manifestSha256: expected.manifestSha256, inventorySha256, cluster,
@@ -128,7 +132,19 @@ export async function observeFencedSource(client: Client, expected: {
     } finally {
       await client.query('ROLLBACK');
     }
-  } catch {
+  } catch (error) {
+    if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
+      && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
+      const value = error !== null && typeof error === 'object'
+        ? error as { readonly name?: unknown; readonly code?: unknown } : undefined;
+      const name = typeof value?.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(value.name)
+        ? value.name : 'UnknownError';
+      const code = typeof value?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(value.code)
+        ? value.code : undefined;
+      process.stderr.write('[p05-source-fence-diagnostic] '
+        + JSON.stringify({ event: 'source-observation-error', stage, name, ...(code === undefined ? {} : { code }) })
+        + String.fromCharCode(10));
+    }
     return refuseRestore('RESTORE_AUTHORITY');
   }
 }
