@@ -561,7 +561,6 @@ jobs:
           test "${{ steps.wire.outcome }}" = success
 
   p05-candidate-freeze:
-    if: always() && (github.event_name != 'push' || github.ref == 'refs/heads/main')
     name: Freeze exact P05 candidate manifest and redacted evidence
     runs-on: ubuntu-24.04
     needs:
@@ -572,7 +571,7 @@ jobs:
       - security
       - p05-full-integration
       - p05-migration-wire
-    if: always()
+    if: always() && (github.event_name != 'push' || github.ref == 'refs/heads/main')
     timeout-minutes: 10
     steps:
       - name: Checkout exact PR head
