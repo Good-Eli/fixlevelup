@@ -114,7 +114,7 @@ export async function observeFencedSource(client: Client, expected: {
               && typeof fence.server_version_num === 'string' && typeof fence.postmaster_start === 'string',
           };
           process.stderr.write('[p05-source-fence-diagnostic] '
-            + JSON.stringify({ event: 'source-fence-refused', facts }) + '\\n');
+            + JSON.stringify({ event: 'source-fence-refused', facts }) + String.fromCharCode(10));
         }
         return refuseRestore('RESTORE_AUTHORITY');
       }
