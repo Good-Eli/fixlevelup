@@ -64,7 +64,8 @@ export async function authorizeComments(staff: P05Context, row: RequestRow, writ
   if (!grant?.canRead || (write && !grant.canWrite)) { return deny('FORBIDDEN'); }
 }
 
-export async function readInternalComments(staff: P05Context, request: RequestRow, config: CommentConfig) {
+export async function readInternalComments(staff: P05Context, request: RequestRow, config: CommentConfig,
+  beforeOpen?: () => Promise<void>) {
   const { rows } = await staff.client.query<CommentIdentity & PayloadCiphertext>(`SELECT id,request_version AS version,nonce,
     ciphertext,auth_tag AS "authTag",aad_context AS "aadContext",
     to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"
@@ -73,6 +74,9 @@ export async function readInternalComments(staff: P05Context, request: RequestRo
   for (const comment of rows) {
     const ref = slot(request.id,comment);
     const wrap = await config.keySlots.read(ref);
+    // Revalidate the external manual-evidence issuer and the locked staff proof
+    // after key-slot I/O, immediately before plaintext can enter process memory.
+    await beforeOpen?.();
     const plaintext = openManagedPayload(ref,config.ring,comment,wrap);
     try {
       items.push({ id:comment.id,version:comment.version,createdAt:comment.createdAt,text:utf8.decode(plaintext).trimEnd() });
@@ -107,14 +111,16 @@ export async function writeInternalComment(staff: P05Context, row: RequestRow, c
     finally { plaintext.fill(0); }
   })();
   await config.keySlots.create(ref, {keyId:sealed.keyId,wrappedDek:sealed.wrappedDek});
+  const persistedWrap = await config.keySlots.read(ref).catch(() => deny('DEPENDENCY_UNAVAILABLE'));
+  if (persistedWrap.keyId !== sealed.keyId || !persistedWrap.wrappedDek.equals(sealed.wrappedDek)) {
+    return deny('DEPENDENCY_UNAVAILABLE');
+  }
   const fingerprint = idempotencyHmac({ring:config.ring,namespace,canonicalIntent});
-  const { rows:[data] } = await staff.client.query<CommentIdentity>(`INSERT INTO p06_crm.comments
-    (id,request_id,author_id,request_version,idempotency_key,idem_key_id,fingerprint,nonce,ciphertext,auth_tag,aad_context)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-    RETURNING id,request_version AS version,to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"`,
-  [id,row.id,staff.staffId,row.row_version,input.key,fingerprint.keyId,fingerprint.digest,sealed.nonce,sealed.ciphertext,sealed.authTag,sealed.aadContext]);
+  const { rows:[data] } = await staff.client.query<CommentIdentity>(`SELECT id,request_version AS version,
+      to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt"
+    FROM p06_crm.insert_internal_comment($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+  [id,row.id,staff.staffId,staff.sessionId,row.row_version,input.key,fingerprint.keyId,fingerprint.digest,
+    sealed.nonce,sealed.ciphertext,sealed.authTag,sealed.aadContext,randomUUID()]);
   if (!data) { return deny('NOT_READY'); }
-  await staff.client.query('INSERT INTO foundation.audit_logs(id,operation,correlation_id,details) VALUES ($1,$2,$3,$4::jsonb)',
-    [randomUUID(),command,id,JSON.stringify({requestId:row.id,commentId:id,actorId:staff.staffId,version:row.row_version})]);
   return { data,replayed:false };
 }
