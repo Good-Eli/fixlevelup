@@ -22,7 +22,8 @@ redacted evidence. p06-results.mjs фиксирует totals и обязател
 Исправлены два error-mapping дефекта в apps/api/src/requests/card/comments.ts:
 ошибка read/decrypt slot остаётся 503 NOT_READY, но отказ final beforeOpen()
 не поглощается и сохраняет авторизационный статус; определённый отказ DB/audit
-при записи комментария также даёт 503 NOT_READY. F-2 теперь обычный
+при записи комментария также даёт 503 NOT_READY через отдельный SQLSTATE
+58000; SQLSTATE 42501/23514 сохраняют FORBIDDEN/CONFLICT. F-2 теперь обычный
 обязательный passing test, без it.fails; рядом подтверждены полный rollback
 и отсутствие plaintext. Дополнительный unit test отдельно проверяет проброс
 FORBIDDEN из final pre-decrypt recheck.

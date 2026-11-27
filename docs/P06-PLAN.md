@@ -468,7 +468,9 @@ PostgreSQL 18.7 (`server_version_num=180007`), а не через NestJS:
 Определённый отказ БД при записи audit-строки комментария теперь
 классифицируется как 503 NOT_READY, а не 500 INTERNAL_ERROR. Ошибка
 SQL-вызова узкой DB-функции комментария переводится в закрытый
-RequestFailure('NOT_READY'); транзакция P05 при этом откатывается целиком.
+RequestFailure('NOT_READY') только при выделенном SQLSTATE 58000 для audit
+storage; 42501 и 23514 сохраняются как FORBIDDEN/CONFLICT. P05 транзакция
+при любом из этих отказов откатывается целиком.
 Нет частичного комментария, audit-строки или plaintext в ответе.
 
 Тест F-2: a definite comment-audit DB failure maps to 503 NOT_READY теперь

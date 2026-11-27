@@ -256,19 +256,26 @@ BEGIN
         RAISE EXCEPTION 'Internal comment request version is stale' USING ERRCODE = '23514';
     END IF;
 
-    INSERT INTO foundation.audit_logs(id,operation,correlation_id,details)
-    VALUES (
-      p_audit_id,
-      'P06_ADD_INTERNAL_COMMENT',
-      p_comment_id,
-      jsonb_build_object(
-        'requestId',p_request_id::text,
-        'commentId',p_comment_id::text,
-        'actorId',p_author_id::text,
-        'sessionId',p_auth_session_id::text,
-        'version',p_request_version
-      )
-    );
+    -- Give the application a dedicated SQLSTATE for an audit-storage failure.
+    -- Authorization (42501) and basis/version (23514) refusals above remain
+    -- distinguishable and are not rewritten as service unavailability.
+    BEGIN
+      INSERT INTO foundation.audit_logs(id,operation,correlation_id,details)
+      VALUES (
+        p_audit_id,
+        'P06_ADD_INTERNAL_COMMENT',
+        p_comment_id,
+        jsonb_build_object(
+          'requestId',p_request_id::text,
+          'commentId',p_comment_id::text,
+          'actorId',p_author_id::text,
+          'sessionId',p_auth_session_id::text,
+          'version',p_request_version
+        )
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION 'Internal comment audit is unavailable' USING ERRCODE = '58000';
+    END;
 
     RETURN QUERY
       INSERT INTO p06_crm.comments(

@@ -128,7 +128,14 @@ export async function writeInternalComment(staff: P05Context, row: RequestRow, c
     FROM p06_crm.insert_internal_comment($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
   [id,row.id,staff.staffId,staff.sessionId,sessionToken,row.row_version,input.key,fingerprint.keyId,fingerprint.digest,
     sealed.nonce,sealed.ciphertext,sealed.authTag,sealed.aadContext,randomUUID()])
-    .catch(() => deny('NOT_READY'));
+    .catch((error: unknown) => {
+      if (typeof error === 'object' && error !== null && 'code' in error) {
+        if (error.code === '58000') { return deny('NOT_READY'); }
+        if (error.code === '42501') { return deny('FORBIDDEN'); }
+        if (error.code === '23514') { return deny('CONFLICT'); }
+      }
+      throw error;
+    });
   if (!data) { return deny('NOT_READY'); }
   return { data,replayed:false };
 }

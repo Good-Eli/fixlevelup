@@ -486,7 +486,7 @@ describe.runIf(enabled)('P06 gap: runtime SQL grants and DB-enforced comment bou
         CHECK (operation <> '${commentAudit}') NOT VALID`);
       try {
         const refused = await write(client, functionParameters({ requestId: created.id, version: created.version }));
-        expect(refused.statement).toBe('23514');
+        expect(refused.statement).toBe('58000');
         expect(await commentRows(created.id)).toBe(0);
       } finally {
         await db().db.query('ALTER TABLE foundation.audit_logs DROP CONSTRAINT p06_gap_comment_audit_failure');
