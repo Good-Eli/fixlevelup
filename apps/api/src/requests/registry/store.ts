@@ -64,6 +64,10 @@ export function readRegistryEvidence(row: Pick<RegistryRow,'evidenceId'|'procedu
 }
 
 const MIN_SCAN_SIZE = 30;
+// A revoked-but-not-yet-expired external manual basis can make SQL candidates
+// invisible only after the issuer check. Bound total candidates examined while
+// the policy/consent locks are held; never return a partial page on exhaustion.
+const MAX_REGISTRY_CANDIDATES = 512;
 
 function cursorScope(city: SingleCityContext, query: RegistryQuery): string {
   return createHash('sha256').update(JSON.stringify([
@@ -200,9 +204,14 @@ export async function readVisibleRegistry(client: PoolClient, city: SingleCityCo
   const visible: RegistryItem[] = [];
   const scanSize = Math.max(MIN_SCAN_SIZE, query.limit + 1);
   const manualEvidence: StaffEvidence[] = [];
+  let scanned = 0;
   while (visible.length <= query.limit) {
-    const rows = await scanRegistry(client, city, query, after, scanSize);
-    for (const row of rows) {
+    const remaining = MAX_REGISTRY_CANDIDATES - scanned;
+    const batchLimit = Math.min(scanSize, remaining + 1);
+    const rows = await scanRegistry(client, city, query, after, batchLimit);
+    const exhausted = rows.length > remaining;
+    const candidates = exhausted ? rows.slice(0, remaining) : rows;
+    for (const row of candidates) {
       const evidence = readRegistryEvidence(row);
       if (evidence) {
         if (!isCurrent?.(evidence)) { continue; }
@@ -212,8 +221,15 @@ export async function readVisibleRegistry(client: PoolClient, city: SingleCityCo
       visible.push({ id, publicNumber, createdAt, type, status, version });
       if (visible.length > query.limit) { break; }
     }
-    const lastScanned = rows.at(-1);
-    if (rows.length < scanSize || lastScanned === undefined) { break; }
+    scanned += candidates.length;
+    // A complete requested page is enough; its cursor is based only on visible
+    // rows. Otherwise, a sentinel beyond the candidate budget proves that the
+    // remaining page cannot be established within the bounded work budget.
+    if (visible.length > query.limit) { break; }
+    if (exhausted) { return deny('NOT_READY'); }
+    const lastScanned = candidates.at(-1);
+    if (rows.length < batchLimit || lastScanned === undefined) { break; }
+    if (scanned >= MAX_REGISTRY_CANDIDATES) { return deny('NOT_READY'); }
     after = lastScanned;
   }
   const items = visible.slice(0, query.limit);
