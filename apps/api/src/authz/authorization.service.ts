@@ -532,26 +532,6 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
     }, mode === 'write' && 'P04');
   }
 
-  /** Refresh the CRM idle lease in a short transaction before the longer P05
-   * domain transaction. Holding the session row FOR UPDATE through a command would
-   * serialize otherwise-independent requests from the same browser session. Keep the
-   * established policy -> staff -> session lock order and revalidate the token again
-   * in the actual command transaction. An already-expired/revoked session is never
-   * resurrected by this touch. */
-  private async refreshP05WebSession(proof: SessionProof): Promise<void> {
-    if (proof.kind !== 'staff-web') { throw new AuthorizationError('FORBIDDEN'); }
-    await this.transaction('read', async (client) => {
-      const locked = await this.lockedPrincipal(client, proof);
-      const refreshed = await client.query<{ id: string }>(
-        `UPDATE foundation.web_sessions
-         SET idle_expires_at = LEAST(absolute_expires_at, clock_timestamp() + interval '30 minutes')
-         WHERE id=$1 AND token_hash=$2 AND channel='CRM' AND revoked_at IS NULL
-           AND idle_expires_at>clock_timestamp() AND absolute_expires_at>clock_timestamp()
-         RETURNING id`, [locked.sessionId, locked.tokenHash]);
-      if (refreshed.rowCount !== 1 || !refreshed.rows[0]) { throw new AuthorizationError('UNAUTHORIZED'); }
-    });
-  }
-
   /** P05 staff commands. The policy lock is deliberately the *shared* one, exactly as
    * P04 uses it for its domain writes: P05 domain writers are serialized by their own
    * request/anchor/geography locks, a shared policy lock cannot invert against a
@@ -574,7 +554,6 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
     if (!codes.length || codes.some((code) => !isP05Capability(code))) { throw new BadRequestException(); }
     const needed = Object.freeze([...new Set<P05Capability>(['requests.read', ...codes])]);
     const write = receipt === 'write' || codes.some((code) => code !== 'requests.read');
-    await this.refreshP05WebSession(proof);
     return this.transaction('read', async (client) => {
       const locked = await this.lockedPrincipal(client, proof);
       const { principal } = locked;
