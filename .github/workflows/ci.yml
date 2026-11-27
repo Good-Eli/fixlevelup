@@ -304,15 +304,19 @@ jobs:
           mkdir -p node_modules/.cache/ci-artifacts/p06/results
           # The script runs INSIDE the lab container (snapshot of this exact tree,
           # disposable PostgreSQL 18.7) and applies the strict report gate.
+          # s3test executes in a disposable container, so its files are not on the host.
+          # Capture the gate's machine-readable stdout summary into host evidence instead.
           node infra/p05-lab/lab.mjs s3test -- --cmd env \
             FIXLEVELUP_P06_COMMENT_PROOF=1 \
             FIXLEVELUP_P06_SEARCH_PROOF=1 \
             FIXLEVELUP_P06_DASHBOARD_PROOF=1 \
             FIXLEVELUP_P06_LOAD_PROOF=1 \
             FIXLEVELUP_P06_GAP_PROOF=1 \
-            node infra/ci/p06-server-gate.mjs
+            node infra/ci/p06-server-gate.mjs 2>&1 | tee "$RUNNER_TEMP/p06-server-gate.log"
+          sed -n 's/^P06 GATE SUMMARY //p' "$RUNNER_TEMP/p06-server-gate.log" \
+            | tail -n 1 > node_modules/.cache/ci-artifacts/p06/results/server-summary.json
           test -s node_modules/.cache/ci-artifacts/p06/results/server-summary.json
-          grep -q '"status": "passed"' node_modules/.cache/ci-artifacts/p06/results/server-summary.json
+          grep -q '"status":"passed"' node_modules/.cache/ci-artifacts/p06/results/server-summary.json
       - name: Stop only this job's private PostgreSQL lab
         if: ${{ always() && steps.p06-lab-up.outcome == 'success' }}
         run: node infra/p05-lab/lab.mjs down
