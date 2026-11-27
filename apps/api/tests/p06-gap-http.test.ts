@@ -716,7 +716,7 @@ describe.runIf(enabled)('P06 gap: HTTPS authority, races, rollback and negatives
     const descriptor = Object.getOwnPropertyDescriptor(Client.prototype, 'query');
     const original: unknown = descriptor?.value;
     if (!descriptor || typeof original !== 'function') { throw new Error('Missing PG query'); }
-    let armed = false;
+    const armedConnections = new WeakSet<object>();
     let lost = 0;
     const text = 'Synthetic uncertain commit comment';
     const key = randomUUID();
@@ -725,9 +725,14 @@ describe.runIf(enabled)('P06 gap: HTTPS authority, races, rollback and negatives
       value: function patched(this: unknown, ...args: unknown[]) {
         const sql = args[0];
         const run = (): unknown => Reflect.apply(original as (...input: unknown[]) => unknown, this, args);
-        if (typeof sql === 'string' && /p06_crm\.insert_internal_comment/i.test(sql)) { armed = true; }
-        if (typeof sql === 'string' && /^\s*COMMIT\b/i.test(sql) && armed) {
-          armed = false;
+        // Arm only the exact connection that ran the writer. The isolated HTTP
+        // boundary authenticates the staff session in its own transaction, so an
+        // unbound flag would break an unrelated COMMIT instead.
+        if (typeof sql === 'string' && /p06_crm\.insert_internal_comment/i.test(sql)) {
+          armedConnections.add(this as object);
+        }
+        if (typeof sql === 'string' && /^\s*COMMIT\b/i.test(sql) && armedConnections.has(this as object)) {
+          armedConnections.delete(this as object);
           lost += 1;
           return Promise.resolve(run()).then(() => {
             throw Object.assign(new Error('Simulated connection loss at COMMIT'), { code: 'ECONNRESET' });
