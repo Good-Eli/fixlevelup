@@ -166,7 +166,7 @@ export class RequestIntakeController {
         return deny('INVALID_REQUEST');
       }
       const token = sessionToken(req);
-      await service.authenticateStaff(token,this.deps.staff.csrfSecret);
+      await service.authenticateStaff(token);
       const data = await service.searchStaffRegistry({ kind:'staff-web',token },Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
       res.setHeader('Cache-Control','no-store, no-transform');
       res.setHeader('Content-Type','application/json; charset=utf-8');
@@ -179,7 +179,7 @@ export class RequestIntakeController {
       if (header(req,'x-form-session-id') !== undefined) { return deny('INVALID_REQUEST'); }
       const token = sessionToken(req);
       requireMutation(req,token,this.deps.staff);
-      await service.authenticateStaff(token,this.deps.staff.csrfSecret);
+      await service.authenticateStaff(token);
       const result = await service.addStaffComment({ kind:'staff-web',token },detail.id,writeInput(req));
       res.setHeader('Content-Type','application/json; charset=utf-8');
       res.setHeader('X-Request-Id',randomUUID());
@@ -194,7 +194,7 @@ export class RequestIntakeController {
         || ['x-form-session-id','x-csrf-token','idempotency-key','if-match','if-none-match'].some(key => header(req,key) !== undefined)) {
         return deny('INVALID_REQUEST');
       }
-      await service.authenticateStaff(token,this.deps.staff.csrfSecret);
+      await service.authenticateStaff(token);
       const proof = { kind:'staff-web' as const,token };
       let data: unknown;
       if (dashboard) {
@@ -249,13 +249,13 @@ export class RequestIntakeController {
     const staff = { kind:'staff-web' as const,token };
     if (op === 'readStaffRequest') {
       expectExactOrigin(req,this.deps.staff.origin);
-      await service.authenticateStaff(token,this.deps.staff.csrfSecret);
+      await service.authenticateStaff(token);
       const result = await service.readStaff(staff,matched.params.id);
       sendRead(res,result,conditional(req));
       return;
     }
     requireMutation(req,token,this.deps.staff);
-    await service.authenticateStaff(token,this.deps.staff.csrfSecret);
+    await service.authenticateStaff(token);
     if (op === 'createManualRequest') { sendWrite(res,await service.submitStaff(staff,writeInput(req)),op,true,true); return; }
     if (isStaffCommand(op) && 'id' in matched.params && typeof matched.params.id === 'string') {
       sendWrite(res,await service.commandStaff(op,staff,matched.params.id,writeInput(req)),op,true);
