@@ -300,8 +300,8 @@ jobs:
           node infra/ci/evidence.mjs summary "P06 CRM acceptance" node_modules/.cache/ci-artifacts/p06
           {
             echo
-            echo "P06 candidate SHA: `$P06_COMMIT`"
-            echo "P06 Gate job status: `$CI_JOB_STATUS`"
+            echo "P06 candidate SHA: $P06_COMMIT"
+            echo "P06 Gate job status: $CI_JOB_STATUS"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Publish redacted P06 Gate evidence
         if: always()
