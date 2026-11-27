@@ -43,6 +43,8 @@ const FENCE_SQL = `SELECT pg_backend_pid() AS pid,
   NOT EXISTS (SELECT FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid()) AS no_other_backends,
   COALESCE((SELECT array_agg(DISTINCT a.backend_type ORDER BY a.backend_type)
     FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid()), ARRAY[]::text[]) AS other_backend_types,
+  COALESCE((SELECT array_agg(DISTINCT a.usename::text ORDER BY a.usename::text)
+    FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid()), ARRAY[]::text[]) AS other_backend_users,
   (SELECT count(*)::int FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid()) AS other_backend_count,
   NOT EXISTS (SELECT FROM pg_prepared_xacts p WHERE p.database=d.datname) AS no_prepared_xacts,
   EXISTS (SELECT FROM foundation.file_runtime_epochs e WHERE e.singleton AND e.mode='FENCED'
@@ -92,7 +94,7 @@ export async function observeFencedSource(client: Client, expected: {
         server_version_num: string | null; postmaster_start: string | null; is_primary: boolean;
         database_matches: boolean; database_oid_matches: boolean; database_connections_disabled: boolean;
         migrator_identity: boolean; default_read_only: boolean; transaction_read_only: boolean;
-        runtime_connect_revoked: boolean; no_other_backends: boolean; other_backend_types: string[];
+        runtime_connect_revoked: boolean; no_other_backends: boolean; other_backend_types: string[]; other_backend_users: string[];
         other_backend_count: number; no_prepared_xacts: boolean; matching_fenced_epoch: boolean }>(FENCE_SQL,
       [expected.database, expected.databaseOid, expected.scope.namespace, expected.scope.writerEpoch.toString()]);
       const fence = result.rows[0];
@@ -109,7 +111,8 @@ export async function observeFencedSource(client: Client, expected: {
             migratorIdentity: fence.migrator_identity, defaultReadOnly: fence.default_read_only,
             transactionReadOnly: fence.transaction_read_only, runtimeConnectRevoked: fence.runtime_connect_revoked,
             noOtherBackends: fence.no_other_backends, otherBackendCount: fence.other_backend_count,
-            otherBackendTypes: fence.other_backend_types, noPreparedXacts: fence.no_prepared_xacts,
+            otherBackendTypes: fence.other_backend_types, otherBackendUsers: fence.other_backend_users,
+            noPreparedXacts: fence.no_prepared_xacts,
             matchingFencedEpoch: fence.matching_fenced_epoch,
             backendPidMatches: expected.backendPid === undefined || expected.backendPid === fence.pid,
             clusterIdentityPresent: typeof fence.system_identifier === 'string'
