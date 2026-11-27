@@ -510,20 +510,19 @@ describe('P06 crypto idempotency and managed payload', () => {
   });
 
   it('preserves the P05 authorization refusal from the final pre-decrypt recheck', async () => {
-    const read = vi.fn(async (_ref: PayloadKeySlotRef) =>
-      ({ keyId:'kek-unit-1',wrappedDek:Buffer.alloc(60) }));
+    const read = vi.fn(() => Promise.resolve({ keyId:'kek-unit-1',wrappedDek:Buffer.alloc(60) }));
     const slots: PayloadKeySlots = {
       environment:COMMENT_KEY_ENVIRONMENT,
-      create:async () => undefined,
+      create:() => Promise.resolve(),
       read,
     };
     const comment = { id:id(30),version:1,nonce:Buffer.alloc(12),ciphertext:Buffer.alloc(16),
       authTag:Buffer.alloc(16),aadContext:'unit',createdAt:'2026-11-28T00:00:00.000000Z' };
-    const client = { query:vi.fn(async () => ({rows:[comment]})) };
+    const client = { query:vi.fn(() => Promise.resolve({rows:[comment]})) };
     const staff = { client } as unknown as Parameters<typeof readInternalComments>[0];
     const request = { id:id(31) } as unknown as Parameters<typeof readInternalComments>[1];
     const refusal = new RequestFailure('FORBIDDEN');
-    await expect(readInternalComments(staff,request,{ring:RING,keySlots:slots},async () => { throw refusal; }))
+    await expect(readInternalComments(staff,request,{ring:RING,keySlots:slots},() => Promise.reject(refusal)))
       .rejects.toBe(refusal);
     expect(read).toHaveBeenCalledOnce();
   });
