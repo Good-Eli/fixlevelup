@@ -186,9 +186,15 @@ invocations. В новом exact-head run оба должны быть видн�
   migrate or reset the developer database. No live deployment, production
   migration or production restore was executed.
 
-### Publication boundary
+### Owner acceptance and publication boundary
 
-Existing [P05-PLAN §9](P05-PLAN.md) remains unchanged: a separate independent
-`PASS — FULL ASTRA P05` and owner acceptance are still required by the
-repository's existing publication procedure before fast-forward to `main`.
-No production deployment authorization is granted.
+27.11.2026 владелец явно признал `ChatGPT PASS — FULL P05` эквивалентом
+`PASS — FULL ASTRA P05` и принял P05-01…P05-04 в synthetic scope. Это решение
+удовлетворяет reviewer/owner condition §9 только для данного P05 candidate;
+оно не утверждает, что отдельный Astra-run выполнялся. После этой статусной
+редакции нужен новый full exact-head CI и новый candidate freeze: artifact
+`p05-exact-candidate-45953489126` относится строго к SHA
+`0d7f60dbee1bddca63e9f1868a03ebf1230ec69f` и не переносится на следующий SHA.
+После успешного нового freeze §9 разрешает только fast-forward в `main`.
+Production migration, deployment, live PII, public site/file transport и live
+channel delivery не разрешены.
