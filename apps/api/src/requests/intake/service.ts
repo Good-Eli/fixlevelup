@@ -510,7 +510,7 @@ export class RequestIntake {
 
   async readStaffComments(proof: SessionProof, id: string) {
     const config = this.config.comments;
-    return await this.readCrmTarget(proof,id,async (staff,row) => {
+    return await this.readCrmTarget(proof,id,async (staff,row,basis) => {
       if (!config || config.keySlots.environment !== COMMENT_KEY_ENVIRONMENT) { return deny('NOT_READY'); }
       await authorizeComments(staff,row,false);
       const isCurrent = await this.crmBasisAtDecision(staff,basis);
