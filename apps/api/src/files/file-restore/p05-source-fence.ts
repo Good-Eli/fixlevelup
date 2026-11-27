@@ -188,8 +188,8 @@ export async function observeFencedSource(client: Client, expected: {
         process.stderr.write('[p05-source-fence-diagnostic] '
           + JSON.stringify({ event: 'source-fence-backend-drain-timeout', facts: {
             timeoutMs: SOURCE_FENCE_BACKEND_DRAIN_TIMEOUT_MS,
-            otherBackendCount: lastBackendDrain?.count ?? 0,
-            otherBackendUsers: lastBackendDrain?.users ?? [],
+            otherBackendCount: lastBackendDrain.count,
+            otherBackendUsers: lastBackendDrain.users,
           } }) + String.fromCharCode(10));
       }
       return refuseRestore('RESTORE_AUTHORITY');
