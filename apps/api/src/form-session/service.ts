@@ -100,6 +100,8 @@ export interface FormSessionConfig {
     readonly global: FormThrottleBudget;
     readonly anchor: FormThrottleBudget;
   };
+  /** Optional derived-data cleanup in the isolated composition. */
+  readonly afterProcessingRevoked?: (client: PoolClient, sessionId: string, consentId: string) => Promise<void>;
 }
 
 /** Throttle subjects, matching the closed S2 `kind` vocabulary. */
@@ -1049,12 +1051,14 @@ export class FormSessionService implements FormSessionApi {
       || (parsed.documentVersionId !== undefined && given.document_version_id !== parsed.documentVersionId)) {
       throw new LegalPortError('REPLAY_MISMATCH');
     }
-    return await recordConsentRevoked(client, {
+    const receipt = await recordConsentRevoked(client, {
       session: { sessionId: selector, token: secret },
       purpose: 'REQUEST_PROCESSING',
       evidenceRef: parsed.evidenceRef,
       supersedesEvidenceId: parsed.supersedesEvidenceId,
     });
+    await this.config.afterProcessingRevoked?.(client,selector,parsed.supersedesEvidenceId);
+    return receipt;
   }
 
   private mapConsentError(error: unknown, selector: string): never {

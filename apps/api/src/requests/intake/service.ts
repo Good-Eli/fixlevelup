@@ -3,7 +3,7 @@ import type { PoolClient } from 'pg';
 import {
   decodeP05Body, p05DecodeStatus, P05DecodeError, P05_IF_MATCH_OPERATIONS, parseP05Etag,
 } from '@fixlevelup/p03-contracts/p05';
-import type { P05BodyOperation, P05Bodies, P05CallbackRequest, P05ManualRequest, P05RepairRequest, P05ChannelSelection } from '@fixlevelup/p03-contracts/p05';
+import type { P05BodyOperation, P05Bodies, P05CallbackRequest, P05ManualRequest, P05RepairRequest, P05ChannelSelection, P05FContact } from '@fixlevelup/p03-contracts/p05';
 import type { P05AuthorizationApi, P05Context, SessionProof } from '../../authz/authorization.service.js';
 import { P05CommitUnknown } from '../../authz/authorization.service.js';
 import type { P05Capability } from '../../authz/capability.js';
@@ -24,14 +24,16 @@ import { deny, RequestFailure } from './errors.js';
 import type { RequestFailureCode } from './errors.js';
 import { activeReference, boundConsent, confirmEvidence, confirmOffer, currentCity, geoFence,
   lockConsent, staffEvidenceLive, submitEdge } from './basis.js';
-import { readVisibleRegistry } from '../registry/store.js';
+import { readRegistrySearch, readVisibleRegistry } from '../registry/store.js';
 import { readRegistryOptions } from '../registry/options.js';
 import type { RegistryQuery } from '../registry/filters.js';
 import { readCard, readTimeline } from '../card/store.js';
 import { authorizeComments, commentGrant, COMMENT_KEY_ENVIRONMENT, readInternalComments, writeInternalComment } from '../card/comments.js';
 import type { CommentConfig } from '../card/comments.js';
-import { hasContactGrant, readContactDetails } from '../card/contacts.js';
+import { hasContactGrant, readContactDetails, readStoredContact } from '../card/contacts.js';
 import type { ContactAudit } from '../card/contacts.js';
+import { parseSearch } from '../search/contract.js';
+import type { ContactSearchIndex } from '../search/index.js';
 import type { ConsentBinding, OfferBasis, RequestOffers, SessionSubmit, StaffEvidence, StaffEvidencePort } from './basis.js';
 import { activePhone, clonePhonePreference, createRequestRow, insertStaffEvidence, modeOf, readContactMode,
   requestRow, updateRequestRow, writeAddress, writeAppliance, writeContact, writePhone, writePreference } from './store.js';
@@ -62,6 +64,7 @@ export interface RequestIntakeConfig extends Snapshots {
   readonly coverage?: CoverageEffect;
   readonly comments?: CommentConfig;
   readonly contactAudit?: ContactAudit;
+  readonly search?: ContactSearchIndex;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -230,6 +233,7 @@ export class RequestIntake {
     const actor: Actor = { kind: 'F', id: prepared.selector };
     const command = operation === 'createCallback' ? 'CreateCallback' : 'CreateRepair';
     return await this.transaction(async (client) => {
+      await this.config.search?.lock(client);
       if (operation === 'createRepair') { await fenceRead(client); }
       await geoFence(client);
       if (operation === 'createRepair') { await this.config.offers?.lock(client); }
@@ -272,6 +276,7 @@ export class RequestIntake {
     requireHeaders('createManualRequest',input);
     return await this.staffCall(() => this.staff.withP05(proof,['requests.create'],async (staff) => {
       const { client } = staff;
+      await this.config.search?.lock(client);
       await fenceRead(client);
       await geoFence(client);
       const actor: Actor = { kind:'STAFF',id:staff.staffId };
@@ -372,6 +377,7 @@ export class RequestIntake {
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [form.selector,row.id,row.customer_id,row.city_id,row.intake_city_version_id,
         consent.id,consent.document_id,consent.document_version_id,event,cmd.command]);
     }
+    await this.config.search?.setContact(client,row,body.contact,mode === 'PHONE');
     await client.query('SET CONSTRAINTS ALL IMMEDIATE');
     const deadlines: Deadline[] = [];
     const fileIds = 'attachments' in body ? body.attachments : undefined;
@@ -485,7 +491,7 @@ export class RequestIntake {
           actor:'S',status:row.status,type:row.type,branch }).decision === 'EXECUTABLE';
       }
       const comments = this.config.comments?.keySlots.environment === COMMENT_KEY_ENVIRONMENT ? await commentGrant(staff,row) : undefined;
-      const contacts = this.config.contactAudit && basis.current && await hasContactGrant(staff,row);
+      const contacts = this.config.contactAudit && basis.current && await hasContactGrant(staff,row.city_id);
       const unavailable = { ...card.unavailable,comments:comments?.canRead ? 'available' : 'not_ready',
         contactDetails:contacts ? 'available' : 'not_ready' };
       return { data:{ ...card,canStartReview,unavailable },commandEtag:requestRepresentation('STAFF',row,true).etag,
@@ -510,7 +516,7 @@ export class RequestIntake {
     const audit = this.config.contactAudit;
     return await this.readCrmTarget(proof,id,async (staff,row,basis) => {
       if (!audit) { return deny('NOT_READY'); }
-      if (!await hasContactGrant(staff,row)) { return deny('FORBIDDEN'); }
+      if (!await hasContactGrant(staff,row.city_id)) { return deny('FORBIDDEN'); }
       const recheck = async () => {
         if (!await basis.recheck()) { return deny('CONSENT_REQUIRED'); }
         const clock = await staff.recheck();
@@ -565,6 +571,33 @@ export class RequestIntake {
     }));
   }
 
+  async searchStaffRegistry(proof: SessionProof, bytes: Uint8Array) {
+    return await this.staffCall(() => this.staff.withP05(proof, ['requests.read'], async staff => {
+      const search = this.config.search;
+      if (!search) { return deny('NOT_READY'); }
+      await search.lock(staff.client);
+      await geoFence(staff.client);
+      const city = await currentCity(staff.client);
+      await staff.authorizeCity(city.cityId);
+      const query = parseSearch(bytes);
+      if (query.kind !== 'number' && !await hasContactGrant(staff,city.cityId)) { return deny('FORBIDDEN'); }
+      if (query.kind !== 'number') { await search.assertCurrent(staff.client); }
+      await search.admit(staff.staffId,city.cityId,query.kind);
+      if (!await lockConsent(staff.client,undefined,'shared')) { return deny('NOT_READY'); }
+      const port = this.config.staffEvidence;
+      if (port && !port.openRegistry) { return deny('NOT_READY'); }
+      const isCurrent = await port?.openRegistry?.(staff.client);
+      const match = query.kind === 'number' ? { kind:query.kind,key:query.value } as const
+        : { kind:query.kind,key:search.token(query.kind,city.cityId,query.value) };
+      return { ...await readRegistrySearch(staff.client,city.cityId,match,isCurrent),isCurrent };
+    }, ({ items,truncated,manualEvidence,isCurrent }, clock) => {
+      if (manualEvidence.some(evidence => !(evidence.validUntil.getTime() > clock.getTime()) || !isCurrent?.(evidence))) {
+        return deny('NOT_READY');
+      }
+      return { items,truncated };
+    }));
+  }
+
   async readForm(proof: FProof) {
     const prepared = await this.form.prepareRequestProof(proof,false);
     return await this.transaction(async (client) => {
@@ -585,6 +618,7 @@ export class RequestIntake {
     requireHeaders(operation,input);
     const prepared = await this.form.prepareRequestProof(proof,true);
     return await this.transaction(async (client) => {
+      if (operation !== 'cancelRequestF') { await this.config.search?.lock(client); }
       await geoFence(client);
       const { anchor,recheck } = await prepared.lock(client);
       const edge = await submitEdge(client,{ sessionId:anchor.id });
@@ -608,6 +642,7 @@ export class RequestIntake {
     requireHeaders(operation,input);
     const [command,code] = STAFF_COMMANDS[operation];
     return await this.staffCall(() => this.staff.withP05(proof,[code],async (staff) => {
+      if (operation === 'changeContact' || operation === 'withdrawPhoneStaff') { await this.config.search?.lock(staff.client); }
       if (operation === 'convertCallback' || operation === 'changeDetails') { await fenceRead(staff.client); }
       await geoFence(staff.client);
       const identity = { actor:{kind:'STAFF' as const,id:staff.staffId},command,key:input.key,target:id,match:input.ifMatch ?? null };
@@ -674,6 +709,7 @@ export class RequestIntake {
     let extra: Record<string,string> = {};
     let permission: { action:'GIVEN'|'REVOKED'; id:string; evidenceId?:string; supersedes?:string } | undefined;
     let finalEvidence: StaffEvidence | undefined;
+    let changedContact: P05FContact | undefined;
     let assessmentDeadline: number | undefined;
     let expires: string | null = null;
     switch (cmd.command) {
@@ -728,6 +764,7 @@ export class RequestIntake {
         finalEvidence = await this.consumeStaffEvidence(staff,row,'CONTACT_CHANGE',patch.evidenceId,cmd);
         const contact = randomUUID();
         await writeContact(client,this.config,row.id,contact,nextVersion,await readContactMode(client,row),patch.contact);
+        changedContact = patch.contact;
         revisions = { ...revisions,contact };
         break;
       }
@@ -764,6 +801,15 @@ export class RequestIntake {
     const changed = await updateRequestRow(client,row,decision.target ?? row.status,decision.resultingType ?? row.type,revisions);
     const receipt = await writeEffect(client,this.config.ring,changed,cmd,effectId,randomUUID(),extra);
     if (permission) { await writePhone(client,changed,effectId,permission.action,permission.id,permission.evidenceId,permission.supersedes); }
+    const search = this.config.search;
+    if (search && changedContact) {
+      await search.setContact(client,changed,changedContact,false);
+    } else if (search && permission?.action === 'GIVEN') {
+      await search.assertCurrent(client);
+      await search.setContact(client,changed,await readStoredContact(client,changed,this.config),true);
+    } else if (search && permission?.action === 'REVOKED') {
+      await search.removePhone(client,changed);
+    }
     await client.query('SET CONSTRAINTS ALL IMMEDIATE');
     if (!closing && !await basis.recheck()) { return deny('CONSENT_REQUIRED'); }
     if (finalEvidence && !await staffEvidenceLive(client,this.config.staffEvidence,finalEvidence)) { return deny('FORBIDDEN'); }

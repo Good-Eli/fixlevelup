@@ -15,6 +15,7 @@ import { boundedJsonForFormSession } from '../../form-session/body-parser.js';
 import { closeAfterProblem, readBoundedJson } from '../../settings/management/body-parser.js';
 import { parseRegistryQuery } from '../registry/filters.js';
 import { COMMENT_BODY_BYTES } from '../card/comments.js';
+import { SEARCH_BODY_BYTES } from '../search/contract.js';
 import { deny, RequestFailure } from './errors.js';
 import type { FProof, RequestIntake, StaffCommand, WriteInput, WriteResult } from './service.js';
 
@@ -51,6 +52,10 @@ function crmDetail(method: string, target: string) {
   return { id:route.params.id, resource };
 }
 
+function isRegistrySearch(method: string, target: string): boolean {
+  return method === 'POST' && target === '/api/v1/requests/search';
+}
+
 /** Install only in T. Unknown aliases don't get interpreted or forwarded as a
  * successful route; real P03/P04 and S2 paths keep their own parser. */
 export function intakeBody(readiness: Readiness) {
@@ -59,12 +64,14 @@ export function intakeBody(readiness: Readiness) {
     const method = req.method ?? '';
     const target = req.url ?? '';
     const detail = crmDetail(method,target);
-    if (registryQueryString(method,target) === null && !isRegistryOptions(method,target) && !detail && !matchP05Route(method,target)) {
+    const search = isRegistrySearch(method,target);
+    if (registryQueryString(method,target) === null && !isRegistryOptions(method,target) && !search && !detail && !matchP05Route(method,target)) {
       form(req,res,next); return;
     }
     void readiness.requestEffectsReady().then((ready) => {
       if (!ready) { return deny('NOT_READY'); }
-      if (!res.destroyed) { readBoundedJson(req,res,next,{ limit:detail?.resource === 'comments' ? COMMENT_BODY_BYTES : P05_BODY_BYTES,
+      const limit = search ? SEARCH_BODY_BYTES : detail?.resource === 'comments' ? COMMENT_BODY_BYTES : P05_BODY_BYTES;
+      if (!res.destroyed) { readBoundedJson(req,res,next,{ limit,
         decode:null, forbidBody:method === 'GET' }); }
     }).catch(() => {
       if (!res.destroyed) { closeAfterProblem(req,res); next(new RequestFailure('NOT_READY')); }
@@ -128,7 +135,7 @@ export class RequestIntakeController {
 
   @All(['public/callback-requests','public/repair-requests','public/request-session','public/request-session/contact-mode',
     'public/request-session/phone-permissions','public/request-session/cancel','requests','requests/:id','requests/:id/commands/:command',
-    'requests/:id/card','requests/:id/events','requests/:id/comments','requests/:id/contact-details'])
+    'requests/search','requests/:id/card','requests/:id/events','requests/:id/comments','requests/:id/contact-details'])
   async handle(@Req() req: StaffRequest, @Res() res: ServerResponse): Promise<void> {
     res.setHeader('Cache-Control','no-store');
     const method = req.method ?? '';
@@ -136,14 +143,30 @@ export class RequestIntakeController {
     const matched = matchP05Route(method,target);
     const registry = registryQueryString(method,target);
     const options = isRegistryOptions(method,target);
+    const search = isRegistrySearch(method,target);
     const detail = crmDetail(method,target);
-    if (matched === null && registry === null && !options && detail === null) { return deny('NOT_FOUND'); }
+    if (matched === null && registry === null && !options && !search && detail === null) { return deny('NOT_FOUND'); }
     if (!await this.deps.readiness.requestEffectsReady()) { return deny('NOT_READY'); }
     for (const key of RAW_HEADERS) { header(req,key); }
     const cookies = header(req,'cookie');
     if (cookies && Buffer.byteLength(cookies,'utf8') > F_MAX_COOKIE_BYTES) { return deny('BODY_TOO_LARGE'); }
     if (header(req,'authorization') !== undefined) { throw new AuthorizationError('UNAUTHORIZED'); }
     const service = this.deps.service;
+    if (search) {
+      // JSON plus a non-simple header and an exact Origin bind this sensitive POST to the web app.
+      if (header(req,'origin') !== this.deps.staff.origin || header(req,'x-auth-request') !== '1') { return deny('FORBIDDEN'); }
+      if (['x-form-session-id','x-csrf-token','idempotency-key','if-match','if-none-match'].some(key => header(req,key) !== undefined)) {
+        return deny('INVALID_REQUEST');
+      }
+      const token = sessionToken(req);
+      const data = await service.searchStaffRegistry({ kind:'staff-web',token },Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
+      res.setHeader('Cache-Control','no-store, no-transform');
+      res.setHeader('Content-Type','application/json; charset=utf-8');
+      res.setHeader('X-Request-Id',randomUUID());
+      res.statusCode=200;
+      res.end(JSON.stringify({ data }));
+      return;
+    }
     if (detail?.resource === 'comments' && method === 'POST') {
       if (header(req,'x-form-session-id') !== undefined) { return deny('INVALID_REQUEST'); }
       const token = sessionToken(req);

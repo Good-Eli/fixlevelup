@@ -13,6 +13,7 @@ const webPort = 4175;
 const registryPath = '/crm/requests';
 const list = '/api/v1/requests';
 const optionsPath = `${list}/filters`;
+const searchPath = `${list}/search`;
 const browserEndpoint = `ws://${loopback}:4178/p06-registry`;
 const web = new URL('../../../apps/web/', import.meta.url);
 const next = createRequire(new URL('package.json', web)).resolve('next/dist/bin/next');
@@ -26,6 +27,7 @@ interface Fixture {
   readonly publicNumber: string;
   readonly requestId: string;
   readonly checkPanels: boolean;
+  readonly checkSearch: boolean;
 }
 
 export async function proveLiveRegistry(fixture: Fixture) {
@@ -50,8 +52,8 @@ export async function proveLiveRegistry(fixture: Fixture) {
   const ingress = createServer({ key: fixture.key, cert: fixture.cert }, (req, res) => {
     const path = new URL(req.url ?? '/', fixture.origin).pathname;
     const api = path === list || path === optionsPath || path === cardApi || path === eventApi || path === reviewApi
-      || (fixture.checkPanels && (path === commentApi || path === contactApi));
-    const methodOk = path === reviewApi ? req.method === 'POST'
+      || (fixture.checkPanels && (path === commentApi || path === contactApi)) || (fixture.checkSearch && path === searchPath);
+    const methodOk = path === reviewApi || (fixture.checkSearch && path === searchPath) ? req.method === 'POST'
       : req.method === 'GET' || (fixture.checkPanels && path === commentApi && req.method === 'POST');
     if (req.headers.host !== new URL(fixture.origin).host || !methodOk
       || (!api && path !== registryPath && path !== cardPage && !path.startsWith('/_next/static/') && path !== '/favicon.ico')) {
@@ -148,8 +150,35 @@ export async function proveLiveRegistry(fixture: Fixture) {
       await expect(category).toHaveValue('');
       await expect(district).toHaveValue('');
       await expect(source).toHaveValue('');
+      let cardLink = row.getByRole('link', { name:fixture.publicNumber });
+      if (fixture.checkSearch) {
+        const search = page.getByRole('region',{name:'Поиск заявок'});
+        const kind = search.getByRole('combobox',{name:'Искать по'});
+        const submit = search.getByRole('button',{name:'Найти'});
+        const searchFor = async (mode: 'number'|'name'|'phone', label: string, query: string) => {
+          await kind.selectOption(mode);
+          const value = search.getByRole('textbox',{name:label});
+          await value.fill(query);
+          const [searched] = await Promise.all([byPath(searchPath),submit.click()]);
+          expect(searched.status()).toBe(200);
+          expect(searched.request().method()).toBe('POST');
+          expect(new URL(searched.url()).search).toBe('');
+          expect(searched.request().postDataJSON()).toEqual({kind:mode,query});
+          await expect(value).toHaveValue('');
+          expect(page.url()).toBe(pageUrl);
+        };
+        await searchFor('number','Номер заявки',fixture.publicNumber);
+        await expect(search.getByRole('link',{name:fixture.publicNumber})).toBeVisible();
+        await searchFor('name','Имя клиента','SYNTHETIC INTAKE SENTINEL');
+        await expect(search.getByRole('link',{name:fixture.publicNumber})).toBeVisible();
+        await searchFor('phone','Телефон','+1 (555) 010-0001');
+        cardLink = search.getByRole('link',{name:fixture.publicNumber});
+        await expect(cardLink).toBeVisible();
+        await expect(search).not.toContainText('+15550100001');
+        await expect(search).not.toContainText('Synthetic intake sentinel');
+      }
       const [card, timeline] = await Promise.all([
-        byPath(cardApi), byPath(eventApi), row.getByRole('link', { name:fixture.publicNumber }).click(),
+        byPath(cardApi), byPath(eventApi), cardLink.click(),
       ]);
       expect(card.status()).toBe(200);
       expect(timeline.status()).toBe(200);

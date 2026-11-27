@@ -63,7 +63,8 @@ try {
   }
   if (!ready) { throw new Error('Chromium container did not start'); }
 
-  lab('s3run', '--', 'env', 'FIXLEVELUP_P06_BROWSER=1', 'FIXLEVELUP_P06_COMMENT_PROOF=1', 'corepack', 'pnpm', 'exec', 'vitest', 'run',
+  lab('s3run', '--', 'env', 'FIXLEVELUP_P06_BROWSER=1', 'FIXLEVELUP_P06_COMMENT_PROOF=1', 'FIXLEVELUP_P06_SEARCH_PROOF=1',
+    'corepack', 'pnpm', 'exec', 'vitest', 'run',
     'apps/api/tests/p05-intake-http.test.ts', '-t', 'P06 browser renders and filters the live CRM registry');
 } finally {
   try {

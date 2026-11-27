@@ -22,7 +22,7 @@ import { requestEffectsHistoryComplete } from '../src/infrastructure/database/re
 import type { RequestOffers, StaffEvidence, StaffEvidencePort } from '../src/requests/intake/basis.js';
 import { coverageEffects } from '../src/requests/intake/coverage-effects.js';
 import { parseRegistryQuery } from '../src/requests/registry/filters.js';
-import { readVisibleRegistry } from '../src/requests/registry/store.js';
+import { readRegistrySearch, readVisibleRegistry } from '../src/requests/registry/store.js';
 import type { CoverageReviewEvidence } from '../src/requests/intake/coverage.js';
 import { fixtureCredentials } from './owned-test-database.js';
 import { RbacFixture, record, text } from './rbac-fixture.js';
@@ -40,6 +40,8 @@ import { createSyntheticKeySlots } from './p05-key-slot-fixture.js';
 import { COMMENT_KEY_ENVIRONMENT } from '../src/requests/card/comments.js';
 import { installCommentFixture, grantCommentFixture, grantContactFixture } from './p06-comment-fixture.js';
 import { createContactAudit } from '../src/requests/card/contacts.js';
+import { ContactSearchIndex } from '../src/requests/search/index.js';
+import { installSearchFixture, rebuildSearchFixture } from './p06-search-fixture.js';
 
 const origin = 'https://crm.example.test';
 const enabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
@@ -48,6 +50,7 @@ const contact = Object.freeze({ name:'Synthetic intake sentinel',phone:'+1555010
 const address = Object.freeze({ street:'Synthetic comparison sentinel',building:'12' });
 const pub = '/public';
 const commentProof = process.env['FIXLEVELUP_P06_COMMENT_PROOF'] === '1';
+const searchProof = process.env['FIXLEVELUP_P06_SEARCH_PROOF'] === '1';
 
 interface Reply {
   readonly status: number;
@@ -69,8 +72,10 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   let keyring: KeyringConfig;
   let managed: Awaited<ReturnType<typeof createSyntheticKeySlots>> | undefined;
   let managedComments: Awaited<ReturnType<typeof createSyntheticKeySlots>> | undefined;
+  let activeSearch: ContactSearchIndex | undefined;
+  const firstSearchKey = { generation:randomUUID(),key:randomBytes(32) };
   let launchWithPolicy: (id: string, pins?: ReadonlyMap<string,string>, anchorTtlMs?: number,
-    matrixOffers?: RequestOffers) => ReturnType<typeof startIsolatedIntake>;
+    matrixOffers?: RequestOffers, searchKey?: { generation:string; key:Buffer } | null) => ReturnType<typeof startIsolatedIntake>;
   const historicalDigest = '3799c7e532579641d010675a229541c998f4d02bf85c3156fe167f79d33631cf';
   const evidence = new Map<string, NonNullable<Awaited<ReturnType<StaffEvidencePort['verify']>>> & Parameters<StaffEvidencePort['verify']>[1]>();
   const review = new Map<string,CoverageReviewEvidence>();
@@ -128,16 +133,17 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       hmac:[{keyId:'test-hmac-1',secretHex:randomBytes(32).toString('hex')}] });
     const keys=await createSyntheticKeySlots('p05-isolated');
     managed=keys;
-    if (commentProof) {
+    if (commentProof || searchProof) {
       await installCommentFixture(lab);
-      managedComments = await createSyntheticKeySlots(COMMENT_KEY_ENVIRONMENT);
+      if (commentProof) { managedComments = await createSyntheticKeySlots(COMMENT_KEY_ENVIRONMENT); }
+      if (searchProof) { await installSearchFixture(lab); }
     }
     const supportedPolicies = new Map(supportedFixturePolicies());
     supportedPolicies.set(policyPairKey(historical.workflowVersion,historical.policyRevision),historicalDigest);
     const csrf = randomBytes(32).toString('hex');
     // Every T instance uses the same exact admitted database and staff proof;
     // package and short-TTL settings are explicit synthetic inputs.
-    launchWithPolicy = async (id, pins = supportedPolicies, anchorTtlMs = 600000, matrixOffers) => {
+    launchWithPolicy = async (id, pins = supportedPolicies, anchorTtlMs = 600000, matrixOffers, searchKey = firstSearchKey) => {
       const settings = { ring:keyring,keySlots:keys.slots,environment:'p05-isolated',currentPolicyId:id,
         supportedPolicies:pins,formSourceEntryId:fixture.formSourceEntryId };
       const matrix = matrixOffers !== undefined;
@@ -147,7 +153,9 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
           groupTtlMs:matrix ? 1800000 : 900000,anchorTtlMs,csrfTtlMs:matrix ? anchorTtlMs : Math.min(300000,anchorTtlMs),
           throttles:{ source:{windowSeconds:600,maxHits:matrix ? 3000 : 300},global:{windowSeconds:600,maxHits:matrix ? 3000 : 300},
             anchor:{windowSeconds:600,maxHits:60} } },
-        configure:audit=>({...settings,offers:matrixOffers ?? offers,staffEvidence:evidencePort,
+        configure:audit=>({
+          ...settings,offers:matrixOffers ?? offers,staffEvidence:evidencePort,
+          ...(searchProof && searchKey ? { search:activeSearch = new ContactSearchIndex(audit,'p05-isolated',searchKey.generation,searchKey.key) } : {}),
           ...(managedComments ? {comments:{ring:keyring,keySlots:managedComments.slots},contactAudit:createContactAudit(audit)} : {}),
           coverage:coverageEffects(settings,audit,{
           async verify(input) { return await Promise.resolve(review.get(input.evidenceId)); },
@@ -155,6 +163,10 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       });
     };
     testApp = await launchWithPolicy(fixture.policyId);
+    if (activeSearch) {
+      await rebuildSearchFixture(lab,activeSearch,{ ring:keyring,keySlots:keys.slots,environment:'p05-isolated' },
+        client => evidencePort.openRegistry?.(client) ?? Promise.reject(new Error('Missing evidence issuer')));
+    }
     port = portOf(testApp);
     staffCsrf = csrf;
   },90000);
@@ -251,11 +263,11 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     } finally { evidenceSnapshotHooks.delete(id); }
   }
 
-  async function manualPrepared(districtId?: string) {
+  async function manualPrepared(districtId?: string, inputContact: {name:string; phone:string} = contact) {
     const source=(await db().db.query<{version:string}>('SELECT current_version_id AS version FROM foundation.reference_entries WHERE id=$1',[fixture.formSourceEntryId])).rows[0];
     if (!source) { throw new Error('Missing synthetic source'); }
     const key=randomUUID();
-    const body=decodeP05ManualRequest({type:'REPAIR',sourceEntryId:fixture.formSourceEntryId,evidenceId:randomUUID(),contact:{...contact,
+    const body=decodeP05ManualRequest({type:'REPAIR',sourceEntryId:fixture.formSourceEntryId,evidenceId:randomUUID(),contact:{...inputContact,
       mode:'PHONE',phonePermission:true,phoneEvidenceId:randomUUID()},address:{...address,...(districtId ? {districtId} : {})},
       appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]}});
     if (body.type !== 'REPAIR' || body.contact.mode !== 'PHONE') { throw new Error('Wrong test DTO'); }
@@ -502,10 +514,12 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
     if (commentProof) {
       await grantCommentFixture(db(),db().admin.id,fixture.cityId,true);
+    }
+    if (commentProof || searchProof) {
       await grantContactFixture(db(),db().admin.id,fixture.cityId);
     }
     const browserFixture = { origin,apiPort:port,key:staffTlsKey,cert,sessionToken:db().admin.token,
-      publicNumber:text(created,'publicNumber'),requestId:text(created,'id'),checkPanels:commentProof };
+      publicNumber:text(created,'publicNumber'),requestId:text(created,'id'),checkPanels:commentProof,checkSearch:searchProof };
     const helper = new URL('../../../packages/browser-tooling/fixtures/p06-live.ts', import.meta.url);
     const { proveLiveRegistry } = await import(helper.href) as { proveLiveRegistry: (input: typeof browserFixture) => Promise<void> };
     await proveLiveRegistry(browserFixture);
@@ -655,6 +669,253 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     expect(noCall.data()).toEqual({name:contact.name,phone:null});
     failure(await https('POST',`/requests/${target.id}/commands/create-call-task`,{},staffMutation()),404,'NOT_FOUND');
   },60000);
+
+  it.runIf(searchProof)('P06 search uses protected exact matches, independent CITY authority and durable quotas', async () => {
+    const target = { name:'Синтетическая Ёлка',phone:'+15550110011' };
+    const manual = await manualPrepared(undefined,target);
+    const duplicate = await manualPrepared(undefined,target);
+    manual.authorize();
+    duplicate.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const next = accepted(await https('POST','/requests',duplicate.body,staffMutation(duplicate.key)),201).data();
+    const id = text(created,'id');
+    const query = (kind: string, value: string) => ({kind,query:value});
+    const browserProof = {'X-Auth-Request':'1'};
+    const proof = {...staff(),...browserProof};
+    const numberQuery = query('number',text(created,'publicNumber'));
+    const nameQuery = query('name','  СИНТЕТИЧЕСКАЯ\u00a0Е\u0308ЛКА  ');
+    const phoneQuery = query('phone','+1 (555) 011-0011');
+    const find = (body: object, headers: Record<string,string> = proof) => https('POST','/requests/search',body,headers);
+    const ids = (reply: Reply) => {
+      const data = closed(reply,200,['items','truncated']).data();
+      const items = data['items'];
+      expect(data['truncated']).toBe(false);
+      if (!Array.isArray(items)) { throw new Error('Invalid search items'); }
+      return items.map(item => {
+        const row = record(item);
+        expect(Object.keys(row).sort()).toEqual(['createdAt','id','publicNumber','status','type','version']);
+        return text(row,'id');
+      });
+    };
+    failure(await find(numberQuery,browserProof),401,'UNAUTHORIZED');
+    failure(await find(numberQuery,staff()),403,'FORBIDDEN');
+    failure(await find(numberQuery,{...proof,Origin:'https://other.example.test'}),403,'FORBIDDEN');
+    failure(await find({...nameQuery,unknown:target.name}),400,'MALFORMED');
+    failure(await find(query('phone','011-0011')),400,'MALFORMED');
+    failure(await https('GET','/requests/search',undefined,proof),404,'NOT_FOUND');
+    failure(await https('POST','/requests/search?query=synthetic',numberQuery,proof),404,'NOT_FOUND');
+    await withHttpMatrixActors(db(),fixture.cityId,async actors => {
+      const reader = {Cookie:actors.reader.cookie,...browserProof};
+      expect(ids(await find(numberQuery,reader))).toEqual([id]);
+      failure(await find(nameQuery,reader),403,'FORBIDDEN');
+      failure(await find(query('name','totally absent'),reader),403,'FORBIDDEN');
+      await grantContactFixture(db(),actors.wrong.id,fixture.cityId);
+      failure(await find(nameQuery,{Cookie:actors.wrong.cookie,...browserProof}),404,'NOT_FOUND');
+      await grantContactFixture(db(),actors.reader.id,fixture.cityId);
+      expect(ids(await find(nameQuery,reader))).toEqual([text(next,'id'),id]);
+    });
+    await grantContactFixture(db(),db().admin.id,fixture.cityId);
+    expect(ids(await find(query('name','Синтетическая')))).toEqual([]);
+    expect(ids(await find(query('name','Синтетическая Елка')))).toEqual([]);
+    const result = await find(phoneQuery);
+    expect(ids(result)).toEqual([text(next,'id'),id]);
+    expect(result.headers['cache-control']).toBe('no-store, no-transform');
+    expect(result.bytes).not.toContain(target.name);
+    expect(result.bytes).not.toContain(target.phone);
+    const {rows:[stored]} = await db().db.query<{ name:Buffer; phone:Buffer; row:string }>(`SELECT name_token AS name, phone_token AS phone,
+      token::text AS row FROM p06_crm.contact_search token WHERE request_id=$1`,[id]);
+    expect(stored?.name.length).toBe(32);
+    expect(stored?.phone.length).toBe(32);
+    expect(stored?.row).not.toContain(target.name);
+    expect(stored?.row).not.toContain(target.phone);
+    expect(await db().count(`SELECT count(*)::int n FROM foundation.audit_logs
+      WHERE operation='P06_SEARCH_REQUESTS' AND (details ? 'query' OR details ? 'token' OR details ? 'items'
+        OR position($1 IN details::text)>0 OR position($2 IN details::text)>0)`,[target.name,target.phone])).toBe(0);
+
+    registryEvidenceHooks.set(manual.body.evidenceId,() => { evidence.delete(manual.body.evidenceId); });
+    try { failure(await find(numberQuery),503,'NOT_READY'); }
+    finally { registryEvidenceHooks.delete(manual.body.evidenceId); }
+    expect(ids(await find(numberQuery))).toEqual([]);
+    expect(ids(await find(nameQuery))).toEqual([text(next,'id')]);
+
+    // A database time window and principal key apply across sessions and node processes.
+    await db().db.query(`UPDATE p06_crm.search_budget SET used=24,minute=date_trunc('minute',statement_timestamp()) + interval '1 minute'
+      WHERE scope='STAFF' AND subject_id=$1`,[db().admin.id]);
+    try { failure(await find(phoneQuery),429,'QUOTA'); }
+    finally { await db().db.query("DELETE FROM p06_crm.search_budget WHERE scope='STAFF' AND subject_id=$1",[db().admin.id]); }
+  },75000);
+
+  it.runIf(searchProof)('P06 search removes revoked and obsolete tokens and rebuilds a rotated historic index', async () => {
+    const original = activeSearch;
+    if (!original || !managed) { throw new Error('Missing isolated index source'); }
+    const rebuild = (index: ContactSearchIndex) => {
+      if (!managed) { throw new Error('Missing isolated key slots'); }
+      return rebuildSearchFixture(db(),index,{ring:keyring,environment:'p05-isolated',keySlots:managed.slots},
+        client => evidencePort.openRegistry?.(client) ?? Promise.reject(new Error('Missing evidence issuer')));
+    };
+    const searchHeaders = {...staff(),'X-Auth-Request':'1'};
+    await grantContactFixture(db(),db().admin.id,fixture.cityId);
+    const find = (kind:string, query:string, targetPort = port) => https('POST','/requests/search',{kind,query},searchHeaders,targetPort);
+    const found = (reply: Reply) => {
+      const items = closed(reply,200,['items','truncated']).data()['items'];
+      if (!Array.isArray(items)) { throw new Error('Invalid search items'); }
+      return items.map(item => text(record(item),'id'));
+    };
+    const seed = async (name: string, phone: string, targetPort = port) => {
+      const prepared = await manualPrepared(undefined,{name,phone});
+      prepared.authorize();
+      return accepted(await https('POST','/requests',prepared.body,staffMutation(prepared.key),targetPort),201).data();
+    };
+    const token = async (id:string) => (await db().db.query<{name_token:Buffer;phone_token:Buffer|null}>(`
+      SELECT name_token,phone_token FROM p06_crm.contact_search WHERE request_id=$1`,[id])).rows[0];
+    const oldName = 'Synthetic only before replacement';
+    const oldPhone = '+15550110111';
+    const replaced = text(await seed(oldName,oldPhone),'id');
+    const replacePath = `/requests/${replaced}`;
+    const revisionTag = async () => tag(accepted(await https('GET',replacePath,undefined,staff()),200));
+    accepted(await https('POST',`${replacePath}/commands/start-review`,{},staffMutation(undefined,await revisionTag())),200);
+    const etag = await revisionTag();
+    const { rows:[row] } = await db().db.query<{contact_id:string}>(`
+      SELECT current_contact_revision_id AS contact_id FROM foundation.requests WHERE id=$1`,[replaced]);
+    if (!row) { throw new Error('Missing contact revision'); }
+    const newName = 'Synthetic only after replacement';
+    const newPhone = '+15550110112';
+    const change = { evidenceId:randomUUID(),contact:{name:newName,phone:newPhone} };
+    mintEvidence(change.evidenceId,'CONTACT_CHANGE',canonicalJson({ requestId:replaced,contactRevisionId:row.contact_id,
+      permit:null,version:2,ifMatch:etag }),change);
+    accepted(await https('POST',`${replacePath}/commands/change-contact`,change,staffMutation(undefined,etag)),200);
+    expect(found(await find('name',oldName))).toEqual([]);
+    expect(found(await find('name',newName))).toEqual([replaced]);
+    expect(found(await find('phone',oldPhone))).toEqual([]);
+    expect(found(await find('phone',newPhone))).toEqual([]);
+    expect((await token(replaced))?.phone_token).toBeNull();
+
+    const linked = await issue();
+    const consentId = await given(linked);
+    const hidden = {name:'Synthetic channel name only',phone:'+15550110113'};
+    const repair = accepted(await https('POST',`${pub}/repair-requests`,{
+      contact:hidden,address,appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]},channelSelection:offers.ids,
+      consent:{evidenceId:consentId,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(linked,randomUUID())),201).data();
+    const { rows:[linkedRequest] } = await db().db.query<{id:string}>(
+      'SELECT id FROM foundation.requests WHERE public_number=$1',[repair['publicNumber']]);
+    if (!linkedRequest) { throw new Error('Missing indexed request'); }
+    const channelId = linkedRequest.id;
+    expect(found(await find('name',hidden.name))).toEqual([channelId]);
+    expect(found(await find('phone',hidden.phone))).toEqual([]);
+    const formRequest = `${pub}/request-session`;
+    const formTag = async () => tag(accepted(await https('GET',formRequest,undefined,proof(linked)),200));
+    const choose = await https('POST',`${formRequest}/contact-mode`,{phonePermission:true},mutate(linked,randomUUID(),await formTag()));
+    accepted(choose,200);
+    expect(found(await find('phone',hidden.phone))).toEqual([channelId]);
+    const revokedPhone = await https('POST',`${formRequest}/phone-permissions`,{action:'REVOKED'},mutate(linked,randomUUID(),await formTag()));
+    accepted(revokedPhone,200);
+    expect(found(await find('phone',hidden.phone))).toEqual([]);
+    expect((await token(channelId))?.phone_token).toBeNull();
+    const withdrawalKey = randomUUID();
+    accepted(await https('POST',`${pub}/form-session/consents`,{action:'REVOKED',evidenceRef:withdrawalKey,supersedesEvidenceId:consentId},
+      mutate(linked,withdrawalKey)),201);
+    expect(await token(channelId)).toBeUndefined();
+    expect(found(await find('name',hidden.name))).toEqual([]);
+
+    const oldApp = await launchWithPolicy(fixture.policyId,undefined,undefined,undefined,null);
+    const legacyName = 'Synthetic before search installation';
+    const legacyPhone = '+15550110114';
+    let legacyId: string;
+    try { legacyId = text(await seed(legacyName,legacyPhone,portOf(oldApp)),'id'); }
+    finally { await oldApp.app.close(); }
+    expect(found(await find('name',legacyName))).toEqual([]);
+    const oldToken = (await token(replaced))?.name_token;
+    const callback = await issue();
+    const callbackConsent = await given(callback);
+    const callbackContact = { name:'Synthetic rotation callback',phone:'+15550110115' };
+    const callbackReceipt = accepted(await https('POST',`${pub}/callback-requests`,{
+      contact:callbackContact,phonePermission:true,callbackIntervalId:fixture.callbackIntervalEntryId,
+      consent:{evidenceId:callbackConsent,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(callback)),201).data();
+    const expiring = await manualPrepared(undefined,{name:'Synthetic lost evidence during rebuild',phone:'+15550110116'});
+    expiring.authorize();
+    const expiringId = text(accepted(await https('POST','/requests',expiring.body,staffMutation(expiring.key)),201).data(),'id');
+    const rotated = await launchWithPolicy(fixture.policyId,undefined,undefined,undefined,{generation:randomUUID(),key:randomBytes(32)});
+    try {
+      const newIndex = activeSearch;
+      if (!newIndex) { throw new Error('Missing rotated search index'); }
+      const newPort = portOf(rotated);
+      failure(await find('name',legacyName,newPort),503,'NOT_READY');
+      const sourceSlots = managed.slots;
+      let withdrewBeforeOpen = false;
+      await rebuildSearchFixture(db(),newIndex,{ring:keyring,environment:'p05-isolated',keySlots:{...sourceSlots,
+        async read(ref) {
+          const wrap = await sourceSlots.read(ref);
+          if (ref.requestId !== expiringId) { return wrap; }
+          withdrewBeforeOpen = evidence.delete(expiring.body.evidenceId);
+          // Decryption would fail if the rebuilt path opened this wrap after revocation.
+          return {keyId:'missing-key',wrappedDek:wrap.wrappedDek};
+        },
+      }}, client => evidencePort.openRegistry?.(client) ?? Promise.reject(new Error('Missing evidence issuer')));
+      expect(withdrewBeforeOpen).toBe(true);
+      expect(await token(expiringId)).toBeUndefined();
+      failure(await find('name',legacyName),503,'NOT_READY');
+      expect(found(await find('phone',legacyPhone,newPort))).toEqual([legacyId]);
+      const callbackMatches = found(await find('phone',callbackContact.phone,newPort));
+      expect(callbackMatches).toHaveLength(1);
+      expect(found(await find('number',text(callbackReceipt,'publicNumber')))).toEqual(callbackMatches);
+      const callbackTag = tag(accepted(await https('GET',formRequest,undefined,proof(callback)),200));
+      accepted(await https('POST',`${formRequest}/phone-permissions`,{action:'REVOKED'},mutate(callback,randomUUID(),callbackTag)),200);
+      expect(found(await find('phone',callbackContact.phone,newPort))).toEqual([]);
+      expect(await token(channelId)).toBeUndefined();
+      expect((await token(replaced))?.name_token).not.toEqual(oldToken);
+      expect((await token(replaced))?.phone_token).toBeNull();
+      await rebuild(newIndex);
+      expect(found(await find('name',legacyName,newPort))).toEqual([legacyId]);
+    } finally {
+      try { await rebuild(original); } finally {
+        activeSearch = original;
+        await rotated.app.close();
+      }
+    }
+  },90000);
+
+  it.runIf(searchProof)('P06 search limits the retained and locked results across bounded candidate batches', async () => {
+    if (!testApp || !activeSearch) { throw new Error('Missing isolated search'); }
+    const app = testApp;
+    const proof = {kind:'staff-web' as const,token:db().admin.token};
+    const target = {name:'Synthetic common name batch',phone:'+15550110200'};
+    const ids: string[] = [];
+    for (let index = 0; index < 70; index++) {
+      const prepared = await manualPrepared(undefined,target);
+      prepared.authorize();
+      const { receipt } = await app.service.submitStaff(proof,{key:prepared.key,bytes:Buffer.from(JSON.stringify(prepared.body))});
+      if (index < 51) { ids.unshift(receipt.requestId); }
+      else { evidence.delete(prepared.body.evidenceId); }
+    }
+    const client = await app.filePool.connect();
+    try {
+      await client.query('BEGIN');
+      let batches = 0;
+      let locked = 0;
+      const wrapped = new Proxy(client,{get(targetClient,key) {
+        if (key !== 'query') { return Reflect.get(targetClient,key,targetClient) as unknown; }
+        return async (sql: string, parameters: unknown[]) => {
+          if (sql.includes('LIMIT 64')) { batches++; }
+          if (sql.includes('ORDER BY id FOR SHARE')) {
+            expect(parameters[0]).toHaveLength(51);
+            locked++;
+          }
+          return await targetClient.query(sql,parameters);
+        };
+      }});
+      const key = activeSearch.token('name',fixture.cityId,target.name.toLowerCase());
+      const data = await readRegistrySearch(wrapped,fixture.cityId,{kind:'name',key},
+        item => evidence.get(item.id)?.procedureRevision === item.procedureRevision);
+      expect(batches).toBe(2);
+      expect(locked).toBe(1);
+      expect(data.truncated).toBe(true);
+      expect(data.items.map(item => item.id)).toEqual(ids.slice(0,50));
+    } finally {
+      try { await client.query('ROLLBACK'); } finally { client.release(); }
+    }
+  },150000);
 
   it('callback is consent-bound, single effect and exact replay; revoke changes both GET validators without changing row_version', async () => {
     const f=await issue();

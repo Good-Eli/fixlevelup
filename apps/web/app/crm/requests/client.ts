@@ -53,6 +53,40 @@ export async function readRegistry(query: URLSearchParams, signal: AbortSignal) 
   return { items: items.map(item), nextCursor };
 }
 
+export type RegistrySearchKind = 'number' | 'name' | 'phone';
+
+export async function searchRegistry(kind: RegistrySearchKind, query: string, signal: AbortSignal) {
+  const lifetime = AbortSignal.any([signal, AbortSignal.timeout(18_000)]);
+  const response = await fetch('/api/v1/requests/search', {
+    method: 'POST', body: JSON.stringify({ kind, query }), signal: lifetime,
+    cache: 'no-store', credentials: 'same-origin', mode: 'same-origin', redirect: 'error',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Auth-Request': '1' },
+  });
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => undefined);
+    switch (response.status) {
+      case 400:
+      case 422: throw new RegistryError('Проверьте поисковый запрос.');
+      case 401:
+      case 403:
+      case 404: throw new RegistryError('Поиск недоступен.');
+      case 429: throw new RegistryError('Слишком много запросов. Повторите поиск позже.');
+      default: throw new RegistryError('Поиск временно недоступен.');
+    }
+  }
+  if (response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
+    void response.body?.cancel().catch(() => undefined);
+    throw new RegistryError('Некорректный ответ поиска.');
+  }
+  const payload: unknown = JSON.parse(await boundedResponseText(response, P05_RESPONSE_BYTES.json, true));
+  lifetime.throwIfAborted();
+  const { items, truncated } = object(object(payload, ['data'])['data'], ['items', 'truncated']);
+  if (!Array.isArray(items) || items.length > 50 || typeof truncated !== 'boolean') {
+    throw new RegistryError('Некорректный ответ поиска.');
+  }
+  return { items: items.map(item), truncated };
+}
+
 function choices(value: unknown) {
   if (!Array.isArray(value)) { throw new RegistryError('Некорректный справочник реестра.'); }
   return value.map(option => {

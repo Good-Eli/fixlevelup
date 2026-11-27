@@ -1,19 +1,97 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { SubmitEvent } from 'react';
 import Link from 'next/link';
 import { P05_STATUSES } from '@fixlevelup/p03-contracts/p05';
-import { readRegistry, readRegistryOptions, RegistryError } from './client';
+import { readRegistry, readRegistryOptions, RegistryError, searchRegistry } from './client';
+import type { RegistrySearchKind } from './client';
 import { date, requestTypes, statuses } from './format';
 type Page = Awaited<ReturnType<typeof readRegistry>>;
 type View = { page: Page } | { error: string } | null;
 type Options = Awaited<ReturnType<typeof readRegistryOptions>>;
+type SearchResult = Awaited<ReturnType<typeof searchRegistry>>;
+type SearchView = 'pending' | { result: SearchResult } | { error: string } | null;
+const searchModes: Record<RegistrySearchKind, string> = {
+  number: 'Номер заявки', name: 'Имя клиента', phone: 'Телефон',
+};
 const directories = [
   { group: 'categories', name: 'categoryId', label: 'Тип техники' },
   { group: 'districts', name: 'districtId', label: 'Район' },
   { group: 'sources', name: 'sourceId', label: 'Источник' },
 ] as const;
+
+function RequestTable({ items }: { items: Page['items'] }) {
+  return <div className="registry-table"><table>
+    <thead><tr><th scope="col">Номер</th><th scope="col">Создана (UTC)</th><th scope="col">Тип</th><th scope="col">Статус</th></tr></thead>
+    <tbody>{items.map(row => <tr key={row.id}><td><Link href={`/crm/requests/${row.id}`}>{row.publicNumber}</Link></td>
+      <td><time dateTime={row.createdAt}>{date.format(new Date(row.createdAt))}</time></td>
+      <td>{requestTypes[row.type]}</td><td>{statuses[row.status]}</td></tr>)}</tbody>
+  </table></div>;
+}
+
+function RequestSearch() {
+  const [kind, setKind] = useState<RegistrySearchKind>('number');
+  const [view, setView] = useState<SearchView>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const pending = useRef<AbortController | null>(null);
+
+  useEffect(() => () => { pending.current?.abort(); }, []);
+
+  function clearResult() {
+    pending.current?.abort();
+    setView(null);
+  }
+
+  function clearSearch() {
+    if (input.current) { input.current.value = ''; }
+    clearResult();
+  }
+
+  function submit(event: SubmitEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!input.current?.value) { return; }
+    const query = input.current.value;
+    clearSearch();
+    const request = new AbortController();
+    pending.current = request;
+    setView('pending');
+    void searchRegistry(kind, query, request.signal).then(result => {
+      if (!request.signal.aborted) { setView({ result }); }
+    }).catch((error: unknown) => {
+      if (!request.signal.aborted) {
+        setView({ error: error instanceof RegistryError ? error.message : 'Поиск временно недоступен.' });
+      }
+    }).finally(() => {
+      if (pending.current === request) { pending.current = null; }
+    });
+  }
+
+  const result = view && view !== 'pending' && 'result' in view ? view.result : null;
+  return <section aria-labelledby="request-search-title">
+    <h2 id="request-search-title">Поиск заявок</h2>
+    <form className="panel" aria-labelledby="request-search-title" autoComplete="off" method="post" onSubmit={submit}>
+      <label>Искать по<select value={kind} onChange={event => {
+        setKind(event.currentTarget.value as RegistrySearchKind);
+        clearSearch();
+      }}>
+        {Object.entries(searchModes).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+      </select></label>
+      <label>{searchModes[kind]}<input ref={input} required maxLength={256} autoComplete="off"
+        spellCheck={false} autoCapitalize="none" aria-describedby="request-search-hint"
+        inputMode={kind === 'phone' ? 'tel' : kind === 'number' ? 'numeric' : 'text'} onChange={clearResult}/></label>
+      <small id="request-search-hint">Поиск по точному совпадению.{kind === 'phone' && ' Введите полный номер с кодом страны.'}</small>
+      <div className="actions"><button type="submit">Найти</button><button type="button" onClick={clearSearch}>Очистить поиск</button></div>
+    </form>
+    <div role="status">
+      {view === 'pending' && <p>Поиск заявок…</p>}
+      {result && <p>{result.items.length === 0 ? 'Совпадений нет.' : result.truncated
+        ? <>Показаны первые {result.items.length} совпадений.</> : <>Найдено заявок: {result.items.length}.</>}</p>}
+    </div>
+    {view && view !== 'pending' && 'error' in view && <p role="alert">{view.error}</p>}
+    {result && result.items.length > 0 && <RequestTable items={result.items}/>}
+  </section>;
+}
 
 export default function Registry() {
   const [filters, setFilters] = useState(new URLSearchParams());
@@ -62,6 +140,7 @@ export default function Registry() {
   const nextCursor = page?.nextCursor;
   return <main className="desk">
     <header><h1>Реестр заявок</h1></header>
+    <RequestSearch/>
     <form className="panel" aria-label="Фильтры заявок" onSubmit={apply} onReset={() => {
       const empty = new URLSearchParams();
       setFilters(empty);
@@ -104,12 +183,7 @@ export default function Registry() {
       {view && 'error' in view && <div role="alert"><p>{view.error}</p>
         <button onClick={() => { open(new URLSearchParams(filters)); }}>Повторить с первой страницы</button></div>}
       {page?.items.length === 0 && <p role="status">Заявок по выбранным фильтрам нет.</p>}
-      {page && page.items.length > 0 && <div className="registry-table"><table>
-        <thead><tr><th scope="col">Номер</th><th scope="col">Создана (UTC)</th><th scope="col">Тип</th><th scope="col">Статус</th></tr></thead>
-        <tbody>{page.items.map(row => <tr key={row.id}><td><Link href={`/crm/requests/${row.id}`}>{row.publicNumber}</Link></td>
-          <td><time dateTime={row.createdAt}>{date.format(new Date(row.createdAt))}</time></td>
-          <td>{requestTypes[row.type]}</td><td>{statuses[row.status]}</td></tr>)}</tbody>
-      </table></div>}
+      {page && page.items.length > 0 && <RequestTable items={page.items}/>}
       {nextCursor && <button onClick={() => {
         const next = new URLSearchParams(filters);
         next.set('cursor', nextCursor);

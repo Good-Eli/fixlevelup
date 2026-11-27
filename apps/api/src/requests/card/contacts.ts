@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { decodeP05FContact } from '@fixlevelup/p03-contracts/p05';
 import { parseP04JsonText } from '@fixlevelup/p03-contracts/p04-json';
 import type { P05Context } from '../../authz/authorization.service.js';
+import type { PoolClient } from 'pg';
 import type { GuardedPool } from '../../infrastructure/admission/pool-guard.js';
 import { requireRequestEffectsPool } from '../../infrastructure/admission/pool-guard.js';
 import { MANAGED_PAYLOAD_KEY_MARKER, openManagedPayload } from '../crypto/payload-cipher.js';
@@ -39,9 +40,9 @@ export function createContactAudit(pool: GuardedPool): ContactAudit {
   } };
 }
 
-export async function hasContactGrant(staff: P05Context, row: RequestRow): Promise<boolean> {
+export async function hasContactGrant(staff: P05Context, cityId: string): Promise<boolean> {
   const result = await staff.client.query(`SELECT 1 FROM p06_crm.contact_grants
-    WHERE staff_id=$1 AND city_id=$2 AND capability='customer.pii.read'`, [staff.staffId,row.city_id]);
+    WHERE staff_id=$1 AND city_id=$2 AND capability='customer.pii.read'`, [staff.staffId,cityId]);
   return result.rowCount === 1;
 }
 
@@ -51,25 +52,30 @@ export async function readContactDetails(staff: P05Context, row: RequestRow, con
   if (!contactRevisionId) { return deny('NOT_READY'); }
   await audit.record({ staffId:staff.staffId,requestId:row.id,contactRevisionId });
   await recheck();
+  const revealPhone = await modeOf(staff.client,row) === 'PHONE' && await activePhone(staff.client,row) !== undefined;
+  const { name,phone } = await readStoredContact(staff.client,row,config,recheck);
+  return { name,phone:revealPhone ? phone : null };
+}
 
-  const { rows:[cell] } = await staff.client.query<PayloadCiphertext & { id: string; revision: number }>(`SELECT payload.id,
+/** Caller establishes its own authority before accessing an encrypted snapshot. */
+export async function readStoredContact(client: PoolClient, row: Pick<RequestRow,'id'|'current_contact_revision_id'>,
+  config: Snapshots, beforeOpen?: () => Promise<void>) {
+  const { rows:[cell] } = await client.query<PayloadCiphertext & { id: string; revision: number }>(`SELECT payload.id,
       revision.revision,payload.nonce,payload.ciphertext,payload.auth_tag AS "authTag",payload.aad_context AS "aadContext"
     FROM foundation.request_contact_revisions revision JOIN foundation.request_payload_cells payload
       ON payload.id=revision.payload_cell_id AND payload.request_id=revision.request_id AND payload.revision=revision.revision
     WHERE revision.request_id=$1 AND revision.id=$2 AND payload.kind='CONTACT' AND payload.key_id=$3`,
-  [row.id,contactRevisionId,MANAGED_PAYLOAD_KEY_MARKER]);
+  [row.id,row.current_contact_revision_id,MANAGED_PAYLOAD_KEY_MARKER]);
   if (!cell) { return deny('DEPENDENCY_UNAVAILABLE'); }
-  const revealPhone = await modeOf(staff.client,row) === 'PHONE' && await activePhone(staff.client,row) !== undefined;
   const ref = { environment:config.environment,requestId:row.id,cellId:cell.id,revision:cell.revision,kind:'CONTACT' as const };
   const wrap = await config.keySlots.read(ref).catch(() => deny('DEPENDENCY_UNAVAILABLE'));
-  await recheck();
+  await beforeOpen?.();
   try {
     const plaintext = openManagedPayload(ref,config.ring,cell,wrap);
     try {
       const parsed = parseP04JsonText(new TextDecoder('utf-8',{fatal:true}).decode(plaintext));
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { return deny('DEPENDENCY_UNAVAILABLE'); }
-      const { name,phone } = decodeP05FContact({ name:parsed['name'],phone:parsed['phone'] });
-      return { name,phone:revealPhone ? phone : null };
+      return decodeP05FContact({ name:parsed['name'],phone:parsed['phone'] });
     } finally { plaintext.fill(0); }
   } catch { return deny('DEPENDENCY_UNAVAILABLE'); }
 }
