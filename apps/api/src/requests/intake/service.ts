@@ -513,7 +513,15 @@ export class RequestIntake {
     return await this.readCrmTarget(proof,id,async (staff,row) => {
       if (!config || config.keySlots.environment !== COMMENT_KEY_ENVIRONMENT) { return deny('NOT_READY'); }
       await authorizeComments(staff,row,false);
-      return await readInternalComments(staff,row,config);
+      const isCurrent = await this.crmBasisAtDecision(staff,basis);
+      const beforeOpen = async () => {
+        if (!await basis.recheck()) { return deny('CONSENT_REQUIRED'); }
+        const clock = await staff.recheck();
+        if ((basis.expiresAtMs !== null && basis.expiresAtMs <= clock.getTime()) || !isCurrent()) {
+          return deny('CONSENT_REQUIRED');
+        }
+      };
+      return await readInternalComments(staff,row,config,beforeOpen);
     },() => ({ items:[] }));
   }
 
