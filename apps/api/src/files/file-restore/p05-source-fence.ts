@@ -31,7 +31,22 @@ const FENCE_SQL = `SELECT pg_backend_pid() AS pid,
   AND NOT EXISTS (SELECT FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid())
   AND NOT EXISTS (SELECT FROM pg_prepared_xacts p WHERE p.database=d.datname)
   AND EXISTS (SELECT FROM foundation.file_runtime_epochs e WHERE e.singleton AND e.mode='FENCED'
-    AND e.namespace_id=$3::uuid AND e.epoch=$4::bigint) AS valid
+    AND e.namespace_id=$3::uuid AND e.epoch=$4::bigint) AS valid,
+  NOT pg_is_in_recovery() AS is_primary,
+  current_database()=$1 AS database_matches,
+  d.oid=$2::oid AS database_oid_matches,
+  NOT d.datallowconn AS database_connections_disabled,
+  current_user='fixlevelup_migrator' AND session_user=current_user AS migrator_identity,
+  current_setting('default_transaction_read_only')='on' AS default_read_only,
+  current_setting('transaction_read_only')='on' AS transaction_read_only,
+  NOT has_database_privilege('fixlevelup_runtime',d.oid,'CONNECT') AS runtime_connect_revoked,
+  NOT EXISTS (SELECT FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid()) AS no_other_backends,
+  COALESCE((SELECT array_agg(DISTINCT a.backend_type ORDER BY a.backend_type)
+    FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid()), ARRAY[]::text[]) AS other_backend_types,
+  (SELECT count(*)::int FROM pg_stat_activity a WHERE a.datid=d.oid AND a.pid<>pg_backend_pid()) AS other_backend_count,
+  NOT EXISTS (SELECT FROM pg_prepared_xacts p WHERE p.database=d.datname) AS no_prepared_xacts,
+  EXISTS (SELECT FROM foundation.file_runtime_epochs e WHERE e.singleton AND e.mode='FENCED'
+    AND e.namespace_id=$3::uuid AND e.epoch=$4::bigint) AS matching_fenced_epoch
   FROM pg_database d WHERE d.datname=current_database()`;
 
 /** Reads the physical cluster identity of the current primary. Exported so a
@@ -72,7 +87,11 @@ export async function observeFencedSource(client: Client, expected: {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     try {
       const result = await client.query<{ pid: number; valid: boolean; system_identifier: string | null;
-        server_version_num: string | null; postmaster_start: string | null }>(FENCE_SQL,
+        server_version_num: string | null; postmaster_start: string | null; is_primary: boolean;
+        database_matches: boolean; database_oid_matches: boolean; database_connections_disabled: boolean;
+        migrator_identity: boolean; default_read_only: boolean; transaction_read_only: boolean;
+        runtime_connect_revoked: boolean; no_other_backends: boolean; other_backend_types: string[];
+        other_backend_count: number; no_prepared_xacts: boolean; matching_fenced_epoch: boolean }>(FENCE_SQL,
       [expected.database, expected.databaseOid, expected.scope.namespace, expected.scope.writerEpoch.toString()]);
       const fence = result.rows[0];
       if (fence?.valid !== true || !Number.isSafeInteger(fence.pid)
@@ -80,6 +99,23 @@ export async function observeFencedSource(client: Client, expected: {
         || typeof fence.system_identifier !== 'string' || !/^[1-9][0-9]{0,19}$/.test(fence.system_identifier)
         || typeof fence.server_version_num !== 'string' || !/^[1-9][0-9]{5}$/.test(fence.server_version_num)
         || typeof fence.postmaster_start !== 'string' || fence.postmaster_start.length < 10) {
+        if (process.env['FIXLEVELUP_FILE_RESTORE_TESTS'] === '1'
+          && process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1') {
+          const facts = fence === undefined ? { rowPresent: false } : {
+            rowPresent: true, isPrimary: fence.is_primary, databaseMatches: fence.database_matches,
+            databaseOidMatches: fence.database_oid_matches, databaseConnectionsDisabled: fence.database_connections_disabled,
+            migratorIdentity: fence.migrator_identity, defaultReadOnly: fence.default_read_only,
+            transactionReadOnly: fence.transaction_read_only, runtimeConnectRevoked: fence.runtime_connect_revoked,
+            noOtherBackends: fence.no_other_backends, otherBackendCount: fence.other_backend_count,
+            otherBackendTypes: fence.other_backend_types, noPreparedXacts: fence.no_prepared_xacts,
+            matchingFencedEpoch: fence.matching_fenced_epoch,
+            backendPidMatches: expected.backendPid === undefined || expected.backendPid === fence.pid,
+            clusterIdentityPresent: typeof fence.system_identifier === 'string'
+              && typeof fence.server_version_num === 'string' && typeof fence.postmaster_start === 'string',
+          };
+          process.stderr.write('[p05-source-fence-diagnostic] '
+            + JSON.stringify({ event: 'source-fence-refused', facts }) + '\\n');
+        }
         return refuseRestore('RESTORE_AUTHORITY');
       }
       const cluster: ClusterFact = Object.freeze({ systemIdentifier: fence.system_identifier,
