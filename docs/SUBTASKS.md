@@ -28,7 +28,11 @@ skip. Удалён per-route authenticateStaff, вызвавший lock timeout 
 pre-decrypt authorization recheck не маскируется под 503. Показанные DeepSeek
 локальные прогоны 148/132/132 относятся к предыдущему набору; новый merged
 SHA требует полного exact-SHA прогона. Статус остаётся **verification pending**
-до зелёного GitHub Actions p06-acceptance и полного required Gate. Полный P06
+до зелёного GitHub Actions p06-acceptance и полного required Gate. Exact-SHA run
+`46081315700` подтвердил 149/149 unit/client, 11/11 accepted и 133/133 server
+gap, но общий job упал на host-проверке summary, созданного внутри временного
+lab-контейнера; P06 browser был пропущен. CI-обвязка исправлена, нужен новый
+полный exact-SHA run до PASS. Полный P06
 backup/restore обязателен только до выхода за границы T в R/реальные ПД.
 
 Release composition R не регистрирует ни P05, ни P06-маршруты: всё это
