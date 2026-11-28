@@ -218,18 +218,20 @@ async function acrossEvidenceExpiry<T>(
       );
       try {
         const waiting = await untilObserved(async () => {
-          const observed = await db.runtime.query<{ query: string; live: boolean }>(
-            `SELECT a.query, s.expires_at > clock_timestamp() AS live
+          // Activity and lock state can be sampled at different points during
+          // the transition from the clock query to the blocked evidence SELECT.
+          const observed = await db.runtime.query<{ live: boolean }>(
+            `SELECT s.expires_at > clock_timestamp() AS live
              FROM pg_stat_activity a
              JOIN pg_locks l ON l.pid=a.pid AND l.relation='foundation.consent_records'::regclass
                AND l.locktype='relation' AND l.mode='AccessShareLock' AND NOT l.granted
              CROSS JOIN foundation.request_sessions s
              WHERE a.application_name=$1 AND a.datname=current_database()
-               AND a.wait_event_type='Lock' AND $2=ANY(pg_blocking_pids(a.pid)) AND s.id=$3`,
-            [name, blockerPid, sessionId]);
+               AND a.wait_event_type='Lock' AND $2=ANY(pg_blocking_pids(a.pid)) AND s.id=$3
+               AND strpos(a.query,$4)>0`,
+            [name, blockerPid, sessionId, queryFragment]);
           return observed.rows[0];
-        }, 'the named caller waiting on the consent_records relation lock');
-        expect(waiting.query).toContain(queryFragment);
+        }, 'the named evidence SELECT waiting on the consent_records relation lock');
         expect(waiting.live).toBe(true);
         // The unblock is driven by the persisted expiry on PostgreSQL's clock,
         // not a guessed elapsed delay after launching the port.
