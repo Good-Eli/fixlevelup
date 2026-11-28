@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+
 const script = fileURLToPath(new URL('./p05-matrix-results.mjs', import.meta.url));
 const suites = {
   normative: [
@@ -31,24 +32,33 @@ const suites = {
     'CITY-RBAC × state × command: CUSTOM CITY states 3/3',
   ],
 };
+
 function makeReport(suite, mutate = () => {}) {
   const selected = suites[suite];
-  const assertionResults = Array.from({ length: 42 - selected.length }, (_, i) => ({
-    title: 'filtered unrelated case ' + String(i + 1), status: 'pending',
+  const assertionResults = Array.from({ length: 42 - selected.length }, (_, index) => ({
+    title: 'filtered unrelated case ' + String(index + 1),
+    status: 'pending',
   }));
-  for (const title of selected) assertionResults.push({ title, status: 'passed' });
+  for (const title of selected) {
+    assertionResults.push({ title, status: 'passed' });
+  }
   mutate(assertionResults);
-  return { testResults: [{
-    name: '/workspace/apps/api/tests/p05-intake-http.test.ts',
-    status: 'passed', assertionResults,
-  }] };
+  return {
+    testResults: [{
+      name: '/workspace/apps/api/tests/p05-intake-http.test.ts',
+      status: 'passed',
+      assertionResults,
+    }],
+  };
 }
+
 function run(report, suite) {
-  const dir = mkdtempSync(join(tmpdir(), 'p05-matrix-results-'));
-  const path = join(dir, 'report.json');
+  const directory = mkdtempSync(join(tmpdir(), 'p05-matrix-results-'));
+  const path = join(directory, 'report.json');
   writeFileSync(path, JSON.stringify(report));
   return spawnSync(process.execPath, [script, path, suite], { encoding: 'utf8' });
 }
+
 for (const suite of Object.keys(suites)) {
   test('passes exact selected scenario titles for ' + suite, () => {
     const result = run(makeReport(suite), suite);
@@ -56,44 +66,57 @@ for (const suite of Object.keys(suites)) {
     assert.match(result.stdout, /P05 MATRIX GATE PASS/u);
   });
 }
+
 test('fails a renamed required test even if the pass count stays constant', () => {
   const result = run(makeReport('city-admin', assertions => {
-    assertions.find(x => x.status === 'passed').title = 'renamed CITY admin test';
+    const selected = assertions.find(item => item.status === 'passed');
+    selected.title = 'renamed CITY admin test';
   }), 'city-admin');
   assert.equal(result.status, 1);
   assert.match(result.stderr, /required title occurs 0 times/u);
 });
+
 test('fails when an exact selected test is skipped', () => {
   const result = run(makeReport('normative', assertions => {
-    assertions.find(x => x.status === 'passed').status = 'pending';
+    const selected = assertions.find(item => item.status === 'passed');
+    selected.status = 'pending';
   }), 'normative');
   assert.equal(result.status, 1);
   assert.match(result.stderr, /required title is not passed/u);
 });
+
 test('fails when the filter accidentally selects an unrelated test', () => {
   const result = run(makeReport('city-manager', assertions => {
-    assertions.find(x => x.status === 'pending').status = 'passed';
+    const filtered = assertions.find(item => item.status === 'pending');
+    filtered.status = 'passed';
   }), 'city-manager');
   assert.equal(result.status, 1);
   assert.match(result.stderr, /passed 4 tests; exact suite requires 3/u);
 });
+
 test('fails if a selected title is duplicated or inventory changes', () => {
   const duplicate = run(makeReport('city-custom', assertions => {
-    const first = assertions.find(x => x.status === 'passed');
+    const first = assertions.find(item => item.status === 'passed');
     assertions.push({ ...first });
   }), 'city-custom');
   assert.equal(duplicate.status, 1);
   assert.match(duplicate.stderr, /inventory is 42/u);
-  const shrunk = run(makeReport('city-custom', assertions => assertions.pop()), 'city-custom');
+  assert.match(duplicate.stderr, /required title occurs 2 times/u);
+
+  const shrunk = run(makeReport('city-custom', assertions => {
+    assertions.pop();
+  }), 'city-custom');
   assert.equal(shrunk.status, 1);
   assert.match(shrunk.stderr, /inventory is 42/u);
 });
+
 test('rejects unknown suites and unexpected test files', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'p05-matrix-results-'));
-  const path = join(dir, 'report.json');
+  const directory = mkdtempSync(join(tmpdir(), 'p05-matrix-results-'));
+  const path = join(directory, 'report.json');
   writeFileSync(path, JSON.stringify(makeReport('normative')));
   const unknown = spawnSync(process.execPath, [script, path, 'not-a-suite'], { encoding: 'utf8' });
   assert.equal(unknown.status, 2);
+
   const wrong = makeReport('normative');
   wrong.testResults[0].name = '/workspace/apps/api/tests/another-file.test.ts';
   assert.equal(run(wrong, 'normative').status, 1);
