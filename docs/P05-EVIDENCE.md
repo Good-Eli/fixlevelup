@@ -121,37 +121,64 @@ The old S3 pins did not describe the changed SQL trigger function, and verifyClo
 | **F** — нормативная матрица role × state × command | Независимый [oracle](<../apps/api/tests/p05-http-matrix-oracle.ts>), не читающий controller/dispatcher/X01. Девять HTTPS phases: `city-admin-{0..2}`, `city-manager-{0..2}`, `city-custom-{0..2}`. Они покрывают 18 lawful states × 8 staff commands × три разрешающие CITY role shapes = **432 oracle cells**; каждая ячейка проверяет точный эффект/отказ, fresh aggregate, receipt/audit/outbox/replay и неизменность inventories при deny. | **PASS — 432/432, run 45799842651**, parent SHA `2c2b54abe69c678a23406bf71a385fc2fdac9200`; на более новом SHA `153fb6a...` требуется повтор CI |
 | Регрессия | [Офлайн 153/153](<../test-results/p05-release-20261125/p05-regression-offline.log>), [живая PG](<../test-results/p05-release-20261125/p05-regression-live.log>), [tsc + ESLint](<../test-results/p05-release-20261125/static-five-phase.log>) | [lint 2 ошибки](<../test-results/p05-release-20261125/static-full.log>) | **PASS** |
 
-## Полный P05 Gate и freeze-контракт — актуализация 27.11.2026
+## Полный P05 Gate и freeze-контракт — актуализация 28.11.2026
 
 ### Объём и точный источник истины
 
-P05-01…P05-04 реализованы и приняты владельцем в synthetic scope. P05-01
-сохраняет историческую owner acceptance; P05-02/P05-03/P05-04 приняты
-владельцем 27.11.2026. ChatGPT `PASS — FULL P05` на точном candidate
-`0d7f60dbee1bddca63e9f1868a03ebf1230ec69f` владелец явно приравнял к
-`PASS — FULL ASTRA P05`. Run `45953489126`: 7 required jobs + freeze job =
-**8/8 success**. Этот раздел заменяет устаревшие статусы `SOURCE ADDED / CI
-PENDING` из предыдущего snapshot.
-Технический Gate относится только к HEAD PR #2. Не переносить его на другой
-SHA: точные `headSha`, tree, все tracked paths/modes/Git blobs/content SHA-256,
-manifest SHA-256, canonical tree inventory SHA-256 и redacted job evidence
-фиксируются в артефакте `p05-exact-candidate-<run_id>` freeze job текущего
-[PR #2](https://github.com/Good-Eli/fixlevelup/pull/2). Артефакт должен
-соответствовать текущему HEAD; freeze job завершается success только после
-всех required jobs.
+P05-01…P05-04 реализованы и приняты владельцем в synthetic scope.
+Историческая owner acceptance от 27.11.2026 сохраняется: владелец признал
+ChatGPT `PASS — FULL P05` эквивалентом `PASS — FULL ASTRA P05` для исходного
+candidate `0d7f60dbee1bddca63e9f1868a03ebf1230ec69f`, run `45953489126`
+(8/8 с freeze). Этот run остаётся историческим evidence, не переносится на
+другие SHA и не заменяет последующий exact-candidate freeze.
+
+Дополнительный полный P05/P06 technical Gate прошёл 28.11.2026 на exact SHA
+`ef290da2170d05e65bd9d1fd2838a82b796e0e81`: GitHub Actions
+[run 46122855702](https://github.com/Good-Eli/fixlevelup/actions/runs/46122855702),
+event `workflow_dispatch`, **13/13 jobs success**. Для P05 подтверждены:
+F-01/PHONE guards, четыре изолированные HTTPS matrix jobs, normative matrix,
+три CITY role partitions (**432/432 oracle cells**), full opt-in PG/Garage/
+ledger/privacy/restore/old-binary suites и четыре реальные ClamAV/Sharp engine
+scenarios; оба attachment HTTP cases были выполнены и прошли. P05 full opt-in
+Vitest summary: **1727 passed / 53 skipped**; 53 filtered/opt-in cases не
+считаются passed. Остальные required jobs — migration history/build/typecheck/
+wire, Linux integration, browser и security — также success.
+
+Exact freeze artifact: `p05-exact-candidate-46122855702`. Его manifest
+зафиксировал:
+- commit SHA: `ef290da2170d05e65bd9d1fd2838a82b796e0e81`;
+- Git tree SHA: `080db99000a3a50cae024fafde87caad8d1fdd40`;
+- tracked files: **722**;
+- lockfile SHA-256: `15b7e7f3413a86b45dc0d047402e004e9394175b6f7f648da64e392865e51bdb`;
+- canonical source-tree SHA-256: `028eed1cddb678dca47d49a08c4a70bd12463e3cad8f0026e040b770ab08edcd`;
+- candidate-manifest SHA-256: `1e47dba4bb019ab0924359574d09e291e60ef6eda257bc313142e6c5a1195ab4`.
+
+GitHub artifact archive digest is `sha256:8f76be742d38a1af5652d6e05152e87d2139e6c7403fac0148e7e70f815a1e24`;
+это digest ZIP-артефакта, не SHA самого manifest. Общий workflow включал
+13 успешных jobs, включая четыре matrix partitions, P06 acceptance и freeze.
+
+Run `46122855702` был ручным `workflow_dispatch`, а не `pull_request`;
+у него не было привязанного PR. Поэтому он доказывает именно `ef290da`,
+но не последующий commit. Commit `58d4782` добавляет строгий matrix checker,
+который сверяет точные названия сценариев, статус каждого обязательного
+теста, inventory 42 cases и точный filtered/skipped count. Его собственные
+Node regression tests проверяют переименование, skip, неожиданный passing
+test, дубли и изменение inventory. Для этого нового HEAD требуется отдельный
+полный PR workflow и новый freeze; результат `46122855702` на него не
+переносится.
 
 ### Сводка реализации и полного Gate
 
-| Требование / job | Что подтверждается | Что требуется для итогового PASS |
+| Требование / job | Что подтверждается | Результат на exact SHA `ef290da` / run `46122855702` |
 |---|---|---|
-| **P05 F-01 / DB boundary** | Прямой DML от имени `fixlevelup_runtime` не может выпускать, резервировать, повторно включать, расширять или удалять request capability grant; negative tests и revoke proof. | Success на точном HEAD |
-| **CITY-RBAC × state × command** | Независимый HTTPS oracle: 3 разрешающие role shapes × 18 lawful states × 8 staff commands = **432 клетки**; allow-пути проверяют effects/receipt/audit/outbox/replay, deny-пути — отсутствие durable effects. | 432/432 и success на точном HEAD |
-| **PII / decrypt boundary** | Реальный HTTPS + PG: scope/role/evidence проверяются до audit/ciphertext read; denied cases имеют ноль ciphertext SELECT/audit attempts и неизменный snapshot. | Full opt-in suite success |
-| **Partial effects / rollback** | Неполные receipt/audit/outbox, отсутствующий submit edge и rollback после доменных записей дают fail-closed результат; exact replay/reconciliation не дублирует effect. | Full opt-in suite success |
-| **Restore / ledger / old binary** | Приватные PG 18.7, Garage, ledger и trust-floor; restore, migration history, старый бинарник, persistence/restart и teardown изолированных ресурсов. | Full integration/migration jobs success |
-| **Real file engine / READY attachment** | Закреплённые ClamAV/Sharp сценарии с one-ticket bridge; READY attachment проходит реальный HTTP/PG/Garage path, digest/inventory сохраняются, retention race закрывается FK interlock. | Оба `p05-attachment-http` engine cases executed и passed, не skipped |
-| **Build / wire / browser** | API, Web и Mini App builds; workspace typecheck; P03/P04/P05 OpenAPI/runtime/client parity; Chromium/Firefox/WebKit desktop/mobile. | Required migration-wire и browser jobs success |
-| **Security / lockfile / freeze** | Dependency/license/secret gates, clean tracked tree; manifest включает полный tracked source inventory. | Security и freeze jobs success |
+| **P05 F-01 / DB boundary** | Прямой DML от имени `fixlevelup_runtime` не может выпускать, резервировать, повторно включать, расширять или удалять request capability grant; negative tests и revoke proof. | **PASS** — F-01 и PHONE guards success |
+| **CITY-RBAC × state × command** | Независимый HTTPS oracle: 3 разрешающие role shapes × 18 lawful states × 8 staff commands = **432 клетки**; allow-пути проверяют effects/receipt/audit/outbox/replay, deny-пути — отсутствие durable effects. | **PASS — 432/432 oracle cells**; четыре HTTPS partitions success |
+| **PII / decrypt boundary** | Реальный HTTPS + PG: scope/role/evidence проверяются до audit/ciphertext read; denied cases имеют ноль ciphertext SELECT/audit attempts и неизменный snapshot. | **PASS** — full opt-in suite; 1727 passed, 53 filtered/opt-in skips |
+| **Partial effects / rollback** | Неполные receipt/audit/outbox, отсутствующий submit edge и rollback после доменных записей дают fail-closed результат; exact replay/reconciliation не дублирует effect. | **PASS** — partial effects / rollback входят в успешный full opt-in run |
+| **Restore / ledger / old binary** | Приватные PG 18.7, Garage, ledger и trust-floor; restore, migration history, старый бинарник, persistence/restart и teardown изолированных ресурсов. | **PASS** — PostgreSQL 18.7, Garage, ledger, restore, old binary и migration jobs |
+| **Real file engine / READY attachment** | Закреплённые ClamAV/Sharp сценарии с one-ticket bridge; READY attachment проходит реальный HTTP/PG/Garage path, digest/inventory сохраняются, retention race закрывается FK interlock. | **PASS** — оба `p05-attachment-http` engine cases executed и passed |
+| **Build / wire / browser** | API, Web и Mini App builds; workspace typecheck; P03/P04/P05 OpenAPI/runtime/client parity; Chromium/Firefox/WebKit desktop/mobile. | **PASS** — migration/build/typecheck/wire и browser jobs |
+| **Security / lockfile / freeze** | Dependency/license/secret gates, clean tracked tree; manifest включает полный tracked source inventory. | **PASS** — security и exact candidate freeze success; 722 tracked files |
 
 ### Исправление пропуска в прежнем CI run
 
@@ -190,11 +217,12 @@ invocations. В новом exact-head run оба должны быть видн�
 
 27.11.2026 владелец явно признал `ChatGPT PASS — FULL P05` эквивалентом
 `PASS — FULL ASTRA P05` и принял P05-01…P05-04 в synthetic scope. Это решение
-удовлетворяет reviewer/owner condition §9 только для данного P05 candidate;
-оно не утверждает, что отдельный Astra-run выполнялся. После этой статусной
-редакции нужен новый full exact-head CI и новый candidate freeze: artifact
-`p05-exact-candidate-45953489126` относится строго к SHA
-`0d7f60dbee1bddca63e9f1868a03ebf1230ec69f` и не переносится на следующий SHA.
-После успешного нового freeze §9 разрешает только fast-forward в `main`.
-Production migration, deployment, live PII, public site/file transport и live
-channel delivery не разрешены.
+удовлетворяет reviewer/owner condition §9 для исходной owner acceptance; оно
+не утверждает, что отдельный Astra-run выполнялся. Следующий exact candidate
+Gate успешно заморожен на `ef290da` (run 46122855702, artifact
+`p05-exact-candidate-46122855702`). Любой последующий commit, включая strict
+matrix checker и документационную синхронизацию, требует собственного полного
+exact-head PR Gate и нового freeze. Этот technical PASS не разрешает merge:
+`main` остаётся неизменённой до отдельного решения владельца. Production
+migration, deployment, live PII, public site/file transport и live channel
+delivery не разрешены.

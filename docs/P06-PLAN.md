@@ -407,12 +407,9 @@ acceptance. The follow-up remediation branch
    builds, all P06 opt-in server/load tests and the isolated HTTPS Chromium CRM
    scenario, and stores redacted evidence tied to the exact candidate SHA.
 
-**Follow-up status: test-coverage gap closed on the candidate branch; exact-SHA CI
-Gate run still outstanding.** The PII audit implementation already writes a
-durable audit record before selecting/decrypting contact ciphertext and fails
-closed on audit errors. The negative fault-injection tests (connect, INSERT,
-COMMIT failures, asserting no key-slot read/decrypt) now exist and pass; §6
-records their commands, results and the one recorded defect.
+**Follow-up status: exact-SHA technical CI Gate PASS on `ef290da2170d05e65bd9d1fd2838a82b796e0e81`, run [46122855702](https://github.com/Good-Eli/fixlevelup/actions/runs/46122855702).** All 13 workflow jobs passed. P06 acceptance reports 149/149 database-free unit/client tests, 133/133 server gap tests, all 11 accepted P06 HTTP scenarios and the isolated Chromium CRM proof. This is a technical PASS for that exact SHA and the isolated T composition; it is not an independent Astra follow-up verdict or production approval.
+
+The PII audit still commits before ciphertext disclosure and fails closed on audit errors. Direct runtime-DML denial, DB writer atomicity, basis recheck at COMMIT, rollback, idempotency races and pre-decrypt recheck are included in the passing gap Gate. The newer strict matrix-checker commit `58d4782` requires its own exact-head PR CI; its results are not inferred from run 46122855702.
 
 **Restore boundary:** P06 remains T-only. The P05 managed-slot backup/rewrap
 primitives are not yet integrated into a complete P06 database-dump + comment
@@ -527,11 +524,11 @@ PASS. Это локальные результаты предыдущего на
 новому объединённому SHA.
 
 В объединённую ветку добавлен ещё один обязательный unit regression test;
-строгие exact totals теперь 149 database-free и 133 server gap tests, оба
-с нулём неожиданных skip. Новый exact-SHA workflow должен подтвердить эти
-числа, 14/14 gap HTTP tests без it.fails, browser proof, migration/build/wire
-и все общие обязательные jobs. До такого прогона follow-up P06 остаётся
-verification pending; локальный результат не объявляет PASS.
+строгие exact totals — 149 database-free и 133 server gap tests. На момент
+первичной подготовки exact-SHA workflow ещё ожидался; этот статус был
+superseded run 46122855702 на SHA `ef290da`: 149/149 unit/client, 133/133
+server gap, 11/11 accepted P06 scenarios, browser proof и все 13 jobs успешны.
+Результат ограничен точным SHA и композицией T.
 
 Exact-SHA run `46081315700` на `38c108f3a780e1c5cc080b3aaa4bd7928a953e59`
 подтвердил 149/149 unit/client, 11/11 принятых P06-сценариев и 133/133
@@ -541,7 +538,10 @@ server gap-теста; `p06-server-gate` вывел `status: passed`. Job, од�
 P06 browser Gate поэтому был skipped. Это ошибка доставки CI evidence, не
 отрицательный результат этих тестов; общий PASS по-прежнему не заявлен.
 Workflow исправлен на сбор summary из stdout в host evidence directory.
-Повторный полный run на новом SHA обязателен.
+Исправление подтвердилось полным run [46122855702](https://github.com/Good-Eli/fixlevelup/actions/runs/46122855702)
+на exact SHA `ef290da2170d05e65bd9d1fd2838a82b796e0e81`: P06 Gate и browser
+прошли. Новый commit со строгой проверкой точных названий P05 matrix tests
+потребует следующего exact-head PR run.
 
 ### 6.7. Остаточные риски
 
@@ -552,4 +552,15 @@ Workflow исправлен на сбор summary из stdout в host evidence d
   единый прогон; P06 остаётся T-only.
 - **R3 — композиция.** P06 по-прежнему не входит в release composition R.
 - **R4 — KNOWN GAP web-декодера.** `readRegistryItem` кидает `P05DecodeError`,
-  а не `RegistryError`, на невалидных полях item; задокументировано тестом.
+  а не `RegistryError`, на невалидных полях item; задокументировано тестом и
+  остаётся исправлением до release acceptance.
+- **R5 — visual/accessibility review.** Полный ручной визуальный и
+  accessibility-аудит CRM-интерфейса не входит в текущий CI Gate и не заявляется
+  пройденным; выполнить отдельно до release acceptance.
+
+
+### 6.8. Строгая проверка состава P05 HTTPS matrix (28.11.2026)
+
+Commit `58d4782` добавляет `infra/ci/p05-matrix-results.mjs` и его Node regression tests. Для partitions `normative`, `city-admin`, `city-manager` и `city-custom` закреплены точные titles выбранных тестов; проверяются один ожидаемый test file, inventory ровно 42 cases, точное число passing tests, точное число отфильтрованных/skipped cases, отсутствие дополнительных passing tests и `status=passed` для каждого обязательного title. Негативные проверки симулируют переименование, skip, неожиданный match, дубли и изменение inventory.
+
+Checker подключён в каждом из четырёх P05 HTTPS matrix jobs. Его unit tests попадают в существующий `node --test infra/ci/*.test.mjs` security job. На момент этой редакции exact-SHA PR run для commit `58d4782` ещё не завершён: run `46122855702` относится к родительскому SHA `ef290da` и не является доказательством нового checker. Новый технический результат возможен только после полного PR workflow и freeze на новом HEAD.

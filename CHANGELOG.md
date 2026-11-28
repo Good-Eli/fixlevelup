@@ -1,6 +1,33 @@
 # История изменений
 
-Техническая история репозитория по состоянию на 27.11.2026. Дата — дата коммитов в их локальном часовом поясе; номера релизов не назначались. Актуальные статусы P01 — в [Preflight](docs/PREFLIGHT_P01.md); контур P02 — в [RBAC](docs/RBAC.md); прогресс, трудоёмкость и все подэтапы — в [журнале подэтапов](docs/SUBTASKS.md), подробные доказательства приёмок — в [SUBTASKS-EVIDENCE](docs/SUBTASKS-EVIDENCE.md); остальные документы R3.2 сохраняют исторические формулировки этапа 0.
+Техническая история репозитория по состоянию на 28.11.2026. Дата — дата коммитов в их локальном часовом поясе; номера релизов не назначались. Актуальные статусы P01 — в [Preflight](docs/PREFLIGHT_P01.md); контур P02 — в [RBAC](docs/RBAC.md); прогресс, трудоёмкость и все подэтапы — в [журнале подэтапов](docs/SUBTASKS.md), подробные доказательства приёмок — в [SUBTASKS-EVIDENCE](docs/SUBTASKS-EVIDENCE.md); остальные документы R3.2 сохраняют исторические формулировки этапа 0.
+
+## 28.11.2026 — P05/P06 exact-SHA Gate и candidate freeze
+
+Run [46122855702](https://github.com/Good-Eli/fixlevelup/actions/runs/46122855702)
+завершился **13/13 jobs success** на exact SHA
+`ef290da2170d05e65bd9d1fd2838a82b796e0e81`. P05 full opt-in Vitest:
+**1727 passed / 53 skipped** (53 — filtered/opt-in cases, они не включены в
+число passed). Отдельные четыре HTTPS matrix jobs завершились успешно:
+normative inventory и три CITY role partitions, суммарно **432/432 oracle
+cells**. P06 Gate: **149/149 unit/client**, **133/133 server gap**,
+11/11 принятых P06 HTTPS сценариев и Chromium CRM browser proof.
+
+Freeze artifact `p05-exact-candidate-46122855702`: 722 tracked files,
+Git tree `080db99000a3a50cae024fafde87caad8d1fdd40`, canonical tree SHA-256
+`028eed1cddb678dca47d49a08c4a70bd12463e3cad8f0026e040b770ab08edcd`,
+manifest SHA-256
+`1e47dba4bb019ab0924359574d09e291e60ef6eda257bc313142e6c5a1195ab4`.
+Это доказательство `workflow_dispatch` для SHA `ef290da`, а не CI
+последующего коммита и не production readiness.
+
+Commit `58d4782` добавляет строгий P05 matrix checker: exact titles каждой
+partition, status=passed для обязательных тестов, inventory из 42 cases,
+точный filtered/skipped count и отрицательные regression tests. Его PR CI и
+freeze ещё должны завершиться на новом HEAD; run 46122855702 не переносится
+на него. P06 остаётся T-only; полный DB dump + external managed comment-slot
+restore, исправление документированного web decoder gap и визуальный/
+accessibility review остаются release gates.
 
 ## 28.11.2026 — P06 CI: исправлена передача server summary из lab-контейнера
 
@@ -14,8 +41,9 @@ workflow искал `server-summary.json` на хосте, хотя `s3test` с�
 
 Исправлен workflow: машинный summary теперь захватывается из stdout через
 `tee`, материализуется в host evidence directory и затем проверяется
-строгим условием `status: passed`. Проверки не ослаблены. Требуется новый
-полный exact-SHA run; P06 follow-up до его успеха остаётся verification pending.
+строгим условием `status: passed`. Проверки не ослаблены. Это историческое
+описание устранённого CI handoff failure; последующий полный exact-SHA run
+`46122855702` на `ef290da` прошёл, см. запись выше.
 
 ## 27.11.2026 — P06: объединённое gap-покрытие и строгий CI Gate
 
@@ -50,7 +78,7 @@ FORBIDDEN из final pre-decrypt recheck.
 GitHub Actions run на опубликованном SHA. P06 остаётся T-only; полный DB dump
 + managed comment-slot restore — отдельный blocker до R/реальных ПД.
 
-## 27.11.2026 — P06 follow-up audit remediation (verification pending)
+## 27.11.2026 — P06 follow-up audit remediation (исторический статус до exact-SHA Gate)
 
 Отдельная ветка `fix/p06-audit-findings-2026-11-27` закрывает найденные
 после исторической приёмки defence-in-depth замечания: запись внутренних
@@ -59,9 +87,9 @@ GitHub Actions run на опубликованном SHA. P06 остаётся T
 ограничен 512 кандидатами с отказом без частичной страницы; основание и staff
 session повторно проверяются непосредственно перед расшифровкой комментария.
 Добавлен обязательный P06 CI Gate (линт, typecheck, сборки, opt-in server/load
-и HTTPS browser). Это **не PASS** до успешного прогона на exact SHA и проверки
-результатов тестов, включая параллельно добавляемые fault-injection тесты
-отказа PII-аудита. P06 остаётся только в T; полный P06 restore dump+managed
+и HTTPS browser). На момент этой записи PASS ещё не был выдан: ожидался прогон на exact SHA и
+проверка fault-injection тестов отказа PII-аудита. Этот исторический статус
+был заменён успешным точным прогоном 46122855702 на `ef290da`. P06 остаётся только в T; полный P06 restore dump+managed
 comment slots — отдельный blocker до переноса в R/реальных ПД.
 
 ## 27.11.2026 — P06 закрыт: 4 из 4 приняты, ASTRA PASS P06

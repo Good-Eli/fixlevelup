@@ -1,6 +1,6 @@
 # Подэтапы проекта: прогресс, трудоёмкость и состав
 
-**Статус на 27.11.2026, HEAD `affa0ce`, 197 коммитов.** P00–P04 сохраняют ранее
+**Статус на 28.11.2026. Исторический exact candidate `ef290da` прошёл полный technical Gate: [run 46122855702](https://github.com/Good-Eli/fixlevelup/actions/runs/46122855702), 13/13 jobs и freeze. Новый commit `58d4782` добавляет точную проверку состава P05 HTTPS matrix и требует собственного PR Gate.** P00–P04 сохраняют ранее
 зафиксированные статусы. **P05 принят владельцем полностью (4/4)** в synthetic
 scope: P05-01 исторически (`f2caab05`), P05-02…P05-04 — 27.11.2026. Владелец
 явно приравнял ChatGPT `PASS — FULL P05` к требуемому `PASS — FULL ASTRA P05`
@@ -16,26 +16,19 @@ scope: P05-01 исторически (`f2caab05`), P05-02…P05-04 — 27.11.202
 План и доказательства — [P06-PLAN](P06-PLAN.md).
 
 
-**Примечание к P06 после owner acceptance:** исторический статус 4/4 относится
-к исходным SHA и изолированному контуру T. В единой ветке
-fix/p06-audit-findings-2026-11-27 объединены DB-boundary hardening, bounded
-registry scan, recheck перед decrypt, проверка P05 partial receipt и обязательный
-exact-SHA P06 Gate. Добавлены 159 тестов: 99 unit, 8 прямых SQL от
-fixlevelup_runtime, 14 HTTPS/race и 38 web client. Gate фиксирует точные
-пороги 149 database-free unit/client и 133 server gap tests, 0 неожиданных
-skip. Удалён per-route authenticateStaff, вызвавший lock timeout в race
-сценариях; F-2 исправлен: DB audit failure → 503 NOT_READY, а отказ final
-pre-decrypt authorization recheck не маскируется под 503. Показанные DeepSeek
-локальные прогоны 148/132/132 относятся к предыдущему набору; новый merged
-SHA требует полного exact-SHA прогона. Статус остаётся **verification pending**
-до зелёного GitHub Actions p06-acceptance и полного required Gate. Exact-SHA run
-`46081315700` подтвердил 149/149 unit/client, 11/11 accepted и 133/133 server
-gap, но общий job упал на host-проверке summary, созданного внутри временного
-lab-контейнера; P06 browser был пропущен. CI-обвязка исправлена, нужен новый
-полный exact-SHA run до PASS. Полный P06
-backup/restore обязателен только до выхода за границы T в R/реальные ПД.
+**P06 follow-up Gate — technical PASS на exact SHA `ef290da2170d05e65bd9d1fd2838a82b796e0e81` (run `46122855702`).** Историческая owner acceptance P06-01…04 (4/4) остаётся привязана к исходным SHA и изолированной композиции T; follow-up hardening не переписывает и не отменяет её. Новый exact-SHA прогон подтвердил:
+- P06 database-free unit/client — **149/149**, 0 skip;
+- P06 server gap — **133/133**, 0 skip; отдельно 11/11 принятых P06 сценариев и Chromium CRM browser proof;
+- P05 full opt-in integration — **1727 passed / 53 skipped** (53 — filtered/opt-in cases, не считать passed); отдельная матрица HTTPS прошла, включая **432/432 CITY-RBAC oracle cells**;
+- полный workflow — **13/13 jobs success**, exact P05 candidate freeze создан.
 
-Release composition R не регистрирует ни P05, ни P06-маршруты: всё это
+Артефакт `p05-exact-candidate-46122855702` фиксирует 722 tracked files, Git tree `080db99000a3a50cae024fafde87caad8d1fdd40`, canonical tree SHA-256 `028eed1cddb678dca47d49a08c4a70bd12463e3cad8f0026e040b770ab08edcd` и manifest SHA-256 `1e47dba4bb019ab0924359574d09e291e60ef6eda257bc313142e6c5a1195ab4`. Run был `workflow_dispatch` и доказывает ровно SHA `ef290da`; он не переносится на последующий commit.
+
+В commit `58d4782` добавлен строгий matrix checker: точные названия выбранных HTTPS tests, отсутствие пропуска обязательного сценария, отсутствие неожиданных passing/failed/skipped tests и pinned inventory из 42 случаев. Его собственные Node regression tests проверяют переименование, skip, неожиданный match, дубли и изменение inventory. Этот новый checker ещё не проверен PR CI; run 46122855702 не считается доказательством для commit `58d4782`.
+
+P06 остаётся T-only. Полный PostgreSQL dump + inventory внешних managed comment key slots restore drill не выполнен и обязателен до переноса P06 в R или использования реальных ПД. P06 routes в release composition R отсутствуют; рабочая БД не мигрировалась, реальных ПД нет. Известный web decoder gap (`readRegistryItem` может выбросить `P05DecodeError` вместо `RegistryError`) и полный visual/accessibility review остаются release follow-up.
+
+Release composition R не регистрирует ни P05, ни P06-маршруты: всё этоRelease composition R не регистрирует ни P05, ни P06-маршруты: всё это
 изолированный контур T. Рабочая БД не мигрировалась, реальных ПД нет.
 Как читать этот файл:
 
@@ -62,7 +55,7 @@ P02 ██████████ 100%   (сотрудники, Auth, capabilit
 P03 ██████████ 100%   (настройки, география, файлы; 2,3 балла — 7%)
 P04 ██████████ 100%   (каталог, цены, CRM; 1,4 балла — 4%)
 P05 ██████████ 100%   (реализация и owner acceptance 4/4; 2,4 балла — 7%; ChatGPT FULL P05 PASS, owner-equivalent to Astra)
-P06 ██████████ 100%   (CRM: реестр, карточка, дашборд; 4 из 4, ASTRA PASS P06; follow-up Gate — verification pending)
+P06 ██████████ 100%   (CRM: реестр, карточка, дашборд; owner acceptance 4/4, historical ASTRA PASS P06; follow-up technical Gate PASS на ef290da; новый matrix checker ждёт PR CI)
 P07 ░░░░░░░░░░   0%   (каналы TG/VK/MAX; 5,5 балла — 17%)
 P08 ░░░░░░░░░░   0%   (сайт и публичные формы; 2,3 балла — 7%)
 P09 ░░░░░░░░░░   0%   (расписание, визиты, подтверждение; 4,9 балла — 15%)
@@ -82,7 +75,7 @@ P15 ░░░░░░░░░░   0%   (production и передача; 1,0 �
 | **P03** | Настройки, география, файлы | 5 | 5 | 2,3 балла | 7% | ✅ полный аудит Astra P03 — PASS |
 | **P04** | Каталог, цены, CRM | 4 | 4 | 1,4 балла | 4% | ✅ FULL ASTRA P04 — PASS 22.11.2026 |
 | **P05** | Клиенты и заявки | 4 | 4 | 2,4 балла | 7% | ✅ принято владельцем 4/4; ChatGPT PASS — FULL P05 признан эквивалентом Astra |
-| **P06** | CRM: реестр и карточка | 4 | 4 | 1,5 балла | 5% | ✅ принято владельцем 4/4; ASTRA PASS P06 27.11.2026 |
+| **P06** | CRM: реестр и карточка | 4 | 4 | 1,5 балла | 5% | ✅ owner acceptance 4/4; historical ASTRA PASS; follow-up technical Gate PASS на ef290da; R/restore остаются release gates |
 | **P07** | Каналы TG/VK/MAX | 6 | 0 | 5,5 балла | **17%** | ⬜ не начат |
 | **P08** | Сайт и формы | 2 | 0 | 2,3 балла | 7% | ⬜ не начат |
 | **P09** | Расписание и визиты | 3 | 0 | 4,9 балла | **15%** | ⬜ не начат |
@@ -408,6 +401,7 @@ API, права, тесты, без экзотики. Остальные оце�
 
 | Дата | Что сделано |
 |---|---|
+| 28.11.2026 | **P06 follow-up exact-SHA Gate PASS на `ef290da`** (run 46122855702): 13/13 jobs, 149/149 unit/client, 133/133 server gap, 11/11 accepted server scenarios и Chromium proof; P05 matrix 432/432, exact candidate freeze. Новый commit `58d4782` усилил matrix gate точными title/status checks; его PR Gate ещё ожидается. Все результаты T-only; P06 restore dump + external comment key-slot inventory и visual/accessibility review остаются release gates. |
 | 27.11.2026 | **P06 закрыт: 4 из 4 приняты, ASTRA PASS P06.** HEAD `affa0ce` (197 коммитов). Добавлены P06-02 (`e2389e4`, карточка, история, комментарии, защищённый показ контактов), P06-03 (`a717fe4`, поиск по номеру/имени/телефону с HMAC-индексом и ротацией) и P06-04 (`affa0ce`, дашборд и снимок реестра). Каждый подэтап прошёл отдельный адресный аудит GPT-6.2-Astra, затем полный статический аудит P06 — PASS. Пересчитано: 51 из 69 подэтапов принято, 10,5 балла из 33 (≈32%), прогресс P06 — 100%. В измеренные факты добавлен весь P06 (4 коммита, 46 файлов кода, 4 308 строк, 4 тестовых файла). Раздел границ P06 переписан под принятое состояние. |
 | 27.11.2026 | **P06-01 принят и закоммичен; актуализация сводки.** HEAD `c6ff390` (194 коммита). P06 разложен на четыре подэтапа по [P06-PLAN](P06-PLAN.md) вместо одной строки: реестр (P06-01, принят), карточка и комментарии (P06-02, в дереве), поиск (P06-03), дашборд (P06-04). Пересчитаны итоги: 69 подэтапов, 47 принято, сделано 9,0 балла из 33 (≈27%), прогресс P06 — 25%. В измеренные факты добавлены P05 (135 коммитов, 229 файлов кода, 50 443 строки, 57 тестовых файлов, 3 миграции) и P06-01 (1 коммит, 16 файлов, 1 069 строк, 2 тестовых файла); в репозитории 24 миграции. Записаны границы P06: маршруты только в композиции T, поиск ПД отложен до P06-03, дашборд — до P06-04. |
 | 27.11.2026 | **FULL P05 PASS и owner acceptance.** P05-01…P05-04 реализованы и приняты владельцем (4/4) в synthetic scope. Владелец признал ChatGPT PASS — FULL P05 эквивалентом Astra PASS. Точный candidate `0d7f60d…`, run 45953489126: 8/8, manifest 681 files, оба real attachment HTTP tests passed, CITY matrix 432/432. Production/live остаются запрещены; эта документационная редакция требует нового exact-head CI/freeze до fast-forward. |
