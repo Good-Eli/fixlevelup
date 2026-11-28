@@ -245,19 +245,16 @@ jobs:
       - name: Run this HTTPS matrix partition
         env:
           MATRIX_PATTERN: ${{ matrix.pattern }}
-          MATRIX_EXPECTED: ${{ matrix.expected }}
+          MATRIX_SUITE: ${{ matrix.suite }}
         run: |
           set -euo pipefail
           node infra/p05-lab/lab.mjs s3test -- --cmd sh -ec '
             corepack pnpm exec vitest run apps/api/tests/p05-intake-http.test.ts \
               --maxWorkers 1 --testNamePattern "$1" \
               --reporter=default --reporter=json --outputFile.json=/tmp/p05-matrix.json
-            passed=$(node -p "require(process.argv[1]).numPassedTests" /tmp/p05-matrix.json)
-            if [ "$passed" != "$2" ]; then
-              printf "Expected %s passed HTTPS matrix tests, got %s\n" "$2" "$passed" >&2
-              exit 1
-            fi
-          ' p05-matrix "$MATRIX_PATTERN" "$MATRIX_EXPECTED"
+            node infra/ci/p05-matrix-results.mjs /tmp/p05-matrix.json "$2"
+
+          ' p05-matrix "$MATRIX_PATTERN" "$MATRIX_SUITE"
       - name: Stop only this job's dedicated P05 lab
         if: always()
         run: node infra/p05-lab/lab.mjs down
