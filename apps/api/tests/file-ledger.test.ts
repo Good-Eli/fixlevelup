@@ -60,7 +60,8 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
     const password = env[`${user.toUpperCase()}_PASSWORD`];
     if (!password || !/^[0-9a-f]{64}$/.test(password)) {throw new Error('INVALID_SYNTHETIC_LEDGER_CREDENTIAL_CONFIG');}
     const p = new Pool({ user, password, database, host: '127.0.0.1', port: kind === 'ledger' ? 55433 : 55434, max: 4,
-      connectionTimeoutMillis: 5_000, statement_timeout: 10_000 });
+      connectionTimeoutMillis: 5_000, statement_timeout: 10_000,
+      application_name: `p05-file-ledger-test:${role}:${database}` });
     // Idle-client socket errors must be observed and asserted during teardown,
     // never escape Vitest as process-level unhandled errors.
     p.on('error', (error: unknown) => {
@@ -109,16 +110,37 @@ describe.skipIf(process.env['FIXLEVELUP_ISOLATED_FILE_LEDGER_TESTS'] !== '1')('i
   const dropCreatedDatabases = async (): Promise<void> => {
     for (const db of createdLedgerDbs.splice(0)) {
       if (!/^file_ledger_proof_[a-f0-9]{24}$/.test(db)) { throw new Error('SYNTHETIC_LEDGER_REFUSING_NON_FIXTURE_DROP'); }
-      const active = await ledgerAdmin.query<{ pid: number }>(
-        'SELECT pid FROM pg_stat_activity WHERE datname=$1', [db]);
-      if (active.rowCount !== 0) { throw new Error('SYNTHETIC_LEDGER_DISPOSABLE_DATABASE_HAS_OPEN_SESSIONS'); }
+      // Pool.end() closes client sockets, but PostgreSQL may need a short
+      // scheduling interval to reap the corresponding backends. Wait boundedly;
+      // never terminate sessions or drop a database while a backend is present.
+      const deadline = Date.now() + 5_000;
+      let active = await ledgerAdmin.query<{ pid: number; usename: string; application_name: string; state: string }>(
+        'SELECT pid,usename,application_name,state FROM pg_stat_activity WHERE datname=$1 ORDER BY pid', [db]);
+      while (active.rowCount !== 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        active = await ledgerAdmin.query<{ pid: number; usename: string; application_name: string; state: string }>(
+          'SELECT pid,usename,application_name,state FROM pg_stat_activity WHERE datname=$1 ORDER BY pid', [db]);
+      }
+      if (active.rowCount !== 0) {
+        const owners = active.rows.map((row) => `${row.usename}:${row.application_name}:${row.state}`).join(',');
+        throw new Error(`SYNTHETIC_LEDGER_DISPOSABLE_DATABASE_HAS_OPEN_SESSIONS:${db}:${owners}`);
+      }
       await ledgerAdmin.query(`DROP DATABASE IF EXISTS "${db}"`);
     }
     for (const db of createdFloorDbs.splice(0)) {
       if (!/^file_floor_proof_[a-f0-9]{24}$/.test(db)) { throw new Error('SYNTHETIC_LEDGER_REFUSING_NON_FIXTURE_DROP'); }
-      const active = await floorAdmin.query<{ pid: number }>(
-        'SELECT pid FROM pg_stat_activity WHERE datname=$1', [db]);
-      if (active.rowCount !== 0) { throw new Error('SYNTHETIC_LEDGER_DISPOSABLE_DATABASE_HAS_OPEN_SESSIONS'); }
+      const deadline = Date.now() + 5_000;
+      let active = await floorAdmin.query<{ pid: number; usename: string; application_name: string; state: string }>(
+        'SELECT pid,usename,application_name,state FROM pg_stat_activity WHERE datname=$1 ORDER BY pid', [db]);
+      while (active.rowCount !== 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        active = await floorAdmin.query<{ pid: number; usename: string; application_name: string; state: string }>(
+          'SELECT pid,usename,application_name,state FROM pg_stat_activity WHERE datname=$1 ORDER BY pid', [db]);
+      }
+      if (active.rowCount !== 0) {
+        const owners = active.rows.map((row) => `${row.usename}:${row.application_name}:${row.state}`).join(',');
+        throw new Error(`SYNTHETIC_LEDGER_DISPOSABLE_DATABASE_HAS_OPEN_SESSIONS:${db}:${owners}`);
+      }
       await floorAdmin.query(`DROP DATABASE IF EXISTS "${db}"`);
     }
   };
