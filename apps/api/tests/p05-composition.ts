@@ -56,8 +56,12 @@ export async function startIsolatedIntake(options: {
       AND current_user='fixlevelup_runtime' AND session_user=current_user AND current_setting('cluster_name')=$2
       AND current_setting('server_version_num')='180007' AS valid`,[target.database,cluster]);
     if (identity?.valid !== true || !await readiness.requestEffectsReady()) { throw new Error('Isolated S3 is not ready'); }
-    const form = new FormSessionService(business,options.form);
-    const service = new RequestIntake(business,form,new AuthorizationService(business),options.configure(audit));
+    const config = options.configure(audit);
+    const search = config.search;
+    const form = new FormSessionService(business,{ ...options.form,
+      ...(search ? { afterProcessingRevoked:(client,sessionId,consentId) => search.removeProcessingConsent(client,sessionId,consentId) } : {}),
+    });
+    const service = new RequestIntake(business,form,new AuthorizationService(business),config);
     const module = {module:IsolatedIntakeModule,controllers:[FormSessionController,RequestIntakeController],providers:[
       {provide:'P05_TEST_RESOURCES',useValue:resources},
       {provide:FORM_SESSION_HTTP_DEPS,useValue:{service:form,database:readiness,config:{origin:options.form.origin}}},

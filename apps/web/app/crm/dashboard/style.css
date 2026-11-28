@@ -1,0 +1,31 @@
+.desk.crm-dashboard { max-width: 64rem; }
+.desk .crm-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: .75rem;
+  list-style: none;
+  padding: 0;
+  margin-block: 0 1.75rem;
+}
+.desk .crm-metric-grid li { margin: 0; }
+.desk .crm-metric {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-sizing: border-box;
+  height: 100%;
+  gap: .7rem;
+  padding: .95rem;
+  border: 1px solid #91b1ab;
+  border-radius: .45rem;
+  background: #edf6f3;
+  color: #103c39;
+  font-weight: 650;
+  text-underline-offset: .17em;
+}
+.desk a.crm-metric:hover { background: #dcefe9; }
+.desk a.crm-metric:focus-visible { outline: .15rem solid #20675f; outline-offset: .15rem; }
+.desk .crm-metric strong { font-size: 2rem; line-height: 1; font-variant-numeric: tabular-nums; }
+.desk .crm-metric-unavailable { border-color: #c5cfd3; background: #f5f7f8; color: #455763; }
+.desk .crm-snapshot-meta { color: #455763; }
+.desk .crm-snapshot-meta span { display: block; }

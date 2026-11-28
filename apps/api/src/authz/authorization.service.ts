@@ -112,12 +112,14 @@ export interface P05Context {
   /** Null means every required grant is GLOBAL (exact SYSTEM ADMIN). */
   readonly cityIds: readonly string[] | null;
   readonly authorizeCity: (cityId: string) => Promise<void>;
+  readonly hasCityGrant: (code: P05Capability, cityId: string) => Promise<boolean>;
   readonly recheck: () => Promise<Date>;
 }
 export interface P05AuthorizationApi {
   withP05<T>(proof: SessionProof, required: readonly P05Capability[], callback: (ctx: P05Context) => Promise<T>): Promise<T>;
   withP05<Prepared, Result>(proof: SessionProof, required: readonly P05Capability[],
-    prepare: (ctx: P05Context) => Promise<Prepared>, decide: (prepared: Prepared, clock: Date) => Result): Promise<Result>;
+    prepare: (ctx: P05Context) => Promise<Prepared>, decide: (prepared: Prepared, clock: Date) => Result,
+    receipt?: 'write'): Promise<Result>;
 }
 
 const P04_COMPANY_ACTIONS: readonly (readonly P04Capability[])[] = [
@@ -543,13 +545,15 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
    * callback, before COMMIT; a domain write gets its own unknown-COMMIT signal. */
   async withP05<T>(proof: SessionProof, required: readonly P05Capability[], callback: (ctx: P05Context) => Promise<T>): Promise<T>;
   async withP05<Prepared, Result>(proof: SessionProof, required: readonly P05Capability[],
-    prepare: (ctx: P05Context) => Promise<Prepared>, decide: (prepared: Prepared, clock: Date) => Result): Promise<Result>;
+    prepare: (ctx: P05Context) => Promise<Prepared>, decide: (prepared: Prepared, clock: Date) => Result,
+    receipt?: 'write'): Promise<Result>;
   async withP05<Prepared, Result = Prepared>(proof: SessionProof, required: readonly P05Capability[],
-    callback: (ctx: P05Context) => Promise<Prepared>, decide?: (prepared: Prepared, clock: Date) => Result): Promise<Prepared | Result> {
+    callback: (ctx: P05Context) => Promise<Prepared>, decide?: (prepared: Prepared, clock: Date) => Result,
+    receipt?: 'write'): Promise<Prepared | Result> {
     const codes = [...required];
     if (!codes.length || codes.some((code) => !isP05Capability(code))) { throw new BadRequestException(); }
     const needed = Object.freeze([...new Set<P05Capability>(['requests.read', ...codes])]);
-    const write = codes.some((code) => code !== 'requests.read');
+    const write = receipt === 'write' || codes.some((code) => code !== 'requests.read');
     return this.transaction('read', async (client) => {
       const locked = await this.lockedPrincipal(client, proof);
       const { principal } = locked;
@@ -569,7 +573,7 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
         }
         // Keep the time-sensitive session predicate the last statement in the proof.
         const clock = await this.assertProofCurrent(client, locked, false, sampleDecisionClock);
-        return { cityIds, role: view.role, clock };
+        return { cityIds, role: view.role, clock, grants: p05Permissions };
       };
       const checked: string[] = [];
       const authorizeCity = async (cityId: string): Promise<void> => {
@@ -584,8 +588,13 @@ export class AuthorizationService implements AuthorizationServiceApi, GeographyA
         return clock;
       };
       const initial = await authorizeTargets([]);
+      const hasCityGrant = async (code: P05Capability, cityId: string): Promise<boolean> => {
+        const grant = initial.grants.find(candidate => candidate.code === code);
+        return checked.includes(cityId) && (grant?.scope === 'GLOBAL'
+          || (grant?.scope === 'CITY' && (initial.cityIds ?? await activeAdminCityIds(client, principal.staffId)).includes(cityId)));
+      };
       const result = await callback(Object.freeze({ client, staffId: principal.staffId, sessionId: locked.sessionId,
-        role: initial.role, cityIds: initial.cityIds, authorizeCity, recheck }));
+        role: initial.role, cityIds: initial.cityIds, authorizeCity, hasCityGrant, recheck }));
       // A command that never named its target has no authority over any row: fail closed
       // before COMMIT rather than after an effect.
       if (!checked.length) { throw new InternalServerErrorException(); }

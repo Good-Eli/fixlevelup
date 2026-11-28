@@ -3,7 +3,7 @@ import type { PoolClient } from 'pg';
 import {
   decodeP05Body, p05DecodeStatus, P05DecodeError, P05_IF_MATCH_OPERATIONS, parseP05Etag,
 } from '@fixlevelup/p03-contracts/p05';
-import type { P05BodyOperation, P05Bodies, P05CallbackRequest, P05ManualRequest, P05RepairRequest, P05ChannelSelection } from '@fixlevelup/p03-contracts/p05';
+import type { P05BodyOperation, P05Bodies, P05CallbackRequest, P05ManualRequest, P05RepairRequest, P05ChannelSelection, P05FContact } from '@fixlevelup/p03-contracts/p05';
 import type { P05AuthorizationApi, P05Context, SessionProof } from '../../authz/authorization.service.js';
 import { P05CommitUnknown } from '../../authz/authorization.service.js';
 import type { P05Capability } from '../../authz/capability.js';
@@ -24,6 +24,20 @@ import { deny, RequestFailure } from './errors.js';
 import type { RequestFailureCode } from './errors.js';
 import { activeReference, boundConsent, confirmEvidence, confirmOffer, currentCity, geoFence,
   lockConsent, staffEvidenceLive, submitEdge } from './basis.js';
+import { readRegistrySearch, readVisibleRegistry } from '../registry/store.js';
+import { readRegistryOptions } from '../registry/options.js';
+import type { RegistryQuery } from '../registry/filters.js';
+import { readCard, readTimeline } from '../card/store.js';
+import { authorizeComments, commentGrant, COMMENT_KEY_ENVIRONMENT, readInternalComments, writeInternalComment } from '../card/comments.js';
+import type { CommentConfig } from '../card/comments.js';
+import { hasContactGrant, readContactDetails, readStoredContact } from '../card/contacts.js';
+import type { ContactAudit } from '../card/contacts.js';
+import { parseSearch } from '../search/contract.js';
+import type { ContactSearchIndex } from '../search/index.js';
+import { captureDashboard, dashboardRowsCurrent } from '../dashboard/store.js';
+import { dashboardDto, dashboardPage } from '../dashboard/snapshots.js';
+import type { DashboardSnapshot, DashboardSnapshots, DashboardSubject } from '../dashboard/snapshots.js';
+import type { DashboardLink } from '../dashboard/contract.js';
 import type { ConsentBinding, OfferBasis, RequestOffers, SessionSubmit, StaffEvidence, StaffEvidencePort } from './basis.js';
 import { activePhone, clonePhonePreference, createRequestRow, insertStaffEvidence, modeOf, readContactMode,
   requestRow, updateRequestRow, writeAddress, writeAppliance, writeContact, writePhone, writePreference } from './store.js';
@@ -52,6 +66,10 @@ export interface RequestIntakeConfig extends Snapshots {
   readonly offers?: RequestOffers;
   readonly attachments?: ReadyAttachmentContext;
   readonly coverage?: CoverageEffect;
+  readonly comments?: CommentConfig;
+  readonly contactAudit?: ContactAudit;
+  readonly search?: ContactSearchIndex;
+  readonly dashboard?: DashboardSnapshots;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -99,6 +117,7 @@ interface Basis {
   readonly historicalLive: () => Promise<boolean>;
   /** Null denotes a legal basis without a time limit, not absent manual evidence. */
   readonly expiresAtMs: number | null;
+  readonly manualEvidence?: StaffEvidence;
 }
 type Authorization = { readonly form?: { selector: string; secret: string }; readonly staff?: P05Context;
   readonly recheck: () => Promise<Date> };
@@ -164,26 +183,30 @@ export class RequestIntake {
     } finally { client.release(discard); }
   }
 
-  private async rules(client: PoolClient, id: string): Promise<string> {
+  private async ruleVersion(client: PoolClient, id: string): Promise<string | null> {
     const { rows: [row] } = await client.query<{ workflow_version: string; policy_revision: string; metadata_sha256: string; digest_ok: boolean }>(`
       SELECT workflow_version,policy_revision,metadata_sha256,metadata_sha256=encode(sha256(convert_to(metadata::text,'UTF8')),'hex') AS digest_ok
       FROM foundation.request_policy_packages WHERE id=$1`, [id]);
     if (!row?.digest_ok || !SUPPORTED_WORKFLOW_VERSIONS.includes(row.workflow_version)
       || this.config.supportedPolicies.get(policyPairKey(row.workflow_version,row.policy_revision)) !== row.metadata_sha256) {
-      return deny('REQUEST_RULES_UNAVAILABLE');
+      return null;
     }
     return row.workflow_version;
+  }
+
+  private async rules(client: PoolClient, id: string): Promise<string> {
+    return await this.ruleVersion(client,id) ?? deny('REQUEST_RULES_UNAVAILABLE');
   }
 
   private async manualBasis(client: PoolClient, row: RequestRow): Promise<Basis> {
     const { rows: [source] } = await client.query<{ id: string; procedure_revision: string; valid_until: Date }>(`
       SELECT id,procedure_revision,valid_until FROM foundation.request_staff_evidence
       WHERE request_id=$1 AND purpose='MANUAL_INTAKE'`, [row.id]);
-    const check = async () => source !== undefined && await staffEvidenceLive(client,this.config.staffEvidence,
-      { id: source.id, procedureRevision: source.procedure_revision, validUntil: source.valid_until });
+    const evidence = source && { id:source.id,procedureRevision:source.procedure_revision,validUntil:source.valid_until };
+    const check = async () => evidence !== undefined && await staffEvidenceLive(client,this.config.staffEvidence,evidence);
     const allowed = await check();
     return { historical: allowed, current: allowed, recheck: check, historicalLive: check,
-      expiresAtMs: source?.valid_until.getTime() ?? null };
+      expiresAtMs: source?.valid_until.getTime() ?? null, ...(evidence ? {manualEvidence:evidence} : {}) };
   }
 
   private async formBasis(client: PoolClient, edge: SessionSubmit): Promise<Basis> {
@@ -215,6 +238,7 @@ export class RequestIntake {
     const actor: Actor = { kind: 'F', id: prepared.selector };
     const command = operation === 'createCallback' ? 'CreateCallback' : 'CreateRepair';
     return await this.transaction(async (client) => {
+      await this.config.search?.lock(client);
       if (operation === 'createRepair') { await fenceRead(client); }
       await geoFence(client);
       if (operation === 'createRepair') { await this.config.offers?.lock(client); }
@@ -257,6 +281,7 @@ export class RequestIntake {
     requireHeaders('createManualRequest',input);
     return await this.staffCall(() => this.staff.withP05(proof,['requests.create'],async (staff) => {
       const { client } = staff;
+      await this.config.search?.lock(client);
       await fenceRead(client);
       await geoFence(client);
       const actor: Actor = { kind:'STAFF',id:staff.staffId };
@@ -357,6 +382,7 @@ export class RequestIntake {
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [form.selector,row.id,row.customer_id,row.city_id,row.intake_city_version_id,
         consent.id,consent.document_id,consent.document_version_id,event,cmd.command]);
     }
+    await this.config.search?.setContact(client,row,body.contact,mode === 'PHONE');
     await client.query('SET CONSTRAINTS ALL IMMEDIATE');
     const deadlines: Deadline[] = [];
     const fileIds = 'attachments' in body ? body.attachments : undefined;
@@ -437,6 +463,193 @@ export class RequestIntake {
     },decidePrepared));
   }
 
+  private async readCrmTarget<T, R>(proof: SessionProof, id: string,
+    project: (staff: P05Context, row: RequestRow, basis: Basis) => Promise<T>, restricted: (row: RequestRow) => R) {
+    return await this.staffCall(() => this.staff.withP05(proof, ['requests.read'], async staff => {
+      const { row,basis } = await this.scopedStaffRequest(staff,id);
+      if (!basis.historical) { return () => restricted(row); }
+      const stillCurrent = await this.crmBasisAtDecision(staff,basis);
+      const data = await project(staff,row,basis);
+      const available = await basis.historicalLive();
+      return (clock: Date) => available && (basis.expiresAtMs === null || clock.getTime() < basis.expiresAtMs)
+        && stillCurrent()
+        ? data : restricted(row);
+    },decidePrepared));
+  }
+
+  private async crmBasisAtDecision(staff: P05Context, basis: Basis): Promise<() => boolean> {
+    const evidence = basis.manualEvidence;
+    if (!evidence) { return () => true; }
+    const isCurrent = await this.config.staffEvidence?.openRegistry?.(staff.client);
+    if (!isCurrent) { return deny('NOT_READY'); }
+    return () => isCurrent(evidence);
+  }
+
+  async readStaffCard(proof: SessionProof, id: string) {
+    return await this.readCrmTarget(proof, id, async (staff,row,basis) => {
+      const { branch, ...card } = await readCard(staff.client,row);
+      let canStartReview = false;
+      if (basis.current && branch !== null && (row.status === 'NEW' || row.status === 'CALLBACK_REQUIRED')
+        && await staff.hasCityGrant('requests.review',row.city_id)) {
+        const workflowVersion = await this.ruleVersion(staff.client,row.workflow_package_id);
+        canStartReview = workflowVersion !== null && decide({ workflowVersion, command:'StartReview',
+          actor:'S',status:row.status,type:row.type,branch }).decision === 'EXECUTABLE';
+      }
+      const comments = this.config.comments?.keySlots.environment === COMMENT_KEY_ENVIRONMENT ? await commentGrant(staff,row) : undefined;
+      const contacts = this.config.contactAudit && basis.current && await hasContactGrant(staff,row.city_id);
+      const unavailable = { ...card.unavailable,comments:comments?.canRead ? 'available' : 'not_ready',
+        contactDetails:contacts ? 'available' : 'not_ready' };
+      return { data:{ ...card,canStartReview,unavailable },commandEtag:requestRepresentation('STAFF',row,true).etag,
+        canAddComment:basis.current && comments?.canWrite === true };
+    }, row => ({ data:{ version:row.row_version },commandEtag:null,canAddComment:false }));
+  }
+
+  async readStaffTimeline(proof: SessionProof, id: string) {
+    return await this.readCrmTarget(proof,id,(staff,row) => readTimeline(staff.client,row),() => ({ items:[] }));
+  }
+
+  async readStaffComments(proof: SessionProof, id: string) {
+    const config = this.config.comments;
+    return await this.readCrmTarget(proof,id,async (staff,row,basis) => {
+      if (!config || config.keySlots.environment !== COMMENT_KEY_ENVIRONMENT) { return deny('NOT_READY'); }
+      await authorizeComments(staff,row,false);
+      const isCurrent = await this.crmBasisAtDecision(staff,basis);
+      const beforeOpen = async () => {
+        if (!await basis.recheck()) { return deny('CONSENT_REQUIRED'); }
+        const clock = await staff.recheck();
+        if ((basis.expiresAtMs !== null && basis.expiresAtMs <= clock.getTime()) || !isCurrent()) {
+          return deny('CONSENT_REQUIRED');
+        }
+      };
+      return await readInternalComments(staff,row,config,beforeOpen);
+    },() => ({ items:[] }));
+  }
+
+  async readStaffContact(proof: SessionProof, id: string) {
+    const audit = this.config.contactAudit;
+    return await this.readCrmTarget(proof,id,async (staff,row,basis) => {
+      if (!audit) { return deny('NOT_READY'); }
+      if (!await hasContactGrant(staff,row.city_id)) { return deny('FORBIDDEN'); }
+      const recheck = async () => {
+        if (!await basis.recheck()) { return deny('CONSENT_REQUIRED'); }
+        const clock = await staff.recheck();
+        atDecision(basisDeadline(basis),() => undefined)(clock);
+      };
+      await recheck();
+      const contact = await readContactDetails(staff,row,this.config,audit,recheck);
+      await recheck();
+      return contact;
+    },() => deny('CONSENT_REQUIRED'));
+  }
+
+  async addStaffComment(proof: SessionProof, id: string, input: WriteInput) {
+    const config = this.config.comments;
+    return await this.staffCall(() => this.staff.withP05(proof, ['requests.read'], async staff => {
+      const { row,basis } = await this.scopedStaffRequest(staff,id);
+      if (!config || config.keySlots.environment !== COMMENT_KEY_ENVIRONMENT) { return deny('NOT_READY'); }
+      await authorizeComments(staff,row,true);
+      if (!basis.current) { return deny('CONSENT_REQUIRED'); }
+      const stillCurrent = await this.crmBasisAtDecision(staff,basis);
+      const result = await writeInternalComment(staff,row,config,input,requestRepresentation('STAFF',row,true).etag,proof.token);
+      if (!await basis.recheck()) { return deny('CONSENT_REQUIRED'); }
+      return atDecision(basisDeadline(basis),() => stillCurrent() ? result : deny('CONSENT_REQUIRED'));
+    },decidePrepared,'write'));
+  }
+
+  async readStaffRegistry(proof: SessionProof, query: RegistryQuery) {
+    return await this.staffCall(() => this.staff.withP05(proof, ['requests.read'], async (staff) => {
+      await geoFence(staff.client);
+      const city = await currentCity(staff.client);
+      await staff.authorizeCity(city.cityId);
+      // Consent withdrawal takes this same document lock before writing the revocation.
+      if (!await lockConsent(staff.client, undefined, 'shared')) { return deny('NOT_READY'); }
+      const evidencePort = this.config.staffEvidence;
+      if (evidencePort && !evidencePort.openRegistry) { return deny('NOT_READY'); }
+      const isCurrent = await evidencePort?.openRegistry?.(staff.client);
+      return { ...await readVisibleRegistry(staff.client, city, query, isCurrent), isCurrent };
+    }, ({ items, nextCursor, manualEvidence, isCurrent }, clock) => {
+      if (manualEvidence.some(evidence => !(evidence.validUntil.getTime() > clock.getTime()) || !isCurrent?.(evidence))) {
+        return deny('NOT_READY');
+      }
+      return { items, nextCursor };
+    }));
+  }
+
+  async readStaffRegistryOptions(proof: SessionProof) {
+    return await this.staffCall(() => this.staff.withP05(proof, ['requests.read'], async (staff) => {
+      await geoFence(staff.client);
+      const city = await currentCity(staff.client);
+      await staff.authorizeCity(city.cityId);
+      return await readRegistryOptions(staff.client, city.cityId);
+    }));
+  }
+
+  async searchStaffRegistry(proof: SessionProof, bytes: Uint8Array) {
+    return await this.staffCall(() => this.staff.withP05(proof, ['requests.read'], async staff => {
+      const search = this.config.search;
+      if (!search) { return deny('NOT_READY'); }
+      await search.lock(staff.client);
+      await geoFence(staff.client);
+      const city = await currentCity(staff.client);
+      await staff.authorizeCity(city.cityId);
+      const query = parseSearch(bytes);
+      if (query.kind !== 'number' && !await hasContactGrant(staff,city.cityId)) { return deny('FORBIDDEN'); }
+      if (query.kind !== 'number') { await search.assertCurrent(staff.client); }
+      await search.admit(staff.staffId,city.cityId,query.kind);
+      if (!await lockConsent(staff.client,undefined,'shared')) { return deny('NOT_READY'); }
+      const port = this.config.staffEvidence;
+      if (port && !port.openRegistry) { return deny('NOT_READY'); }
+      const isCurrent = await port?.openRegistry?.(staff.client);
+      const match = query.kind === 'number' ? { kind:query.kind,key:query.value } as const
+        : { kind:query.kind,key:search.token(query.kind,city.cityId,query.value) };
+      return { ...await readRegistrySearch(staff.client,city.cityId,match,isCurrent),isCurrent };
+    }, ({ items,truncated,manualEvidence,isCurrent }, clock) => {
+      if (manualEvidence.some(evidence => !(evidence.validUntil.getTime() > clock.getTime()) || !isCurrent?.(evidence))) {
+        return deny('NOT_READY');
+      }
+      return { items,truncated };
+    }));
+  }
+
+  async readStaffDashboard(proof: SessionProof) {
+    return dashboardDto((await this.dashboardSnapshot(proof)).snapshot);
+  }
+
+  async readStaffDashboardPage(proof: SessionProof, link: DashboardLink) {
+    const { snapshot,reused } = await this.dashboardSnapshot(proof,link);
+    return dashboardPage(snapshot,link,!reused);
+  }
+
+  private async dashboardSnapshot(proof: SessionProof, link?: DashboardLink) {
+    const cache = this.config.dashboard;
+    if (!cache) { return deny('NOT_READY'); }
+    const run = async (tryReuse: boolean) => await this.staffCall(() => this.staff.withP05(proof,['requests.read'],async staff => {
+      await geoFence(staff.client);
+      const city = await currentCity(staff.client);
+      await staff.authorizeCity(city.cityId);
+      if (!await lockConsent(staff.client,undefined,'shared')) { return deny('NOT_READY'); }
+      const port = this.config.staffEvidence;
+      if (port && !port.openRegistry) { return deny('NOT_READY'); }
+      const isCurrent = await port?.openRegistry?.(staff.client);
+      const subject: DashboardSubject = { ...city,staffId:staff.staffId,sessionId:staff.sessionId };
+      const basisCurrent = (snapshot: DashboardSnapshot, clock: Date) => snapshot.material.evidence.every(evidence =>
+        evidence.validUntil.getTime() > clock.getTime() && isCurrent?.(evidence) === true);
+      const usable = (snapshot: DashboardSnapshot, clock: Date) => cache.live(snapshot)
+        && Date.parse(snapshot.material.localDay.to) > clock.getTime() && basisCurrent(snapshot,clock);
+      const previous = tryReuse && link ? cache.find(link.snapshot,subject) : undefined;
+      if (previous && await dashboardRowsCurrent(staff.client,city.cityId,previous.material)
+        && usable(previous,await staff.recheck())) {
+        return (clock:Date) => usable(previous,clock) ? { snapshot:previous,reused:true } : null;
+      }
+      const snapshot = cache.issue(subject,await captureDashboard(staff.client,city,isCurrent));
+      return (clock:Date) => usable(snapshot,clock) ? { snapshot,reused:false } : null;
+    },decidePrepared));
+    const selected = await run(true) ?? await run(false);
+    if (!selected) { return deny('NOT_READY'); }
+    if (!selected.reused) { cache.remember(selected.snapshot); }
+    return selected;
+  }
+
   async readForm(proof: FProof) {
     const prepared = await this.form.prepareRequestProof(proof,false);
     return await this.transaction(async (client) => {
@@ -457,6 +670,7 @@ export class RequestIntake {
     requireHeaders(operation,input);
     const prepared = await this.form.prepareRequestProof(proof,true);
     return await this.transaction(async (client) => {
+      if (operation !== 'cancelRequestF') { await this.config.search?.lock(client); }
       await geoFence(client);
       const { anchor,recheck } = await prepared.lock(client);
       const edge = await submitEdge(client,{ sessionId:anchor.id });
@@ -480,6 +694,7 @@ export class RequestIntake {
     requireHeaders(operation,input);
     const [command,code] = STAFF_COMMANDS[operation];
     return await this.staffCall(() => this.staff.withP05(proof,[code],async (staff) => {
+      if (operation === 'changeContact' || operation === 'withdrawPhoneStaff') { await this.config.search?.lock(staff.client); }
       if (operation === 'convertCallback' || operation === 'changeDetails') { await fenceRead(staff.client); }
       await geoFence(staff.client);
       const identity = { actor:{kind:'STAFF' as const,id:staff.staffId},command,key:input.key,target:id,match:input.ifMatch ?? null };
@@ -546,6 +761,7 @@ export class RequestIntake {
     let extra: Record<string,string> = {};
     let permission: { action:'GIVEN'|'REVOKED'; id:string; evidenceId?:string; supersedes?:string } | undefined;
     let finalEvidence: StaffEvidence | undefined;
+    let changedContact: P05FContact | undefined;
     let assessmentDeadline: number | undefined;
     let expires: string | null = null;
     switch (cmd.command) {
@@ -600,6 +816,7 @@ export class RequestIntake {
         finalEvidence = await this.consumeStaffEvidence(staff,row,'CONTACT_CHANGE',patch.evidenceId,cmd);
         const contact = randomUUID();
         await writeContact(client,this.config,row.id,contact,nextVersion,await readContactMode(client,row),patch.contact);
+        changedContact = patch.contact;
         revisions = { ...revisions,contact };
         break;
       }
@@ -636,6 +853,15 @@ export class RequestIntake {
     const changed = await updateRequestRow(client,row,decision.target ?? row.status,decision.resultingType ?? row.type,revisions);
     const receipt = await writeEffect(client,this.config.ring,changed,cmd,effectId,randomUUID(),extra);
     if (permission) { await writePhone(client,changed,effectId,permission.action,permission.id,permission.evidenceId,permission.supersedes); }
+    const search = this.config.search;
+    if (search && changedContact) {
+      await search.setContact(client,changed,changedContact,false);
+    } else if (search && permission?.action === 'GIVEN') {
+      await search.assertCurrent(client);
+      await search.setContact(client,changed,await readStoredContact(client,changed,this.config),true);
+    } else if (search && permission?.action === 'REVOKED') {
+      await search.removePhone(client,changed);
+    }
     await client.query('SET CONSTRAINTS ALL IMMEDIATE');
     if (!closing && !await basis.recheck()) { return deny('CONSENT_REQUIRED'); }
     if (finalEvidence && !await staffEvidenceLive(client,this.config.staffEvidence,finalEvidence)) { return deny('FORBIDDEN'); }

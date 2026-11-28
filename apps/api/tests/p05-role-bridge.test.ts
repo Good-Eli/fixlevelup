@@ -271,6 +271,21 @@ describe('P05 staff authorization port', () => {
     expect(statements.some(({ sql }) => sql === 'COMMIT')).toBe(false);
   });
 
+  it('uses durable receipt handling for a write with independent domain grants', async () => {
+    const { auth,statements,release } = authorizationFixture({
+      grants:[p05('requests.read','GLOBAL')],commitError:new Error('Synthetic lost acknowledgement'),
+    });
+    const prepare = vi.fn(async ({authorizeCity}: {authorizeCity: (city: string) => Promise<void>}) => {
+      await authorizeCity(cityA);
+      return 'comment receipt';
+    });
+    await expect(auth.withP05(crm,['requests.read'],prepare,result => result,'write')).rejects.toEqual(new P05CommitUnknown());
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(statements.some(({sql}) => sql === 'SET LOCAL synchronous_commit=on')).toBe(true);
+    expect(statements.at(-1)?.sql).toBe('COMMIT');
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
   it('signals its own unknown COMMIT for a domain write and keeps a definite rejection typed', async () => {
     const grants = [p05('requests.read', 'GLOBAL'), p05('requests.review', 'GLOBAL')];
     const callback = vi.fn(async ({ authorizeCity }: { authorizeCity: (id: string) => Promise<void> }) => {

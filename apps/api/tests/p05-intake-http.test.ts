@@ -21,6 +21,8 @@ import { clonePhonePreference, requestRow, updateRequestRow, writeContact, write
 import { requestEffectsHistoryComplete } from '../src/infrastructure/database/request-phone-history.js';
 import type { RequestOffers, StaffEvidence, StaffEvidencePort } from '../src/requests/intake/basis.js';
 import { coverageEffects } from '../src/requests/intake/coverage-effects.js';
+import { parseRegistryQuery } from '../src/requests/registry/filters.js';
+import { readRegistrySearch, readVisibleRegistry } from '../src/requests/registry/store.js';
 import type { CoverageReviewEvidence } from '../src/requests/intake/coverage.js';
 import { fixtureCredentials } from './owned-test-database.js';
 import { RbacFixture, record, text } from './rbac-fixture.js';
@@ -35,6 +37,13 @@ import { withHttpMatrixActors } from './p05-http-matrix-actors.js';
 import type { StaffProof } from './p05-http-matrix-actors.js';
 import { noP05CommandRoutes, witnesses } from './p05-http-matrix-oracle.js';
 import { createSyntheticKeySlots } from './p05-key-slot-fixture.js';
+import { COMMENT_KEY_ENVIRONMENT } from '../src/requests/card/comments.js';
+import { installCommentFixture, grantCommentFixture, grantContactFixture } from './p06-comment-fixture.js';
+import { createContactAudit } from '../src/requests/card/contacts.js';
+import { ContactSearchIndex } from '../src/requests/search/index.js';
+import { installSearchFixture, rebuildSearchFixture } from './p06-search-fixture.js';
+import { DashboardSnapshots } from '../src/requests/dashboard/snapshots.js';
+import { captureDashboard, dashboardClockSql, dashboardRowsCurrent } from '../src/requests/dashboard/store.js';
 
 const origin = 'https://crm.example.test';
 const enabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
@@ -42,6 +51,9 @@ const enabled = process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] === '1'
 const contact = Object.freeze({ name:'Synthetic intake sentinel',phone:'+15550100001' });
 const address = Object.freeze({ street:'Synthetic comparison sentinel',building:'12' });
 const pub = '/public';
+const commentProof = process.env['FIXLEVELUP_P06_COMMENT_PROOF'] === '1';
+const searchProof = process.env['FIXLEVELUP_P06_SEARCH_PROOF'] === '1';
+const dashboardProof = process.env['FIXLEVELUP_P06_DASHBOARD_PROOF'] === '1';
 
 interface Reply {
   readonly status: number;
@@ -56,17 +68,25 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   let fixture: RequestFixtures;
   let testApp: Awaited<ReturnType<typeof startIsolatedIntake>> | undefined;
   let cert: Buffer;
+  let staffTlsKey: Buffer;
   let port: number;
   let offers: RequestOfferFixture;
   let historical: PolicyPackage;
   let keyring: KeyringConfig;
   let managed: Awaited<ReturnType<typeof createSyntheticKeySlots>> | undefined;
+  let managedComments: Awaited<ReturnType<typeof createSyntheticKeySlots>> | undefined;
+  let activeSearch: ContactSearchIndex | undefined;
+  const firstSearchKey = { generation:randomUUID(),key:randomBytes(32) };
+  let dashboardClockOffset = 0;
   let launchWithPolicy: (id: string, pins?: ReadonlyMap<string,string>, anchorTtlMs?: number,
-    matrixOffers?: RequestOffers) => ReturnType<typeof startIsolatedIntake>;
+    matrixOffers?: RequestOffers, searchKey?: { generation:string; key:Buffer } | null) => ReturnType<typeof startIsolatedIntake>;
   const historicalDigest = '3799c7e532579641d010675a229541c998f4d02bf85c3156fe167f79d33631cf';
   const evidence = new Map<string, NonNullable<Awaited<ReturnType<StaffEvidencePort['verify']>>> & Parameters<StaffEvidencePort['verify']>[1]>();
   const review = new Map<string,CoverageReviewEvidence>();
   const evidenceClockHooks = new Map<string,(client: import('pg').PoolClient, proof: StaffEvidence) => Promise<void>>();
+  const evidenceSnapshotHooks = new Map<string,() => void>();
+  const registryEvidenceHooks = new Map<string,() => void>();
+  let registryOpenHook: ((client: import('pg').PoolClient) => Promise<void>) | undefined;
   const evidencePort: StaffEvidencePort = {
     async verify(_client, expected) {
       await Promise.resolve();
@@ -76,7 +96,17 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     },
     async isCurrent(client, proof) {
       await evidenceClockHooks.get(proof.id)?.(client,proof);
-      return evidence.get(proof.id)?.procedureRevision === proof.procedureRevision;
+      const current = evidence.get(proof.id)?.procedureRevision === proof.procedureRevision;
+      evidenceSnapshotHooks.get(proof.id)?.();
+      return current;
+    },
+    async openRegistry(client) {
+      await registryOpenHook?.(client);
+      return proof => {
+        const current = evidence.get(proof.id)?.procedureRevision === proof.procedureRevision;
+        registryEvidenceHooks.get(proof.id)?.();
+        return current;
+      };
     },
   };
   function db() { if (!base) { throw new Error('Missing fixture'); } return base; }
@@ -93,7 +123,6 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     await lab.db.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type)
       SELECT r.id,c,'GLOBAL' FROM foundation.roles r CROSS JOIN unnest($1::text[]) c WHERE r.role_type='SYSTEM' AND r.code='ADMIN'`, [P05_CAPABILITIES]);
     const dir = mkdtempSync(resolve(tmpdir(),'p05-intake-tls-'));
-    let key: Buffer;
     try {
       const pem = resolve(dir,'server.pem');
       const privateKey = resolve(dir,'server.key');
@@ -101,34 +130,48 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       execFileSync(openssl,['req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=localhost',
         '-addext','subjectAltName=IP:127.0.0.1,DNS:localhost','-keyout',privateKey,'-out',pem],{stdio:'ignore',timeout:10000});
       cert = readFileSync(pem);
-      key = readFileSync(privateKey);
+      staffTlsKey = readFileSync(privateKey);
     } finally { rmSync(dir,{recursive:true,force:true}); }
     keyring = loadKeyring({ activeKekId:'test-kek-1',activeHmacKeyId:'test-hmac-1',
       kek:[{keyId:'test-kek-1',secretHex:randomBytes(32).toString('hex')}],
       hmac:[{keyId:'test-hmac-1',secretHex:randomBytes(32).toString('hex')}] });
     const keys=await createSyntheticKeySlots('p05-isolated');
     managed=keys;
+    if (commentProof || searchProof) {
+      await installCommentFixture(lab);
+      if (commentProof) { managedComments = await createSyntheticKeySlots(COMMENT_KEY_ENVIRONMENT); }
+      if (searchProof) { await installSearchFixture(lab); }
+    }
     const supportedPolicies = new Map(supportedFixturePolicies());
     supportedPolicies.set(policyPairKey(historical.workflowVersion,historical.policyRevision),historicalDigest);
     const csrf = randomBytes(32).toString('hex');
     // Every T instance uses the same exact admitted database and staff proof;
     // package and short-TTL settings are explicit synthetic inputs.
-    launchWithPolicy = async (id, pins = supportedPolicies, anchorTtlMs = 600000, matrixOffers) => {
+    launchWithPolicy = async (id, pins = supportedPolicies, anchorTtlMs = 600000, matrixOffers, searchKey = firstSearchKey) => {
       const settings = { ring:keyring,keySlots:keys.slots,environment:'p05-isolated',currentPolicyId:id,
         supportedPolicies:pins,formSourceEntryId:fixture.formSourceEntryId };
       const matrix = matrixOffers !== undefined;
       return await startIsolatedIntake({ target:{ host:'127.0.0.1',port:55432,database:lab.database,user:'fixlevelup_runtime',password:fixtureCredentials().runtime },
-        authorization:lab.admitted.authorization,tls:{key,cert},staff:{origin,csrfSecret:csrf},
+        authorization:lab.admitted.authorization,tls:{key:staffTlsKey,cert},staff:{origin,csrfSecret:csrf},
         form:{ origin,csrfKeyring:{current:{keyId:'csrf-t1',secret:randomBytes(32)}},throttleSecret:randomBytes(32),
           groupTtlMs:matrix ? 1800000 : 900000,anchorTtlMs,csrfTtlMs:matrix ? anchorTtlMs : Math.min(300000,anchorTtlMs),
           throttles:{ source:{windowSeconds:600,maxHits:matrix ? 3000 : 300},global:{windowSeconds:600,maxHits:matrix ? 3000 : 300},
             anchor:{windowSeconds:600,maxHits:60} } },
-        configure:audit=>({...settings,offers:matrixOffers ?? offers,staffEvidence:evidencePort,coverage:coverageEffects(settings,audit,{
+        configure:audit=>({
+          ...settings,offers:matrixOffers ?? offers,staffEvidence:evidencePort,
+          ...(searchProof && searchKey ? { search:activeSearch = new ContactSearchIndex(audit,'p05-isolated',searchKey.generation,searchKey.key) } : {}),
+          ...(dashboardProof ? { dashboard:new DashboardSnapshots(() => performance.now()+dashboardClockOffset) } : {}),
+          ...(managedComments ? {comments:{ring:keyring,keySlots:managedComments.slots},contactAudit:createContactAudit(audit)} : {}),
+          coverage:coverageEffects(settings,audit,{
           async verify(input) { return await Promise.resolve(review.get(input.evidenceId)); },
         },64)}),
       });
     };
     testApp = await launchWithPolicy(fixture.policyId);
+    if (activeSearch) {
+      await rebuildSearchFixture(lab,activeSearch,{ ring:keyring,keySlots:keys.slots,environment:'p05-isolated' },
+        client => evidencePort.openRegistry?.(client) ?? Promise.reject(new Error('Missing evidence issuer')));
+    }
     port = portOf(testApp);
     staffCsrf = csrf;
   },90000);
@@ -136,7 +179,10 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   let staffCsrf: string;
   afterAll(async () => {
     try { await testApp?.app.close(); }
-    finally { try { await managed?.close(); } finally { await base?.close(); } }
+    finally {
+      try { await managed?.close(); }
+      finally { try { await managedComments?.close(); } finally { await base?.close(); } }
+    }
   },20000);
 
   function portOf(instance: Awaited<ReturnType<typeof startIsolatedIntake>>): number {
@@ -212,12 +258,23 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       validUntil:new Date(Date.now()+300000)});
   }
 
-  async function manualPrepared() {
+  async function withdrawAtEvidenceSnapshot<T>(id: string, target: number, read: () => Promise<T>): Promise<T> {
+    let checks = 0;
+    evidenceSnapshotHooks.set(id,() => { if (++checks === target) { evidence.delete(id); } });
+    try {
+      const result = await read();
+      expect(checks).toBe(target);
+      return result;
+    } finally { evidenceSnapshotHooks.delete(id); }
+  }
+
+  async function manualPrepared(districtId?: string, inputContact: {name:string; phone:string} = contact) {
     const source=(await db().db.query<{version:string}>('SELECT current_version_id AS version FROM foundation.reference_entries WHERE id=$1',[fixture.formSourceEntryId])).rows[0];
     if (!source) { throw new Error('Missing synthetic source'); }
     const key=randomUUID();
-    const body=decodeP05ManualRequest({type:'REPAIR',sourceEntryId:fixture.formSourceEntryId,evidenceId:randomUUID(),contact:{...contact,
-      mode:'PHONE',phonePermission:true,phoneEvidenceId:randomUUID()},address,appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]}});
+    const body=decodeP05ManualRequest({type:'REPAIR',sourceEntryId:fixture.formSourceEntryId,evidenceId:randomUUID(),contact:{...inputContact,
+      mode:'PHONE',phonePermission:true,phoneEvidenceId:randomUUID()},address:{...address,...(districtId ? {districtId} : {})},
+      appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]}});
     if (body.type !== 'REPAIR' || body.contact.mode !== 'PHONE') { throw new Error('Wrong test DTO'); }
     const target=canonicalJson({cityId:fixture.cityId,cityVersionId:fixture.cityVersionId,sourceVersionId:source.version,operation:'CreateRepair',key});
     const phoneEvidenceId=body.contact.phoneEvidenceId;
@@ -364,6 +421,751 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     throw new Error('Expected two observed PostgreSQL lock contenders');
   }
 
+  it.runIf(dashboardProof)('P06 dashboard keeps counts and pages on one authorized snapshot and refreshes expired or changed data', async () => {
+    const path = '/crm/dashboard';
+    const keys = ['snapshotId','asOf','definitionsVersion','cityId','cityVersionId','timezone','localDay','metrics'];
+    const ready = ['newRequests','createdToday','callbackRequired','awaitingChannel','readyForAssignment'];
+    const read = async (headers = staff()) => closed(await https('GET',path,undefined,headers),200,keys).data();
+    const metric = (dashboard: Record<string,unknown>, name: string) => record(record(dashboard['metrics'])[name]);
+    const drill = async (dashboard: Record<string,unknown>, name: string, headers = staff(), offset?: number) => {
+      const href = text(metric(dashboard,name),'href');
+      expect(href).toBe(`/crm/requests?snapshot=${text(dashboard,'snapshotId')}&metric=${name}`);
+      return closed(await https('GET',href.slice(4)+(offset === undefined ? '' : `&offset=${String(offset)}`),undefined,headers),
+        200,['snapshot','metric','items','nextOffset','refreshed']).data();
+    };
+    const rows = (data: Record<string,unknown>) => {
+      const result = data['items'];
+      if (!Array.isArray(result)) { throw new Error('Invalid snapshot result'); }
+      return result.map(record);
+    };
+    const uuidOfNumber = async (number: unknown) => {
+      const { rows:[row] } = await db().db.query<{ id:string }>('SELECT id FROM foundation.requests WHERE public_number=$1',[number]);
+      if (!row) { throw new Error('Missing synthetic request'); }
+      return row.id;
+    };
+    const createManual = async () => {
+      const prepared = await manualPrepared();
+      prepared.authorize();
+      const result = accepted(await https('POST','/requests',prepared.body,staffMutation(prepared.key)),201).data();
+      return {id:text(result,'id'),prepared};
+    };
+    failure(await https('GET',path),401,'UNAUTHORIZED');
+    failure(await https('GET',`${path}?cityId=${fixture.cityId}`,undefined,staff()),404,'NOT_FOUND');
+    const empty = await read();
+    expect(empty).toMatchObject({definitionsVersion:'p06-v1',cityId:fixture.cityId,cityVersionId:fixture.cityVersionId,timezone:fixture.timezone});
+    const day = record(empty['localDay']);
+    expect(text(day,'from') <= text(empty,'asOf') && text(empty,'asOf') < text(day,'to')).toBe(true);
+    for (const key of ready) { expect(metric(empty,key)).toMatchObject({state:'ready',count:0}); }
+    expect(metric(empty,'newRequests')['appliedFilters']).toEqual({statuses:['NEW']});
+    expect(metric(empty,'createdToday')['appliedFilters']).toEqual(day);
+    expect(metric(empty,'callbackRequired')['appliedFilters']).toEqual({statuses:['CALLBACK_REQUIRED'],contactMode:'PHONE',
+      phonePermission:'active_current_revision',processing:'current'});
+    expect(metric(empty,'awaitingChannel')['appliedFilters']).toEqual({statuses:['WAITING_TELEGRAM_LINK','WAITING_CHANNEL_LINK']});
+    expect(metric(empty,'readyForAssignment')['appliedFilters']).toEqual({statuses:['WAITING_ASSIGNMENT']});
+    for (const key of ['unassigned','unconfirmedAssignments','visitsToday','diagnosisOrApproval','pendingReports','overdueOrProblem','freeTechnicians']) {
+      expect(metric(empty,key)).toEqual({state:'not_ready'});
+    }
+    expect(rows(await drill(empty,'newRequests'))).toEqual([]);
+    const rawLink = text(metric(empty,'newRequests'),'href').slice(4);
+    failure(await https('GET',`${rawLink}&status=NEW`,undefined,staff()),400,'MALFORMED');
+    failure(await https('GET',`${rawLink}&offset=1`,undefined,staff()),400,'MALFORMED');
+    failure(await https('GET',`${rawLink}&metric=createdToday`,undefined,staff()),400,'MALFORMED');
+
+    const newRequest = await createManual();
+    const pending = await createManual();
+    const pendingPath = `/requests/${pending.id}`;
+    const pendingTag = async () => tag(accepted(await https('GET',pendingPath,undefined,staff()),200));
+    accepted(await https('POST',`${pendingPath}/commands/start-review`,{},staffMutation(undefined,await pendingTag())),200);
+    const { rows:[pendingAddress] } = await db().db.query<{id:string}>(
+      'SELECT current_address_revision_id AS id FROM foundation.requests WHERE id=$1',[pending.id]);
+    if (!pendingAddress) { throw new Error('Missing synthetic address'); }
+    const reviewId = randomUUID();
+    review.set(reviewId,{evidenceId:reviewId,issuer:'T',purpose:'COVERAGE_REVIEW',staffId:db().admin.id,requestId:pending.id,
+      addressRevisionId:pendingAddress.id,candidate:address,expiresAt:new Date(Date.now()+60000)});
+    accepted(await https('POST',`${pendingPath}/commands/record-coverage`,
+      {evidenceId:reviewId,outcome:'IN_ZONE',areaId:fixture.areaId},staffMutation(undefined,await pendingTag())),200);
+    accepted(await https('POST',`${pendingPath}/commands/ready-for-dispatch`,{},staffMutation(undefined,await pendingTag())),200);
+
+    const callback = await issue();
+    const callbackConsent = await given(callback);
+    const callbackResult = accepted(await https('POST',`${pub}/callback-requests`,{
+      contact,phonePermission:true,callbackIntervalId:fixture.callbackIntervalEntryId,
+      consent:{evidenceId:callbackConsent,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(callback)),201).data();
+    const callbackId = await uuidOfNumber(callbackResult['publicNumber']);
+    const channel = await issue();
+    const channelConsent = await given(channel);
+    const channelResult = accepted(await https('POST',`${pub}/repair-requests`,{
+      contact,address,appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]},channelSelection:offers.ids,
+      consent:{evidenceId:channelConsent,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(channel)),201).data();
+    const channelId = await uuidOfNumber(channelResult['publicNumber']);
+
+    const snapshot = await read();
+    const expected: Record<string,string[]> = {newRequests:[newRequest.id],createdToday:[channelId,callbackId,pending.id,newRequest.id],
+      callbackRequired:[callbackId],awaitingChannel:[channelId],readyForAssignment:[pending.id]};
+    for (const [key,ids] of Object.entries(expected)) {
+      const page = await drill(snapshot,key);
+      expect(page).toMatchObject({metric:key,refreshed:false,nextOffset:null});
+      expect(page['snapshot']).toEqual(snapshot);
+      expect(metric(snapshot,key)['count']).toBe(ids.length);
+      expect(rows(page).map(row => text(row,'id'))).toEqual(ids);
+      for (const row of rows(page)) { expect(Object.keys(row).sort()).toEqual(['createdAt','id','publicNumber','status','type','version']); }
+    }
+    await withHttpMatrixActors(db(),fixture.cityId,async actors => {
+      const foreign = await drill(snapshot,'newRequests',{Cookie:actors.reader.cookie});
+      const missing = randomUUID();
+      const unknown = {...snapshot,snapshotId:missing,metrics:{ ...record(snapshot['metrics']),
+        newRequests:{...metric(snapshot,'newRequests'),href:`/crm/requests?snapshot=${missing}&metric=newRequests`} }};
+      const absent = await drill(unknown,'newRequests',{Cookie:actors.reader.cookie});
+      expect(foreign['refreshed']).toBe(true);
+      expect(absent['refreshed']).toBe(true);
+      expect(record(foreign['snapshot'])['snapshotId']).not.toEqual(snapshot['snapshotId']);
+      failure(await https('GET',path,undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+      failure(await https('GET',rawLink,undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+    });
+
+    const [duringInsert,inserted] = await Promise.all([drill(snapshot,'newRequests'),createManual()]);
+    expect(duringInsert['snapshot']).toEqual(snapshot);
+    expect(rows(duringInsert).map(row => row['id'])).toEqual([newRequest.id]);
+
+    const formRequest = `${pub}/request-session`;
+    const callbackTag = tag(accepted(await https('GET',formRequest,undefined,proof(callback)),200));
+    accepted(await https('POST',`${formRequest}/phone-permissions`,{action:'REVOKED'},mutate(callback,randomUUID(),callbackTag)),200);
+    const lostPhone = await drill(snapshot,'callbackRequired');
+    const fresh = record(lostPhone['snapshot']);
+    expect(lostPhone['refreshed']).toBe(true);
+    expect(rows(lostPhone)).toEqual([]);
+    expect(metric(fresh,'callbackRequired')['count']).toBe(0);
+    expect(metric(fresh,'newRequests')['count']).toBe(2);
+
+    const withdrew = randomUUID();
+    accepted(await https('POST',`${pub}/form-session/consents`,{action:'REVOKED',evidenceRef:withdrew,supersedesEvidenceId:channelConsent},
+      mutate(channel,withdrew)),201);
+    const noChannel = await drill(fresh,'newRequests');
+    expect(noChannel['refreshed']).toBe(true);
+    expect(metric(record(noChannel['snapshot']),'awaitingChannel')['count']).toBe(0);
+
+    registryEvidenceHooks.set(inserted.prepared.body.evidenceId,() => { evidence.delete(inserted.prepared.body.evidenceId); });
+    try {
+      const noLongerVisible = await drill(record(noChannel['snapshot']),'newRequests');
+      expect(noLongerVisible['refreshed']).toBe(true);
+      expect(rows(noLongerVisible).map(row => row['id'])).toEqual([newRequest.id]);
+      const expired = record(noLongerVisible['snapshot']);
+      dashboardClockOffset = 91000;
+      const next = await drill(expired,'newRequests',staff(),30);
+      expect(next['refreshed']).toBe(true);
+      expect(record(next['snapshot'])['snapshotId']).not.toEqual(expired['snapshotId']);
+      expect(rows(next).map(row => row['id'])).toEqual([newRequest.id]);
+    } finally {
+      dashboardClockOffset = 0;
+      registryEvidenceHooks.delete(inserted.prepared.body.evidenceId);
+    }
+  },90000);
+
+  it.runIf(dashboardProof)('P06 dashboard paginates a large snapshot without N+1 and uses true city-day bounds', async () => {
+    if (!testApp) { throw new Error('Missing dashboard fixture'); }
+    const app = testApp;
+    const staffProof = {kind:'staff-web' as const,token:db().admin.token};
+    const created: string[] = [];
+    for (let index = 0; index < 105; index++) {
+      const prepared = await manualPrepared(fixture.districtId);
+      prepared.authorize();
+      const {receipt} = await app.service.submitStaff(staffProof,{key:prepared.key,bytes:Buffer.from(JSON.stringify(prepared.body))});
+      created.unshift(receipt.requestId);
+    }
+    const dashboard = accepted(await https('GET','/crm/dashboard',undefined,staff()),200).data();
+    const metric = record(record(dashboard['metrics'])['newRequests']);
+    const href = text(metric,'href').slice(4);
+    const seen: string[] = [];
+    let offset = 0;
+    for (;;) {
+      const page = accepted(await https('GET',`${href}&offset=${String(offset)}`,undefined,staff()),200).data();
+      expect(page['refreshed']).toBe(false);
+      expect(page['snapshot']).toEqual(dashboard);
+      const items = page['items'];
+      if (!Array.isArray(items)) { throw new Error('Invalid dashboard page'); }
+      seen.push(...items.map(item => text(record(item),'id')));
+      if (page['nextOffset'] === null) { break; }
+      expect(page['nextOffset']).toBe(offset+30);
+      offset += 30;
+    }
+    expect(seen).toHaveLength(Number(metric['count']));
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen.slice(0,created.length)).toEqual(created);
+
+    const dbClient = await app.filePool.connect();
+    try {
+      const { rows:[identity] } = await dbClient.query<{role:string}>('SELECT current_user AS role');
+      expect(identity?.role).toBe('fixlevelup_runtime');
+      const observed: number[] = [];
+      const measured = new Proxy(dbClient,{get(target,key) {
+        if (key !== 'query') { return Reflect.get(target,key,target) as unknown; }
+        return async (sql: string, parameters: unknown[]) => {
+          const plan = await target.query<{ 'QUERY PLAN': readonly { 'Execution Time': number }[] }>(
+            `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`,parameters);
+          const duration = plan.rows[0]?.['QUERY PLAN'][0]?.['Execution Time'];
+          if (duration === undefined) { throw new Error('Missing dashboard execution plan'); }
+          observed.push(duration);
+          return await target.query(sql,parameters);
+        };
+      }});
+      const city = {cityId:fixture.cityId,cityVersionId:fixture.cityVersionId,timezone:fixture.timezone};
+      const current = (item: StaffEvidence) => evidence.get(item.id)?.procedureRevision === item.procedureRevision;
+      const material = await captureDashboard(measured,city,current);
+      expect(material.queues.newRequests.map(row => row.id)).toEqual(seen);
+      expect(await dashboardRowsCurrent(measured,city.cityId,material)).toBe(true);
+      expect(observed).toHaveLength(2);
+      process.stdout.write(`P06 dashboard PostgreSQL capture and revalidation ms ${JSON.stringify(observed)}\n`);
+
+      const dayBounds = dashboardClockSql('$1::timestamptz','$2::text');
+      const boundary = async (instant: string, timezone: string) => (await dbClient.query<{
+        from:Date; to:Date; includesStart:boolean; excludesEnd:boolean;
+      }>(`SELECT clock.day_start AS "from",clock.day_end AS "to",
+        (clock.day_start AT TIME ZONE $2::text)::date=clock.city_date AS "includesStart",
+        (clock.day_end AT TIME ZONE $2::text)::date<>clock.city_date AS "excludesEnd"
+        FROM (${dayBounds}) AS clock`,[instant,timezone])).rows[0];
+      const beforeMidnight = await boundary('2026-11-27T20:59:59.999999Z','Europe/Moscow');
+      const midnight = await boundary('2026-11-27T21:00:00Z','Europe/Moscow');
+      expect(beforeMidnight?.from.toISOString()).toBe('2026-11-26T21:00:00.000Z');
+      expect(beforeMidnight?.to.toISOString()).toBe(midnight?.from.toISOString());
+      expect(midnight?.from.toISOString()).toBe('2026-11-27T21:00:00.000Z');
+      expect(midnight).toMatchObject({includesStart:true,excludesEnd:true});
+      const spring = await boundary('2026-03-29T12:00:00Z','Europe/Berlin');
+      const autumn = await boundary('2026-10-25T12:00:00Z','Europe/Berlin');
+      const repeatedMidnight = await boundary('2025-11-02T04:30:00Z','America/Havana');
+      const secondMidnight = await boundary('2025-11-02T05:30:00Z','America/Havana');
+      if (!spring || !autumn || !repeatedMidnight || !secondMidnight) { throw new Error('Missing DST boundaries'); }
+      expect((spring.to.getTime()-spring.from.getTime())/3600000).toBe(23);
+      expect((autumn.to.getTime()-autumn.from.getTime())/3600000).toBe(25);
+      expect(repeatedMidnight.from.toISOString()).toBe('2025-11-02T04:00:00.000Z');
+      expect((repeatedMidnight.to.getTime()-repeatedMidnight.from.getTime())/3600000).toBe(25);
+      expect(secondMidnight).toEqual(repeatedMidnight);
+    } finally { dbClient.release(); }
+  },150000);
+
+  it('P06 registry paginates only visible requests over HTTPS', async () => {
+    const { rows: [start] } = await db().db.query<{ instant: string }>(`SELECT
+      to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS instant`);
+    if (!start) { throw new Error('Missing fixture clock'); }
+    const path = `/requests?from=${encodeURIComponent(start.instant)}&limit=1`;
+    const form = await issue();
+    const evidenceId = await given(form);
+    const callback = accepted(await https('POST',`${pub}/callback-requests`,{
+      contact,phonePermission:true,callbackIntervalId:fixture.callbackIntervalEntryId,
+      consent:{evidenceId,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(form,randomUUID())),201).data();
+    const manual = await manualPrepared(fixture.districtId);
+    manual.authorize();
+    const repair = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+
+    failure(await https('GET',path),401,'UNAUTHORIZED');
+    failure(await https('GET',path,undefined,{...staff(),Origin:'https://other.example.test'}),403,'FORBIDDEN');
+    failure(await https('GET',`${path}&cityId=${fixture.cityId}`,undefined,staff()),400,'MALFORMED');
+    const first = closed(await https('GET',path,undefined,staff()),200,['items','nextCursor']).data();
+    const items = first['items'];
+    if (!Array.isArray(items) || items.length !== 1) { throw new Error('Expected one registry item'); }
+    const { createdAt, ...row } = record(items[0]);
+    expect(row).toEqual({ id:repair['id'],publicNumber:repair['publicNumber'],status:repair['status'],type:'REPAIR',version:1 });
+    expect(String(createdAt)).toMatch(/\.\d{6}Z$/);
+    const optionsPath = '/requests/filters';
+    failure(await https('GET',optionsPath),401,'UNAUTHORIZED');
+    const options = closed(await https('GET',optionsPath,undefined,staff()),200,['categories','districts','sources','unavailable']).data();
+    expect(options['categories']).toContainEqual({id:fixture.categoryId,name:'Synthetic category'});
+    expect(options['districts']).toContainEqual({id:fixture.districtId,name:'Synthetic district'});
+    expect(options['sources']).toContainEqual(expect.objectContaining({id:fixture.formSourceEntryId}));
+    expect(options['unavailable']).toEqual({technician:'not_ready',payment:'not_ready',alert:'not_ready'});
+    const named = `categoryId=${fixture.categoryId}&districtId=${fixture.districtId}&sourceId=${fixture.formSourceEntryId}`;
+    expect(accepted(await https('GET',`${path}&${named}`,undefined,staff()),200).data()).toEqual({items,nextCursor:null});
+    const cursor = encodeURIComponent(text(first,'nextCursor'));
+    const second = accepted(await https('GET',`${path}&cursor=${cursor}`,undefined,staff()),200).data();
+    expect(second).toEqual({items:[expect.objectContaining({publicNumber:callback['publicNumber']})],nextCursor:null});
+
+    registryEvidenceHooks.set(manual.body.evidenceId, () => {
+      registryEvidenceHooks.delete(manual.body.evidenceId);
+      evidence.delete(manual.body.evidenceId);
+    });
+    try { failure(await https('GET',path,undefined,staff()),503,'NOT_READY'); }
+    finally { registryEvidenceHooks.delete(manual.body.evidenceId); }
+    manual.authorize();
+
+    const withdrawalKey = randomUUID();
+    accepted(await https('POST',`${pub}/form-session/consents`,{
+      action:'REVOKED',evidenceRef:withdrawalKey,supersedesEvidenceId:evidenceId,
+    },mutate(form,withdrawalKey)),201);
+    expect(accepted(await https('GET',path,undefined,staff()),200).data()).toEqual({items:first['items'],nextCursor:null});
+    expect(accepted(await https('GET',`${path}&cursor=${cursor}`,undefined,staff()),200).data()).toEqual({items:[],nextCursor:null});
+    evidence.delete(manual.body.evidenceId);
+    expect(accepted(await https('GET',path,undefined,staff()),200).data()).toEqual({items:[],nextCursor:null});
+  },45000);
+
+  it('P06 registry enforces GLOBAL and CITY grants over HTTPS', async () => {
+    const path = '/requests?from=2099-01-01T00%3A00%3A00.000Z';
+    const read = (actor: StaffProof) => https('GET', path, undefined, { Cookie:actor.cookie });
+    await withHttpMatrixActors(db(), fixture.cityId, async actors => {
+      const expected = {items:[],nextCursor:null};
+      for (const actor of [actors.global,actors.reader,actors.manager,actors.custom]) {
+        expect(accepted(await read(actor),200).data()).toEqual(expected);
+      }
+      failure(await read(actors.actionOnly),403,'FORBIDDEN');
+      failure(await read(actors.wrong),404,'NOT_FOUND');
+      failure(await https('GET','/requests/filters',undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+      failure(await read(actors.noCity),404,'NOT_FOUND');
+      await actors.setAdminScope('CITY');
+      expect(accepted(await read(actors.cityAdmin),200).data()).toEqual(expected);
+      await actors.revokeCity(actors.cityAdmin);
+      failure(await read(actors.cityAdmin),404,'NOT_FOUND');
+
+      const app = testApp;
+      if (!app) { throw new Error('Missing isolated app'); }
+      const hash = createHash('sha256').update(actors.reader.token).digest('hex');
+      const { rows: [session] } = await db().db.query<{ expires: Date }>(`UPDATE foundation.web_sessions
+        SET idle_expires_at=clock_timestamp()+interval '3 seconds' WHERE token_hash=$1
+        RETURNING idle_expires_at AS expires`,[hash]);
+      if (!session) { throw new Error('Missing synthetic reader session'); }
+      let opened = false;
+      registryOpenHook = async client => {
+        opened = true;
+        await client.query("SELECT pg_sleep_until($1::timestamptz + interval '20 milliseconds')", [session.expires.toISOString()]);
+      };
+      try {
+        await expect(app.service.readStaffRegistry({kind:'staff-web',token:actors.reader.token},
+          parseRegistryQuery(new URLSearchParams({from:'2099-01-01T00:00:00.000Z'})))).rejects.toMatchObject({code:'UNAUTHORIZED'});
+        expect(opened).toBe(true);
+      } finally { registryOpenHook = undefined; }
+    });
+  },45000);
+
+  it.runIf(process.env['FIXLEVELUP_P06_BROWSER'] === '1')('P06 browser renders and filters the live CRM registry and opens its card', async () => {
+    const manual = await manualPrepared(fixture.districtId);
+    manual.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    if (commentProof) {
+      await grantCommentFixture(db(),db().admin.id,fixture.cityId,true);
+    }
+    if (commentProof || searchProof) {
+      await grantContactFixture(db(),db().admin.id,fixture.cityId);
+    }
+    const requestId = text(created,'id');
+    // A real committed staff change from outside the browser: the browser proof
+    // uses it to exercise the stale-ETag comment path end to end.
+    const bumpVersion = async () => {
+      const latest = accepted(await https('GET',`/requests/${requestId}`,undefined,staff()),200);
+      const latestVersion = Number(latest.data()['version']);
+      const changed = accepted(await https('POST',`/requests/${requestId}/commands/change-details`,
+        {section:'PREFERENCE',urgency:'WITHIN_DAY'},staffMutation(undefined,tag(latest))),200);
+      // The staff receipt carries the new version, not the effect pplied flag.
+      expect(changed.data()).toMatchObject({ id:requestId, version:latestVersion + 1 });
+    };
+    const revokeContact = async () => {
+      const client = await db().db.connect();
+      try {
+        await client.query('BEGIN');
+        await lockAccessPolicy(client,'write');
+        expect((await client.query('DELETE FROM p06_crm.contact_grants WHERE staff_id=$1 AND city_id=$2',
+          [db().admin.id,fixture.cityId])).rowCount).toBe(1);
+        await client.query('COMMIT');
+      } finally { try { await client.query('ROLLBACK'); } finally { client.release(); } }
+    };
+    const browserFixture = { origin,apiPort:port,key:staffTlsKey,cert,sessionToken:db().admin.token,
+      publicNumber:text(created,'publicNumber'),requestId,checkPanels:commentProof,checkSearch:searchProof,
+      checkDashboard:dashboardProof,bumpVersion,revokeContact };
+    const helper = new URL('../../../packages/browser-tooling/fixtures/p06-live.ts', import.meta.url);
+    const { proveLiveRegistry } = await import(helper.href) as { proveLiveRegistry: (input: typeof browserFixture) => Promise<void> };
+    await proveLiveRegistry(browserFixture);  },90000);
+
+  it('P06 card and timeline use the request authority and the existing command validator', async () => {
+    const manual = await manualPrepared(fixture.districtId);
+    manual.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const path = `/requests/${text(created,'id')}`;
+    const cardPath = `${path}/card`;
+    const timelinePath = `${path}/events`;
+    failure(await https('GET',cardPath),401,'UNAUTHORIZED');
+    const card = closed(await https('GET',cardPath,undefined,staff()),200,
+      ['id','publicNumber','type','status','version','createdAt','contactMode','provider','facts','unavailable','canStartReview']);
+    expect(card.data()).toMatchObject({ ...created,type:'REPAIR',contactMode:'PHONE',provider:null,canStartReview:true });
+    expect(card.data()['facts']).toEqual({source:'Synthetic REQUEST_SOURCE',category:'Synthetic category',district:'Synthetic district',
+      urgency:null,coverage:null});
+    expect(card.data()['unavailable']).toMatchObject({appointments:'not_ready',quotes:'not_ready',reports:'not_ready',payments:'not_ready'});
+    const commandTag = card.headers['x-command-etag'];
+    expect(card.headers['x-command-csrf']).toBeUndefined();
+    const armed = accepted(await https('GET',cardPath,undefined,{...staff(),'X-Auth-Request':'1'}),200);
+    const commandCsrf = armed.headers['x-command-csrf'];
+    expect(commandCsrf).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(commandTag).toBe(tag(accepted(await https('GET',path,undefined,staff()),200)));
+    if (typeof commandTag !== 'string' || typeof commandCsrf !== 'string') { throw new Error('Missing command proof'); }
+
+    await withHttpMatrixActors(db(), fixture.cityId, async actors => {
+      const reader = {Cookie:actors.reader.cookie,'X-Auth-Request':'1'};
+      const readOnly = accepted(await https('GET',cardPath,undefined,reader),200);
+      expect(readOnly.data()['canStartReview']).toBe(false);
+      expect(readOnly.headers['x-command-csrf']).toBeUndefined();
+      for (const route of [cardPath,timelinePath]) {
+        failure(await https('GET',route,undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+      }
+    });
+    const key = randomUUID();
+    const headers = {...staffMutation(key,commandTag),'X-CSRF-Token':commandCsrf};
+    const started = accepted(await https('POST',`${path}/commands/start-review`,{},headers),200);
+    expect(accepted(await https('POST',`${path}/commands/start-review`,{},headers),200).bytes).toBe(started.bytes);
+    failure(await https('POST',`${path}/commands/start-review`,{},staffMutation(undefined,commandTag)),412,'VERSION_MISMATCH');
+    const history = closed(await https('GET',timelinePath,undefined,staff()),200,['items']).data()['items'];
+    if (!Array.isArray(history)) { throw new Error('Invalid timeline'); }
+    expect(history.map(item => {
+      const { createdAt,...fields } = record(item);
+      expect(String(createdAt)).toMatch(/\.\d{6}Z$/);
+      return fields;
+    })).toEqual([{version:2,command:'StartReview',actorKind:'STAFF'},{version:1,command:'CreateRepair',actorKind:'STAFF'}]);
+
+    const restricted = closed(await withdrawAtEvidenceSnapshot(manual.body.evidenceId,2,
+      () => https('GET',cardPath,undefined,staff())),200,['version']);
+    expect(restricted.data()).toEqual({version:2});
+    expect(restricted.headers['x-command-etag']).toBeUndefined();
+    expect(closed(await https('GET',timelinePath,undefined,staff()),200,['items']).data()).toEqual({items:[]});
+  },60000);
+
+  it.runIf(commentProof)('P06 comments are private, encrypted, versioned and idempotent over HTTPS', async () => {
+    const manual = await manualPrepared();
+    manual.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const id = text(created,'id');
+    const path = `/requests/${id}/comments`;
+    const initial = tag(accepted(await https('GET',`/requests/${id}`,undefined,staff()),200));
+    const note = {text:'Проверить наличие детали.'};
+    failure(await https('GET',path,undefined,staff()),403,'FORBIDDEN');
+    failure(await https('POST',path,note,staffMutation(undefined,initial)),403,'FORBIDDEN');
+    await grantCommentFixture(db(),db().admin.id,fixture.cityId,true);
+    const card = accepted(await https('GET',`/requests/${id}/card`,undefined,{...staff(),'X-Auth-Request':'1'}),200);
+    expect(card.headers['x-comment-csrf']).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(card.data()['unavailable']).toMatchObject({comments:'available',contactDetails:'not_ready'});
+    await withHttpMatrixActors(db(),fixture.cityId,async actors => {
+      await grantCommentFixture(db(),actors.reader.id,fixture.cityId,false);
+      const headers = {Cookie:actors.reader.cookie,'X-Auth-Request':'1'};
+      const readerCard = accepted(await https('GET',`/requests/${id}/card`,undefined,headers),200);
+      expect(readerCard.data()['unavailable']).toMatchObject({comments:'available'});
+      expect(readerCard.headers['x-comment-csrf']).toBeUndefined();
+      expect(accepted(await https('GET',path,undefined,headers),200).data()).toEqual({items:[]});
+      const csrf = createHmac('sha256',staffCsrf).update('web-auth-csrf\0').update(actors.reader.token).digest('base64url');
+      failure(await https('POST',path,note,{...headers,'X-CSRF-Token':csrf,'Idempotency-Key':randomUUID(),'If-Match':initial}),403,'FORBIDDEN');
+      await grantCommentFixture(db(),actors.wrong.id,fixture.cityId,true);
+      failure(await https('GET',path,undefined,{Cookie:actors.wrong.cookie}),404,'NOT_FOUND');
+    });
+    failure(await https('POST',path,note,staffMutation()),428,'PRECONDITION_REQUIRED');
+    const key = randomUUID();
+    const submitted = closed(await https('POST',path,note,staffMutation(key,initial)),201,['id','version','createdAt']);
+    const commentId = text(submitted.data(),'id');
+    expect(accepted(await https('POST',path,note,staffMutation(key,initial)),200).bytes).toBe(submitted.bytes);
+    failure(await https('POST',path,{text:'Другая запись'},staffMutation(key,initial)),409,'IDEMPOTENCY_KEY_REUSED');
+    const listed = closed(await https('GET',path,undefined,staff()),200,['items']).data();
+    expect(listed).toEqual({items:[{...submitted.data(),...note}]});
+    expect(await db().count(`SELECT count(*)::int n FROM p06_crm.comments
+      WHERE id=$1 AND position(convert_to($2,'UTF8') IN ciphertext)=0`,[commentId,note.text])).toBe(1);
+    expect(await db().count(`SELECT count(*)::int n FROM foundation.audit_logs
+      WHERE correlation_id=$1 AND operation='P06_ADD_INTERNAL_COMMENT' AND position($2 IN details::text)=0`,[commentId,note.text])).toBe(1);
+    accepted(await https('POST',`/requests/${id}/commands/start-review`,{},staffMutation(undefined,initial)),200);
+    failure(await https('POST',path,note,staffMutation(undefined,initial)),412,'VERSION_MISMATCH');
+    const latest = tag(accepted(await https('GET',`/requests/${id}`,undefined,staff()),200));
+    failure(await withdrawAtEvidenceSnapshot(manual.body.evidenceId,2,
+      () => https('POST',path,note,staffMutation(undefined,latest))),409,'CONSENT_REQUIRED');
+    expect(await db().count('SELECT count(*)::int n FROM p06_crm.comments WHERE request_id=$1',[id])).toBe(1);
+    expect(accepted(await https('GET',path,undefined,staff()),200).data()).toEqual({items:[]});
+    failure(await https('POST',path,note,staffMutation(key,initial)),409,'CONSENT_REQUIRED');
+  },60000);
+
+  it.runIf(commentProof)('P06 contact details require explicit CITY authority and audit, and hide no-call phone', async () => {
+    const manual = await manualPrepared();
+    manual.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const id = text(created,'id');
+    const path = `/requests/${id}/contact-details`;
+    const headers = {...staff(),'X-Auth-Request':'1'};
+    failure(await https('GET',path,undefined,headers),403,'FORBIDDEN');
+    const count = () => db().count(`SELECT count(*)::int n FROM foundation.audit_logs
+      WHERE operation='P06_READ_REQUEST_CONTACT' AND details->>'requestId'=$1`,[id]);
+    expect(await count()).toBe(0);
+    await grantContactFixture(db(),db().admin.id,fixture.cityId);
+    failure(await https('GET',path,undefined,staff()),403,'FORBIDDEN');
+    await withHttpMatrixActors(db(),fixture.cityId,async actors => {
+      await grantContactFixture(db(),actors.wrong.id,fixture.cityId);
+      failure(await https('GET',path,undefined,{Cookie:actors.wrong.cookie,'X-Auth-Request':'1'}),404,'NOT_FOUND');
+      failure(await https('GET',path,undefined,{Cookie:actors.reader.cookie,'X-Auth-Request':'1'}),403,'FORBIDDEN');
+    });
+    expect(await count()).toBe(0);
+    const read = await https('GET',path,undefined,headers);
+    expect(read.status).toBe(200);
+    expect(read.headers['cache-control']).toBe('no-store, no-transform');
+    expect(read.data()).toEqual(contact);
+    expect(await count()).toBe(1);
+    expect(await db().count(`SELECT count(*)::int n FROM foundation.audit_logs WHERE operation='P06_READ_REQUEST_CONTACT'
+      AND details->>'requestId'=$1 AND position($2 IN details::text)=0 AND position($3 IN details::text)=0`,[id,contact.name,contact.phone])).toBe(1);
+    failure(await withdrawAtEvidenceSnapshot(manual.body.evidenceId,6,
+      () => https('GET',path,undefined,headers)),409,'CONSENT_REQUIRED');
+    expect(await count()).toBe(2);
+    failure(await https('GET',path,undefined,headers),409,'CONSENT_REQUIRED');
+    expect(await count()).toBe(2);
+
+    const form = await issue();
+    const evidenceId = await given(form);
+    const channel = accepted(await https('POST',`${pub}/repair-requests`,{
+      contact,address,appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]},channelSelection:offers.ids,
+      consent:{evidenceId,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(form,randomUUID())),201).data();
+    const {rows:[target]} = await db().db.query<{id: string}>('SELECT id FROM foundation.requests WHERE public_number=$1',[channel['publicNumber']]);
+    if (!target) { throw new Error('Missing isolated channel request'); }
+    const noCall = await https('GET',`/requests/${target.id}/contact-details`,undefined,headers);
+    expect(noCall.status).toBe(200);
+    expect(noCall.data()).toEqual({name:contact.name,phone:null});
+    failure(await https('POST',`/requests/${target.id}/commands/create-call-task`,{},staffMutation()),404,'NOT_FOUND');
+  },60000);
+
+  it.runIf(searchProof)('P06 search uses protected exact matches, independent CITY authority and durable quotas', async () => {
+    const target = { name:'Синтетическая Ёлка',phone:'+15550110011' };
+    const manual = await manualPrepared(undefined,target);
+    const duplicate = await manualPrepared(undefined,target);
+    manual.authorize();
+    duplicate.authorize();
+    const created = accepted(await https('POST','/requests',manual.body,staffMutation(manual.key)),201).data();
+    const next = accepted(await https('POST','/requests',duplicate.body,staffMutation(duplicate.key)),201).data();
+    const id = text(created,'id');
+    const query = (kind: string, value: string) => ({kind,query:value});
+    const browserProof = {'X-Auth-Request':'1'};
+    const proof = {...staff(),...browserProof};
+    const numberQuery = query('number',text(created,'publicNumber'));
+    const nameQuery = query('name','  СИНТЕТИЧЕСКАЯ\u00a0Е\u0308ЛКА  ');
+    const phoneQuery = query('phone','+1 (555) 011-0011');
+    const find = (body: object, headers: Record<string,string> = proof) => https('POST','/requests/search',body,headers);
+    const ids = (reply: Reply) => {
+      const data = closed(reply,200,['items','truncated']).data();
+      const items = data['items'];
+      expect(data['truncated']).toBe(false);
+      if (!Array.isArray(items)) { throw new Error('Invalid search items'); }
+      return items.map(item => {
+        const row = record(item);
+        expect(Object.keys(row).sort()).toEqual(['createdAt','id','publicNumber','status','type','version']);
+        return text(row,'id');
+      });
+    };
+    failure(await find(numberQuery,browserProof),401,'UNAUTHORIZED');
+    failure(await find(numberQuery,staff()),403,'FORBIDDEN');
+    failure(await find(numberQuery,{...proof,Origin:'https://other.example.test'}),403,'FORBIDDEN');
+    failure(await find({...nameQuery,unknown:target.name}),400,'MALFORMED');
+    failure(await find(query('phone','011-0011')),400,'MALFORMED');
+    failure(await https('GET','/requests/search',undefined,proof),404,'NOT_FOUND');
+    failure(await https('POST','/requests/search?query=synthetic',numberQuery,proof),404,'NOT_FOUND');
+    await withHttpMatrixActors(db(),fixture.cityId,async actors => {
+      const reader = {Cookie:actors.reader.cookie,...browserProof};
+      expect(ids(await find(numberQuery,reader))).toEqual([id]);
+      failure(await find(nameQuery,reader),403,'FORBIDDEN');
+      failure(await find(query('name','totally absent'),reader),403,'FORBIDDEN');
+      await grantContactFixture(db(),actors.wrong.id,fixture.cityId);
+      failure(await find(nameQuery,{Cookie:actors.wrong.cookie,...browserProof}),404,'NOT_FOUND');
+      await grantContactFixture(db(),actors.reader.id,fixture.cityId);
+      expect(ids(await find(nameQuery,reader))).toEqual([text(next,'id'),id]);
+    });
+    await grantContactFixture(db(),db().admin.id,fixture.cityId);
+    expect(ids(await find(query('name','Синтетическая')))).toEqual([]);
+    expect(ids(await find(query('name','Синтетическая Елка')))).toEqual([]);
+    const result = await find(phoneQuery);
+    expect(ids(result)).toEqual([text(next,'id'),id]);
+    expect(result.headers['cache-control']).toBe('no-store, no-transform');
+    expect(result.bytes).not.toContain(target.name);
+    expect(result.bytes).not.toContain(target.phone);
+    const {rows:[stored]} = await db().db.query<{ name:Buffer; phone:Buffer; row:string }>(`SELECT name_token AS name, phone_token AS phone,
+      token::text AS row FROM p06_crm.contact_search token WHERE request_id=$1`,[id]);
+    expect(stored?.name.length).toBe(32);
+    expect(stored?.phone.length).toBe(32);
+    expect(stored?.row).not.toContain(target.name);
+    expect(stored?.row).not.toContain(target.phone);
+    expect(await db().count(`SELECT count(*)::int n FROM foundation.audit_logs
+      WHERE operation='P06_SEARCH_REQUESTS' AND (details ? 'query' OR details ? 'token' OR details ? 'items'
+        OR position($1 IN details::text)>0 OR position($2 IN details::text)>0)`,[target.name,target.phone])).toBe(0);
+
+    registryEvidenceHooks.set(manual.body.evidenceId,() => { evidence.delete(manual.body.evidenceId); });
+    try { failure(await find(numberQuery),503,'NOT_READY'); }
+    finally { registryEvidenceHooks.delete(manual.body.evidenceId); }
+    expect(ids(await find(numberQuery))).toEqual([]);
+    expect(ids(await find(nameQuery))).toEqual([text(next,'id')]);
+
+    // A database time window and principal key apply across sessions and node processes.
+    await db().db.query(`UPDATE p06_crm.search_budget SET used=24,minute=date_trunc('minute',statement_timestamp()) + interval '1 minute'
+      WHERE scope='STAFF' AND subject_id=$1`,[db().admin.id]);
+    try { failure(await find(phoneQuery),429,'QUOTA'); }
+    finally { await db().db.query("DELETE FROM p06_crm.search_budget WHERE scope='STAFF' AND subject_id=$1",[db().admin.id]); }
+  },75000);
+
+  it.runIf(searchProof)('P06 search removes revoked and obsolete tokens and rebuilds a rotated historic index', async () => {
+    const original = activeSearch;
+    if (!original || !managed) { throw new Error('Missing isolated index source'); }
+    const rebuild = (index: ContactSearchIndex) => {
+      if (!managed) { throw new Error('Missing isolated key slots'); }
+      return rebuildSearchFixture(db(),index,{ring:keyring,environment:'p05-isolated',keySlots:managed.slots},
+        client => evidencePort.openRegistry?.(client) ?? Promise.reject(new Error('Missing evidence issuer')));
+    };
+    const searchHeaders = {...staff(),'X-Auth-Request':'1'};
+    await grantContactFixture(db(),db().admin.id,fixture.cityId);
+    const find = (kind:string, query:string, targetPort = port) => https('POST','/requests/search',{kind,query},searchHeaders,targetPort);
+    const found = (reply: Reply) => {
+      const items = closed(reply,200,['items','truncated']).data()['items'];
+      if (!Array.isArray(items)) { throw new Error('Invalid search items'); }
+      return items.map(item => text(record(item),'id'));
+    };
+    const seed = async (name: string, phone: string, targetPort = port) => {
+      const prepared = await manualPrepared(undefined,{name,phone});
+      prepared.authorize();
+      return accepted(await https('POST','/requests',prepared.body,staffMutation(prepared.key),targetPort),201).data();
+    };
+    const token = async (id:string) => (await db().db.query<{name_token:Buffer;phone_token:Buffer|null}>(`
+      SELECT name_token,phone_token FROM p06_crm.contact_search WHERE request_id=$1`,[id])).rows[0];
+    const oldName = 'Synthetic only before replacement';
+    const oldPhone = '+15550110111';
+    const replaced = text(await seed(oldName,oldPhone),'id');
+    const replacePath = `/requests/${replaced}`;
+    const revisionTag = async () => tag(accepted(await https('GET',replacePath,undefined,staff()),200));
+    accepted(await https('POST',`${replacePath}/commands/start-review`,{},staffMutation(undefined,await revisionTag())),200);
+    const etag = await revisionTag();
+    const { rows:[row] } = await db().db.query<{contact_id:string}>(`
+      SELECT current_contact_revision_id AS contact_id FROM foundation.requests WHERE id=$1`,[replaced]);
+    if (!row) { throw new Error('Missing contact revision'); }
+    const newName = 'Synthetic only after replacement';
+    const newPhone = '+15550110112';
+    const change = { evidenceId:randomUUID(),contact:{name:newName,phone:newPhone} };
+    mintEvidence(change.evidenceId,'CONTACT_CHANGE',canonicalJson({ requestId:replaced,contactRevisionId:row.contact_id,
+      permit:null,version:2,ifMatch:etag }),change);
+    accepted(await https('POST',`${replacePath}/commands/change-contact`,change,staffMutation(undefined,etag)),200);
+    expect(found(await find('name',oldName))).toEqual([]);
+    expect(found(await find('name',newName))).toEqual([replaced]);
+    expect(found(await find('phone',oldPhone))).toEqual([]);
+    expect(found(await find('phone',newPhone))).toEqual([]);
+    expect((await token(replaced))?.phone_token).toBeNull();
+
+    const linked = await issue();
+    const consentId = await given(linked);
+    const hidden = {name:'Synthetic channel name only',phone:'+15550110113'};
+    const repair = accepted(await https('POST',`${pub}/repair-requests`,{
+      contact:hidden,address,appliance:{categoryId:fixture.categoryId},fault:{faultIds:[fixture.faultId]},channelSelection:offers.ids,
+      consent:{evidenceId:consentId,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(linked,randomUUID())),201).data();
+    const { rows:[linkedRequest] } = await db().db.query<{id:string}>(
+      'SELECT id FROM foundation.requests WHERE public_number=$1',[repair['publicNumber']]);
+    if (!linkedRequest) { throw new Error('Missing indexed request'); }
+    const channelId = linkedRequest.id;
+    expect(found(await find('name',hidden.name))).toEqual([channelId]);
+    expect(found(await find('phone',hidden.phone))).toEqual([]);
+    const formRequest = `${pub}/request-session`;
+    const formTag = async () => tag(accepted(await https('GET',formRequest,undefined,proof(linked)),200));
+    const choose = await https('POST',`${formRequest}/contact-mode`,{phonePermission:true},mutate(linked,randomUUID(),await formTag()));
+    accepted(choose,200);
+    expect(found(await find('phone',hidden.phone))).toEqual([channelId]);
+    const revokedPhone = await https('POST',`${formRequest}/phone-permissions`,{action:'REVOKED'},mutate(linked,randomUUID(),await formTag()));
+    accepted(revokedPhone,200);
+    expect(found(await find('phone',hidden.phone))).toEqual([]);
+    expect((await token(channelId))?.phone_token).toBeNull();
+    const withdrawalKey = randomUUID();
+    accepted(await https('POST',`${pub}/form-session/consents`,{action:'REVOKED',evidenceRef:withdrawalKey,supersedesEvidenceId:consentId},
+      mutate(linked,withdrawalKey)),201);
+    expect(await token(channelId)).toBeUndefined();
+    expect(found(await find('name',hidden.name))).toEqual([]);
+
+    const oldApp = await launchWithPolicy(fixture.policyId,undefined,undefined,undefined,null);
+    const legacyName = 'Synthetic before search installation';
+    const legacyPhone = '+15550110114';
+    let legacyId: string;
+    try { legacyId = text(await seed(legacyName,legacyPhone,portOf(oldApp)),'id'); }
+    finally { await oldApp.app.close(); }
+    expect(found(await find('name',legacyName))).toEqual([]);
+    const oldToken = (await token(replaced))?.name_token;
+    const callback = await issue();
+    const callbackConsent = await given(callback);
+    const callbackContact = { name:'Synthetic rotation callback',phone:'+15550110115' };
+    const callbackReceipt = accepted(await https('POST',`${pub}/callback-requests`,{
+      contact:callbackContact,phonePermission:true,callbackIntervalId:fixture.callbackIntervalEntryId,
+      consent:{evidenceId:callbackConsent,documentVersionId:fixture.consentDocumentVersionId,accepted:true},
+    },mutate(callback)),201).data();
+    const expiring = await manualPrepared(undefined,{name:'Synthetic lost evidence during rebuild',phone:'+15550110116'});
+    expiring.authorize();
+    const expiringId = text(accepted(await https('POST','/requests',expiring.body,staffMutation(expiring.key)),201).data(),'id');
+    const rotated = await launchWithPolicy(fixture.policyId,undefined,undefined,undefined,{generation:randomUUID(),key:randomBytes(32)});
+    try {
+      const newIndex = activeSearch;
+      if (!newIndex) { throw new Error('Missing rotated search index'); }
+      const newPort = portOf(rotated);
+      failure(await find('name',legacyName,newPort),503,'NOT_READY');
+      const sourceSlots = managed.slots;
+      let withdrewBeforeOpen = false;
+      await rebuildSearchFixture(db(),newIndex,{ring:keyring,environment:'p05-isolated',keySlots:{...sourceSlots,
+        async read(ref) {
+          const wrap = await sourceSlots.read(ref);
+          if (ref.requestId !== expiringId) { return wrap; }
+          withdrewBeforeOpen = evidence.delete(expiring.body.evidenceId);
+          // Decryption would fail if the rebuilt path opened this wrap after revocation.
+          return {keyId:'missing-key',wrappedDek:wrap.wrappedDek};
+        },
+      }}, client => evidencePort.openRegistry?.(client) ?? Promise.reject(new Error('Missing evidence issuer')));
+      expect(withdrewBeforeOpen).toBe(true);
+      expect(await token(expiringId)).toBeUndefined();
+      failure(await find('name',legacyName),503,'NOT_READY');
+      expect(found(await find('phone',legacyPhone,newPort))).toEqual([legacyId]);
+      const callbackMatches = found(await find('phone',callbackContact.phone,newPort));
+      expect(callbackMatches).toHaveLength(1);
+      expect(found(await find('number',text(callbackReceipt,'publicNumber')))).toEqual(callbackMatches);
+      const callbackTag = tag(accepted(await https('GET',formRequest,undefined,proof(callback)),200));
+      accepted(await https('POST',`${formRequest}/phone-permissions`,{action:'REVOKED'},mutate(callback,randomUUID(),callbackTag)),200);
+      expect(found(await find('phone',callbackContact.phone,newPort))).toEqual([]);
+      expect(await token(channelId)).toBeUndefined();
+      expect((await token(replaced))?.name_token).not.toEqual(oldToken);
+      expect((await token(replaced))?.phone_token).toBeNull();
+      await rebuild(newIndex);
+      expect(found(await find('name',legacyName,newPort))).toEqual([legacyId]);
+    } finally {
+      try { await rebuild(original); } finally {
+        activeSearch = original;
+        await rotated.app.close();
+      }
+    }
+  },90000);
+
+  it.runIf(searchProof)('P06 search limits the retained and locked results across bounded candidate batches', async () => {
+    if (!testApp || !activeSearch) { throw new Error('Missing isolated search'); }
+    const app = testApp;
+    const proof = {kind:'staff-web' as const,token:db().admin.token};
+    const target = {name:'Synthetic common name batch',phone:'+15550110200'};
+    const ids: string[] = [];
+    for (let index = 0; index < 70; index++) {
+      const prepared = await manualPrepared(undefined,target);
+      prepared.authorize();
+      const { receipt } = await app.service.submitStaff(proof,{key:prepared.key,bytes:Buffer.from(JSON.stringify(prepared.body))});
+      if (index < 51) { ids.unshift(receipt.requestId); }
+      else { evidence.delete(prepared.body.evidenceId); }
+    }
+    const client = await app.filePool.connect();
+    try {
+      await client.query('BEGIN');
+      let batches = 0;
+      let locked = 0;
+      const wrapped = new Proxy(client,{get(targetClient,key) {
+        if (key !== 'query') { return Reflect.get(targetClient,key,targetClient) as unknown; }
+        return async (sql: string, parameters: unknown[]) => {
+          if (sql.includes('LIMIT 64')) { batches++; }
+          if (sql.includes('ORDER BY id FOR SHARE')) {
+            expect(parameters[0]).toHaveLength(51);
+            locked++;
+          }
+          return await targetClient.query(sql,parameters);
+        };
+      }});
+      const key = activeSearch.token('name',fixture.cityId,target.name.toLowerCase());
+      const data = await readRegistrySearch(wrapped,fixture.cityId,{kind:'name',key},
+        item => evidence.get(item.id)?.procedureRevision === item.procedureRevision);
+      expect(batches).toBe(2);
+      expect(locked).toBe(1);
+      expect(data.truncated).toBe(true);
+      expect(data.items.map(item => item.id)).toEqual(ids.slice(0,50));
+    } finally {
+      try { await client.query('ROLLBACK'); } finally { client.release(); }
+    }
+  },150000);
+
   it('callback is consent-bound, single effect and exact replay; revoke changes both GET validators without changing row_version', async () => {
     const f=await issue();
     const cb=`${pub}/callback-requests`;
@@ -429,13 +1231,25 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     const evidenceId=await given(f);
     const repair=`${pub}/repair-requests`;
     const body={contact,address:{...address,districtId:fixture.districtId},appliance:{categoryId:fixture.categoryId},
-      fault:{otherDescription:'Synthetic other symptom sentinel'},
+      fault:{otherDescription:'Synthetic other symptom sentinel'},urgency:'WITHIN_DAY',
       consent:{evidenceId,documentVersionId:fixture.consentDocumentVersionId,accepted:true},channelSelection:offers.ids};
     const key=randomUUID();
     failure(await https('POST',repair,{...body,fault:{}},mutate(f,key)),422,'SEMANTIC');
     expect(await db().count('SELECT count(*)::int n FROM foundation.request_events WHERE idempotency_key=$1',[key])).toBe(0);
     const created=accepted(await https('POST',repair,body,mutate(f,key)),201);
     expect(created.data()['status']).toBe('WAITING_TELEGRAM_LINK');
+    const { rows:[stamp] } = await db().db.query<{ instant: string }>(`SELECT
+      to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS instant
+      FROM foundation.requests WHERE public_number=$1`,[created.data()['publicNumber']]);
+    if (!stamp) { throw new Error('Missing captured request'); }
+    const timestamp = encodeURIComponent(stamp.instant);
+    const included = await https('GET',`/requests?from=${timestamp}&status=WAITING_TELEGRAM_LINK&urgency=WITHIN_DAY&contactMode=CHANNEL&provider=TG`,undefined,staff());
+    expect(accepted(included,200).data()['items']).toContainEqual(expect.objectContaining({publicNumber:created.data()['publicNumber']}));
+    for (const filter of ['status=NEW','urgency=FLEXIBLE','contactMode=PHONE','provider=VK']) {
+      expect(accepted(await https('GET',`/requests?from=${timestamp}&${filter}`,undefined,staff()),200).data()).toEqual({items:[],nextCursor:null});
+    }
+    expect(accepted(await https('GET',`/requests?to=${timestamp}&status=WAITING_TELEGRAM_LINK&urgency=WITHIN_DAY&provider=TG`,undefined,staff()),200)
+      .data()['items']).not.toContainEqual(expect.objectContaining({publicNumber:created.data()['publicNumber']}));
     const fault=await db().db.query(`SELECT f.is_other,f.fault_id,f.fault_version_id FROM foundation.request_faults f
       JOIN foundation.requests q ON q.id=f.request_id AND q.current_appliance_revision_id=f.appliance_revision_id
       WHERE q.public_number=$1`,[created.data()['publicNumber']]);
@@ -608,6 +1422,8 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     wrongPins.set(policyPairKey(historical.workflowVersion,historical.policyRevision),REQUEST_POLICY_METADATA_SHA256);
     const wrong = await launchWithPolicy(fixture.policyId,wrongPins);
     try {
+      const card = accepted(await https('GET',`${path}/card`,undefined,staff(),portOf(wrong)),200);
+      expect(card.data()).toMatchObject({id,version:1,canStartReview:false});
       failure(await https('POST',`${path}/commands/start-review`,{},staffMutation(key,etag),portOf(wrong)),503,'REQUEST_RULES_UNAVAILABLE');
     } finally { await wrong.app.close(); }
     expect(await db().count('SELECT count(*)::int n FROM foundation.request_events WHERE idempotency_key=$1',[key])).toBe(0);
@@ -856,19 +1672,37 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
   },90000);
 
   it('conceals a fresh manual target before decoding an unauthorized CITY actor’s body', async () => {
-    const manager = await db().webStaff();
+    // P05 grants are intentionally not delegable through the staff HTTP API.
+    // Create this isolated matrix actor as a DB fixture instead of weakening the
+    // production requireDelegable policy just to obtain a synthetic MANAGER.
+    const managerId = randomUUID();
+    const managerRoleId = await db().systemRole('MANAGER');
     const provision = await db().db.connect();
     try {
       await provision.query('BEGIN');
       await lockAccessPolicy(provision,'write');
+      // Staff + current system role must be committed atomically: the deferred
+      // rbac_staff_current constraint validates the complete employee at COMMIT.
+      await provision.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES ($1,'MANAGER','ACTIVE',0)",
+        [managerId]);
+      await provision.query('INSERT INTO foundation.staff_role_assignments(id,staff_id,role_id) VALUES ($1,$2,$3)',
+        [randomUUID(),managerId,managerRoleId]);
+      const permissions = ['requests.read','requests.create'];
+      // Earlier matrix scenarios can already have seeded these MANAGER grants.
       await provision.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type)
-        SELECT r.id,p,'CITY' FROM foundation.roles r CROSS JOIN unnest($1::text[]) p
-        WHERE r.role_type='SYSTEM' AND r.code='MANAGER'`, [['requests.read','requests.create']]);
+        SELECT $1,p,'CITY' FROM unnest($2::text[]) p
+        ON CONFLICT (role_id,permission_code) DO NOTHING`, [managerRoleId,permissions]);
+      const cityGrants = await provision.query(`SELECT permission_code FROM foundation.role_permissions
+        WHERE role_id=$1 AND permission_code=ANY($2::text[]) AND scope_type='CITY' AND enabled`,
+        [managerRoleId,permissions]);
+      expect(cityGrants.rowCount).toBe(permissions.length);
       await provision.query('COMMIT');
     } catch (error) {
       await provision.query('ROLLBACK');
       throw error;
     } finally { provision.release(); }
+    const managerCredentials = await db().credentials(managerId);
+    const manager = await db().login(managerId,managerCredentials.login,managerCredentials.password);
     const mutateAsManager = (key: string) => ({ Cookie:manager.cookie, 'Idempotency-Key':key,
       'X-CSRF-Token':createHmac('sha256',staffCsrf).update('web-auth-csrf\0').update(manager.token).digest('base64url') });
     const manual = await manualPrepared();
@@ -1497,4 +2331,91 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       },
     });
   },90000);
+
+  it.runIf(process.env['FIXLEVELUP_P06_LOAD_PROOF'] === '1')('P06 registry measures a multi-page PostgreSQL fixture under runtime role', async () => {
+    if (!testApp) { throw new Error('Missing isolated app'); }
+    const app = testApp;
+    const { rows: [clock] } = await db().db.query<{ instant: string }>(`SELECT
+      to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS instant`);
+    if (!clock) { throw new Error('Missing fixture clock'); }
+    const proof = { kind:'staff-web' as const,token:db().admin.token };
+    async function createRepair() {
+      const { authorize, key, body } = await manualPrepared(fixture.districtId);
+      authorize();
+      return (await app.service.submitStaff(proof, { key,bytes:Buffer.from(JSON.stringify(body)) })).receipt.publicNumber;
+    }
+    const created: string[] = [];
+    for (let index = 0; index < 105; index++) { created.push(await createRepair()); }
+
+    const query = parseRegistryQuery(new URLSearchParams({from:clock.instant,limit:'100',categoryId:fixture.categoryId}));
+    const first = await app.service.readStaffRegistry(proof, query);
+    expect(first.items).toHaveLength(100);
+    expect(first.nextCursor).not.toBeNull();
+    const inserted = await createRepair();
+    const second = await app.service.readStaffRegistry(proof, { ...query,cursor:first.nextCursor });
+    expect(second.nextCursor).toBeNull();
+    const numbers = [...first.items,...second.items].map(item => item.publicNumber);
+    expect(numbers).toEqual(created.reverse());
+    expect(numbers).not.toContain(inserted);
+
+    const { cityId, cityVersionId } = fixture;
+    const client = await app.filePool.connect();
+    try {
+      const { rows: [identity] } = await client.query<{ role: string }>('SELECT current_user AS role');
+      expect(identity?.role).toBe('fixlevelup_runtime');
+      let executions = 0;
+      const explain = new Proxy(client, { get(target, key) {
+        if (key !== 'query') { return Reflect.get(target, key, target) as unknown; }
+        return async (sql: string, parameters: unknown[]) => {
+          executions++;
+          const result = await target.query<{ 'QUERY PLAN': readonly { 'Execution Time': number }[] }>(
+            `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, parameters);
+          const milliseconds = result.rows[0]?.['QUERY PLAN'][0]?.['Execution Time'];
+          expect(milliseconds).toBeGreaterThan(0);
+          process.stdout.write(`P06 registry PostgreSQL execution ${String(milliseconds)} ms\n`);
+          return await target.query(sql, parameters);
+        };
+      } });
+      const page = await readVisibleRegistry(explain, {cityId,cityVersionId,timezone:'UTC'}, query,
+        item => evidence.get(item.id)?.procedureRevision === item.procedureRevision);
+      expect(page.items).toHaveLength(100);
+      expect(executions).toBe(1);
+
+      // Keep the persisted request facts and run the production ordering with a
+      // deterministic timestamp projection. This avoids changing P05's clock or schema.
+      const tied = new Proxy(client, { get(target, key) {
+        if (key !== 'query') { return Reflect.get(target, key, target) as unknown; }
+        return async (sql: string, parameters: unknown[]) => {
+          const pair = parameters.length + 1;
+          const near = pair + 1;
+          const fixtureSql = sql.replace('FROM foundation.requests AS request', `FROM (
+            SELECT id,city_id,public_number,type,status,row_version,current_appliance_revision_id,
+              current_address_revision_id,current_preference_revision_id,
+              CASE WHEN public_number = ANY($${String(pair)}::bigint[]) THEN '2090-01-01 00:00:00.123456Z'::timestamptz
+                WHEN public_number = $${String(near)}::bigint THEN '2090-01-01 00:00:00.123455Z'::timestamptz
+                ELSE created_at END AS created_at
+            FROM foundation.requests
+          ) AS request`);
+          expect(fixtureSql).not.toBe(sql);
+          return await target.query(fixtureSql, [...parameters, numbers.slice(1,3), numbers[0]]);
+        };
+      } });
+      const scope = {cityId,cityVersionId,timezone:'UTC'};
+      const boundary = parseRegistryQuery(new URLSearchParams({from:'2090-01-01T00:00:00.123455Z',
+        to:'2090-01-01T00:00:00.123457Z',limit:'1'}));
+      const current = (item: {id: string; procedureRevision: string}) => evidence.get(item.id)?.procedureRevision === item.procedureRevision;
+      const a = await readVisibleRegistry(tied, scope, boundary, current);
+      const b = await readVisibleRegistry(tied, scope, { ...boundary,cursor:a.nextCursor }, current);
+      const c = await readVisibleRegistry(tied, scope, { ...boundary,cursor:b.nextCursor }, current);
+      expect([a,b,c].flatMap(result => result.items.map(item => [item.publicNumber,item.createdAt]))).toEqual([
+        [numbers[1],'2090-01-01T00:00:00.123456Z'],
+        [numbers[2],'2090-01-01T00:00:00.123456Z'],
+        [numbers[0],'2090-01-01T00:00:00.123455Z'],
+      ]);
+      expect(c.nextCursor).toBeNull();
+      const exclusive = await readVisibleRegistry(tied, scope, { ...boundary,to:'2090-01-01T00:00:00.123456Z' }, current);
+      expect(exclusive.items.map(item => item.publicNumber)).toEqual([numbers[0]]);
+      expect(exclusive.nextCursor).toBeNull();
+    } finally { client.release(); }
+  },180000);
 });

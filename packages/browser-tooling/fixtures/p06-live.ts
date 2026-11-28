@@ -1,0 +1,318 @@
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { readFile } from 'node:fs/promises';
+import { request as http } from 'node:http';
+import { createServer, request as https } from 'node:https';
+import { createRequire } from 'node:module';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
+import { chromium, expect } from '@playwright/test';
+
+const loopback = '127.0.0.1';
+const webPort = 4175;
+const registryPath = '/crm/requests';
+const list = '/api/v1/requests';
+const optionsPath = `${list}/filters`;
+const searchPath = `${list}/search`;
+const dashboardPage = '/crm/dashboard';
+const dashboardApi = '/api/v1/crm/dashboard';
+const browserEndpoint = `ws://${loopback}:4178/p06-registry`;
+const web = new URL('../../../apps/web/', import.meta.url);
+const next = createRequire(new URL('package.json', web)).resolve('next/dist/bin/next');
+
+interface Fixture {
+  readonly origin: string;
+  readonly apiPort: number;
+  readonly key: Buffer;
+  readonly cert: Buffer;
+  readonly sessionToken: string;
+  readonly publicNumber: string;
+  readonly requestId: string;
+  readonly checkPanels: boolean;
+  readonly checkSearch: boolean;
+  readonly checkDashboard: boolean;
+  /** Optional: bump the request version through the real API (stale-ETag race). */
+  readonly bumpVersion?: () => Promise<void>;
+  /** Optional: revoke the caller's PII authority through the real API/policy. */
+  readonly revokeContact?: () => Promise<void>;
+}
+
+export async function proveLiveRegistry(fixture: Fixture) {
+  if (process.env['FIXLEVELUP_SYNTHETIC_ORCHESTRATOR'] !== '1' || process.env['FIXLEVELUP_P06_BROWSER'] !== '1'
+    || fixture.origin !== 'https://crm.example.test'
+    || (await readFile('/proc/net/dev', 'utf8')).trim().split('\n').slice(2).some(line => !/^\s*lo:/u.test(line))) {
+    throw new Error('P06 browser proof requires the isolated loopback lab');
+  }
+
+  const child = spawn(process.execPath, [next, 'start', '--hostname', loopback, '--port', String(webPort)], {
+    cwd: fileURLToPath(web), stdio: 'ignore',
+    env: { PATH: process.env['PATH'], HOME: process.env['HOME'], NODE_ENV: 'production', NEXT_TELEMETRY_DISABLED: '1' },
+  });
+  const stopped = once(child, 'exit');
+  let unexpected = 0;
+  const cardPage = `${registryPath}/${fixture.requestId}`;
+  const cardApi = `${list}/${fixture.requestId}/card`;
+  const eventApi = `${list}/${fixture.requestId}/events`;
+  const reviewApi = `${list}/${fixture.requestId}/commands/start-review`;
+  const commentApi = `${list}/${fixture.requestId}/comments`;
+  const contactApi = `${list}/${fixture.requestId}/contact-details`;
+  const ingress = createServer({ key: fixture.key, cert: fixture.cert }, (req, res) => {
+    const path = new URL(req.url ?? '/', fixture.origin).pathname;
+    const api = path === list || path === optionsPath || path === cardApi || path === eventApi || path === reviewApi
+      || (fixture.checkPanels && (path === commentApi || path === contactApi)) || (fixture.checkSearch && path === searchPath)
+      || (fixture.checkDashboard && path === dashboardApi);
+    const methodOk = path === reviewApi || (fixture.checkSearch && path === searchPath) ? req.method === 'POST'
+      : req.method === 'GET' || (fixture.checkPanels && path === commentApi && req.method === 'POST');
+    if (req.headers.host !== new URL(fixture.origin).host || !methodOk
+      || (!api && path !== registryPath && path !== cardPage && (!fixture.checkDashboard || path !== dashboardPage)
+        && !path.startsWith('/_next/static/') && path !== '/favicon.ico')) {
+      unexpected++;
+      res.writeHead(404).end();
+      return;
+    }
+    const target = { host: loopback, port: api ? fixture.apiPort : webPort, path: req.url, method: req.method, headers: req.headers };
+    const forward = (response: import('node:http').IncomingMessage) => {
+      res.writeHead(response.statusCode ?? 502, response.headers);
+      response.pipe(res);
+    };
+    const upstream = api ? https({ ...target, ca: fixture.cert, servername: 'localhost' }, forward) : http(target, forward);
+    upstream.once('error', () => { if (!res.headersSent) { res.writeHead(502); } res.end(); });
+    upstream.setTimeout(10_000, () => upstream.destroy());
+    res.once('close', () => upstream.destroy());
+    req.pipe(upstream);
+  });
+
+  const ready = async () => {
+    for (let attempt = 0; attempt < 30 && child.exitCode === null; attempt++) {
+      try {
+        const response = await fetch(`http://${loopback}:${String(webPort)}${registryPath}`, { signal: AbortSignal.timeout(500) });
+        await response.body?.cancel();
+        if (response.ok) { return; }
+      } catch { /* Next is still starting. */ }
+      await delay(250);
+    }
+    throw new Error('Production Next registry page did not start');
+  };
+
+  let browser: Awaited<ReturnType<typeof chromium.connect>> | undefined;
+  try {
+    await ready();
+    ingress.listen(443, loopback);
+    await once(ingress, 'listening');
+    browser = await chromium.connect(browserEndpoint, { timeout: 10_000 });
+    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    try {
+      const page = await context.newPage();
+      page.setDefaultTimeout(10_000);
+      const pageUrl = `${fixture.origin}${registryPath}`;
+      const heading = page.getByRole('heading', { name: 'Реестр заявок' });
+      const result = page.getByRole('region', { name: 'Заявки' });
+      const row = result.getByRole('row').filter({ hasText: fixture.publicNumber });
+      const consoleErrors: Error[] = [];
+      page.on('pageerror', error => consoleErrors.push(error));
+      const byPath = (path: string) => page.waitForResponse(response => new URL(response.url()).pathname === path);
+
+      const [anonymous] = await Promise.all([byPath(list), page.goto(pageUrl)]);
+      expect(anonymous.status()).toBe(401);
+      await expect(heading).toBeVisible();
+      await expect(result.getByRole('alert')).toContainText('Войдите в CRM');
+      await expect(row).toHaveCount(0);
+
+      // The existing real staff login fixture has already created this session.
+      await context.addCookies([{ name: '__Host-fixlevelup_session', value: fixture.sessionToken,
+        url: fixture.origin, secure: true, httpOnly: true, sameSite: 'Strict' }]);
+      const [listed, choices] = await Promise.all([byPath(list), byPath(optionsPath), page.reload()]);
+      expect(listed.status()).toBe(200);
+      expect(choices.status()).toBe(200);
+      expect(listed.headers()['cache-control']).toMatch(/^no-store\b/u);
+      expect(choices.headers()['cache-control']).toMatch(/^no-store\b/u);
+      await expect(row).toContainText('Ремонт');
+      await expect(result).not.toContainText('Synthetic intake sentinel');
+      await expect(result).not.toContainText('+15550100001');
+
+      const category = page.getByRole('combobox', { name: 'Тип техники', exact: true });
+      const district = page.getByRole('combobox', { name: 'Район', exact: true });
+      const source = page.getByRole('combobox', { name: 'Источник', exact: true });
+      await expect(category.getByRole('option', { name: 'Synthetic category' })).toHaveCount(1);
+      await expect(district.getByRole('option', { name: 'Synthetic district' })).toHaveCount(1);
+      await expect(source.getByRole('option', { name: 'Synthetic REQUEST_SOURCE' })).toHaveCount(1);
+      await expect(page.getByText('Фильтры по мастеру, оплате и проблемам пока недоступны.')).toBeVisible();
+      const apply = page.getByRole('button', { name: 'Применить' });
+      const categoryId = await category.selectOption({ label: 'Synthetic category' });
+      const districtId = await district.selectOption({ label: 'Synthetic district' });
+      const sourceId = await source.selectOption({ label: 'Synthetic REQUEST_SOURCE' });
+      const [filtered] = await Promise.all([byPath(list), apply.click()]);
+      const query = new URL(filtered.url()).searchParams;
+      expect(query.get('categoryId')).toBe(categoryId[0]);
+      expect(query.get('districtId')).toBe(districtId[0]);
+      expect(query.get('sourceId')).toBe(sourceId[0]);
+      await expect(row).toBeVisible();
+
+      await page.getByLabel('Создана с (UTC)').fill('2099-01-01T00:00');
+      const [empty] = await Promise.all([byPath(list), apply.click()]);
+      expect(new URL(empty.url()).searchParams.get('from')).toBe('2099-01-01T00:00:00.000Z');
+      await expect(result.getByRole('status')).toHaveText('Заявок по выбранным фильтрам нет.');
+      await expect(row).toHaveCount(0);
+
+      await page.getByRole('button', { name: 'Сбросить' }).click();
+      await expect(row).toBeVisible();
+      await expect(category).toHaveValue('');
+      await expect(district).toHaveValue('');
+      await expect(source).toHaveValue('');
+      if (fixture.checkDashboard) {
+        const [dashboard] = await Promise.all([byPath(dashboardApi),page.getByRole('link',{name:'Дашборд CRM',exact:true}).click()]);
+        expect(dashboard.status()).toBe(200);
+        expect(dashboard.headers()['cache-control']).toMatch(/^no-store\b/u);
+        await expect(page.getByRole('heading',{name:'Дашборд CRM'})).toBeVisible();
+        const pending = page.getByRole('region',{name:'Другие показатели'});
+        await expect(pending.getByText('Пока недоступно',{exact:true})).toHaveCount(7);
+        await expect(pending.getByRole('link')).toHaveCount(0);
+        const metric = page.getByRole('link',{name:'Новые заявки',exact:true});
+        await expect(metric.getByText('1',{exact:true})).toBeVisible();
+        const timestamp = await page.locator('time').getAttribute('datetime');
+        const [drilled] = await Promise.all([
+          page.waitForResponse(response => {
+            const url = new URL(response.url());
+            return url.pathname === list && url.searchParams.get('metric') === 'newRequests';
+          }),metric.click(),
+        ]);
+        expect(drilled.status()).toBe(200);
+        const snapshots = page.getByRole('region',{name:'Новые заявки'});
+        await expect(snapshots.getByText('Заявок в снимке: 1.',{exact:true})).toBeVisible();
+        await expect(snapshots.getByRole('link',{name:fixture.publicNumber})).toBeVisible();
+        expect(await snapshots.locator('time').first().getAttribute('datetime')).toBe(timestamp);
+        const stale = `${pageUrl}?snapshot=${randomUUID()}&metric=newRequests&offset=30`;
+        await page.goto(stale);
+        await expect(snapshots.getByText('Снимок обновлён. Показана первая страница актуального списка.',{exact:true})).toBeVisible();
+        await expect(snapshots.getByRole('link',{name:fixture.publicNumber})).toBeVisible();
+        await page.getByRole('link',{name:'Весь реестр',exact:true}).click();
+        await expect(row).toBeVisible();
+      }
+      let cardLink = row.getByRole('link', { name:fixture.publicNumber });
+      if (fixture.checkSearch) {
+        const search = page.getByRole('region',{name:'Поиск заявок'});
+        const kind = search.getByRole('combobox',{name:'Искать по'});
+        const submit = search.getByRole('button',{name:'Найти'});
+        const searchFor = async (mode: 'number'|'name'|'phone', label: string, query: string) => {
+          await kind.selectOption(mode);
+          const value = search.getByRole('textbox',{name:label});
+          await value.fill(query);
+          const [searched] = await Promise.all([byPath(searchPath),submit.click()]);
+          expect(searched.status()).toBe(200);
+          expect(searched.request().method()).toBe('POST');
+          expect(new URL(searched.url()).search).toBe('');
+          expect(searched.request().postDataJSON()).toEqual({kind:mode,query});
+          await expect(value).toHaveValue('');
+          expect(page.url()).toBe(pageUrl);
+        };
+        await searchFor('number','Номер заявки',fixture.publicNumber);
+        await expect(search.getByRole('link',{name:fixture.publicNumber})).toBeVisible();
+        await searchFor('name','Имя клиента','SYNTHETIC INTAKE SENTINEL');
+        await expect(search.getByRole('link',{name:fixture.publicNumber})).toBeVisible();
+        await searchFor('phone','Телефон','+1 (555) 010-0001');
+        cardLink = search.getByRole('link',{name:fixture.publicNumber});
+        await expect(cardLink).toBeVisible();
+        await expect(search).not.toContainText('+15550100001');
+        await expect(search).not.toContainText('Synthetic intake sentinel');
+      }
+      const [card, timeline] = await Promise.all([
+        byPath(cardApi), byPath(eventApi), cardLink.click(),
+      ]);
+      expect(card.status()).toBe(200);
+      expect(timeline.status()).toBe(200);
+      expect(card.headers()['cache-control']).toMatch(/^no-store\b/u);
+      await expect(page.getByRole('heading', { name:`Заявка № ${fixture.publicNumber}` })).toBeVisible();
+      const details = page.getByRole('region',{name:'Основные сведения'});
+      await expect(details.getByText('Synthetic category',{exact:true})).toBeVisible();
+      await expect(details.getByText('Synthetic district',{exact:true})).toBeVisible();
+      await expect(page.getByRole('region',{name:'Пока недоступно'}).getByText('Отчёты',{exact:true})).toBeVisible();
+      await expect(page.getByRole('region', { name:'Последние события заявки' }).getByRole('table')).toContainText('Сотрудник');
+      const [review] = await Promise.all([byPath(reviewApi),page.getByRole('button',{name:'Начать проверку'}).click()]);
+      expect(review.status()).toBe(200);
+      await expect(page.getByText('Проверка заявки начата.')).toBeVisible();
+      await expect(page.getByRole('cell',{name:'Начата проверка менеджером'})).toBeVisible();
+      await expect(page.getByRole('main')).not.toContainText('+15550100001');
+      if (fixture.checkPanels) {
+        const comments = page.getByRole('region',{name:'Внутренние комментарии'});
+        await comments.getByRole('textbox',{name:'Текст комментария'}).fill('Проверить наличие детали.');
+        const [added] = await Promise.all([
+          page.waitForResponse(response => new URL(response.url()).pathname === commentApi && response.request().method() === 'POST'),
+          comments.getByRole('button',{name:'Добавить комментарий'}).click(),
+        ]);
+        expect(added.status()).toBe(201);
+        await expect(comments.getByText('Проверить наличие детали.',{exact:true})).toBeVisible();
+        // A second, distinct comment is a separate idempotency key: both are
+        // rendered, newest first, and neither is duplicated.
+        await comments.getByRole('textbox',{name:'Текст комментария'}).fill('Согласовать с клиентом.');
+        const [second] = await Promise.all([
+          page.waitForResponse(response => new URL(response.url()).pathname === commentApi && response.request().method() === 'POST'),
+          comments.getByRole('button',{name:'Добавить комментарий'}).click(),
+        ]);
+        expect(second.status()).toBe(201);
+        expect(second.request().postDataJSON()).toEqual({text:'Согласовать с клиентом.'});
+        await expect(comments.getByText('Согласовать с клиентом.',{exact:true})).toBeVisible();
+        const rendered = await comments.locator('li').allInnerTexts();
+        expect(rendered.filter(text => text.includes('Проверить наличие детали.'))).toHaveLength(1);
+        expect(rendered.filter(text => text.includes('Согласовать с клиентом.'))).toHaveLength(1);
+        expect(rendered[0]).toContain('Согласовать с клиентом.');
+        if (fixture.bumpVersion) {
+          // A concurrent committed change makes the retained ETag stale: the UI
+          // must refuse, explain, and only then allow an explicit refresh + retry.
+          await fixture.bumpVersion();
+          await comments.getByRole('textbox',{name:'Текст комментария'}).fill('После параллельного изменения.');
+          const [stale] = await Promise.all([
+            page.waitForResponse(response => new URL(response.url()).pathname === commentApi && response.request().method() === 'POST'),
+            comments.getByRole('button',{name:'Добавить комментарий'}).click(),
+          ]);
+          expect(stale.status()).toBe(412);
+          await expect(comments.getByRole('alert')).toHaveText('Заявка изменилась. Обновите карточку перед отправкой комментария.');
+          // Nothing was committed: the list still holds exactly the two comments.
+          expect(await comments.locator('li').count()).toBe(2);
+          const [refreshed] = await Promise.all([byPath(cardApi),comments.getByRole('button',{name:'Обновить карточку'}).click()]);
+          expect(refreshed.status()).toBe(200);
+          // The refresh re-issues the card proof and keeps the drafted text; the
+          // retry must then commit exactly once with the fresh ETag/CSRF pair.
+          const retryText = comments.getByRole('textbox',{name:'Текст комментария'});
+          await expect(retryText).toHaveValue('После параллельного изменения.');
+          const [retried] = await Promise.all([
+            page.waitForResponse(response => new URL(response.url()).pathname === commentApi && response.request().method() === 'POST'),
+            comments.getByRole('button',{name:'Добавить комментарий'}).click(),
+          ]);
+          expect(retried.status()).toBe(201);
+          await expect(comments.getByText('После параллельного изменения.',{exact:true})).toBeVisible();
+        }
+        const contacts = page.getByRole('region',{name:'Контактные данные'});
+        const [revealed] = await Promise.all([byPath(contactApi),contacts.getByRole('button',{name:'Показать контактные данные'}).click()]);
+        expect(revealed.status()).toBe(200);
+        expect(revealed.headers()['cache-control']).toMatch(/^no-store\b/u);
+        await expect(contacts).toContainText('+15550100001');
+        await contacts.getByRole('button',{name:'Скрыть контактные данные'}).click();
+        await expect(contacts).not.toContainText('+15550100001');
+        if (fixture.revokeContact) {
+          // After the authority is revoked the panel must fail closed and must not
+          // leave the previously revealed plaintext on screen.
+          await fixture.revokeContact();
+          const [denied] = await Promise.all([
+            page.waitForResponse(response => new URL(response.url()).pathname === contactApi),
+            contacts.getByRole('button',{name:'Показать контактные данные'}).click(),
+          ]);
+          expect([403,404]).toContain(denied.status());
+          await expect(contacts.getByRole('alert')).toHaveText('Контактные данные сейчас недоступны.');
+          await expect(contacts).not.toContainText('+15550100001');
+          await expect(page.getByRole('main')).not.toContainText('+15550100001');
+        }
+      }
+      expect(consoleErrors).toHaveLength(0);
+      expect(unexpected).toBe(0);
+    } finally {
+      await context.close();
+    }
+  } finally {
+    await browser?.close();
+    ingress.closeAllConnections();
+    ingress.close();
+    child.kill();
+    await stopped;
+  }
+}

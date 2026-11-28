@@ -5,7 +5,7 @@ import type { ArgumentsHost, ExceptionFilter } from '@nestjs/common';
 import { matchP05Route, P05_BODY_BYTES, P05_PROBLEM_STATUS, parseP05Etag } from '@fixlevelup/p03-contracts/p05';
 import type { P05Operation, P05ProblemCode } from '@fixlevelup/p03-contracts/p05';
 import type { StaffRequest } from '../../auth/http.js';
-import { expectExactOrigin, header, requireMutation, sessionToken } from '../../auth/http.js';
+import { expectExactOrigin, header, requireMutation, sessionToken, staffSessionCsrf } from '../../auth/http.js';
 import type { WebAuthHttpConfig } from '../../auth/web-auth.controller.js';
 import { AuthorizationError } from '../../authz/authorization.service.js';
 import { F_MAX_COOKIE_BYTES, FormSessionError } from '../../form-session/contract.js';
@@ -13,6 +13,10 @@ import { formatHostCookie } from '../../form-session/cookies.js';
 import { FormSessionAuthError } from '../../form-session/service.js';
 import { boundedJsonForFormSession } from '../../form-session/body-parser.js';
 import { closeAfterProblem, readBoundedJson } from '../../settings/management/body-parser.js';
+import { parseRegistryQuery } from '../registry/filters.js';
+import { COMMENT_BODY_BYTES } from '../card/comments.js';
+import { SEARCH_BODY_BYTES } from '../search/contract.js';
+import { parseDashboardLink } from '../dashboard/contract.js';
 import { deny, RequestFailure } from './errors.js';
 import type { FProof, RequestIntake, StaffCommand, WriteInput, WriteResult } from './service.js';
 
@@ -29,7 +33,33 @@ interface HttpDependencies {
 }
 export const REQUEST_INTAKE_HTTP = Symbol('REQUEST_INTAKE_HTTP');
 const RAW_HEADERS = ['cookie','origin','authorization','content-type','content-encoding','content-length',
-  'transfer-encoding','x-form-session-id','x-csrf-token','idempotency-key','if-match','if-none-match'];
+  'transfer-encoding','x-form-session-id','x-auth-request','x-csrf-token','idempotency-key','if-match','if-none-match'];
+
+function registryQueryString(method: string, target: string): string | null {
+  if (method !== 'GET') { return null; }
+  const separator = target.indexOf('?');
+  const path = separator === -1 ? target : target.slice(0, separator);
+  if (path !== '/api/v1/requests') { return null; }
+  return separator === -1 ? '' : target.slice(separator + 1);
+}
+
+function crmDetail(method: string, target: string) {
+  if (method !== 'GET' && method !== 'POST') { return null; }
+  const detail = /^(.+)\/(card|events|comments|contact-details)$/.exec(target);
+  const route = detail?.[1] === undefined ? null : matchP05Route('GET',detail[1]);
+  if (route?.operation !== 'readStaffRequest' || detail?.[0] !== target) { return null; }
+  const resource = detail[2];
+  if (resource !== 'comments' && method !== 'GET') { return null; }
+  return { id:route.params.id, resource };
+}
+
+function isRegistrySearch(method: string, target: string): boolean {
+  return method === 'POST' && target === '/api/v1/requests/search';
+}
+
+function isDashboard(method: string, target: string): boolean {
+  return method === 'GET' && target === '/api/v1/crm/dashboard';
+}
 
 /** Install only in T. Unknown aliases don't get interpreted or forwarded as a
  * successful route; real P03/P04 and S2 paths keep their own parser. */
@@ -37,15 +67,26 @@ export function intakeBody(readiness: Readiness) {
   const form = boundedJsonForFormSession(readiness);
   return (req: StaffRequest,res: ServerResponse,next: (error?: HttpException) => void): void => {
     const method = req.method ?? '';
-    const matched = matchP05Route(method,req.url ?? '');
-    if (!matched) { form(req,res,next); return; }
+    const target = req.url ?? '';
+    const detail = crmDetail(method,target);
+    const search = isRegistrySearch(method,target);
+    if (registryQueryString(method,target) === null && !isRegistryOptions(method,target) && !isDashboard(method,target)
+      && !search && !detail && !matchP05Route(method,target)) {
+      form(req,res,next); return;
+    }
     void readiness.requestEffectsReady().then((ready) => {
       if (!ready) { return deny('NOT_READY'); }
-      if (!res.destroyed) { readBoundedJson(req,res,next,{ limit:P05_BODY_BYTES, decode:null, forbidBody:method === 'GET' }); }
+      const limit = search ? SEARCH_BODY_BYTES : detail?.resource === 'comments' ? COMMENT_BODY_BYTES : P05_BODY_BYTES;
+      if (!res.destroyed) { readBoundedJson(req,res,next,{ limit,
+        decode:null, forbidBody:method === 'GET' }); }
     }).catch(() => {
       if (!res.destroyed) { closeAfterProblem(req,res); next(new RequestFailure('NOT_READY')); }
     });
   };
+}
+
+function isRegistryOptions(method: string, target: string): boolean {
+  return method === 'GET' && target === '/api/v1/requests/filters';
 }
 
 function isStaffCommand(operation: P05Operation): operation is StaffCommand {
@@ -99,18 +140,96 @@ export class RequestIntakeController {
   constructor(@Inject(REQUEST_INTAKE_HTTP) private readonly deps: HttpDependencies) {}
 
   @All(['public/callback-requests','public/repair-requests','public/request-session','public/request-session/contact-mode',
-    'public/request-session/phone-permissions','public/request-session/cancel','requests','requests/:id','requests/:id/commands/:command'])
+    'public/request-session/phone-permissions','public/request-session/cancel','requests','requests/:id','requests/:id/commands/:command',
+    'requests/search','requests/:id/card','requests/:id/events','requests/:id/comments','requests/:id/contact-details','crm/dashboard'])
   async handle(@Req() req: StaffRequest, @Res() res: ServerResponse): Promise<void> {
     res.setHeader('Cache-Control','no-store');
-    const matched = matchP05Route(req.method ?? '',req.url ?? '');
-    if (!matched) { return deny('NOT_FOUND'); }
+    const method = req.method ?? '';
+    const target = req.url ?? '';
+    const matched = matchP05Route(method,target);
+    const registry = registryQueryString(method,target);
+    const options = isRegistryOptions(method,target);
+    const search = isRegistrySearch(method,target);
+    const dashboard = isDashboard(method,target);
+    const detail = crmDetail(method,target);
+    if (matched === null && registry === null && !options && !search && !dashboard && detail === null) { return deny('NOT_FOUND'); }
     if (!await this.deps.readiness.requestEffectsReady()) { return deny('NOT_READY'); }
     for (const key of RAW_HEADERS) { header(req,key); }
     const cookies = header(req,'cookie');
     if (cookies && Buffer.byteLength(cookies,'utf8') > F_MAX_COOKIE_BYTES) { return deny('BODY_TOO_LARGE'); }
     if (header(req,'authorization') !== undefined) { throw new AuthorizationError('UNAUTHORIZED'); }
-    const op = matched.operation;
     const service = this.deps.service;
+    if (search) {
+      // JSON plus a non-simple header and an exact Origin bind this sensitive POST to the web app.
+      if (header(req,'origin') !== this.deps.staff.origin || header(req,'x-auth-request') !== '1') { return deny('FORBIDDEN'); }
+      if (['x-form-session-id','x-csrf-token','idempotency-key','if-match','if-none-match'].some(key => header(req,key) !== undefined)) {
+        return deny('INVALID_REQUEST');
+      }
+      const token = sessionToken(req);
+      const data = await service.searchStaffRegistry({ kind:'staff-web',token },Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
+      res.setHeader('Cache-Control','no-store, no-transform');
+      res.setHeader('Content-Type','application/json; charset=utf-8');
+      res.setHeader('X-Request-Id',randomUUID());
+      res.statusCode=200;
+      res.end(JSON.stringify({ data }));
+      return;
+    }
+    if (detail?.resource === 'comments' && method === 'POST') {
+      if (header(req,'x-form-session-id') !== undefined) { return deny('INVALID_REQUEST'); }
+      const token = sessionToken(req);
+      requireMutation(req,token,this.deps.staff);
+      const result = await service.addStaffComment({ kind:'staff-web',token },detail.id,writeInput(req));
+      res.setHeader('Content-Type','application/json; charset=utf-8');
+      res.setHeader('X-Request-Id',randomUUID());
+      res.statusCode = result.replayed ? 200 : 201;
+      res.end(JSON.stringify({ data:result.data }));
+      return;
+    }
+    if (registry !== null || options || dashboard || detail !== null) {
+      expectExactOrigin(req,this.deps.staff.origin);
+      const token = sessionToken(req);
+      if ((registry !== null && (registry.length > 2048 || registry.includes('#')))
+        || ['x-form-session-id','x-csrf-token','idempotency-key','if-match','if-none-match'].some(key => header(req,key) !== undefined)) {
+        return deny('INVALID_REQUEST');
+      }
+      const proof = { kind:'staff-web' as const,token };
+      let data: unknown;
+      if (dashboard) {
+        data = await service.readStaffDashboard(proof);
+      } else if (detail?.resource === 'card') {
+        const result = await service.readStaffCard(proof,detail.id);
+        data = result.data;
+        if (result.commandEtag) { res.setHeader('X-Command-ETag',result.commandEtag); }
+        if ('canStartReview' in result.data && result.data.canStartReview && header(req,'x-auth-request') === '1') {
+          res.setHeader('X-Command-CSRF',staffSessionCsrf(token,this.deps.staff.csrfSecret));
+        }
+        if (result.canAddComment && header(req,'x-auth-request') === '1') {
+          res.setHeader('X-Comment-CSRF',staffSessionCsrf(token,this.deps.staff.csrfSecret));
+        }
+      } else if (detail?.resource === 'events') {
+        data = await service.readStaffTimeline(proof,detail.id);
+      } else if (detail?.resource === 'comments') {
+        data = await service.readStaffComments(proof,detail.id);
+      } else if (detail?.resource === 'contact-details') {
+        if (header(req,'x-auth-request') !== '1') { return deny('FORBIDDEN'); }
+        data = await service.readStaffContact(proof,detail.id);
+      } else {
+        if (registry === null) { data = await service.readStaffRegistryOptions(proof); }
+        else {
+          const query = new URLSearchParams(registry);
+          const link = parseDashboardLink(query);
+          data = link ? await service.readStaffDashboardPage(proof,link) : await service.readStaffRegistry(proof,parseRegistryQuery(query));
+        }
+      }
+      res.setHeader('Cache-Control','no-store, no-transform');
+      res.setHeader('Content-Type','application/json; charset=utf-8');
+      res.setHeader('X-Request-Id',randomUUID());
+      res.statusCode=200;
+      res.end(JSON.stringify({ data }));
+      return;
+    }
+    if (matched === null) { return deny('NOT_FOUND'); }
+    const op = matched.operation;
     if (op === 'readRequestSession' || op === 'createCallback' || op === 'createRepair' || op === 'chooseCallback'
       || op === 'withdrawPhonePermission' || op === 'cancelRequestF') {
       const origin = header(req,'origin');

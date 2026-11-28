@@ -182,9 +182,35 @@ jobs:
   p05-acceptance:
     name: P05 F-01 and CITY-RBAC × state acceptance
     runs-on: ubuntu-24.04
-    # This gate owns its own isolated S3 lab and must report independently of
-    # the broader PostgreSQL/Garage integration job.
+    needs: p05-https-matrix
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Require every isolated P05 acceptance job to pass
+        env:
+          MATRIX_RESULT: ${{ needs.p05-https-matrix.result }}
+        run: test "$MATRIX_RESULT" = success
+
+  p05-https-matrix:
+    name: P05 HTTPS matrix (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: normative
+            pattern: 'F normative HTTPS matrix(?: inventory)?:'
+            expected: 6
+          - suite: city-admin
+            pattern: 'CITY-RBAC × state × command: SYSTEM ADMIN CITY states '
+            expected: 3
+          - suite: city-manager
+            pattern: 'CITY-RBAC × state × command: SYSTEM MANAGER CITY states '
+            expected: 3
+          - suite: city-custom
+            pattern: 'CITY-RBAC × state × command: CUSTOM CITY states '
+            expected: 3
     steps:
       - name: Checkout without credential persistence
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -209,14 +235,192 @@ jobs:
       - name: Start the dedicated private PostgreSQL 18.7 P05 lab
         run: node infra/p05-lab/lab.mjs up --image=s3
       - name: Measure exact P05 S3 catalog pins on fresh PostgreSQL 18.7
+        if: matrix.suite == 'normative'
         run: node infra/p05-lab/lab.mjs s3measure
-      - name: Run real F-01 DML and complete 432-cell CITY HTTPS proof
+      - name: Run real F-01 DML and PHONE completeness guard
+        if: matrix.suite == 'normative'
         run: |
           set -euo pipefail
-          node infra/p05-lab/lab.mjs s3test -- --maxWorkers 1 --testNamePattern 'P05 S3 database boundary for request capability grants|024 PHONE completeness guard|F normative HTTPS matrix inventory|CITY-RBAC × state × command' apps/api/tests/p05-bridge-profiles.test.ts apps/api/tests/p05-restore-drain.test.ts apps/api/tests/p05-intake-http.test.ts
+          node infra/p05-lab/lab.mjs s3test -- --maxWorkers 1 --testNamePattern 'P05 S3 database boundary for request capability grants|024 PHONE completeness guard' apps/api/tests/p05-bridge-profiles.test.ts apps/api/tests/p05-restore-drain.test.ts
+      - name: Run this HTTPS matrix partition
+        env:
+          MATRIX_PATTERN: ${{ matrix.pattern }}
+          MATRIX_SUITE: ${{ matrix.suite }}
+        run: |
+          set -euo pipefail
+          node infra/p05-lab/lab.mjs s3test -- --cmd sh -ec '
+            corepack pnpm exec vitest run apps/api/tests/p05-intake-http.test.ts \
+              --maxWorkers 1 --testNamePattern "$1" \
+              --reporter=default --reporter=json --outputFile.json=/tmp/p05-matrix.json
+            node infra/ci/p05-matrix-results.mjs /tmp/p05-matrix.json "$2"
+
+          ' p05-matrix "$MATRIX_PATTERN" "$MATRIX_SUITE"
       - name: Stop only this job's dedicated P05 lab
         if: always()
         run: node infra/p05-lab/lab.mjs down
+
+  p06-acceptance:
+    name: P06 CRM database boundary, bounded reads, PII and browser
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout exact candidate without credential persistence
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up Node 24.22.3
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.3
+          check-latest: false
+          package-manager-cache: false
+      - name: Verify pinned pnpm and Node
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          test "$(node --version)" = "v24.22.3"
+          test "$(corepack pnpm --version)" = "12.21.0"
+      - name: Prepare exact-SHA redacted P06 evidence
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/p06
+          git rev-parse HEAD > node_modules/.cache/ci-artifacts/p06/commit.txt
+          node infra/ci/evidence.mjs context node_modules/.cache/ci-artifacts/p06/context.json
+      - name: Install frozen dependencies and verify lint, types and all builds
+        id: quality
+        run: |
+          set -euo pipefail
+          corepack pnpm install --frozen-lockfile --ignore-scripts --strict-peer-dependencies
+          corepack pnpm run lint
+          corepack pnpm run typecheck
+          # API, Web (Next) and Mini App production builds are part of the gate.
+          corepack pnpm run build
+      - name: Verify P03, P04 and P05 OpenAPI/runtime/client wire
+        id: wire
+        run: |
+          set -euo pipefail
+          node packages/p03-contracts/verify.mjs
+          node packages/p03-contracts/p04-verify.mjs
+          node packages/p03-contracts/p05-verify.mjs
+          corepack pnpm exec vitest run apps/api/tests/p05-wire.test.ts
+      - name: Run database-free P06 unit and client suites with the gate checker
+        id: p06-unit
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/p06/results
+          corepack pnpm exec vitest run --maxWorkers 1 \
+            --reporter=json --outputFile=node_modules/.cache/ci-artifacts/p06/results/p06-unit.json \
+            apps/api/tests/p06-registry.test.ts apps/api/tests/p06-gap-unit.test.ts apps/web/tests/p06-client.test.ts
+          # 149 = 99 gap-unit + 12 registry + 38 web client. All three suites are
+          # database-free, so a skip or a shrunken suite fails here, not later.
+          node infra/ci/p06-results.mjs node_modules/.cache/ci-artifacts/p06/results/p06-unit.json 149 \
+            --total 149 --skipped 0 \
+            --require 'bounds the candidate scan and refuses instead of serving a partial page' \
+            --require 'binds the cursor to city, city version and every filter value, but accepts it unchanged' \
+            --require 'returns a complete page even when the candidate budget is exhausted later' \
+            --require 'derives a deterministic idempotency HMAC per key, namespace and intent' \
+            --require 'seals, opens and binds a managed DETAILS payload without exposing plaintext' \
+            --require 'issues a 90-second snapshot bound to the exact subject' \
+            --require 'decodes a valid registry page' \
+            --require 'rejects malformed registry pages with RegistryError' \
+            --require 'posts an exact registry search and decodes the bounded result' \
+            --require 'gates startReview and addComment proofs on headers and section state' \
+            --require 'preserves the P05 authorization refusal from the final pre-decrypt recheck'
+          node --test infra/ci/p06-results.test.mjs
+      - name: Build current-tree PostgreSQL 18.7 P06 lab image
+        id: p06-image
+        if: ${{ !cancelled() && steps.quality.outcome == 'success' }}
+        run: node infra/p05-lab/lab.mjs s3image --rebuild
+      - name: Start this job's private PostgreSQL 18.7 lab
+        id: p06-lab-up
+        if: ${{ !cancelled() && steps.p06-image.outcome == 'success' }}
+        run: node infra/p05-lab/lab.mjs up --image=s3
+      - name: Run every P06 opt-in server suite, registry tests and load proof
+        id: p06-server
+        if: ${{ !cancelled() && steps.p06-lab-up.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules/.cache/ci-artifacts/p06/results
+          # The script runs INSIDE the lab container (snapshot of this exact tree,
+          # disposable PostgreSQL 18.7) and applies the strict report gate.
+          # s3test executes in a disposable container, so its files are not on the host.
+          # Capture the gate's machine-readable stdout summary into host evidence instead.
+          node infra/p05-lab/lab.mjs s3test -- --cmd env \
+            FIXLEVELUP_P06_COMMENT_PROOF=1 \
+            FIXLEVELUP_P06_SEARCH_PROOF=1 \
+            FIXLEVELUP_P06_DASHBOARD_PROOF=1 \
+            FIXLEVELUP_P06_LOAD_PROOF=1 \
+            FIXLEVELUP_P06_GAP_PROOF=1 \
+            node infra/ci/p06-server-gate.mjs 2>&1 | tee "$RUNNER_TEMP/p06-server-gate.log"
+          sed -n 's/^P06 GATE SUMMARY //p' "$RUNNER_TEMP/p06-server-gate.log" \
+            | tail -n 1 > node_modules/.cache/ci-artifacts/p06/results/server-summary.json
+          test -s node_modules/.cache/ci-artifacts/p06/results/server-summary.json
+          grep -q '"status":"passed"' node_modules/.cache/ci-artifacts/p06/results/server-summary.json
+      - name: Stop only this job's private PostgreSQL lab
+        if: ${{ always() && steps.p06-lab-up.outcome == 'success' }}
+        run: node infra/p05-lab/lab.mjs down
+      - name: Build pinned Chromium proof image from clean exact-SHA source
+        id: p06-browser-image
+        if: ${{ !cancelled() && steps.p06-server.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          # Previous integration steps deliberately create ignored local lab state.
+          # Build the browser image from a clean archive of this exact checked-out
+          # commit so no local state, credentials or test artifacts can enter COPY.
+          P06_CONTEXT="$RUNNER_TEMP/p06-browser-source"
+          mkdir -p "$P06_CONTEXT"
+          git archive --format=tar HEAD | tar -xf - -C "$P06_CONTEXT"
+          (
+            cd "$P06_CONTEXT"
+            node "$GITHUB_WORKSPACE/infra/ci/docker.mjs" build --builder default \
+              --file infra/browser-proof/Dockerfile \
+              --tag fixlevelup-browser-proof:ci-${GITHUB_RUN_ID} .
+          )
+      - name: Run P06 live CRM browser proof over HTTPS and PostgreSQL
+        id: p06-browser
+        if: ${{ !cancelled() && steps.p06-browser-image.outcome == 'success' }}
+        run: node infra/p05-lab/p06-browser.mjs fixlevelup-browser-proof:ci-${GITHUB_RUN_ID}
+      - name: Summarize exact-SHA P06 Gate
+        if: always()
+        env:
+          CI_STEPS: ${{ toJSON(steps) }}
+          CI_JOB_STATUS: ${{ job.status }}
+          P06_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          node infra/ci/evidence.mjs summary "P06 CRM acceptance" node_modules/.cache/ci-artifacts/p06
+          {
+            echo
+            echo "P06 candidate SHA: $P06_COMMIT"
+            echo "P06 Gate job status: $CI_JOB_STATUS"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish redacted P06 Gate evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p06-acceptance-${{ github.run_id }}
+          path: |
+            node_modules/.cache/ci-artifacts/p06/context.json
+            node_modules/.cache/ci-artifacts/p06/execution.json
+            node_modules/.cache/ci-artifacts/p06/commit.txt
+            node_modules/.cache/ci-artifacts/p06/results/
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
+      - name: Fail unless every P06 Gate stage passed
+        if: always()
+        run: |
+          set -euo pipefail
+          test "${{ steps.quality.outcome }}" = success
+          test "${{ steps.wire.outcome }}" = success
+          test "${{ steps.p06-unit.outcome }}" = success
+          test "${{ steps.p06-image.outcome }}" = success
+          test "${{ steps.p06-lab-up.outcome }}" = success
+          test "${{ steps.p06-server.outcome }}" = success
+          test "${{ steps.p06-browser-image.outcome }}" = success
+          test "${{ steps.p06-browser.outcome }}" = success
 
   browser-proof:
     name: Browser proof
@@ -433,9 +637,12 @@ jobs:
         id: opt-in-run
         run: |
           set -euo pipefail
+          # The required P05 acceptance check covers the HTTPS matrix on
+          # separate PostgreSQL labs. Keep the other intake scenarios here.
           node infra/p05-lab/lab.mjs s3test --old-binary --privacy --ledger --s3 --restore -- \
             --cmd env -u FIXLEVELUP_FILE_PROCESSING_TESTS corepack pnpm exec vitest run --maxWorkers 1 \
-            --exclude apps/api/tests/p05-attachment-http.test.ts
+            --exclude apps/api/tests/p05-attachment-http.test.ts \
+            --testNamePattern '^(?!.*(?:F normative HTTPS matrix(?: inventory)?:|CITY-RBAC × state × command:))'
       - name: Run all four real isolated ClamAV/Sharp engine scenarios
         if: ${{ always() && steps.engine-fixture.outcome == 'success' && steps.lab-up.outcome == 'success' && steps.deps-ready.outcome == 'success' }}
         id: engine-run
