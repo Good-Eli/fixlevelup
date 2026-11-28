@@ -1687,9 +1687,15 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
         [managerId]);
       await provision.query('INSERT INTO foundation.staff_role_assignments(id,staff_id,role_id) VALUES ($1,$2,$3)',
         [randomUUID(),managerId,managerRoleId]);
+      const permissions = ['requests.read','requests.create'];
+      // Earlier matrix scenarios can already have seeded these MANAGER grants.
       await provision.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type)
-        SELECT r.id,p,'CITY' FROM foundation.roles r CROSS JOIN unnest($1::text[]) p
-        WHERE r.role_type='SYSTEM' AND r.code='MANAGER'`, [['requests.read','requests.create']]);
+        SELECT $1,p,'CITY' FROM unnest($2::text[]) p
+        ON CONFLICT (role_id,permission_code) DO NOTHING`, [managerRoleId,permissions]);
+      const cityGrants = await provision.query(`SELECT permission_code FROM foundation.role_permissions
+        WHERE role_id=$1 AND permission_code=ANY($2::text[]) AND scope_type='CITY' AND enabled`,
+        [managerRoleId,permissions]);
+      expect(cityGrants.rowCount).toBe(permissions.length);
       await provision.query('COMMIT');
     } catch (error) {
       await provision.query('ROLLBACK');
