@@ -1676,14 +1676,15 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
     // Create this isolated matrix actor as a DB fixture instead of weakening the
     // production requireDelegable policy just to obtain a synthetic MANAGER.
     const managerId = randomUUID();
-    await db().db.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES ($1,'MANAGER','ACTIVE',0)",
-      [managerId]);
-    const managerCredentials = await db().credentials(managerId);
     const managerRoleId = await db().systemRole('MANAGER');
     const provision = await db().db.connect();
     try {
       await provision.query('BEGIN');
       await lockAccessPolicy(provision,'write');
+      // Staff + current system role must be committed atomically: the deferred
+      // rbac_staff_current constraint validates the complete employee at COMMIT.
+      await provision.query("INSERT INTO foundation.staff(id,role,employment_state,auth_version) VALUES ($1,'MANAGER','ACTIVE',0)",
+        [managerId]);
       await provision.query('INSERT INTO foundation.staff_role_assignments(id,staff_id,role_id) VALUES ($1,$2,$3)',
         [randomUUID(),managerId,managerRoleId]);
       await provision.query(`INSERT INTO foundation.role_permissions(role_id,permission_code,scope_type)
@@ -1694,6 +1695,7 @@ describe.runIf(enabled)('P05 isolated T, real HTTPS and PostgreSQL S3', () => {
       await provision.query('ROLLBACK');
       throw error;
     } finally { provision.release(); }
+    const managerCredentials = await db().credentials(managerId);
     const manager = await db().login(managerId,managerCredentials.login,managerCredentials.password);
     const mutateAsManager = (key: string) => ({ Cookie:manager.cookie, 'Idempotency-Key':key,
       'X-CSRF-Token':createHmac('sha256',staffCsrf).update('web-auth-csrf\0').update(manager.token).digest('base64url') });
